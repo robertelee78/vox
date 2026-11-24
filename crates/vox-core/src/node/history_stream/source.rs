@@ -1237,13 +1237,23 @@ impl Source {
                 tokio::task::yield_now().await;
             }
             #[cfg(feature = "test-knobs")]
-            if target.source != target.id && crate::node::channel::bad_prefix("corrupt") {
-                if let Some(first) = descriptors.first_mut() {
-                    first.hash[0] ^= 1;
-                    eprintln!(
-                        "vox: bad prefix served mode=corrupt kind={kind:?} size={}",
-                        head.root.leaves
-                    );
+            {
+                let only = match kind {
+                    ProofKind::Inclusion => "corrupt-inclusion",
+                    ProofKind::Consistency => "corrupt-consistency",
+                    ProofKind::Control => "corrupt-control",
+                };
+                if target.source != target.id
+                    && (crate::node::channel::bad_prefix("corrupt")
+                        || crate::node::channel::bad_prefix(only))
+                {
+                    if let Some(first) = descriptors.first_mut() {
+                        first.hash[0] ^= 1;
+                        eprintln!(
+                            "vox: bad prefix served mode=corrupt kind={kind:?} size={}",
+                            head.root.leaves
+                        );
+                    }
                 }
             }
             match kind {
@@ -1383,7 +1393,10 @@ impl Source {
         #[cfg(feature = "test-knobs")]
         let tokens = {
             let mut tokens = tokens;
-            if target.source != target.id && crate::node::channel::bad_prefix("corrupt") {
+            if target.source != target.id
+                && (crate::node::channel::bad_prefix("corrupt")
+                    || crate::node::channel::bad_prefix("corrupt-control"))
+            {
                 if let Some(first) = tokens.iter_mut().find_map(|token| match token {
                     ControlToken::Collapse(descriptor) => Some(descriptor),
                     _ => None,

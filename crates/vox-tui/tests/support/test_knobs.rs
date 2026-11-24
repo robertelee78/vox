@@ -11,7 +11,12 @@
 /// Refuse as CANNOT MEASURE unless the `vox` under test reads every variable in `knobs`; say so
 /// on stderr when it does.
 pub fn require(knobs: &[&str]) {
-    let bin = env!("CARGO_BIN_EXE_vox");
+    require_in(env!("CARGO_BIN_EXE_vox"), knobs);
+}
+
+/// [`require`] for the `vox` at `bin`: a proof that runs another binary than the one cargo
+/// built (`VOX_PROOF_SHIPPED_BINARY`) checks that one.
+pub fn require_in(bin: &str, knobs: &[&str]) {
     let bytes = std::fs::read(bin).unwrap_or_else(|e| {
         panic!("CANNOT MEASURE (harness error): reading {bin} to find its test-only knobs: {e}")
     });

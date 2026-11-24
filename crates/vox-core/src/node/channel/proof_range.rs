@@ -270,12 +270,18 @@ impl ProofRangeRestore {
                         )?;
                     }
                     if let Some(value) = found {
-                        if cursor.values.len() == MAX_TREE_DEPTH + 1 {
-                            return Err(Error::SizeLimitExceeded("proof repair value depth"));
+                        // Its frontier context, unless it is held, means rebuilding it.
+                        if !work.take_object_load() {
+                            return Ok(ProofRangeStep::Progress);
                         }
-                        cursor.tasks.pop();
-                        cursor.values.push(value);
-                        continue;
+                        if frontier_held(&contexts, &value)? {
+                            if cursor.values.len() == MAX_TREE_DEPTH + 1 {
+                                return Err(Error::SizeLimitExceeded("proof repair value depth"));
+                            }
+                            cursor.tasks.pop();
+                            cursor.values.push(value);
+                            continue;
+                        }
                     }
                     // Existing verified serving material may satisfy a local verifier even
                     // before promotion. Only NEW reconstruction requires independently
@@ -326,7 +332,14 @@ impl ProofRangeRestore {
                                 range.start,
                                 range.leaves,
                             )?;
-                            if found.is_some() {
+                            if let Some(value) = found {
+                                if !work.take_object_load() {
+                                    cursor.linked = Some((range, at));
+                                    return Ok(ProofRangeStep::Progress);
+                                }
+                                if !frontier_held(&contexts, &value)? {
+                                    found = None;
+                                }
                                 break;
                             }
                             at = prior.id();
@@ -478,6 +491,15 @@ impl ProofRangeRestore {
             return Ok(ProofRangeStep::Progress);
         }
     }
+}
+
+/// A kept or cached descriptor is reused only while its frontier context is obtainable here,
+/// durable or in the serving cache: a join above it reads that context, and an asker that is
+/// served it as a proof node asks for it next (`Query::Context`). The serving-context cache
+/// evicts on its own, so a descriptor can outlive the context a serving repair generated with
+/// it; such a descriptor is treated as absent and rebuilt, which caches its context again.
+fn frontier_held(contexts: &impl ContextSource, value: &Descriptor) -> Result<bool> {
+    Ok(contexts.context(&value.frontier)?.is_some())
 }
 
 /// `VOX_MUTANT_PREFIX_PERSIST=1`: every context and range a serving repair generates is kept

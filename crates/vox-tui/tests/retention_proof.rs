@@ -2816,7 +2816,31 @@ mod proof_rows {
         }
         sent
     }
+    /// Stop as APPARATUS (the `test_knobs::require` convention) unless the `vox` under test
+    /// reads every staging knob the store act sets, the mutant it was asked for, and prints the
+    /// hostile member's line it counts.
+    fn require_store_knobs() {
+        #[cfg(feature = "test-knobs")]
+        {
+            let mut knobs = vec![
+                "VOX_TEST_CYCLE_TARGETS_FILE",
+                "hostile target sent variant=",
+                "VOX_TEST_REDUNDANT_CONTROL_FILE",
+                "VOX_TEST_HOLD_VERIFIED_FETCH",
+            ];
+            if std::env::var_os("VOX_MUTANT_PREFIX_PERSIST").is_some() {
+                knobs.push("VOX_MUTANT_PREFIX_PERSIST");
+            }
+            super::test_knobs::require(&knobs);
+        }
+        #[cfg(not(feature = "test-knobs"))]
+        panic!(
+            "CANNOT MEASURE (precondition unmet): the store act stages a hostile member and a \
+             hostile relay with test-only knobs; run it with `--features vox-tui/test-knobs`"
+        );
+    }
     pub(super) fn fetch() {
+        require_store_knobs();
         let (_tmp, a, b, ad, bd, room, id) = fresh();
         let (c, _cd) = hostile_member(&a, &b, &room);
         // A hostile server: from here on the author serves every control proof with each

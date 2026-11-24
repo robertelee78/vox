@@ -10101,6 +10101,25 @@ fn a_newcomer_shows_nothing_a_holder_on_another_fork_serves_under_its_head() {
     rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::Forked);
 }
 
+/// ADR-053 P guard: the corrupting holder of the guard above corrupts only the consistency
+/// proofs it serves under the newcomer's head; inclusion stays honest, so the newcomer reaches
+/// the consistency kind and must refuse it there. Mutant: `VOX_MUTANT_ASKER_ROOT=1`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a holder corrupting consistency proofs, a stopped author; optional"]
+fn a_newcomer_shows_nothing_a_holder_serves_with_a_corrupt_consistency_proof() {
+    rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::CorruptConsistency);
+}
+
+/// ADR-053 P guard: as above, with only the control proofs corrupted. Mutant:
+/// `VOX_MUTANT_ASKER_ROOT=1`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a holder corrupting control proofs, a stopped author; optional"]
+fn a_newcomer_shows_nothing_a_holder_serves_with_a_corrupt_control_proof() {
+    rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::CorruptControl);
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -11223,6 +11242,35 @@ mod rg1 {
         /// it wrote the newcomer's head, writing other posts there) that answers under the
         /// newcomer's head with its own branch's prefix (`VOX_TEST_BAD_PREFIX_FILE` = `fork`).
         Forked,
+        /// A guard: as `Corrupt`, but only the consistency proofs it serves under such a head
+        /// (`VOX_TEST_BAD_PREFIX_FILE` = `corrupt-consistency`); inclusion stays honest.
+        CorruptConsistency,
+        /// A guard: as `Corrupt`, but only the control proofs (`corrupt-control`).
+        CorruptControl,
+    }
+
+    /// Stop as APPARATUS (the `test_knobs::require` convention) unless the `vox` this act runs,
+    /// `VOX_PROOF_SHIPPED_BINARY` included, reads every staging knob and requested mutant it
+    /// needs and prints every line it counts.
+    fn require_prefix_knobs(exe: &str, provider: Provider) {
+        let mut knobs = vec![
+            "VOX_TEST_HEADS_ONLY_FILE",
+            "VOX_TEST_UNAVAILABLE_HEAD_FILE",
+            "history head committed author=",
+            "prefix resolved stage=",
+        ];
+        if provider != Provider::Honest {
+            knobs.extend(["VOX_TEST_BAD_PREFIX_FILE", "bad prefix served mode="]);
+        }
+        for (asked, read) in [
+            ("VOX_MUTANT_ASKER_ROOT", "VOX_TEST_ASKER_ROOT_MUTANT"),
+            ("VOX_MUTANT_PREFIX_GATE", "VOX_MUTANT_PREFIX_GATE"),
+        ] {
+            if std::env::var_os(asked).is_some() {
+                knobs.push(read);
+            }
+        }
+        crate::test_knobs::require_in(exe, &knobs);
     }
 
     /// ADR-053 P (moving-head ruling §5, the availability act). The newcomer N commits a head
@@ -11247,6 +11295,7 @@ mod rg1 {
     pub(super) fn holder_serves_a_prefix_it_never_committed(provider: Provider) {
         let root = root();
         let exe = binary();
+        require_prefix_knobs(&exe, provider);
         let author = room::worker_as(root.path(), "prefix-author", &exe);
         let holder = room::worker_as(root.path(), "prefix-holder", &exe);
         let reader = room::worker_as(root.path(), "prefix-reader", &exe);
@@ -11502,6 +11551,10 @@ mod rg1 {
             Provider::Honest => {}
             Provider::Corrupt => std::fs::write(&bad_prefix, "corrupt")
                 .expect("APPARATUS: the holder corrupts what it serves under n"),
+            Provider::CorruptConsistency => std::fs::write(&bad_prefix, "corrupt-consistency")
+                .expect("APPARATUS: the holder corrupts consistency proofs under n"),
+            Provider::CorruptControl => std::fs::write(&bad_prefix, "corrupt-control")
+                .expect("APPARATUS: the holder corrupts control proofs under n"),
             Provider::Forked => std::fs::write(&bad_prefix, "fork")
                 .expect("APPARATUS: the forked holder answers under n anyway"),
         }
