@@ -642,8 +642,8 @@ fn render(v: &Value) -> Result<String, AppError> {
                 n(b, "failures")
             );
         }
-        // A failure is named only while it is the peer's latest outcome: once a round toward
-        // the peer has completed since, `--json` keeps it as `last_failure`, history only.
+        // A failure is named only while it is the peer's latest outcome: once a round with the
+        // peer has ended without error since, `--json` keeps it as `last_failure`, history only.
         let stands = r.get("last_failure_stands").and_then(Value::as_bool) != Some(false);
         if let Some(f) = r
             .get("last_failure")

@@ -1430,10 +1430,10 @@ pub struct PortCounters {
     /// The last failure's reason, kept after rounds complete again as diagnostic history
     /// (`vox status --json` `last_failure`). Set through [`PortCounters::note_failure`].
     pub last_failure: Option<String>,
-    /// `last_failure` is still the peer's latest outcome: no round this node ran toward the peer
-    /// has completed since it (`vox status --json` `last_failure_stands`). `vox status` names the
-    /// failure only while it stands, so a peer that answers again does not carry an old reason.
-    pub last_failure_stands: bool,
+    /// The rounds with this peer that had ended without error (`completed` + `partial`) when
+    /// `last_failure` was recorded. The failure stands while that count has not grown
+    /// ([`PortCounters::last_failure_stands`]).
+    pub last_failure_at: u64,
     /// Start of this uninterrupted run of failed syncs, cleared by a successful session.
     pub failing_since: Option<std::time::Instant>,
     /// Consecutive sessions that failed in either direction.
@@ -1468,34 +1468,43 @@ pub struct PortCounters {
 }
 
 impl PortCounters {
-    /// A round with this peer failed, for `why`: the peer's latest outcome until a round this
-    /// node runs toward it completes.
-    pub(crate) fn note_failure(&mut self, why: String) {
-        self.last_failure = Some(why);
-        self.last_failure_stands = true;
+    /// The rounds with this peer, in either direction, that ended without error: completed, or
+    /// answered short of all that was asked (`partial`).
+    fn answered(&self) -> u64 {
+        self.completed.saturating_add(self.partial)
     }
 
-    /// A round this node ran toward the peer completed, or ended without error short of all it
-    /// asked for: an earlier failure is no longer the peer's latest outcome.
-    pub(crate) fn note_answered(&mut self) {
+    /// A round with this peer failed, for `why`: it stands until a later round with the peer
+    /// ends without error.
+    pub(crate) fn note_failure(&mut self, why: String) {
+        self.last_failure = Some(why);
+        self.last_failure_at = self.answered();
         #[cfg(feature = "test-knobs")]
         if failure_outlives_answers_mutant() {
-            return;
+            self.last_failure_at = u64::MAX;
         }
-        self.last_failure_stands = false;
+    }
+
+    /// `last_failure` is still the peer's latest outcome: no round with the peer has ended
+    /// without error since it (`vox status --json` `last_failure_stands`). `vox status` names the
+    /// failure only while it stands, so a peer that answers again does not carry an old reason.
+    #[must_use]
+    pub fn last_failure_stands(&self) -> bool {
+        self.last_failure.is_some() && self.answered() <= self.last_failure_at
     }
 }
 
-/// `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`: a round completed toward a peer leaves its last failure
-/// standing. Says so once on stderr when the daemon first reads it.
+/// `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`: a failure is stored ahead of every later round count, so
+/// a round that ends without error leaves it standing. Says so once on stderr when the daemon
+/// first reads it.
 #[cfg(feature = "test-knobs")]
 fn failure_outlives_answers_mutant() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let on = std::env::var_os("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").is_some();
         if on {
             eprintln!(
-                "vox: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged: a round completed toward a \
-                 peer leaves its last failure standing"
+                "vox: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged: a round that ends without \
+                 error leaves the last failure standing"
             );
         }
         on
@@ -1978,7 +1987,7 @@ impl SyncBook {
                 c.last_failure
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), q),
-                c.last_failure.is_some() && c.last_failure_stands,
+                c.last_failure_stands(),
                 c.stale,
                 c.refused,
                 c.skipped_at_cap,

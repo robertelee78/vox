@@ -18392,7 +18392,6 @@ impl Node {
             crate::node::ports::Dir::In => crate::node::status::RoundReason::Served,
             crate::node::ports::Dir::Out => attempt.reason,
         };
-        let outbound = matches!(attempt.dir, crate::node::ports::Dir::Out);
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
@@ -18405,9 +18404,6 @@ impl Node {
                     }
                     c.consecutive_failures = 0;
                     c.failing_since = None;
-                    if outbound {
-                        c.note_answered();
-                    }
                 }
                 Some(f) => {
                     c.failed += 1;

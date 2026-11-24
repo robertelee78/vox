@@ -80,11 +80,12 @@
 //!    what her status showed for Bob's port (backing off while connected), or `APPARATUS (runner
 //!    stalled)` under the same runner clock as the first act.
 //! 2. **Alice's `vox status` names no failure for Bob once he answers again**: read after she
-//!    shows his [`HEALTHY_POSTS`] (her own rounds toward him completed since the first hiccup:
-//!    her `--json` row's `completed` less `reasons.served` rose), her sync line for him names no
-//!    `last failure`. A person reading status otherwise sees a member that answers carry the
-//!    reason of a hiccup it recovered from (on main `4966688ae` the first hiccup's "the peer
-//!    refused: transport failed" stays for good). The red is `PRODUCT` with the line she read.
+//!    shows his [`HEALTHY_POSTS`] (rounds with him ended without error since the first hiccup,
+//!    her own among them: her `--json` row's `completed` less `reasons.served` rose), her sync
+//!    line for him names no `last failure`. A person reading status otherwise sees a member that
+//!    answers carry the reason of a hiccup it recovered from (on main `4966688ae` the first
+//!    hiccup's "the peer refused: transport failed" stays for good). The red is `PRODUCT` with
+//!    the line she read.
 //!
 //! Every wait before the clock is causal (her `failed` rising, the posts shown) and `APPARATUS
 //! (staging not reached)` on expiry.
@@ -94,9 +95,12 @@
 //! no longer ends the transport failure streak. The second failure then extends the first one's
 //! streak past 30 s, the port stops for 30 s, and the marker arrives late. Alice's daemon says
 //! when the mutant first keeps a streak; the act requires that line when the mutant is asked for.
-//! `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`, forwarded to Alice's daemon (test-knobs build): a round
-//! completed toward a peer leaves its last failure standing, and (2) goes red. Alice's daemon says
-//! when it reads the mutant; the act requires that line when the mutant is asked for.
+//! `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`, forwarded to Alice's daemon (test-knobs build): a
+//! failure is stored ahead of every later round count, so it stands after rounds end without
+//! error again, and (2) goes red. Alice's daemon says when it reads the mutant; the act requires
+//! that line when the mutant is asked for.
+//!
+//! Every knob and mutant this act uses must be in the `vox` it runs ([`test_knobs::require`]).
 //!
 //! # Third act: a member that keeps refusing is retried less and less often
 //! [`a_peer_that_keeps_refusing_is_retried_less_and_less_often`]: ending the streak on an answer
@@ -114,6 +118,9 @@
 
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -412,6 +419,14 @@ fn a_peer_that_failed_twice_half_a_minute_apart_still_delivers_in_seconds() {
         .expect("APPARATUS: the scratch path is not UTF-8")
         .to_owned();
     let outlives = std::env::var("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").ok();
+    let mut knobs = vec!["VOX_TEST_REFUSE_HISTORY_FILE"];
+    if mutant.is_some() {
+        knobs.push("VOX_MUTANT_TRANSPORT_STREAK");
+    }
+    if outlives.is_some() {
+        knobs.push("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS");
+    }
+    test_knobs::require(&knobs);
     let mut alice_env: Vec<(&str, &str)> = Vec::new();
     if let Some(m) = mutant.as_deref() {
         alice_env.push(("VOX_MUTANT_TRANSPORT_STREAK", m));
