@@ -297,10 +297,11 @@ other writes wait for one step of the pass at a time. One step moves at most 16 
 unless the first page it moves, with the pages that lead to it, is larger (a single value over
 16 MiB makes such a page). Choosing which pages to move reads every page of the store's tables
 at each step, so that part of a step grows with the store: on a store grown to 2.8 GB it took
-about 0.23 s of each step. In four runs on stores grown to 2.8 and 2.9 GB, one step held writes
-for at most 1.7 s and the longest wait of one post was 1.6 s (both while the store was still
-about 1.9 GB on disk). Larger stores have not been measured. Startup no longer
-compacts before Ready.
+about 0.23 s of each step. In five runs on stores grown to 2.8 and 2.9 GB, one step held writes
+for at most 1.7 s (in a pass that took the file from about 2.24 to 2.23 GB) and the longest wait
+of one post was 1.6 s (while the running node gave back the space of the first expiry, the file
+going from 2.8 to 1.9 GB). Larger stores have not been measured. Startup no longer compacts
+before Ready.
 
 If a read that began before a step can still see the pages the pass moved, the pass stops
 there and `vox status` says `giving back disk space when reads end` (`--json`:

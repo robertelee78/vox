@@ -75,7 +75,8 @@ const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 // One give-back move step copies at most this many bytes of pages, unless its first group (a
 // page and the parents rewritten with it) alone is larger, as a leaf holding one value over
 // 16 MiB is. Choosing the pages still walks every table page, so a step's time grows with the
-// store's pages. Chosen from a 2.75 GB store after a restart (RG-13 fix2).
+// store's pages. A mitigation (RG-13 fix2), adopted after one post waited 12.7 s on a 2.75 GB
+// store after a restart, before any cap; no measured run fails without it.
 const GIVE_BACK_STEP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What one give-back pass left: file and held bytes, its commits, how long it took, the
@@ -1899,16 +1900,8 @@ impl Store {
                     Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
                 };
                 if relocate {
-                    #[cfg(feature = "test-knobs")]
-                    let most = if super::computer::fx28_mutant("rg13-no-step-cap") {
-                        u64::MAX
-                    } else {
-                        GIVE_BACK_STEP_BYTES
-                    };
-                    #[cfg(not(feature = "test-knobs"))]
-                    let most = GIVE_BACK_STEP_BYTES;
                     let moved = txn
-                        .compact_pages_and_trim(most)
+                        .compact_pages_and_trim(GIVE_BACK_STEP_BYTES)
                         .map_err(storage("give back space"))?;
                     largest_move = largest_move.max(moved);
                 } else {
@@ -1926,9 +1919,11 @@ impl Store {
             let file = std::fs::metadata(&self.path)
                 .map_err(storage("measure store file"))?
                 .len();
-            drop(epochs);
             let held = space.allocated.saturating_sub(space.retired);
+            // Published before the writer is released, so a later measure (taken only under
+            // the writer) is never overwritten by this older one.
             self.give_back.now().held = Some(held);
+            drop(epochs);
             longest = longest.max(started.elapsed());
             Ok(Some(Measured {
                 file,
@@ -2030,7 +2025,7 @@ impl Store {
     /// now when no writer holds the store, between two steps of a pass, never inside one;
     /// otherwise what it last measured. `None` while it is not open for writing.
     pub(crate) fn space(&self) -> Option<StoreSpace> {
-        let mut held_now = false;
+        let mut fresh = None;
         if let Ok(epochs) = self.writer.try_lock() {
             if !epochs.replacement {
                 let space = match self.db.try_read().as_deref() {
@@ -2041,16 +2036,20 @@ impl Store {
                     Err(_) => None,
                 };
                 if let Some(space) = space {
-                    self.give_back.now().held = Some(space.allocated.saturating_sub(space.retired));
-                    held_now = true;
+                    let held = space.allocated.saturating_sub(space.retired);
+                    // Published while the writer is held, as every pass step does.
+                    self.give_back.now().held = Some(held);
+                    fresh = Some(held);
                 }
             }
             drop(epochs);
         }
         let now = self.give_back.now();
         Some(StoreSpace {
-            held_bytes: now.held,
-            held_now,
+            // Measured now: this answer's own measure, never the shared one another
+            // measurer may have replaced since.
+            held_bytes: fresh.or(now.held),
+            held_now: fresh.is_some(),
             giving_back: now.passes > 0,
             waiting_for_reads: now.waiting.is_some(),
         })

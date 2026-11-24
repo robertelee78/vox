@@ -6206,20 +6206,13 @@ fn passes_said(log: &str) {
     }
 }
 
-/// The most bytes one move step copied, from every finished pass the daemon logged.
+/// Diagnostic only, printed with each MEASUREMENT: the most bytes one move step copied, as the
+/// daemon's pass lines say. Not a verdict (ADR-018): what a person gets is a post's wait.
 #[cfg(feature = "test-knobs")]
 fn largest_step(log: &str) -> u64 {
     log.lines()
-        .filter(|l| l.contains("store file is now"))
-        .map(|l| {
-            l.split("one step moved at most ")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .and_then(|bytes| bytes.parse::<u64>().ok())
-                .unwrap_or_else(|| {
-                    panic!("PRODUCT: a finished pass does not say what one step moved: {l}")
-                })
-        })
+        .filter_map(|l| l.split("one step moved at most ").nth(1))
+        .filter_map(|rest| rest.split(' ').next()?.parse::<u64>().ok())
         .max()
         .unwrap_or(0)
 }
@@ -6236,7 +6229,6 @@ fn compaction_journey(arm: GiveBack) {
     // Each mutant its own variable; every arm under one asserts the daemon engaged it.
     let mutant = [
         ("VOX_MUTANT_RG13_NO_GIVE_BACK", "rg13-no-give-back"),
-        ("VOX_MUTANT_RG13_NO_STEP_CAP", "rg13-no-step-cap"),
         ("VOX_MUTANT_RG13_NO_RESUME", "rg13-no-resume"),
         ("VOX_MUTANT_RG13_NO_REWAIT", "rg13-no-rewait"),
         (
@@ -6781,18 +6773,6 @@ fn compaction_journey(arm: GiveBack) {
             );
         }
     };
-    // One move step copies at most 16 MiB (`GIVE_BACK_STEP_BYTES`, vox-core node/store.rs);
-    // only a first group (a page and the parents rewritten with it) larger than that alone
-    // passes it, and this act's largest value is a 60,000-byte post.
-    const STEP: u64 = 16 * 1024 * 1024;
-    let stepped = |phase: &str, said: &str| {
-        let largest = largest_step(said);
-        assert!(
-            largest <= STEP,
-            "PRODUCT: {phase}: one give-back step moved {largest} bytes; a step moves at most {STEP} bytes"
-        );
-        largest
-    };
     if arm == GiveBack::Failure {
         // A failed pass is told in the daemon log, where a person reads why space did not
         // come back; vox status says nothing of it.
@@ -6836,7 +6816,7 @@ fn compaction_journey(arm: GiveBack) {
         _ => "the running node expired compact-a",
     };
     let running = gave_back(phase, grown, held, &mut grow, "grow");
-    let largest = stepped(phase, &said);
+    let largest = largest_step(&said);
     eprintln!(
         "MEASUREMENT warm: grown={grown} running-file={running} held={held} passes={} largest-step={largest} probe {}",
         said.matches("giving back disk space (file").count(),
@@ -6999,7 +6979,7 @@ fn compaction_journey(arm: GiveBack) {
     passes_said(&said);
     let phase = format!("after the {tag} start the node expired compact-b");
     let running = gave_back(&phase, before, held, &mut daemon, tag);
-    let largest = stepped(&phase, &said);
+    let largest = largest_step(&said);
     eprintln!(
         "MEASUREMENT cold ({tag}): before={before} running-file={running} held={held} passes={} largest-step={largest} probe {}",
         said.matches("giving back disk space (file").count(),
