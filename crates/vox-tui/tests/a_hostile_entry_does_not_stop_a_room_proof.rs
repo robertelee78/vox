@@ -63,7 +63,14 @@
 //! shipped binary. The room keeps a week; Carol's node keeps a minute (`cfg/retention`, ADR-023
 //! decision 2). Bob is stopped, Alice posts, Carol takes it and a minute later lets its body go;
 //! Alice and the anchor are stopped and Bob resumed, so Carol, who serves the envelope and answers
-//! the body as not held, is his only holder. Asserted:
+//! the body as not held, is his only holder.
+//!
+//! Carol stops showing the post when it expires (her read hides an expired row), and her node
+//! drops its body only at its retention worker's next prune; until then it still serves the text.
+//! So Bob is resumed only once Carol's `vox status --json` says she no longer holds the post: her
+//! `holds_through` of Alice, which had reached the post, falls below it. That is read from her
+//! rendered-message index, which the prune removes the row from in the same store batch that
+//! drops the body (APPARATUS when it does not, within the minute's bound). Asserted:
 //! 1. Bob shows Alice's post as not received yet, in its place right after her first, without its
 //!    text, and his `vox status --json` counts it as a row;
 //! 2. once Alice is back, Bob reads the post, shows it no longer as not received yet, and his row
@@ -549,8 +556,18 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
     }
 }
 
-/// How long a node that keeps a minute may take to let a message go.
+/// How long a node that keeps a minute may take to let a message go: stop showing it, and drop
+/// its body.
 const KEPT_A_MINUTE_GOES_WITHIN: Duration = Duration::from_secs(150);
+
+/// The latest position of `of`'s feed that `m` holds a message of, as `m`'s `vox status --json`
+/// says (`holds_through`, `Channel::holds_through`): read from `m`'s rendered-message index, which
+/// a retention prune removes a message from in the same store batch that drops its body
+/// (`channel/pending_retention.rs`, `Step::Prune`). `m`'s read hides an expired message before
+/// that; this does not.
+fn holds_through(m: &Member, room: &str, of: &Member) -> Option<u64> {
+    member_row(&m.status(), room, of)["holds_through"].as_u64()
+}
 
 #[test]
 #[ignore = "real daemons and an anchor, a node that keeps a minute (about four minutes); CI runs it in release"]
@@ -592,6 +609,14 @@ fn a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet() {
         }
     }
     let rows_before = room_rows(&bob, &room);
+    // Alice's own latest message, her first post: what she holds of her feed by her status.
+    let warm_at = holds_through(&alice, &room, &alice).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT (staging): alice's `vox status --json` names no message of her own feed she \
+             holds, after posting: {}",
+            alice.status()
+        )
+    });
 
     // ---- bob is away; alice posts; carol takes it and, a minute later, lets its body go ----
     signal_took(&bob_d, "-STOP", "bob");
@@ -602,24 +627,72 @@ fn a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet() {
     }
     let hash = hash_of(&alice, &room, post)
         .unwrap_or_else(|| panic!("PRODUCT (staging): alice's own read does not show her post"));
+    // The post's position in alice's feed: her latest message once her status is past her first.
     let t = Instant::now();
-    loop {
-        match reads(&carol, &room, post) {
-            Ok(false) => break,
-            Ok(true) if t.elapsed() < KEPT_A_MINUTE_GOES_WITHIN => {
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            Ok(true) => panic!(
-                "PRODUCT (staging): carol's node keeps a minute and still shows alice's post after \
-                 {} s",
-                t.elapsed().as_secs()
+    let post_at = loop {
+        match holds_through(&alice, &room, &alice) {
+            Some(n) if n > warm_at => break n,
+            through if t.elapsed() >= ARRIVES_WITHIN => panic!(
+                "PRODUCT (staging): alice reads her post, and her `vox status --json` still names \
+                 her first as the latest message she holds of her feed after {ARRIVES_WITHIN:?} \
+                 (holds_through {through:?}, her first at {warm_at})"
             ),
-            Err(e) => panic!("PRODUCT (staging): carol's read failed: {e}"),
+            _ => std::thread::sleep(Duration::from_millis(250)),
         }
-    }
+    };
+    // Carol stops showing the post when it expires; her node drops its body at its retention
+    // worker's next prune, and serves the text until then. Bob is resumed only after that: once
+    // her status, having said she holds alice's feed through the post, says she holds less.
+    let t = Instant::now();
+    let mut held = false;
+    let mut hidden = None;
+    let (shown_until, at_hide, gone, through) = loop {
+        let through = holds_through(&carol, &room, &alice);
+        held |= through == Some(post_at);
+        if hidden.is_none() {
+            match reads(&carol, &room, post) {
+                Ok(false) => hidden = Some((t.elapsed(), through)),
+                Ok(true) => {}
+                Err(e) => panic!("PRODUCT (staging): carol's read failed: {e}"),
+            }
+        }
+        if let Some((at, at_hide)) = hidden.filter(|_| held && through.is_none_or(|n| n < post_at))
+        {
+            break (at, at_hide, t.elapsed(), through);
+        }
+        if t.elapsed() >= KEPT_A_MINUTE_GOES_WITHIN {
+            match hidden {
+                None => panic!(
+                    "PRODUCT (staging): carol's node keeps a minute and still shows alice's post \
+                     after {} s",
+                    t.elapsed().as_secs()
+                ),
+                Some((at, _)) if held => panic!(
+                    "APPARATUS: carol stopped showing alice's post {} s after she read it, and {} \
+                     s after, her `vox status --json` still says she holds alice's feed through \
+                     it (holds_through {through:?}, the post at {post_at}): her node has not \
+                     dropped its body, so bob cannot be resumed with carol not holding it",
+                    at.as_secs(),
+                    t.elapsed().as_secs()
+                ),
+                Some(_) => panic!(
+                    "APPARATUS: carol's `vox status --json` never said she holds alice's feed \
+                     through the post in {} s (holds_through {through:?}, the post at \
+                     {post_at}), so whether her node dropped its body cannot be seen",
+                    t.elapsed().as_secs()
+                ),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
     println!(
-        "[proof] kept less: carol's node let alice's post go {} s after it arrived",
-        t.elapsed().as_secs()
+        "[proof] kept less: carol stopped showing alice's post {:.1} s after she read it, her \
+         status then holding alice's feed through {at_hide:?} (the post at {post_at}); her node \
+         dropped its body {:.1} s after she read it (holds_through {through:?}): it held the text \
+         {:.1} s after it no longer showed it",
+        shown_until.as_secs_f64(),
+        gone.as_secs_f64(),
+        gone.saturating_sub(shown_until).as_secs_f64()
     );
     // Alice and the anchor hold the body; with both stopped, carol is bob's only holder.
     signal_took(&alice_d, "-STOP", "alice");
