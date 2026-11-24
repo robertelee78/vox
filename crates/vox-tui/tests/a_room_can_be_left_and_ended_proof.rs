@@ -41,6 +41,9 @@
 //! - **The CLI says it too** (ADR-028 E-5): `vox room leave` and `vox room end` each say, before
 //!   they act, what they are to do (a line starting "vox: about to leave" or "vox: about to end"
 //!   that names the room), and after, what they did.
+//! - **A post right after a removal.** Alice removes carol and posts while the key rotation the
+//!   removal owes is held unsaved (a `test-knobs` hold). Her post waits for the rotation, exits
+//!   0, and bob reads it; carol does not.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
@@ -53,7 +56,9 @@
 //! end, TUI), or their agent cursor files (end); a post taken after the end, an admin's end ignored, or a join to an ended room
 //! refused as a wrong passphrase (end); the TUI's `:leave` acting with no confirmation, or saying
 //! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave); a readmission
-//! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster).
+//! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster);
+//! a post in a removal's rotation window refused as an internal error (post after removal,
+//! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`).
 
 #![cfg(unix)]
 
@@ -70,6 +75,8 @@ optional_proof::not_run!(
 mod pty_driver;
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -948,6 +955,103 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     }
     eprintln!("[proof] FX62 queued-key: carol never read FX62-ALICE-PRE-DEBT while the removal fold was held");
     eprintln!("[proof] FX62 history-debt: both separately applied and offline-fold senders delivered fresh posts without pre-removal or removal-period debt");
+}
+
+/// A member who removes another and posts at once (ledger 77). The removal is applied by one save
+/// and the fresh sender chain it owes by the next; the window between them is held open here
+/// (`VOX_TEST_HOLD_ROOM_ROTATION_FILE`) so the post lands in it every run. The post must wait
+/// out the rotation and succeed, not be refused as "an internal error".
+/// Mutant: `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped` (the refusal reported as an internal fault).
+#[test]
+#[ignore = "real daemons and a held key rotation; CI runs it in release"]
+fn a_post_made_right_after_a_removal_waits_for_the_new_keys() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_ROOM_ROTATION_FILE"]);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let hold = tmp.path().join("rotation.hold");
+    let engaged = tmp.path().join("rotation.hold.engaged");
+    let met = tmp.path().join("rotation.hold.met");
+    let held_log = tmp.path().join("alice-held.err");
+    let daemon = || std::fs::read_to_string(&held_log).unwrap_or_default();
+    // temp_home strips inherited knobs: the runner's mutant reaches alice's daemon only here.
+    let mutant = std::env::var("VOX_MUTANT_POST_AFTER_REMOVAL").unwrap_or_default();
+    let mut knobs = vec![(
+        "VOX_TEST_HOLD_ROOM_ROTATION_FILE",
+        hold.to_str().expect("APPARATUS: UTF-8 hold path"),
+    )];
+    if !mutant.is_empty() {
+        knobs.push(("VOX_TEST_POST_AFTER_REMOVAL_MUTANT", mutant.as_str()));
+    }
+    room.workers[0].restart_daemon_as(support::VOX, &knobs, &held_log);
+    let [alice, bob, carol] = &room.workers[..] else {
+        unreachable!()
+    };
+    let (ready, read) = poll(alice, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        ready,
+        "APPARATUS: alice's restarted daemon never read the room: {read:?}"
+    );
+    std::fs::write(&hold, id).expect("APPARATUS: arm the rotation hold");
+    setup(alice, &["room", "remove-member", id, &carol.b32()]);
+    let deadline = Instant::now() + WITHIN;
+    while !engaged.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: alice's removal of carol never reached its held key rotation; daemon:\n{}",
+            daemon()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let roster = alice.vox(None, &["room", "roster", id]);
+    assert!(
+        roster.ok && !roster.stdout.contains(&carol.b32()),
+        "APPARATUS: the rotation was held before alice's roster dropped carol: {roster:?}"
+    );
+    eprintln!("[proof] post-after-removal staged: carol's removal applied, its key rotation held");
+    let text = "POST-RIGHT-AFTER-REMOVAL";
+    let (answered_while_held, post) = std::thread::scope(|s| {
+        let post = s.spawn(|| alice.vox(None, &["room", "post", id, text]));
+        // The post is in the window once the daemon refused it there at least once.
+        let deadline = Instant::now() + WITHIN;
+        while !met.is_file() && !post.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: alice's post never reached the held window; daemon:\n{}",
+                daemon()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let answered_while_held = post.is_finished();
+        std::fs::remove_file(&hold).expect("APPARATUS: release the rotation hold");
+        (
+            answered_while_held,
+            post.join().expect("APPARATUS: the post's thread"),
+        )
+    });
+    assert!(
+        post.ok && !answered_while_held,
+        "PRODUCT: alice's post made inside the held window (carol's removal applied, its key \
+         rotation not yet saved) did not wait for the rotation and succeed (answered while the \
+         rotation was still held: {answered_while_held}): {post:?}; daemon:\n{}",
+        daemon()
+    );
+    let (seen, read) = poll(bob, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(text)
+    });
+    assert!(
+        seen,
+        "PRODUCT: remaining bob never read alice's post made right after the removal: {read:?}"
+    );
+    let removed = carol.vox(None, &["room", "read", id]);
+    assert!(
+        !removed.stdout.contains(text),
+        "PRODUCT: removed carol read alice's post made after her removal: {removed:?}"
+    );
+    eprintln!("[proof] post-after-removal: alice's post waited for the new keys, exited 0, bob read it and carol did not");
 }
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
