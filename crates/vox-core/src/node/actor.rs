@@ -1701,6 +1701,9 @@ enum NetEvent {
         /// object the peer asked for. A completed round that moved nothing is `empty` in
         /// `vox status --json` (ADR-038 FX-29).
         moved: bool,
+        /// MP-9: the peer's inventory listed a fork or an unresolved head this node would ask it
+        /// for; this node's own round with it is raised, as a new head hint wakes one.
+        ask_back: bool,
     },
     /// A session's worker persisted entries (ADR-025 D1a): the room's generation moved, so its
     /// ports are evaluated — reported on its own, because a retired worker's result is ignored
@@ -13794,6 +13797,7 @@ impl Node {
                 result,
                 inventory_added,
                 moved,
+                ask_back,
             } => {
                 let current = self
                     .ports
@@ -13853,6 +13857,14 @@ impl Node {
                 if current.is_some() && inventory_added {
                     // Pending inbox hints already make the port eligible. Do not create an
                     // extra inventory request when a scoped parked hint is later discarded.
+                    self.sched_rooms.insert(channel_id);
+                }
+                // MP-9: only this node's own inventory exchange asks a listed fork proof or an
+                // unresolved head by its id, so the listing raises one round with this peer.
+                if current.is_some() && ask_back {
+                    if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                        port.raise();
+                    }
                     self.sched_rooms.insert(channel_id);
                 }
                 let still_departed = if departure_receipt || limited_recovery {
@@ -19298,7 +19310,7 @@ impl Node {
         let tx = self.net_tx.clone();
         let inbox = Arc::clone(&self.history_hints);
         let task = tokio::spawn(async move {
-            let (result, inventory_added, moved) = crate::node::history_stream::serve(
+            let (result, inventory_added, moved, ask_back) = crate::node::history_stream::serve(
                 shared,
                 store,
                 peer,
@@ -19321,6 +19333,7 @@ impl Node {
                     result,
                     inventory_added,
                     moved,
+                    ask_back,
                 })
                 .await;
         });

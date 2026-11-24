@@ -55,6 +55,18 @@ pub fn ends_feed(entry: &Entry) -> bool {
     entry.skeleton.end_of_feed
 }
 
+/// The mutant sender build's `split-chain` (MP-9 arm d) appends own entries that do not name the
+/// one before them; every other build checks the chain.
+#[cfg(feature = "mutant-sender")]
+pub(crate) fn chain_unchecked() -> bool {
+    crate::log::sync::mutant::splits_chain()
+}
+
+#[cfg(not(feature = "mutant-sender"))]
+pub(crate) const fn chain_unchecked() -> bool {
+    false
+}
+
 /// The Bamboo lipmaa skip-link **target** sequence number for entry `n`
 /// (1-indexed): the predecessor whose hash entry `n` records in
 /// `lipmaa_backlink`. Returns `1` for `n == 1` (genesis — no predecessor; the
@@ -258,7 +270,7 @@ impl Feed {
         if self.ended {
             return Err(bad("feed already ended"));
         }
-        if entry.skeleton.prev_hash != self.head_hash {
+        if entry.skeleton.prev_hash != self.head_hash && !chain_unchecked() {
             return Err(bad("feed prev_hash mismatch"));
         }
         let backlink = if seq == 1 {
@@ -269,7 +281,7 @@ impl Feed {
                 .ok_or_else(|| bad("feed backlink target missing"))?
                 .entry_hash()
         };
-        if entry.skeleton.lipmaa_backlink != backlink {
+        if entry.skeleton.lipmaa_backlink != backlink && !chain_unchecked() {
             return Err(bad("feed lipmaa_backlink mismatch"));
         }
         Ok(())

@@ -115,6 +115,8 @@ async fn handshake_and_pull(
             role: held.value.1.as_ref().map(|notice| notice.head),
             key_catalog: held.value.2,
             availability: offered_availability,
+            forks: std::mem::take(&mut held.value.5 .0),
+            unresolved: std::mem::take(&mut held.value.5 .1),
         };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;

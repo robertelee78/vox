@@ -186,6 +186,7 @@ impl Receiver {
             Option<([u8; 16], u64)>,
             Option<super::source::CatalogAnnouncement>,
             super::super::channel::availability::Token,
+            (Vec<Digest32>, Vec<super::HeadHint>),
         )>,
     > {
         self.source.inventory(job).await
@@ -437,7 +438,15 @@ impl Receiver {
                         role,
                         key_catalog,
                         availability,
-                    } => Action::Inventory(hints, role, key_catalog, availability),
+                        forks,
+                        unresolved,
+                    } => Action::Inventory(
+                        hints,
+                        role,
+                        key_catalog,
+                        availability,
+                        (forks, unresolved),
+                    ),
                     Frame::KeyAvailability { instance, page, .. } => {
                         Action::KeyAvailability(instance, page)
                     }
@@ -459,10 +468,57 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints, role, key_catalog, token) => {
+                Action::Inventory(hints, role, key_catalog, token, (forks, unresolved)) => {
                     if let (Some(connection), Some(token)) = (io.availability_connection, token) {
                         self.observe_availability(io.job(), connection, token)
                             .await?;
+                    }
+                    // MP-9: at most one listed fork this node has not frozen is asked for per
+                    // inventory; a listing alone records nothing. Rule 6: at most one unresolved
+                    // head is fetched by id or one own unresolved comparison resumed.
+                    let peer_heads: Vec<(Digest32, Digest32)> =
+                        hints.iter().map(|hint| (hint.author, hint.head)).collect();
+                    #[cfg(feature = "test-knobs")]
+                    let listed = (forks.len(), unresolved.len());
+                    let (fork, step) = match self
+                        .source
+                        .read(io.job(), 0, move |room, store| {
+                            let fork = if forks.is_empty() {
+                                None
+                            } else {
+                                room.history_fork_wanted(&forks)
+                            };
+                            let step = unresolved_ask(room, store, &unresolved, &peer_heads)?;
+                            Ok(Some((fork, step)))
+                        })
+                        .await?
+                    {
+                        Lookup::Found(found) => found.value,
+                        Lookup::Busy | Lookup::Missing => (None, None),
+                    };
+                    let ask = match step {
+                        Some(Advanced::Need(query)) => Some(query),
+                        Some(Advanced::Fork(pair)) => {
+                            // Held openings already prove it: recorded as any found fork.
+                            let (existing, conflicting) = *pair;
+                            if let Some(recorded) =
+                                self.record_fork(io.job(), existing, conflicting).await?
+                            {
+                                result.brought |= recorded;
+                            }
+                            None
+                        }
+                        _ => None,
+                    };
+                    #[cfg(feature = "test-knobs")]
+                    if listed != (0, 0) || ask.is_some() {
+                        eprintln!(
+                            "history inventory listed forks={} unresolved={} fork_asked={} \
+                             ask={ask:?}",
+                            listed.0,
+                            listed.1,
+                            fork.is_some()
+                        );
                     }
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
@@ -471,6 +527,8 @@ impl Receiver {
                         hints,
                         role,
                         key_catalog,
+                        fork,
+                        ask,
                         _charge: charge,
                     });
                     drop(incoming);
@@ -478,6 +536,39 @@ impl Receiver {
                 Action::KeyAvailability(instance, page) => {
                     result.key_availability = Some((instance, page));
                     drop(incoming);
+                }
+                Action::Meta if matches!(query, Query::Fork(_)) => {
+                    let &Query::Fork(author) = &query else {
+                        return Err(Error::MalformedBundle("fork response query changed"));
+                    };
+                    let Frame::Meta {
+                        object:
+                            super::Object::Fork {
+                                existing,
+                                conflicting,
+                            },
+                        ..
+                    } = incoming.frame()?
+                    else {
+                        return Err(Error::MalformedBundle("fork response kind"));
+                    };
+                    let existing = crate::log::entry::Entry::from_wire(existing)?;
+                    let conflicting = crate::log::entry::Entry::from_wire(conflicting)?;
+                    drop(incoming);
+                    if existing.payload.is_some()
+                        || conflicting.payload.is_some()
+                        || existing.skeleton.author_id != author
+                        || conflicting.skeleton.author_id != author
+                    {
+                        return Err(Error::MalformedBundle("fork response differs from request"));
+                    }
+                    let Some(recorded) = self.record_fork(io.job(), existing, conflicting).await?
+                    else {
+                        io.abort(WireError::SessionBusy);
+                        result.status = Status::Busy;
+                        return Ok(result);
+                    };
+                    result.brought |= recorded;
                 }
                 Action::Meta => {
                     let generation = self.generation;
@@ -878,6 +969,30 @@ impl Receiver {
         Ok(())
     }
 
+    /// MP-9: apply a fork proof (found by comparing two signed heads, or a peer's kept proof)
+    /// through the room, as a fork at a held position is applied. `None` is local busy.
+    async fn record_fork(
+        &self,
+        job: &crate::node::history_budget::Job,
+        existing: crate::log::entry::Entry,
+        conflicting: crate::log::entry::Entry,
+    ) -> Result<Option<bool>> {
+        let recorded = self
+            .source
+            .write_owned(
+                job,
+                (64 * 1024, 0, false),
+                |_, _| Ok(()),
+                |(), _| Ok(()),
+                move |room, store, ()| room.record_history_fork(store, existing, conflicting),
+            )
+            .await?;
+        Ok(match recorded {
+            Lookup::Found(recorded) => Some(recorded.value),
+            Lookup::Busy | Lookup::Missing => None,
+        })
+    }
+
     /// One persisted verifier slice. This cannot send a request or follow a missing context.
     pub(super) async fn advance(
         &self,
@@ -915,6 +1030,7 @@ enum Action {
         Option<super::HeadHint>,
         Option<([u8; 16], u64)>,
         Option<super::super::channel::availability::Token>,
+        (Vec<Digest32>, Vec<super::HeadHint>),
     ),
     Meta,
     Chunk {
@@ -2010,6 +2126,21 @@ impl Receiver {
                     }
                     Advanced::Need(query) => LocalResult::wait(step, LocalNeed::Wire(query)),
                     Advanced::Busy => LocalResult::busy(step),
+                    Advanced::Fork(pair) => {
+                        let (existing, conflicting) = *pair;
+                        if self
+                            .record_fork(job, existing, conflicting)
+                            .await?
+                            .is_none()
+                        {
+                            return Ok(LocalResult::busy(step));
+                        }
+                        // As at a held position: the fork is recorded, and this head's work
+                        // ends refused.
+                        return Err(Error::MalformedGovernance(
+                            "author signed two histories under two signed heads",
+                        ));
+                    }
                 });
             }
             LocalStep::Control {
@@ -2687,10 +2818,83 @@ impl Receiver {
     }
 }
 
+/// MP-9 (rule 6): what this node would ask for an unresolved head a peer listed, its author not
+/// frozen and its key held: the head by its id when not held here, else the next step of
+/// comparing it with the accepted head (a request to that peer, which proved under it what it
+/// kept, or the fork the held openings already prove).
+fn listed_step(
+    room: &ChannelState,
+    read: &crate::node::channel::entry_store::Read<'_>,
+    hint: &super::HeadHint,
+) -> Result<Option<Advanced>> {
+    if room.history_fork_wanted(&[hint.author]).is_none() {
+        return Ok(None);
+    }
+    if read.history_head(&hint.head)?.is_none() {
+        return Ok(Some(Advanced::Need(Query::HeadById(hint.head))));
+    }
+    admission::comparison_step(read, &hint.author, hint.head)
+}
+
+/// MP-9: whether a peer's inventory listing names something this node would ask that peer for:
+/// a fork it has not frozen, or (rule 6) an unresolved head it does not hold or has not finished
+/// comparing. A listing is never evidence; when a peer's inventory request carries one, it is
+/// this node's reason to run its own inventory exchange with that peer, as a new head hint is
+/// (`server::answer`).
+pub(super) fn listing_wanted(
+    room: &ChannelState,
+    store: &Store,
+    forks: &[Digest32],
+    unresolved: &[super::HeadHint],
+) -> Result<bool> {
+    if room.history_fork_wanted(forks).is_some() {
+        return Ok(true);
+    }
+    let read = room.history_read(store)?;
+    for hint in unresolved {
+        if listed_step(room, &read, hint)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// MP-9 (rule 6), one per inventory: for an unresolved head the peer listed, fetch it by its id
+/// or take the next step of its comparison (`listed_step`); or else take the next step of this
+/// node's own kept unresolved comparison of an author the peer holds. A step a peer once declined
+/// is asked again here, at most one per inventory, never by a timer of its own.
+fn unresolved_ask(
+    room: &ChannelState,
+    store: &Store,
+    listed: &[super::HeadHint],
+    peer_heads: &[(Digest32, Digest32)],
+) -> Result<Option<Advanced>> {
+    let read = room.history_read(store)?;
+    for hint in listed {
+        if let Some(step) = listed_step(room, &read, hint)? {
+            return Ok(Some(step));
+        }
+    }
+    for (author, _) in peer_heads {
+        if room.history_author_frozen(author) {
+            continue;
+        }
+        if let Some(step) = admission::unresolved_step(&read, author)? {
+            return Ok(Some(step));
+        }
+    }
+    Ok(None)
+}
+
 /// Charged scalar hints only. They never advance a feed or authorize a body request.
 pub(crate) struct Inventory {
     pub(crate) hints: Vec<super::HeadHint>,
     pub(crate) role: Option<super::HeadHint>,
     pub(crate) key_catalog: Option<([u8; 16], u64)>,
+    /// MP-9: one fork the peer listed that this node has not frozen, to ask for.
+    pub(crate) fork: Option<Digest32>,
+    /// MP-9 (rule 6): one request for an unresolved comparison: a listed head by its id, or
+    /// what this node's own kept unresolved head still needs.
+    pub(crate) ask: Option<Query>,
     _charge: crate::node::history_budget::BufferCharge,
 }

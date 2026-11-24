@@ -1017,11 +1017,14 @@ impl Source {
 
     /// Resolve the head a request names to one committed source head of the same room, scope and
     /// author whose authenticated material serves it (ADR-053 P). A head this node committed
-    /// serves as itself. Otherwise the source is this node's committed head of that author, at
-    /// least as large, and the asked complete root must equal that source's prefix [1,n]: from
-    /// the canonical prefix index, or rebuilt by the cooperative repair under this request's own
-    /// job, lifetime and work slices. Nothing is committed, observed or written; a differing
-    /// prefix, a smaller source or missing material is Missing, never a verdict on the asker.
+    /// serves as itself, and so does the author's one kept unresolved head (MP-9 rule 6), by its
+    /// exact id only: it is never compared with, or served as, a prefix of the committed head,
+    /// and what is served under it is only what this node proved under it. Otherwise the source
+    /// is this node's committed head of that author, at least as large, and the asked complete
+    /// root must equal that source's prefix [1,n]: from the canonical prefix index, or rebuilt by
+    /// the cooperative repair under this request's own job, lifetime and work slices. Nothing is
+    /// committed, observed or written; a differing prefix, a smaller source or missing material
+    /// is Missing, never a verdict on the asker.
     pub(super) async fn resolve(
         &self,
         job: &Job,
@@ -1036,7 +1039,10 @@ impl Source {
             .read(job, 128 * 1024, move |room, store| {
                 let read = room.history_read(store)?;
                 let id = target.id();
-                if read.history_head_committed(&id, target.binding)? {
+                if read.history_head_committed(&id, target.binding)?
+                    || (read.history_unresolved_head(&target.binding.author)? == Some(id)
+                        && read.history_head(&id)?.is_some())
+                {
                     return Ok(Some((
                         ResolvedTarget::pinned(target, id),
                         true,
@@ -1502,10 +1508,13 @@ impl Source {
             Option<([u8; 16], u64)>,
             Option<CatalogAnnouncement>,
             super::super::channel::availability::Token,
+            (Vec<Digest32>, Vec<super::HeadHint>),
         )>,
     > {
         let charge = job.reserve_or_pressure(
-            (crate::log::history::MAX_CONTEXT_AUTHORS + 2) * std::mem::size_of::<super::HeadHint>(),
+            (crate::log::history::MAX_CONTEXT_AUTHORS + 2) * std::mem::size_of::<super::HeadHint>()
+                + crate::log::history::MAX_CONTEXT_AUTHORS
+                    * (std::mem::size_of::<Digest32>() + std::mem::size_of::<super::HeadHint>()),
         )?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
         let mut after = None;
@@ -1583,20 +1592,44 @@ impl Source {
                     }
                     self.flush_authors_before_ack(room_id, authors).await?;
                     let Lookup::Found(availability) = self
-                        .read(job, 0, move |room, _| {
-                            Ok(Some(room.availability_peer(peer, None)?.local()))
+                        .read(job, 0, move |room, store| {
+                            // MP-9: the forks this node recorded and (rule 6) its unresolved
+                            // second heads, each a reason for the peer to ask, never evidence.
+                            let mut forks = room.history_fork_authors();
+                            if super::admission::fork_mutant_is("fork-unpropagated") {
+                                forks.clear();
+                            }
+                            let unresolved =
+                                if super::admission::fork_mutant_is("second-head-unkept") {
+                                    Vec::new()
+                                } else {
+                                    room.history_unresolved_hints(store)?
+                                        .into_iter()
+                                        .map(|hint| super::HeadHint {
+                                            author: hint.author,
+                                            size: hint.leaves,
+                                            head: hint.head,
+                                        })
+                                        .collect()
+                                };
+                            Ok(Some((
+                                room.availability_peer(peer, None)?.local(),
+                                (forks, unresolved),
+                            )))
                         })
                         .await?
                     else {
                         return Ok(Lookup::Busy);
                     };
+                    let (availability, forks) = availability.value;
                     return Ok(Lookup::Found(Held {
                         value: (
                             hints,
                             role,
                             key_catalog,
                             catalog_announcement,
-                            availability.value,
+                            availability,
+                            forks,
                         ),
                         _charge: charge,
                     }));
@@ -1917,6 +1950,11 @@ impl Source {
                         if room.held_through(&peer).is_none_or(|held| held < hint.size) {
                             missing.push((hint, scope));
                         }
+                        continue;
+                    }
+                    // A frozen author's later history is refused; its heads are not fetched
+                    // again, so a recorded fork is not re-proven every round (MP-9).
+                    if room.history_author_frozen(&hint.author) {
                         continue;
                     }
                     let state =

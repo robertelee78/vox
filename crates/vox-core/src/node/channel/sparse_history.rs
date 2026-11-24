@@ -956,7 +956,11 @@ impl ChannelState {
         let Some(value) = read.history_head(head)? else {
             return Ok(None);
         };
-        if read.history_head_committed(head, value.binding)? {
+        // MP-9 (rule 6): besides committed heads, the one kept unresolved head of an author is
+        // served by its id, with what this node proved under it; the asker's own gates decide.
+        if read.history_head_committed(head, value.binding)?
+            || read.history_unresolved_head(&value.binding.author)? == Some(*head)
+        {
             Ok(Some(value))
         } else {
             Ok(None)
@@ -1116,10 +1120,15 @@ impl ChannelState {
     ) -> Result<Option<HistoryHeader>> {
         let read = self.history_read(store)?;
         let binding = target.target.binding;
-        if let Some(entry) = read.history_position_header(&binding.author, seq)? {
-            return Ok(Some(HistoryHeader {
-                wire: entry.header_wire(),
-            }));
+        // An admitted position is under the accepted chain only. Under another signed head
+        // (MP-9: an unresolved second history, served as itself) only an entry proven under
+        // that head is served. A prefix resolved to a committed source is under that chain.
+        if read.history_head_accepted(&target.source, binding)? {
+            if let Some(entry) = read.history_position_header(&binding.author, seq)? {
+                return Ok(Some(HistoryHeader {
+                    wire: entry.header_wire(),
+                }));
+            }
         }
         let Some(included) =
             read.history_inclusion_receipt(&target.source, &binding.author, seq)?
@@ -1761,6 +1770,119 @@ impl ChannelState {
             }
         }
         completed.result
+    }
+
+    /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending:
+    /// what its inventory lists so a peer that never met the second history can ask for it.
+    pub(crate) fn history_fork_authors(&self) -> Vec<Digest32> {
+        self.dag
+            .fork_proofs()
+            .into_iter()
+            .filter(|proof| proof.existing.is_signed() && proof.conflicting.is_signed())
+            .map(|proof| proof.author_id)
+            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
+            .collect()
+    }
+
+    /// MP-9 (rule 6): per author the kept signed head whose continuity with the accepted chain
+    /// is still unresolved, ascending by author: what the inventory lists so a peer holding the
+    /// other history can fetch it by id and compare. An author frozen by a fork proof, or a head
+    /// accepted since, is resolved and not listed. At most one per author.
+    pub(crate) fn history_unresolved_hints(&self, store: &Store) -> Result<Vec<HistoryHeadHint>> {
+        let read = self.history_read(store)?;
+        let mut hints = Vec::new();
+        let mut after = None;
+        for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
+            let Some((author, _)) = read.history_author_after(after)? else {
+                break;
+            };
+            after = Some(author);
+            if self.dag.is_frozen(&author) {
+                continue;
+            }
+            let Some(id) = read.history_unresolved_head(&author)? else {
+                continue;
+            };
+            let Some(head) = read.history_head(&id)? else {
+                continue;
+            };
+            if read.history_head_accepted(&id, head.binding)? {
+                continue;
+            }
+            hints.push(HistoryHeadHint {
+                author,
+                leaves: head.root.leaves,
+                head: id,
+            });
+        }
+        Ok(hints)
+    }
+
+    /// MP-9: the two signed headers of the proof this node verified and kept for `author`.
+    /// No body and no key material travel.
+    pub(crate) fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
+        let proof = self.dag.fork_proof(author)?;
+        (proof.existing.is_signed() && proof.conflicting.is_signed()).then(|| {
+            (
+                proof.existing.header_wire(),
+                proof.conflicting.header_wire(),
+            )
+        })
+    }
+
+    /// MP-9: of the authors a peer lists, the first one this node has not frozen and whose key
+    /// it holds. One per inventory: a listing never makes this node ask for more.
+    pub(crate) fn history_fork_wanted(&self, authors: &[Digest32]) -> Option<Digest32> {
+        authors
+            .iter()
+            .copied()
+            .find(|author| !self.dag.is_frozen(author) && self.authors.contains_key(author))
+    }
+
+    /// An author frozen by a fork proof: its later history is refused, so nothing of it is
+    /// fetched.
+    pub(crate) fn history_author_frozen(&self, author: &Digest32) -> bool {
+        self.dag.is_frozen(author)
+    }
+
+    /// MP-9: apply two signed entries of one author at one position, found by comparing two
+    /// signed heads or received from a peer, exactly as a fork found at a held position is
+    /// applied: the author is frozen, the proof kept in SEG_FORKS and its boundary noted.
+    /// Returns false when the author was already frozen.
+    pub(crate) fn record_history_fork(
+        &mut self,
+        store: &Store,
+        existing: Entry,
+        conflicting: Entry,
+    ) -> Result<bool> {
+        let author = existing.skeleton.author_id;
+        let seq = existing.skeleton.seq;
+        if seq == 0
+            || existing.skeleton.channel_id != self.channel_id
+            || conflicting.skeleton.channel_id != self.channel_id
+        {
+            return Err(Error::MalformedBundle("fork proof binding"));
+        }
+        if self.dag.is_frozen(&author) {
+            return Ok(false);
+        }
+        let key = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedBundle("fork proof author is unknown"))?;
+        let proof = crate::log::dag::VerifiedFork::verify(
+            crate::log::dag::ForkProof {
+                author_id: author,
+                seq,
+                existing,
+                conflicting,
+            },
+            key,
+        )
+        .map_err(|_| Error::MalformedBundle("fork proof verification failed"))?;
+        self.dag.install_verified_fork(proof);
+        self.keep_forks(store)?;
+        Ok(true)
     }
 
     /// Capture only the exact publication's sealed-index access, never its room guard.

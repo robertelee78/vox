@@ -125,7 +125,7 @@ pub(crate) async fn serve(
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     availability_connection: Option<u64>,
-) -> (Result<Status>, bool, bool) {
+) -> (Result<Status>, bool, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
         room,
@@ -142,6 +142,9 @@ pub(crate) async fn serve(
         transport::Transport::new(send, recv, job, fence, deadline, availability_connection);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
+    // MP-9: the requester's inventory listed a fork or an unresolved head this node would ask it
+    // for (`client::listing_wanted`): the actor raises this node's own round with it.
+    let mut ask_back = false;
     // Whether the round moved anything: an inventory exchange that added no hint on this side
     // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
     // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
@@ -160,6 +163,7 @@ pub(crate) async fn serve(
             )),
             false,
             false,
+            false,
         );
     }
     let result = serve_request(
@@ -170,6 +174,7 @@ pub(crate) async fn serve(
         generation,
         connection_serial,
         &mut inventory_added,
+        &mut ask_back,
         &mut served_object,
         &departure_receipt,
     )
@@ -184,7 +189,12 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
-    (result, inventory_added, inventory_added || served_object)
+    (
+        result,
+        inventory_added,
+        inventory_added || served_object,
+        ask_back,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +206,7 @@ async fn serve_request(
     inbox_generation: u64,
     connection_serial: u64,
     inventory_added: &mut bool,
+    ask_back: &mut bool,
     served_object: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
@@ -267,6 +278,7 @@ async fn serve_request(
         inbox_generation,
         connection_serial,
         inventory_added,
+        ask_back,
         served_object,
     )
     .await
@@ -389,6 +401,11 @@ pub enum Query {
         entries: usize,
         wire_bytes: usize,
     },
+    /// MP-9: the fork proof this peer listed for one author in its inventory.
+    Fork(Digest32),
+    /// MP-9 (rule 6): one signed head this peer retains, by its exact id: an unresolved second
+    /// head it listed. Answered with the signed head bytes; never a committed-head claim.
+    HeadById(Digest32),
 }
 
 impl Query {
@@ -417,7 +434,11 @@ impl Query {
     }
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Inventory | Self::Head(_) | Self::Context(_) => {}
+            Self::Inventory
+            | Self::Head(_)
+            | Self::Context(_)
+            | Self::Fork(_)
+            | Self::HeadById(_) => {}
             Self::KeyAvailability { after } => {
                 if *after == Some(0) {
                     return Err(invalid("key availability cursor"));
@@ -470,6 +491,12 @@ impl Query {
             }
             Self::Head(author) => {
                 e.array(2).uint(0).bytes(author);
+            }
+            Self::Fork(author) => {
+                e.array(2).uint(9).bytes(author);
+            }
+            Self::HeadById(head) => {
+                e.array(2).uint(10).bytes(head);
             }
             Self::Context(hash) => {
                 e.array(2).uint(1).bytes(hash);
@@ -533,6 +560,8 @@ impl Query {
             (6, 1) => Self::Inventory,
             (0, 2) => Self::Head(digest(d)?),
             (1, 2) => Self::Context(digest(d)?),
+            (9, 2) => Self::Fork(digest(d)?),
+            (10, 2) => Self::HeadById(digest(d)?),
             (5, 3) => Self::Header {
                 head: digest(d)?,
                 seq: d.uint()?,
@@ -724,6 +753,12 @@ pub enum Object<'a> {
     Context(&'a [u8]),
     Proof(Proof),
     Header(&'a [u8]),
+    /// MP-9: a fork proof this node verified and kept: the two signed entry headers (no
+    /// body) its author signed at one position.
+    Fork {
+        existing: &'a [u8],
+        conflicting: &'a [u8],
+    },
 }
 
 pub enum Frame<'a> {
@@ -735,6 +770,13 @@ pub enum Frame<'a> {
         role: Option<HeadHint>,
         key_catalog: Option<([u8; 16], u64)>,
         availability: Option<super::channel::availability::Token>,
+        /// MP-9: authors this node holds a verified fork proof for, ascending. A reason to ask
+        /// `Query::Fork`, never itself evidence.
+        forks: Vec<Digest32>,
+        /// MP-9 (rule 6): per author at most one retained signed head whose continuity with
+        /// this node's accepted chain is unresolved, ascending by author. A reason to ask
+        /// `Query::HeadById`; never a committed head.
+        unresolved: Vec<HeadHint>,
     },
     KeyAvailability {
         request: RequestId,
@@ -807,13 +849,32 @@ impl<'a> Frame<'a> {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::KeyAvailability { .. } => 256,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 280 + HAVE_HINT_MAX_BYTES)
+            Self::Have {
+                hints,
+                forks,
+                unresolved,
+                ..
+            } => (HAVE_FRAME_FIXED_BYTES + 280 + HAVE_HINT_MAX_BYTES)
                 .checked_add(
                     hints
                         .len()
-                        .checked_mul(HAVE_HINT_MAX_BYTES)
+                        .checked_add(forks.len())
+                        .and_then(|count| count.checked_add(unresolved.len()))
+                        .and_then(|count| count.checked_mul(HAVE_HINT_MAX_BYTES))
                         .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
                 )
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Meta {
+                object:
+                    Object::Fork {
+                        existing,
+                        conflicting,
+                    },
+                ..
+            } => LOCAL_BYTES_FRAME_FIXED_BYTES
+                .checked_add(existing.len())
+                .and_then(|bound| bound.checked_add(conflicting.len()))
                 .filter(|bound| *bound <= MAX_FRAME_BYTES)
                 .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
             Self::Meta {
@@ -853,11 +914,16 @@ impl<'a> Frame<'a> {
                 role,
                 key_catalog,
                 availability,
+                forks,
+                unresolved,
             } => {
-                if hints.len() > MAX_CONTEXT_AUTHORS {
+                if hints.len() > MAX_CONTEXT_AUTHORS
+                    || forks.len() > MAX_CONTEXT_AUTHORS
+                    || unresolved.len() > MAX_CONTEXT_AUTHORS
+                {
                     return Err(invalid("history have authors"));
                 }
-                e.array(4).array(hints.len());
+                e.array(6).array(hints.len());
                 let mut previous = None;
                 for hint in hints {
                     if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
@@ -889,6 +955,27 @@ impl<'a> Frame<'a> {
                         return Err(invalid("availability lifetime"));
                     }
                     e.array(2).uint(token.open).uint(token.revision);
+                }
+                e.array(forks.len());
+                let mut previous = None;
+                for author in forks {
+                    if previous.is_some_and(|last| last >= *author) {
+                        return Err(invalid("history have fork order"));
+                    }
+                    previous = Some(*author);
+                    e.bytes(author);
+                }
+                e.array(unresolved.len());
+                let mut previous = None;
+                for hint in unresolved {
+                    if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
+                        return Err(invalid("history have unresolved order/size"));
+                    }
+                    previous = Some(hint.author);
+                    e.array(3)
+                        .bytes(&hint.author)
+                        .uint(hint.size)
+                        .bytes(&hint.head);
                 }
                 0x02
             }
@@ -946,6 +1033,14 @@ impl<'a> Frame<'a> {
                     Object::Header(bytes) => {
                         bound(bytes, MAX_HEADER_BYTES)?;
                         e.uint(3).bytes(bytes);
+                    }
+                    Object::Fork {
+                        existing,
+                        conflicting,
+                    } => {
+                        bound(existing, MAX_HEADER_BYTES)?;
+                        bound(conflicting, MAX_HEADER_BYTES)?;
+                        e.uint(4).array(2).bytes(existing).bytes(conflicting);
                     }
                 }
                 0x06
@@ -1053,7 +1148,7 @@ impl<'a> Frame<'a> {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
             0x02 => {
-                arity(&mut d, 4)?;
+                arity(&mut d, 6)?;
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -1114,11 +1209,44 @@ impl<'a> Frame<'a> {
                     }
                     _ => return Err(invalid("availability count")),
                 };
+                let count = d.array()?;
+                if count > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have forks"));
+                }
+                let mut forks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let author = digest(&mut d)?;
+                    if forks.last().is_some_and(|last| *last >= author) {
+                        return Err(invalid("history have fork order"));
+                    }
+                    forks.push(author);
+                }
+                let count = d.array()?;
+                if count > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have unresolved"));
+                }
+                let mut unresolved: Vec<HeadHint> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arity(&mut d, 3)?;
+                    let author = digest(&mut d)?;
+                    let size = d.uint()?;
+                    if size > MAX_SEQ || unresolved.last().is_some_and(|last| last.author >= author)
+                    {
+                        return Err(invalid("history have unresolved order/size"));
+                    }
+                    unresolved.push(HeadHint {
+                        author,
+                        size,
+                        head: digest(&mut d)?,
+                    });
+                }
                 Self::Have {
                     hints,
                     role,
                     key_catalog,
                     availability,
+                    forks,
+                    unresolved,
                 }
             }
             0x03 => {
@@ -1177,6 +1305,13 @@ impl<'a> Frame<'a> {
                         });
                     }
                     3 => Object::Header(bounded_bytes(&mut d, MAX_HEADER_BYTES)?),
+                    4 => {
+                        arity(&mut d, 2)?;
+                        Object::Fork {
+                            existing: bounded_bytes(&mut d, MAX_HEADER_BYTES)?,
+                            conflicting: bounded_bytes(&mut d, MAX_HEADER_BYTES)?,
+                        }
+                    }
                     _ => return Err(invalid("history metadata kind")),
                 };
                 Self::Meta { request, object }

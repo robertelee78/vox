@@ -494,11 +494,15 @@ impl Entry {
                 "log-entry payload hash/len mismatch",
             ));
         }
-        Ok(Self {
+        let entry = Self {
             skeleton,
             authenticator,
             payload: Some(payload),
-        })
+        };
+        // The mutant sender build only (MP-9 arm d): the other copy's entry may stand in for it.
+        #[cfg(feature = "mutant-sender")]
+        let entry = crate::log::sync::mutant::own_entry(entry);
+        Ok(entry)
     }
 
     /// Build a composite-signed entry whose payload body is **not** retained

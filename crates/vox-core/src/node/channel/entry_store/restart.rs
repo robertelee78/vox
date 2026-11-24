@@ -257,7 +257,7 @@ fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
 /// remains unpublished until the signed witness and active root switch commit together.
 pub(super) fn advance(state: &mut PublishedFeed, entry: &Entry) -> Result<()> {
     if state.seq.checked_add(1) != Some(entry.skeleton.seq)
-        || state.hash != entry.skeleton.prev_hash
+        || (state.hash != entry.skeleton.prev_hash && !crate::log::feed::chain_unchecked())
         || state.ended
     {
         return Err(invalid("restart promotion continuity"));
