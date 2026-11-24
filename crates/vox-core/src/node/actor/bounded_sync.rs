@@ -3923,7 +3923,7 @@ impl Node {
                         work.peer,
                         |counts| {
                             counts.failed += 1;
-                            counts.last_failure = Some(error);
+                            counts.note_failure(error);
                         },
                     );
                     if let Some(backoff) = backoff {
@@ -3942,7 +3942,7 @@ impl Node {
                         work.peer,
                         |counts| {
                             counts.failed += 1;
-                            counts.last_failure = Some(error);
+                            counts.note_failure(error);
                         },
                     );
                     if let Some(backoff) = backoff {
@@ -4003,7 +4003,7 @@ impl Node {
                     work.peer,
                     |counts| {
                         counts.failed += 1;
-                        counts.last_failure = Some(error);
+                        counts.note_failure(error);
                     },
                 );
                 if let Some(backoff) = backoff {
