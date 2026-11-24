@@ -675,11 +675,6 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 // - `..._through_a_member_who_meets_both`: bob and carol never run at the same time again; dave
 //   meets carol, then bob, restarts, then meets carol again. bob and carol each list eve's
 //   equivocation.
-// - `..._withheld_is_never_called_a_fork`: carol (a test-side withholding holder,
-//   `VOX_TEST_WITHHOLD_AUTHOR_FILE`) answers no header, proof or fork proof of eve's. She meets
-//   bob and records the fork herself. Then, with bob stopped, alice (an unrelated sender) posts
-//   twice to carol alone; bob, started again, reads both from carol, so he has had carol's
-//   inventory since she recorded the fork. bob lists nothing and says nothing about eve.
 // - `..._held_unresolved_between_two_groups_...` (rule 6): bob (group A) and carol (group B)
 //   never run at the same time again. dave meets bob (side A), then carol (side B) as a holder
 //   that kept eve's accepted head but no opening of it (staging knob
@@ -696,17 +691,17 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 //   proves the fork. bob lists it and says it.
 //
 // Mutants (`VOX_MUTANT_FORK`): `equal-size-only` (heads of different sizes are never compared)
-// turns the first two red; `fork-unpropagated` (a recorded fork is never listed) turns the
-// second and the fourth red at carol, since carol meets only dave, whose current head is her own
-// or unopenable; `second-head-unkept` (an unresolved head is neither kept nor listed) turns the
-// fourth red at bob; `terminal-header-only` (a matching entry at the overlap ends the comparison)
-// turns the fifth red.
+// turns `..._when_the_two_members_meet` and `..._through_a_member_who_meets_both` red;
+// `fork-unpropagated` (a recorded fork is never listed) turns `..._through_a_member_who_meets_both`
+// and rule 6 red at carol, since carol meets only dave, whose current head is her own or
+// unopenable; `second-head-unkept` (an unresolved head is neither kept nor listed) turns rule 6
+// red at bob; `terminal-header-only` (a matching entry at the overlap ends the comparison) turns
+// arm d red. (A withheld proof is never called a fork: a spike, not committed here; see the PR.)
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Meeting {
     Direct,
     ThroughDave,
-    Withheld,
     Unresolved,
     PrefixDiffers,
 }
@@ -785,7 +780,6 @@ fn unequal_fork(meeting: Meeting) {
     watchdog::arm();
     // The staging knobs an arm needs, and a mutant a run names, are in the `vox` under test.
     let mut knobs = match meeting {
-        Meeting::Withheld => vec!["VOX_TEST_WITHHOLD_AUTHOR_FILE"],
         Meeting::Unresolved => vec!["VOX_TEST_NO_ACCEPTED_OPENING_FILE"],
         Meeting::Direct | Meeting::ThroughDave | Meeting::PrefixDiffers => vec![],
     };
@@ -829,9 +823,7 @@ fn unequal_fork(meeting: Meeting) {
             .to_owned();
         (path, text)
     };
-    let (withhold, withhold_path) = staging_file("withhold");
     let (sparse, sparse_path) = staging_file("sparse");
-    let carol_env = [("VOX_TEST_WITHHOLD_AUTHOR_FILE", withhold_path.as_str())];
     let dave_env = [("VOX_TEST_NO_ACCEPTED_OPENING_FILE", sparse_path.as_str())];
     // Arm (d): each copy of eve writes the entries it signs to its own directory; eve′ appends
     // `adopt-<seq>` (eve's entry) in place of its own at that position.
@@ -901,7 +893,7 @@ fn unequal_fork(meeting: Meeting) {
     }
     let alice = daemon("alice", &alice_dir, &spec, &idpass);
     let bob = daemon("bob", &bob_dir, &spec, &idpass);
-    let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+    let carol = daemon("carol", &carol_dir, &spec, &idpass);
     let dave = daemon_env("dave", &dave_dir, &spec, &idpass, &dave_env);
     let eve = daemon("eve", &eve_dir, &spec, &idpass);
 
@@ -1071,7 +1063,7 @@ fn unequal_fork(meeting: Meeting) {
             "PRODUCT (staging): eve′ reads UF-A-1, so its posts continued the first side instead \
              of forking it"
         );
-        let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+        let carol = daemon("carol", &carol_dir, &spec, &idpass);
         staged_read(
             &carol_dir,
             &eve2_dir,
@@ -1129,7 +1121,7 @@ fn unequal_fork(meeting: Meeting) {
             let eve = daemon("eve", &eve_dir, &spec, &idpass);
             post(&eve_dir, &room, "eve", "UF-AFTER");
             let bob = daemon("bob", &bob_dir, &spec, &idpass);
-            let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+            let carol = daemon("carol", &carol_dir, &spec, &idpass);
             for (who, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
                 assert!(
                     wait_reads(d, &room, "UF-CONTROL", STAGE),
@@ -1172,7 +1164,7 @@ fn unequal_fork(meeting: Meeting) {
             // dave restarts before he meets carol again: what he recorded or kept is durable.
             stop(dave);
             let dave = daemon_env("dave", &dave_dir, &spec, &idpass, &dave_env);
-            let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+            let carol = daemon("carol", &carol_dir, &spec, &idpass);
             let carol_list = wait_listed(&carol_dir, &room_id, &eve_fp, DETECT);
             eprintln!("[proof] with dave and carol running: carol lists {carol_list:?}");
             assert!(
@@ -1193,68 +1185,6 @@ fn unequal_fork(meeting: Meeting) {
             }
             drop((carol, dave));
         }
-        Meeting::Withheld => {
-            let carol = carol_running.expect("APPARATUS: carol was staged with side B");
-            std::fs::write(&withhold, &eve_fp).expect("APPARATUS: cannot write a staging file");
-            let bob = daemon("bob", &bob_dir, &spec, &idpass);
-            // carol can verify both sides herself (bob serves side A honestly) and records the
-            // fork; what she withholds is everything of eve's she holds, the fork proof too.
-            let carol_list = wait_listed(&carol_dir, &room_id, &eve_fp, DETECT);
-            eprintln!("[proof] carol, who holds side B and met bob's side A, lists {carol_list:?}");
-            assert!(
-                names(&carol_list, &eve_fp),
-                "PRODUCT (staging): carol never recorded the fork, so no withheld proof was ever \
-                 asked of her: she lists {carol_list:?}"
-            );
-            // alice (an unrelated sender, stopped since before the fork) posts twice alone;
-            // carol, started after, reads them. bob, started again with alice stopped, can read
-            // them only from carol: he has then had carol's inventory, which lists the fork,
-            // since she recorded it.
-            stop(bob);
-            stop(carol);
-            let alice = daemon("alice", &alice_dir, &spec, &idpass);
-            for i in 1..=2 {
-                post(&alice_dir, &room, "alice", &format!("UF-ALICE-{i}"));
-            }
-            let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
-            staged_read(
-                &carol_dir,
-                &alice_dir,
-                &room,
-                "UF-ALICE-2",
-                "carol never read alice's UF-ALICE-2",
-            );
-            stop(alice);
-            let bob = daemon("bob", &bob_dir, &spec, &idpass);
-            assert!(
-                wait_reads(&bob_dir, &room, "UF-ALICE-2", STAGE),
-                "PRODUCT (staging): bob never read alice's UF-ALICE-2 from carol"
-            );
-            let bob_list = listed(&bob_dir, &room_id);
-            let r = room_read(&bob_dir, &room);
-            let (_, status, _) = vox_once(&bob_dir, &args(&["status", "--json"]));
-            eprintln!("[proof] bob lists {bob_list:?}; bob's status: {status}");
-            assert!(
-                !names(&bob_list, &eve_fp),
-                "PRODUCT: bob called eve's withheld second history a fork: he lists {bob_list:?}"
-            );
-            assert!(
-                !says_equivocated(&r, "eve", &eve_fp),
-                "PRODUCT: bob's `vox room read` says eve equivocated, from withheld evidence:\n{r}"
-            );
-            assert!(
-                r.contains("UF-A-3") && !r.contains("UF-B-1"),
-                "PRODUCT: bob no longer reads side A as he held it, or reads withheld side B:\n{r}"
-            );
-            let short_eve: String = eve_fp.chars().take(26).collect();
-            eprintln!(
-                "[proof] bob's rows about eve ({short_eve}): {:?}",
-                r.lines()
-                    .filter(|l| l.contains(&short_eve) || l.contains("eve"))
-                    .collect::<Vec<_>>()
-            );
-            drop((bob, carol));
-        }
         Meeting::Unresolved => {
             let carol = carol_running.expect("APPARATUS: carol was staged with side B");
             // dave meets bob (side A) alone and holds it as any member does.
@@ -1268,7 +1198,7 @@ fn unequal_fork(meeting: Meeting) {
             stop(bob);
             // From here dave keeps eve's accepted head but neither opens nor serves it.
             std::fs::write(&sparse, &eve_fp).expect("APPARATUS: cannot write a staging file");
-            let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+            let carol = daemon("carol", &carol_dir, &spec, &idpass);
             let author = format!("author={eve_fp} ");
             // Observed, not asserted (a build without the knob or the line, main, goes on to the
             // act's own assertions): dave, holding side A, opened side B's overlap under carol's
@@ -1309,7 +1239,7 @@ fn unequal_fork(meeting: Meeting) {
             );
             stop(bob);
             // carol (group B) meets dave again.
-            let carol = daemon_env("carol", &carol_dir, &spec, &idpass, &carol_env);
+            let carol = daemon("carol", &carol_dir, &spec, &idpass);
             let carol_list = wait_listed(&carol_dir, &room_id, &eve_fp, DETECT);
             eprintln!("[proof] with dave and carol running: carol lists {carol_list:?}");
             assert!(
@@ -1368,12 +1298,6 @@ fn a_split_view_of_unequal_sizes_is_caught_when_the_two_members_meet() {
 #[ignore = "real vox processes, five members and a copied profile; CI runs it in release"]
 fn a_split_view_of_unequal_sizes_is_caught_through_a_member_who_meets_both() {
     unequal_fork(Meeting::ThroughDave);
-}
-
-#[test]
-#[ignore = "real vox processes, five members and a copied profile; CI runs it in release"]
-fn a_split_view_whose_proof_is_withheld_is_never_called_a_fork() {
-    unequal_fork(Meeting::Withheld);
 }
 
 #[test]

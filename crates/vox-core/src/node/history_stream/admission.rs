@@ -1418,10 +1418,14 @@ pub(super) fn comparison_step(
         .ok_or(invalid("accepted baseline missing"))?
         .root;
     // A resumed comparison asks a peer that kept this head what it proved under it: the
-    // opening at the accepted size first. Matching there, today's consistency check decides
-    // (`unequal`). The ordinary promotion of a larger head keeps today's order and cost.
-    if signed.root.leaves > baseline.leaves && baseline.leaves != 0 && !fork_mutant() {
-        match compare_overlap(input, id, baseline_id, *author, baseline.leaves)? {
+    // opening at the smaller size first, whichever head is larger. Matching there, today's
+    // consistency check decides (`unequal`). A smaller kept head is not asked a consistency
+    // proof under this node's own accepted head first: the peer that listed it may hold that
+    // head only as an unresolved one and answer unavailable at every meeting, so the two sides
+    // would never be compared. The ordinary promotion of a head keeps today's order and cost.
+    let at = signed.root.leaves.min(baseline.leaves);
+    if signed.root.leaves != baseline.leaves && at != 0 && !fork_mutant() {
+        match compare_overlap(input, id, baseline_id, *author, at)? {
             Overlap::Fork(fork) => return Ok(Some(Advanced::Fork(fork))),
             Overlap::Need(query) => return Ok(Some(Advanced::Need(query))),
             Overlap::Same => {}

@@ -2658,7 +2658,7 @@ fn mp9_peer_holds_own_feed(author: &Worker, peer: &Worker, room: &str) {
     });
     assert!(
         held,
-        "APPARATUS: {} never said it holds {}'s whole feed: {status:?}",
+        "PRODUCT (staging): {} never said it holds {}'s whole feed: {status:?}",
         peer.name, author.name
     );
 }

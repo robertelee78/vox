@@ -210,7 +210,11 @@ impl ProofRangeRestore {
         {
             return Err(Error::MalformedAtRest("proof repair source changed"));
         }
-        let reconstruction_allowed = read.history_head_committed(&cursor.source, cursor.binding)?
+        // The canonical index holds the committed branch's nodes. A source this node never
+        // committed (the author's kept unresolved head, MP-9 rule 6) may be another branch: only
+        // the pieces verified under that head itself are its witnesses.
+        let source_committed = read.history_head_committed(&cursor.source, cursor.binding)?;
+        let reconstruction_allowed = source_committed
             && !frozen
             && read
                 .sparse_author(&cursor.binding.author, cursor.binding.scope)?
@@ -253,14 +257,18 @@ impl ProofRangeRestore {
                             return Ok(ProofRangeStep::Progress);
                         }
                     }
-                    // The canonical acceptance index first. A piece kept under the source is
-                    // that source's node; for an asked head this node never committed only a
-                    // full aligned block is reused, the same node in every head containing it,
-                    // and every partial or right-edge node is rebuilt for the asked size.
+                    // The canonical acceptance index first, when the source is committed. A
+                    // piece kept under the source is that source's node; for an asked head this
+                    // node never committed only a full aligned block is reused, the same node in
+                    // every head containing it, and every partial or right-edge node is rebuilt
+                    // for the asked size.
                     let aligned =
                         range.leaves.is_power_of_two() && (range.start - 1) % range.leaves == 0;
-                    let mut found =
-                        read.history_range(cursor.binding, range.start, range.leaves)?;
+                    let mut found = if source_committed {
+                        read.history_range(cursor.binding, range.start, range.leaves)?
+                    } else {
+                        None
+                    };
                     if found.is_none() && (exact || aligned) {
                         found = read.history_proof_range(
                             &cursor.source,

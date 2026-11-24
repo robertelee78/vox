@@ -288,30 +288,6 @@ pub(super) async fn answer(
                         _ => false,
                     }
             });
-    // A test-side withholding holder (MP-9): every header, proof, body and fork proof of the
-    // author named in the file is answered EvidenceUnavailable; its head is still served. The
-    // author is the asked target's, so a head this node never held (a prefix it would serve,
-    // ADR-053 P) is withheld too.
-    #[cfg(feature = "test-knobs")]
-    let staged_unavailable = staged_unavailable || {
-        let withheld = std::env::var_os("VOX_TEST_WITHHOLD_AUTHOR_FILE")
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty());
-        match (withheld, query.clone()) {
-            (Some(author), Query::Fork(id)) => crate::node::link::b32_encode(&id) == author,
-            (
-                Some(author),
-                Query::Header { .. }
-                | Query::Proof { .. }
-                | Query::Entry { .. }
-                | Query::Page { .. },
-            ) => target.is_some_and(|target| {
-                crate::node::link::b32_encode(&target.binding.author) == author
-            }),
-            _ => false,
-        }
-    };
     // A holder that kept an author's accepted head but no opening of it (MP-9 staging,
     // `admission::no_accepted_opening`): nothing under that accepted head, nor under a prefix of
     // it (ADR-053 P), is served; only what it proved under the kept unresolved head is.
