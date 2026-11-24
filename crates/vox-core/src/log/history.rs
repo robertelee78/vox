@@ -877,6 +877,70 @@ pub fn join_descriptors(
     )))
 }
 
+/// The canonical body of a signed head without its signature: binding, tail epoch and complete
+/// root. A head-bound request carries it so a holder can resolve a head it never stored. It is
+/// an untrusted selector: its bytes are authenticated only by `id` equality with the requested
+/// head and by equality of `root` with a prefix the holder computed from its own material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadTarget {
+    /// Exact room, scope and author binding.
+    pub binding: TreeBinding,
+    /// Epoch of the terminal leaf as the signed body states it.
+    pub tail_epoch: u64,
+    /// Complete requested descriptor; its `leaves` is the prefix size.
+    pub root: Descriptor,
+}
+impl HeadTarget {
+    /// Exact encoded bound: array header, format, two digests, scope, epoch and descriptor.
+    pub const MAX_BYTES: usize = 1 + 1 + 2 * 34 + 1 + 9 + (1 + 9 + 9 + 2 * 34);
+    fn encode_fields(&self, e: &mut Encoder) {
+        e.uint(2)
+            .bytes(&self.binding.author)
+            .bytes(&self.binding.room)
+            .uint(self.binding.scope as u64)
+            .uint(self.tail_epoch);
+        self.root.encode(e);
+    }
+    /// Append the exact canonical head body hashed or signed by [`SignedHead`].
+    pub fn encode(&self, e: &mut Encoder) {
+        e.array(6);
+        self.encode_fields(e);
+    }
+    /// Decode a canonical head body; shape only, never authentication.
+    pub fn decode(d: &mut Decoder<'_>) -> Result<Self> {
+        arity(d, 6, "head body arity")?;
+        if d.uint()? != 2 {
+            return Err(Error::MalformedBundle("head format"));
+        }
+        let author = digest(d)?;
+        let room = digest(d)?;
+        let scope = LogScope::decode(d.uint()?)?;
+        let target = Self {
+            binding: TreeBinding {
+                room,
+                scope,
+                author,
+            },
+            tail_epoch: d.uint()?,
+            root: Descriptor::decode(d)?,
+        };
+        if target.root.leaves == 0 && target.root != Descriptor::empty(target.binding) {
+            return Err(Error::MalformedBundle("noncanonical empty head"));
+        }
+        Ok(target)
+    }
+    /// Encode exactly the canonical head body.
+    pub fn canonical_body(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        self.encode(&mut e);
+        e.finish()
+    }
+    /// The head ID of every signed head with this body.
+    pub fn id(&self) -> Digest32 {
+        sha256(&signing_input(StructTag::LogHead, &self.canonical_body()))
+    }
+}
+
 /// An author-signed descriptor; a signature alone does not prove continuity.
 #[derive(Clone)]
 pub struct SignedHead {
@@ -899,24 +963,24 @@ impl core::fmt::Debug for SignedHead {
     }
 }
 impl SignedHead {
+    /// The unsigned canonical body of this head.
+    pub fn target(&self) -> HeadTarget {
+        HeadTarget {
+            binding: self.binding,
+            tail_epoch: self.tail_epoch,
+            root: self.root,
+        }
+    }
     fn encode_body(&self, e: &mut Encoder) {
-        e.uint(2)
-            .bytes(&self.binding.author)
-            .bytes(&self.binding.room)
-            .uint(self.binding.scope as u64)
-            .uint(self.tail_epoch);
-        self.root.encode(e);
+        self.target().encode_fields(e);
     }
     /// Encode exactly the canonical body hashed or signed by this type.
     pub fn canonical_body(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
-        e.array(6);
-        self.encode_body(&mut e);
-        e.finish()
+        self.target().canonical_body()
     }
     /// Identify the canonical signed head body, excluding randomized signature bytes.
     pub fn id(&self) -> Digest32 {
-        sha256(&signing_input(StructTag::LogHead, &self.canonical_body()))
+        self.target().id()
     }
     /// Sign this descriptor with its exact author's root key.
     pub fn sign(
@@ -1347,6 +1411,10 @@ impl InclusionVerifier {
             || self.next != self.proof.siblings.len()
             || self.current != Some(self.head.head().root)
         {
+            // The P guards' mutant keeps no trace of a proof it took on faith.
+            if root_check_skipped() {
+                return Ok(Vec::new());
+            }
             return Err(Error::MalformedBundle("incomplete inclusion range trace"));
         }
         Ok(std::mem::take(&mut self.ranges))
@@ -1371,13 +1439,13 @@ impl InclusionVerifier {
             };
         };
         let Some(sibling) = self.proof.siblings.get(self.next).copied() else {
-            if self.last != 0 || current != self.head.head().root {
+            if self.last != 0 || (current != self.head.head().root && !root_check_skipped()) {
                 return Err(Error::MalformedBundle("inclusion root mismatch"));
             }
             return Ok(HistoryStep::Complete(IncludedHeader {
                 head_id: self.head.head().id(),
                 binding,
-                root: current,
+                root: self.head.head().root,
                 header: self.header.clone(),
             }));
         };
@@ -1592,6 +1660,9 @@ impl ConsistencyVerifier {
                 && self.new_acc == self.head.head().root
         };
         if !complete {
+            if root_check_skipped() {
+                return Ok(Vec::new());
+            }
             return Err(Error::MalformedBundle("incomplete consistency range trace"));
         }
         if self.head.head().root.leaves != 0 {
@@ -1658,8 +1729,8 @@ impl ConsistencyVerifier {
         let Some(node) = self.proof.nodes.get(self.next).copied() else {
             if self.old_joined
                 || self.last != 0
-                || self.old_acc != self.prefix
-                || self.new_acc != self.head.head().root
+                || ((self.old_acc != self.prefix || self.new_acc != self.head.head().root)
+                    && !root_check_skipped())
             {
                 return Err(Error::MalformedBundle("consistency root mismatch"));
             }
@@ -1962,6 +2033,9 @@ impl ControlRangeVerifier {
             || self.next != self.proof.tokens.len()
             || self.values.as_slice() != [self.head.head().root]
         {
+            if root_check_skipped() {
+                return Ok(Vec::new());
+            }
             return Err(Error::MalformedBundle("incomplete control range trace"));
         }
         Ok(std::mem::take(&mut self.ranges))
@@ -1979,7 +2053,7 @@ impl ControlRangeVerifier {
             let Some(task) = self.tasks.last().cloned() else {
                 if self.next != self.proof.tokens.len()
                     || self.values.len() != 1
-                    || self.values[0] != self.head.head().root
+                    || (self.values[0] != self.head.head().root && !root_check_skipped())
                 {
                     return Err(Error::MalformedBundle(
                         "control proof reconstruction mismatch",
@@ -2550,4 +2624,24 @@ fn bounded_usize(value: u64, maximum: usize, message: &'static str) -> Result<us
         return Err(Error::SizeLimitExceeded(message));
     }
     Ok(value)
+}
+
+/// `VOX_TEST_ASKER_ROOT_MUTANT=1` (the ADR-053 P guards' mutant): this node's inclusion,
+/// consistency and control verifiers take a proof whose reconstruction misses the signed root
+/// as verified, keeping none of its trace. Says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn root_check_skipped() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_TEST_ASKER_ROOT_MUTANT").is_some();
+        if on {
+            eprintln!("vox: VOX_TEST_ASKER_ROOT_MUTANT engaged: verifiers skip the root check");
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn root_check_skipped() -> bool {
+    false
 }

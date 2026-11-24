@@ -14,10 +14,10 @@ use crate::hash::Digest32;
 use crate::log::entry::Entry;
 use crate::log::history::{
     consistency_ranges, inclusion_ranges, split, ConsistencyProof, ControlRangeProof, ControlToken,
-    Descriptor, InclusionProof, SignedHead, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
+    Descriptor, HeadTarget, InclusionProof, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
 use crate::node::channel::pending_text::PENDING_WRITE_WAIT;
-use crate::node::channel::ChannelState;
+use crate::node::channel::{ChannelState, ResolvedTarget};
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
@@ -296,14 +296,14 @@ impl Source {
     pub(super) async fn authorize_recovery_contexts(
         &self,
         job: &Job,
-        head: &SignedHead,
+        target: &ResolvedTarget,
         contexts: Vec<Digest32>,
     ) -> Result<bool> {
-        if !self.own_recovery || head.binding.author != self.peer || contexts.is_empty() {
+        if !self.own_recovery || target.target.binding.author != self.peer || contexts.is_empty() {
             return Ok(true);
         }
         let author = self.peer;
-        let head = head.id();
+        let head = target.id;
         match self
             .write_owned(
                 job,
@@ -1015,17 +1015,122 @@ impl Source {
         ))
     }
 
+    /// Resolve the head a request names to one committed source head of the same room, scope and
+    /// author whose authenticated material serves it (ADR-053 P). A head this node committed
+    /// serves as itself. Otherwise the source is this node's committed head of that author, at
+    /// least as large, and the asked complete root must equal that source's prefix [1,n]: from
+    /// the canonical prefix index, or rebuilt by the cooperative repair under this request's own
+    /// job, lifetime and work slices. Nothing is committed, observed or written; a differing
+    /// prefix, a smaller source or missing material is Missing, never a verdict on the asker.
+    pub(super) async fn resolve(
+        &self,
+        job: &Job,
+        target: HeadTarget,
+        stage: &'static str,
+    ) -> Result<Lookup<ResolvedTarget>> {
+        self.current()?;
+        let gate = prefix_gate_mutant(stage);
+        // The P guards' forked provider (test-knobs; always false otherwise).
+        let fork = crate::node::channel::bad_prefix("fork");
+        let found = self
+            .read(job, 128 * 1024, move |room, store| {
+                let read = room.history_read(store)?;
+                let id = target.id();
+                if read.history_head_committed(&id, target.binding)? {
+                    return Ok(Some((
+                        ResolvedTarget::pinned(target, id),
+                        true,
+                        target.root.leaves,
+                    )));
+                }
+                if gate || target.root.leaves == 0 {
+                    return Ok(None);
+                }
+                let Some(source) = read
+                    .sparse_author(&target.binding.author, target.binding.scope)?
+                    .and_then(|state| state.committed)
+                else {
+                    return Ok(None);
+                };
+                let head = read
+                    .history_head(&source)?
+                    .ok_or(Error::MalformedAtRest("committed history head missing"))?;
+                if head.binding != target.binding || head.root.leaves < target.root.leaves {
+                    return Ok(None);
+                }
+                let prefix = if head.root.leaves == target.root.leaves {
+                    Some(head.root)
+                } else {
+                    read.history_range(target.binding, 1, target.root.leaves)?
+                };
+                let resolved = ResolvedTarget::pinned(target, source);
+                Ok(match prefix {
+                    Some(prefix) if prefix == target.root || fork => {
+                        Some((resolved, true, head.root.leaves))
+                    }
+                    Some(_) => None,
+                    None => Some((resolved, false, head.root.leaves)),
+                })
+            })
+            .await?;
+        let held = match found {
+            Lookup::Found(held) => held,
+            Lookup::Busy => return Ok(Lookup::Busy),
+            Lookup::Missing => return Ok(Lookup::Missing),
+        };
+        let (resolved, settled, source_size) = held.value;
+        let resolved = if settled {
+            Lookup::Found(Held {
+                value: resolved,
+                _charge: held._charge,
+            })
+        } else {
+            let job = held._charge.job();
+            match self.range(&job, &resolved, 1, target.root.leaves).await? {
+                // The repair returns Missing for a root differing from the asked one; recheck
+                // the complete descriptor here before anything is served under this target.
+                Lookup::Found(found) if found.value == target.root || fork => Lookup::Found(Held {
+                    value: resolved,
+                    _charge: found._charge,
+                }),
+                Lookup::Found(_) | Lookup::Missing => Lookup::Missing,
+                Lookup::Busy => Lookup::Busy,
+            }
+        };
+        #[cfg(feature = "test-knobs")]
+        if let Lookup::Found(held) = &resolved {
+            if held.value.source != held.value.id {
+                // The act's evidence that this node served a head it never committed.
+                eprintln!(
+                    "vox: prefix resolved stage={stage} author={} size={} head={} from \
+                     committed source size={source_size}",
+                    crate::node::link::b32_encode(&target.binding.author),
+                    target.root.leaves,
+                    crate::node::link::b32_encode(&held.value.id),
+                );
+                if fork {
+                    eprintln!(
+                        "vox: bad prefix served mode=fork stage={stage} size={}",
+                        target.root.leaves
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "test-knobs"))]
+        let _ = source_size;
+        Ok(resolved)
+    }
+
     async fn range(
         &self,
         job: &Job,
-        head: &SignedHead,
+        target: &ResolvedTarget,
         start: u64,
         leaves: u64,
     ) -> Result<Lookup<Descriptor>> {
-        let mut cursor = crate::node::channel::ProofRangeRestore::new(head, start, leaves)?;
+        let mut cursor = crate::node::channel::ProofRangeRestore::new(target, start, leaves)?;
         loop {
             self.current()?;
-            let ledger = self.commit_ledger();
             let peer = self.peer;
             let authorization = self.authorization;
             // One bounded physical step: Directory scratch is separately reserved by read;
@@ -1044,7 +1149,7 @@ impl Source {
                         Ok((cursor, pending))
                     },
                     move |(mut cursor, pending), store| {
-                        let step = pending.advance(store, &mut cursor, &ledger)?;
+                        let step = pending.advance(store, &mut cursor)?;
                         Ok((cursor, step))
                     },
                     |_, _, value| Ok(value),
@@ -1082,11 +1187,12 @@ impl Source {
     pub(super) async fn proof(
         &self,
         job: &Job,
-        head: &SignedHead,
+        target: &ResolvedTarget,
         kind: ProofKind,
         from: u64,
         to: u64,
     ) -> Result<Lookup<Proof>> {
+        let head = &target.target;
         self.current()?;
         let charge = match job.reserve_or_pressure(1024 * 1024) {
             Ok(charge) => charge,
@@ -1100,7 +1206,7 @@ impl Source {
             return Err(Error::MalformedBundle("proof exceeds requested head"));
         }
         let proof = if kind == ProofKind::Control {
-            return self.control_proof(job, head, from, to, charge).await;
+            return self.control_proof(job, target, from, to, charge).await;
         } else {
             let ranges = match kind {
                 ProofKind::Inclusion => {
@@ -1122,13 +1228,33 @@ impl Source {
             let mut descriptors = Vec::with_capacity(ranges.len());
             for range in ranges {
                 self.current()?;
-                match self.range(job, head, range.start, range.leaves).await? {
+                match self.range(job, target, range.start, range.leaves).await? {
                     Lookup::Found(found) => descriptors.push(found.value),
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),
                 }
                 // No room lock or store snapshot survives even one descriptor lookup.
                 tokio::task::yield_now().await;
+            }
+            #[cfg(feature = "test-knobs")]
+            {
+                let only = match kind {
+                    ProofKind::Inclusion => "corrupt-inclusion",
+                    ProofKind::Consistency => "corrupt-consistency",
+                    ProofKind::Control => "corrupt-control",
+                };
+                if target.source != target.id
+                    && (crate::node::channel::bad_prefix("corrupt")
+                        || crate::node::channel::bad_prefix(only))
+                {
+                    if let Some(first) = descriptors.first_mut() {
+                        first.hash[0] ^= 1;
+                        eprintln!(
+                            "vox: bad prefix served mode=corrupt kind={kind:?} size={}",
+                            head.root.leaves
+                        );
+                    }
+                }
             }
             match kind {
                 ProofKind::Inclusion => Proof::Inclusion(InclusionProof {
@@ -1140,7 +1266,7 @@ impl Source {
                     let prefix = if from == 0 {
                         Descriptor::empty(head.binding)
                     } else {
-                        match self.range(job, head, 1, from).await? {
+                        match self.range(job, target, 1, from).await? {
                             Lookup::Found(found) => found.value,
                             Lookup::Busy => return Ok(Lookup::Busy),
                             Lookup::Missing => return Ok(Lookup::Missing),
@@ -1168,11 +1294,12 @@ impl Source {
     async fn control_proof(
         &self,
         job: &Job,
-        head: &SignedHead,
+        target: &ResolvedTarget,
         lo: u64,
         mut hi: u64,
         charge: BufferCharge,
     ) -> Result<Lookup<Proof>> {
+        let head = &target.target;
         if lo == 0 || lo > hi || hi > head.root.leaves {
             return Err(Error::MalformedBundle("control interval differs from head"));
         }
@@ -1188,7 +1315,7 @@ impl Source {
                 if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
                     return Err(Error::SizeLimitExceeded("served control proof"));
                 }
-                let descriptor = match self.range(job, head, start, leaves).await? {
+                let descriptor = match self.range(job, target, start, leaves).await? {
                     Lookup::Found(found) => found.value,
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),
@@ -1247,7 +1374,7 @@ impl Source {
                 use std::fmt::Write as _;
                 use std::io::Write as _;
                 let mut line = String::with_capacity(96);
-                for byte in head.id() {
+                for byte in target.id {
                     let _ = write!(line, "{byte:02x}");
                 }
                 let _ = writeln!(line, " {lo} {hi}");
@@ -1263,10 +1390,30 @@ impl Source {
             }
             break tokens;
         };
+        #[cfg(feature = "test-knobs")]
+        let tokens = {
+            let mut tokens = tokens;
+            if target.source != target.id
+                && (crate::node::channel::bad_prefix("corrupt")
+                    || crate::node::channel::bad_prefix("corrupt-control"))
+            {
+                if let Some(first) = tokens.iter_mut().find_map(|token| match token {
+                    ControlToken::Collapse(descriptor) => Some(descriptor),
+                    _ => None,
+                }) {
+                    first.hash[0] ^= 1;
+                    eprintln!(
+                        "vox: bad prefix served mode=corrupt kind=Control size={}",
+                        head.root.leaves
+                    );
+                }
+            }
+            tokens
+        };
         self.current()?;
         Ok(Lookup::Found(Held {
             value: Proof::Control(ControlRangeProof {
-                head_id: head.id(),
+                head_id: target.id,
                 lo,
                 hi,
                 tokens,
@@ -1291,6 +1438,31 @@ fn redundant_control() -> Option<std::path::PathBuf> {
 #[cfg(not(feature = "test-knobs"))]
 const fn redundant_control() -> Option<std::path::PathBuf> {
     None
+}
+
+/// `VOX_MUTANT_PREFIX_GATE=header|proof|entry|inclusion|consistency|control`: that serving
+/// stage answers only under a head this node committed itself, as before ADR-053 P (`entry` is
+/// Entry and Page; `proof` is every proof kind). Says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn prefix_gate_mutant(stage: &str) -> bool {
+    static GATE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        let gate = std::env::var("VOX_MUTANT_PREFIX_GATE").ok();
+        if let Some(gate) = &gate {
+            eprintln!(
+                "vox: VOX_MUTANT_PREFIX_GATE={gate} engaged: that stage serves committed heads only"
+            );
+        }
+        gate
+    });
+    GATE.as_deref().is_some_and(|gate| {
+        gate == stage
+            || (gate == "proof" && matches!(stage, "inclusion" | "consistency" | "control"))
+    })
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn prefix_gate_mutant(_stage: &str) -> bool {
+    false
 }
 
 impl Source {

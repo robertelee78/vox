@@ -86,7 +86,7 @@ pub(crate) mod own_writer_gate;
 mod proof_range;
 mod receiver_overlay;
 mod receiver_releases;
-pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
+pub(crate) use proof_range::{bad_prefix, ProofRangeRestore, ProofRangeStep, ResolvedTarget};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
