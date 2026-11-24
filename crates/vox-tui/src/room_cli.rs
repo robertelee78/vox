@@ -850,16 +850,7 @@ pub(crate) async fn post_structured(
             data.insert("attempt".into(), a);
         }
     }
-    let (re, hops_of_reply, known_thread) = answers(
-        &mut client,
-        cid,
-        paths,
-        (!session.is_empty()).then_some(session.as_str()),
-        &snap.me,
-        opts.re.as_deref(),
-        opts.urgent,
-    )
-    .await?;
+    let (re, hops_of_reply, known_thread) = answers(&mut client, cid, opts.re.as_deref()).await?;
     // An operation keeps the root its first post used even if a missing parent arrives, or
     // retention removes one, before a retry. Changed --re/--thread still goes through normal
     // refusal and semantic conflict checks; post_once checks every other semantic field.
@@ -1107,32 +1098,6 @@ pub async fn post_cmd(
                      operation id and a version stamp. Use `vox room {}`.",
                     env.kind, env.kind
                 )));
-            }
-            // **A raw envelope cannot start an urgent chain of its own from a woken session**
-            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
-            // structured post takes, and two agents answering each other that way woke each
-            // other for ever.
-            if env.urgent && env.re.is_none() {
-                if let Some(session) = coord::posting_session(paths, opts.coord.session.as_deref())?
-                {
-                    let (mut client, cid, room_key) = open_room(paths, room).await?;
-                    let me = client
-                        .me()
-                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
-                    // The wakes and what followed the oldest of them (V210-120).
-                    let rows =
-                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
-                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
-                    if !open.is_empty() {
-                        return Err(AppError::Usage(format!(
-                            "refusing a raw urgent message with no `re` from session {session}: \
-                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
-                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
-                             which answer the message that woke it when only one is open.",
-                            open.join(", ")
-                        )));
-                    }
-                }
             }
         }
         return post(
@@ -1926,59 +1891,19 @@ async fn reply_entry(
 }
 
 /// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
-/// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
-/// woke `session`; and that parent's budget less one.
+/// `vox share` follow (ADR-020 §9): `re` if given, and that parent's budget less one.
 ///
 /// # Errors
-/// An urgent post from a session woken by several unanswered messages names none of them, or
-/// the node cannot answer. An unavailable parent leaves the root unknown: callers must use
+/// The node cannot answer. An unavailable parent leaves the root unknown: callers must use
 /// `reply_thread` before a new post, after checking for an existing operation retry.
 pub(crate) async fn answers(
     client: &mut IpcClient,
     cid: Digest32,
-    paths: &Paths,
-    session: Option<&str>,
-    me: &Digest32,
     re: Option<&str>,
-    urgent: bool,
 ) -> Result<(Option<String>, Option<u32>, Option<String>), AppError> {
-    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
-    // chain of its own with a fresh hop budget, and two agents answering each other urgently
-    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
-    // with several, the agent must say which.
-    let re = match (re, session) {
-        (Some(re), _) => Some(reply_entry(client, cid, re).await?),
-        (None, None) => None,
-        (None, Some(session)) => {
-            // The wakes and what followed the oldest of them, read from there (V210-120).
-            let rows = coord::wake_context(client, cid, paths, session, &id(&cid)).await?;
-            let open = crate::wake::open_wakes(paths, session, &id(&cid), &rows, me);
-            match &open[..] {
-                [] => None,
-                [only] => {
-                    eprintln!(
-                        "vox: replying to {} (the message that woke this session); pass --re to \
-                         answer another",
-                        &only[..12.min(only.len())]
-                    );
-                    Some(only.clone())
-                }
-                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
-                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
-                // that left two wakes unanswered stayed that way: every later wake added to the
-                // set rather than being inherited, and two such sessions woke each other for ever.
-                several if urgent => {
-                    return Err(AppError::Usage(format!(
-                        "refusing an urgent message with no --re from session {session}: it was \
-                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
-                         which one this answers.",
-                        several.len(),
-                        several.join(", ")
-                    )));
-                }
-                _ => None,
-            }
-        }
+    let re = match re {
+        Some(re) => Some(reply_entry(client, cid, re).await?),
+        None => None,
     };
     // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
     // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.

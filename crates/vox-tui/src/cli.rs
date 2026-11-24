@@ -812,7 +812,7 @@ pub struct ShareArgs {
     /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
-    /// The entry hash this share answers. A session woken by one message answers it without.
+    /// The entry hash this share answers.
     #[arg(long)]
     pub re: Option<String>,
     /// A note, carried in the share itself.
