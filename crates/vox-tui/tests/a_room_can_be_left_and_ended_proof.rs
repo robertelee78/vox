@@ -41,6 +41,16 @@
 //! - **The CLI says it too** (ADR-028 E-5): `vox room leave` and `vox room end` each say, before
 //!   they act, what they are to do (a line starting "vox: about to leave" or "vox: about to end"
 //!   that names the room), and after, what they did.
+//! - **A readmitted member gets no body from outside its cut** (ADR-053 MP-10, #1171). Carol is
+//!   removed and readmitted; bodies she never saw, some on chains she can still decrypt (one
+//!   written after her removal by a member that had not heard of it), are outside her cut.
+//!   Through the creator, an ordinary member and a restarted holder in turn, she shows none of
+//!   them and keeps what she had read. Each boundary is proven with the other switched off: the
+//!   holders' send with carol rendering everything (`a_readmitted_member_is_sent_no_body…`),
+//!   carol's render with every holder sending everything (`a_readmitted_member_shows_no_body…`).
+//! - **A post right after a removal.** Alice removes carol and posts while the key rotation the
+//!   removal owes is held unsaved (a `test-knobs` hold). Her post waits for the rotation, exits
+//!   0, and bob reads it; carol does not.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
@@ -53,7 +63,13 @@
 //! end, TUI), or their agent cursor files (end); a post taken after the end, an admin's end ignored, or a join to an ended room
 //! refused as a wrong passphrase (end); the TUI's `:leave` acting with no confirmation, or saying
 //! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave); a readmission
-//! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster).
+//! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster);
+//! boundary 1 off in one holder (`VOX_MUTANT_MP10_SEND=alice|bob|dave`: that holder sends a
+//! once-removed recipient every body) and boundary 2 off in carol (`VOX_MUTANT_MP10_RENDER=1`:
+//! she renders every body she is sent): the readmission-cut arm named for that boundary goes red
+//! through that holder;
+//! a post in a removal's rotation window refused as an internal error (post after removal,
+//! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`).
 
 #![cfg(unix)]
 
@@ -1373,6 +1389,538 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     }
     eprintln!("[proof] FX62 queued-key: carol never read FX62-ALICE-PRE-DEBT while the removal fold was held");
     eprintln!("[proof] FX62 history-debt: both separately applied and offline-fold senders delivered fresh posts without pre-removal or removal-period debt");
+}
+
+// ---- ADR-053 MP-10: boundaries 1 and 2 of #1171, each proven alone ---------------------------
+//
+// A once-removed, readmitted member may newly receive (boundary 1, the provider) and newly render
+// (boundary 2, the recipient) only a body whose signed causal past contains its exact readmission
+// cut. Each is proven with the other one switched off, so the act's verdict rests on that boundary
+// alone. Staging (both acts): alice (creator), bob (ordinary member), dave (ordinary member, the
+// holder that restarts) and carol, who has read a post by each. Carol's daemon goes down. Each
+// holder posts `MP10-UNSEEN-<NAME>` on the chain carol already holds; dave's daemon goes down;
+// alice removes carol; alice and bob are frozen (SIGSTOP); dave comes back unaware of the removal
+// (his roster still lists carol) and posts `MP10-UNAWARE-DAVE` on that chain too, after the removal
+// and before the readmission. Alice and bob resume; every holder applies the removal and posts
+// `MP10-GAP-<NAME>` on its rotated chain; alice readmits carol. Every one of those bodies is
+// outside carol's cut, and the four on the old chains are ones she could decrypt.
+// Then carol's daemon starts again, every holder running, and through each holder in turn —
+// alice, then bob, then dave restarted — all run until carol reads that holder's fresh post and
+// completes a sync round toward it (a live session; a holder that was frozen while carol came
+// back was not reached within 60 s in two runs), then the other two are frozen and, over three more
+// completed rounds toward that holder, she shows none of the seven texts and still shows the four
+// `MP10-BEFORE-<NAME>` she had read. Last, every holder runs, carol's daemon restarts, and the
+// same holds over three rounds toward alice. A red names the holder being watched; which holder
+// can have sent the body is set by the knobs (in the mutant runs only one holder has one).
+//
+// Knobs (vox-core `test-knobs`, ADR-053 MP-10): `VOX_TEST_MP10_SEND_EVERY_BODY=1` switches
+// boundary 1 off in the daemon that has it; `VOX_TEST_MP10_RENDER_EVERY_BODY=1` switches
+// boundary 2 off.
+
+/// A daemon's knobs for the act: boundary 1 off when `send`, boundary 2 off when `render`.
+fn mp10_env(send: bool, render: bool) -> Vec<(&'static str, &'static str)> {
+    let mut env = Vec::new();
+    if send {
+        env.push(("VOX_TEST_MP10_SEND_EVERY_BODY", "1"));
+    }
+    if render {
+        env.push(("VOX_TEST_MP10_RENDER_EVERY_BODY", "1"));
+    }
+    env
+}
+
+/// Stop (`-STOP`) or resume (`-CONT`) `w`'s daemon, and check from `ps` that it took.
+fn mp10_signal(w: &Worker, sig: &str) {
+    let pid = w
+        .daemon_pid()
+        .unwrap_or_else(|| panic!("APPARATUS: {} has no daemon to {sig}", w.name));
+    let sent = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status();
+    assert!(
+        sent.is_ok_and(|s| s.success()),
+        "APPARATUS: kill {sig} {} failed",
+        w.name
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let st = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        if st.starts_with('T') == (sig == "-STOP") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: kill {sig} of {}'s daemon did not take: its state is {st:?}",
+            w.name
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Sync rounds `status` reports completed toward `peer`, empty ones included.
+fn mp10_rounds_toward(status: &serde_json::Value, peer: &Worker) -> u64 {
+    let fp = peer.b32();
+    status["sync"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| {
+            r["peer"]
+                .as_str()
+                .is_some_and(|p| fp.starts_with(p) || p.starts_with(fp.as_str()))
+        })
+        .map(|r| {
+            ["completed", "empty", "fetched_completed", "fetched_empty"]
+                .iter()
+                .map(|k| r[*k].as_u64().unwrap_or(0))
+                .sum::<u64>()
+        })
+        .sum()
+}
+
+/// `author` posts `text` again each second until `reader` reads it (a sender's rotated chain is
+/// released with a fresh post); a red names `what` when it never arrives.
+fn mp10_delivered(author: &Worker, reader: &Worker, id: &str, text: &str, what: &str) {
+    let deadline = Instant::now() + support::TIMEOUT;
+    loop {
+        setup(author, &["room", "post", id, text]);
+        let read = reader.vox(None, &["room", "read", id]);
+        if read.ok && read.stdout.contains(text) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {} never read {text} from {}: {read:?}; reader status={:?}",
+            reader.name,
+            author.name,
+            reader.vox(None, &["status", "--json"]).stdout
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The phase's precondition: `holder` posts `text` again every few seconds until carol reads it
+/// and her sync rounds toward `holder` have advanced since this began (a live session with it).
+/// Neither within 300 s is APPARATUS NO RESULT: nothing about the boundary was measured.
+fn mp10_reached(holder: &Worker, carol: &Worker, id: &str, text: &str) {
+    let started = Instant::now();
+    let rounds = || mp10_rounds_toward(&carol.vox(None, &["status", "--json"]).json(), holder);
+    let first = rounds();
+    loop {
+        setup(holder, &["room", "post", id, text]);
+        let read = carol.vox(None, &["room", "read", id]);
+        let now = rounds();
+        if read.ok && read.stdout.contains(text) && now > first {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "APPARATUS NO RESULT (staging) [MP10 forward]: in 300 s carol did not both read {text} \
+             and complete a round toward {} (rounds {first} -> {now}): {read:?}; carol status={}",
+            holder.name,
+            carol.vox(None, &["status", "--json"]).stdout
+        );
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Through `holder`, carol shows none of `gap` and every one of `before` while her sync rounds
+/// toward it complete three more times. Showing any of `gap` is the RED verdict, named `red`; it
+/// is given once three more rounds have completed after the first such text, naming every one
+/// shown by then. Rounds that never complete within 600 s is APPARATUS NO RESULT.
+fn mp10_holds(carol: &Worker, holder: &Worker, id: &str, gap: &[&str], before: &[&str], red: &str) {
+    let started = Instant::now();
+    let first = mp10_rounds_toward(&carol.vox(None, &["status", "--json"]).json(), holder);
+    let mut shown: Vec<&str> = Vec::new();
+    let mut red_at = None;
+    loop {
+        let read = carol.vox(None, &["room", "read", id]);
+        assert!(
+            read.ok,
+            "PRODUCT: carol's `vox room read` failed (through {}): {read:?}",
+            holder.name
+        );
+        for text in gap {
+            if read.stdout.contains(text) && !shown.contains(text) {
+                shown.push(*text);
+            }
+        }
+        for text in before {
+            assert!(
+                read.stdout.contains(text),
+                "PRODUCT [MP10 kept] (through {}): readmitted carol no longer shows {text}, which \
+                 she had read before her removal: {}",
+                holder.name,
+                read.stdout
+            );
+        }
+        let status = carol.vox(None, &["status", "--json"]).json();
+        let rounds = mp10_rounds_toward(&status, holder);
+        if !shown.is_empty() {
+            let since = *red_at.get_or_insert(rounds);
+            assert!(
+                rounds < since + 3 && started.elapsed() < Duration::from_secs(600),
+                "RED PRODUCT [{red}] (watching through {}): readmitted carol shows {shown:?}, written \
+                 outside her readmission cut (the first at round {since} toward it, {rounds} \
+                 now): {}",
+                holder.name,
+                read.stdout
+            );
+        } else if rounds >= first + 3 {
+            eprintln!(
+                "[proof] MP10 through {}: carol's rounds toward it {first} -> {rounds}; none of \
+                 {gap:?} shown; {before:?} kept",
+                holder.name
+            );
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT (through {}): carol's sync rounds toward it went {first} -> \
+             {rounds} in 600 s, fewer than three: status {status}",
+            holder.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The staging and the verdicts both MP-10 acts share; `send[i]` and `render` are the knobs given
+/// to holder `i` (alice, bob, dave) and to carol; `red` names the boundary under test.
+fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &str) {
+    const ALICE: usize = 0;
+    const BOB: usize = 1;
+    const CAROL: usize = 2;
+    const DAVE: usize = 3;
+    let holder_env = |i: usize| mp10_env(send[if i == DAVE { 2 } else { i }], false);
+    // Every knob this staging sets must be read by the `vox` under test, or a default build
+    // would run it unstaged and could pass without isolating its boundary.
+    let knobs: Vec<&str> = mp10_env(send.contains(&true), render)
+        .into_iter()
+        .map(|(knob, _)| knob)
+        .collect();
+    test_knobs::require(&knobs);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let err = |name: &str, what: &str| tmp.path().join(format!("{name}.{what}.err"));
+    for i in [ALICE, BOB, DAVE] {
+        let env = holder_env(i);
+        if !env.is_empty() {
+            let name = room.workers[i].name.clone();
+            room.workers[i].restart_daemon_as(support::VOX, &env, &err(&name, "knobs"));
+        }
+    }
+    let names = ["ALICE", "BOB", "CAROL", "DAVE"];
+    let before: Vec<String> = names.iter().map(|n| format!("MP10-BEFORE-{n}")).collect();
+    for (i, text) in before.iter().enumerate() {
+        if i != CAROL {
+            mp10_delivered(
+                &room.workers[i],
+                &room.workers[CAROL],
+                id,
+                text,
+                "PRODUCT (staging)",
+            );
+        }
+    }
+    setup(&room.workers[CAROL], &["room", "post", id, &before[CAROL]]);
+    let before: Vec<&str> = before.iter().map(String::as_str).collect();
+    room.workers[CAROL].stop_daemon();
+    // Bodies carol never saw, on the chains she holds, written before her removal.
+    let unseen = ["MP10-UNSEEN-ALICE", "MP10-UNSEEN-BOB", "MP10-UNSEEN-DAVE"];
+    for (i, text) in [(ALICE, unseen[0]), (BOB, unseen[1]), (DAVE, unseen[2])] {
+        setup(&room.workers[i], &["room", "post", id, text]);
+    }
+    for i in [ALICE, BOB, DAVE] {
+        for text in unseen {
+            let (held, read) = poll(&room.workers[i], &["room", "read", id], WITHIN, |o| {
+                o.ok && o.stdout.contains(text)
+            });
+            assert!(
+                held,
+                "PRODUCT (staging): {} never read {text}: {read:?}",
+                room.workers[i].name
+            );
+        }
+    }
+    let carol_b32 = room.workers[CAROL].b32();
+    room.workers[DAVE].stop_daemon();
+    let removed = unchanged_busy_retry(
+        &room.workers[ALICE],
+        &["room", "remove-member", id, &carol_b32],
+    );
+    assert!(
+        removed.ok,
+        "PRODUCT (staging): alice could not remove carol: {removed:?}"
+    );
+    for i in [ALICE, BOB] {
+        let (gone, roster) = poll(&room.workers[i], &["room", "roster", id], WITHIN, |o| {
+            o.ok && !o.stdout.contains(&carol_b32)
+        });
+        assert!(
+            gone,
+            "PRODUCT (staging): {} still lists removed carol: {roster:?}",
+            room.workers[i].name
+        );
+    }
+    // Dave writes after the removal and before the readmission, still unaware of it: no holder
+    // that knows of it runs.
+    mp10_signal(&room.workers[ALICE], "-STOP");
+    mp10_signal(&room.workers[BOB], "-STOP");
+    let env = holder_env(DAVE);
+    room.workers[DAVE].restart_daemon_as(support::VOX, &env, &err("dave", "unaware"));
+    setup(
+        &room.workers[DAVE],
+        &["room", "post", id, "MP10-UNAWARE-DAVE"],
+    );
+    let roster = setup(&room.workers[DAVE], &["room", "roster", id]);
+    assert!(
+        roster.stdout.contains(&carol_b32),
+        "APPARATUS: dave learned of carol's removal before he posted, so his post is not on the \
+         chain she holds: {roster:?}"
+    );
+    mp10_signal(&room.workers[ALICE], "-CONT");
+    mp10_signal(&room.workers[BOB], "-CONT");
+    let (gone, roster) = poll(&room.workers[DAVE], &["room", "roster", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&carol_b32)
+    });
+    assert!(
+        gone,
+        "PRODUCT (staging): dave never applied carol's removal: {roster:?}"
+    );
+    for i in [ALICE, BOB] {
+        let (held, read) = poll(&room.workers[i], &["room", "read", id], WITHIN, |o| {
+            o.ok && o.stdout.contains("MP10-UNAWARE-DAVE")
+        });
+        assert!(
+            held,
+            "PRODUCT (staging): {} never read MP10-UNAWARE-DAVE: {read:?}",
+            room.workers[i].name
+        );
+    }
+    // Bodies on the rotated chains, written during the gap.
+    let gap_posts = [
+        (ALICE, BOB, "MP10-GAP-ALICE"),
+        (BOB, DAVE, "MP10-GAP-BOB"),
+        (DAVE, ALICE, "MP10-GAP-DAVE"),
+    ];
+    for (author, reader, text) in gap_posts {
+        mp10_delivered(
+            &room.workers[author],
+            &room.workers[reader],
+            id,
+            text,
+            "PRODUCT (staging)",
+        );
+    }
+    for (author, _, text) in gap_posts {
+        for i in [ALICE, BOB, DAVE] {
+            let (held, read) = poll(&room.workers[i], &["room", "read", id], WITHIN, |o| {
+                o.ok && o.stdout.contains(text)
+            });
+            assert!(
+                held,
+                "PRODUCT (staging): {} never read {text} from {}: {read:?}",
+                room.workers[i].name, room.workers[author].name
+            );
+        }
+    }
+    let readmit = unchanged_busy_retry(
+        &room.workers[ALICE],
+        &["room", "readmit-member", id, &carol_b32],
+    );
+    assert!(
+        readmit.ok,
+        "PRODUCT (staging): alice could not readmit carol: {readmit:?}"
+    );
+    for i in [BOB, DAVE] {
+        let (back, roster) = poll(&room.workers[i], &["room", "roster", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&carol_b32)
+        });
+        assert!(
+            back,
+            "PRODUCT (staging): {} never listed readmitted carol: {roster:?}",
+            room.workers[i].name
+        );
+    }
+    let gap = [
+        unseen[0],
+        unseen[1],
+        unseen[2],
+        "MP10-UNAWARE-DAVE",
+        "MP10-GAP-ALICE",
+        "MP10-GAP-BOB",
+        "MP10-GAP-DAVE",
+    ];
+    let carol_env = mp10_env(false, render);
+    eprintln!("[proof] MP10 staged: carol removed, gap written, carol readmitted");
+    // Carol comes back with every holder running. Then through each holder in turn: all run
+    // until carol reads that holder's fresh post and completes a round toward it (dave restarts
+    // first), then the other two are frozen and the act watches her rounds toward it.
+    room.workers[CAROL].restart_daemon_as(support::VOX, &carol_env, &err("carol", "readmitted"));
+    for (h, others) in [
+        (ALICE, [BOB, DAVE]),
+        (BOB, [ALICE, DAVE]),
+        (DAVE, [ALICE, BOB]),
+    ] {
+        if h == DAVE {
+            let env = holder_env(DAVE);
+            room.workers[DAVE].restart_daemon_as(support::VOX, &env, &err("dave", "restarted"));
+        }
+        let text = format!("MP10-FORWARD-{}", names[h]);
+        mp10_reached(&room.workers[h], &room.workers[CAROL], id, &text);
+        for o in others {
+            mp10_signal(&room.workers[o], "-STOP");
+        }
+        mp10_holds(
+            &room.workers[CAROL],
+            &room.workers[h],
+            id,
+            &gap,
+            &before,
+            red,
+        );
+        for o in others {
+            mp10_signal(&room.workers[o], "-CONT");
+        }
+    }
+    // Every holder at once, after carol's own restart.
+    room.workers[CAROL].restart_daemon_as(support::VOX, &carol_env, &err("carol", "restarted"));
+    mp10_holds(
+        &room.workers[CAROL],
+        &room.workers[ALICE],
+        id,
+        &gap,
+        &before,
+        red,
+    );
+    eprintln!("[proof] {red}: through alice, bob, restarted dave and all at once, readmitted carol shows no body from outside her cut");
+}
+
+/// Boundary 1 alone: carol renders whatever she is sent (boundary 2 off in her daemon: the
+/// hostile recipient), so only the holders' sends stand between her and the gap. Mutant
+/// `VOX_MUTANT_MP10_SEND=alice|bob|dave`: boundary 1 off in that holder's daemon; red through it.
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_readmitted_member_is_sent_no_body_from_outside_its_cut() {
+    watchdog::arm();
+    let mutant = std::env::var("VOX_MUTANT_MP10_SEND").unwrap_or_default();
+    let send = ["alice", "bob", "dave"].map(|h| mutant == h);
+    mp10_readmitted_member_gets_no_gap_body(send, true, "MP10 boundary 1, provider body send");
+}
+
+/// Boundary 2 alone: every holder sends carol every body she asks for (boundary 1 off in each:
+/// the hostile providers), so only her own render decision stands between her and the gap.
+/// Mutant `VOX_MUTANT_MP10_RENDER=1`: boundary 2 off in carol's daemon.
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_readmitted_member_shows_no_body_from_outside_its_cut() {
+    watchdog::arm();
+    let render = std::env::var("VOX_MUTANT_MP10_RENDER").is_ok_and(|v| v == "1");
+    mp10_readmitted_member_gets_no_gap_body([true; 3], render, "MP10 boundary 2, recipient render");
+}
+
+/// A member who removes another and posts at once (ledger 77). The removal is applied by one save
+/// and the fresh sender chain it owes by the next; the window between them is held open here
+/// (`VOX_TEST_HOLD_ROOM_ROTATION_FILE`) so the post lands in it every run. The post must wait
+/// out the rotation and succeed, not be refused as "an internal error".
+/// Mutant: `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped` (the refusal reported as an internal fault).
+#[test]
+#[ignore = "real daemons and a held key rotation; CI runs it in release"]
+fn a_post_made_right_after_a_removal_waits_for_the_new_keys() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_ROOM_ROTATION_FILE"]);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let hold = tmp.path().join("rotation.hold");
+    let engaged = tmp.path().join("rotation.hold.engaged");
+    let met = tmp.path().join("rotation.hold.met");
+    let held_log = tmp.path().join("alice-held.err");
+    let daemon = || std::fs::read_to_string(&held_log).unwrap_or_default();
+    // temp_home strips inherited knobs: the runner's mutant reaches alice's daemon only here.
+    let mutant = std::env::var("VOX_MUTANT_POST_AFTER_REMOVAL").unwrap_or_default();
+    let mut knobs = vec![(
+        "VOX_TEST_HOLD_ROOM_ROTATION_FILE",
+        hold.to_str().expect("APPARATUS: UTF-8 hold path"),
+    )];
+    if !mutant.is_empty() {
+        knobs.push(("VOX_TEST_POST_AFTER_REMOVAL_MUTANT", mutant.as_str()));
+    }
+    room.workers[0].restart_daemon_as(support::VOX, &knobs, &held_log);
+    let [alice, bob, carol] = &room.workers[..] else {
+        unreachable!()
+    };
+    let (ready, read) = poll(alice, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        ready,
+        "APPARATUS: alice's restarted daemon never read the room: {read:?}"
+    );
+    std::fs::write(&hold, id).expect("APPARATUS: arm the rotation hold");
+    setup(alice, &["room", "remove-member", id, &carol.b32()]);
+    let deadline = Instant::now() + WITHIN;
+    while !engaged.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: alice's removal of carol never reached its held key rotation; daemon:\n{}",
+            daemon()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let roster = alice.vox(None, &["room", "roster", id]);
+    assert!(
+        roster.ok && !roster.stdout.contains(&carol.b32()),
+        "APPARATUS: the rotation was held before alice's roster dropped carol: {roster:?}"
+    );
+    eprintln!("[proof] post-after-removal staged: carol's removal applied, its key rotation held");
+    let text = "POST-RIGHT-AFTER-REMOVAL";
+    let (answered_while_held, post) = std::thread::scope(|s| {
+        let post = s.spawn(|| alice.vox(None, &["room", "post", id, text]));
+        // The post is in the window once the daemon refused it there at least once.
+        let deadline = Instant::now() + WITHIN;
+        while !met.is_file() && !post.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: alice's post never reached the held window; daemon:\n{}",
+                daemon()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let answered_while_held = post.is_finished();
+        std::fs::remove_file(&hold).expect("APPARATUS: release the rotation hold");
+        (
+            answered_while_held,
+            post.join().expect("APPARATUS: the post's thread"),
+        )
+    });
+    assert!(
+        post.ok && !answered_while_held,
+        "PRODUCT: alice's post made inside the held window (carol's removal applied, its key \
+         rotation not yet saved) did not wait for the rotation and succeed (answered while the \
+         rotation was still held: {answered_while_held}): {post:?}; daemon:\n{}",
+        daemon()
+    );
+    let (seen, read) = poll(bob, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(text)
+    });
+    assert!(
+        seen,
+        "PRODUCT: remaining bob never read alice's post made right after the removal: {read:?}"
+    );
+    let removed = carol.vox(None, &["room", "read", id]);
+    assert!(
+        !removed.stdout.contains(text),
+        "PRODUCT: removed carol read alice's post made after her removal: {removed:?}"
+    );
+    eprintln!("[proof] post-after-removal: alice's post waited for the new keys, exited 0, bob read it and carol did not");
 }
 
 // ADR-053 MP-6. The runner selects a mutation with `VOX_MUTANT_MP6` (`uncut`: the cut ignores

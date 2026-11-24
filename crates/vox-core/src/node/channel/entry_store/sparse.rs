@@ -65,6 +65,61 @@ pub(crate) fn cache_history_proof_range(
     Ok(())
 }
 
+// Contexts a serving reconstruction generated for an asked prefix (ADR-053 P): request-only
+// math, never acceptance evidence or a verification closure, so never a durable row. They stay
+// in one daemon-wide FIFO bounded by bytes, keyed by room and content hash, for the joins of the
+// same reconstruction and for the asker's `Query::Context`; eviction loses only serving work.
+const SERVING_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
+struct ServingContexts {
+    contexts: std::collections::HashMap<(Digest32, Digest32), ControlContext>,
+    fifo: VecDeque<((Digest32, Digest32), usize)>,
+    bytes: usize,
+}
+static SERVING_CONTEXTS: std::sync::Mutex<Option<ServingContexts>> = std::sync::Mutex::new(None);
+
+/// The charge of one cached context: its coordinates, the value, both FIFO and table keys and
+/// a conservative table slot overhead.
+fn serving_context_bytes(context: &ControlContext) -> usize {
+    context.coordinates.len() * std::mem::size_of::<crate::log::history::EntryReference>()
+        + 2 * std::mem::size_of::<ControlContext>()
+        + 4 * std::mem::size_of::<((Digest32, Digest32), usize)>()
+}
+
+pub(crate) fn cache_serving_context(context: &ControlContext) {
+    let key = (context.room, context.hash());
+    let bytes = serving_context_bytes(context);
+    let mut guard = SERVING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cache = guard.get_or_insert_with(|| ServingContexts {
+        contexts: std::collections::HashMap::new(),
+        fifo: VecDeque::new(),
+        bytes: 0,
+    });
+    if cache.contexts.contains_key(&key) {
+        return;
+    }
+    while cache.bytes + bytes > SERVING_CONTEXT_BYTES {
+        let Some((oldest, size)) = cache.fifo.pop_front() else {
+            return;
+        };
+        cache.contexts.remove(&oldest);
+        cache.bytes -= size;
+    }
+    cache.contexts.insert(key, context.clone());
+    cache.fifo.push_back((key, bytes));
+    cache.bytes += bytes;
+}
+
+/// A context a serving reconstruction generated in this room, while it is still cached.
+pub(crate) fn serving_context(room: &Digest32, hash: &Digest32) -> Option<ControlContext> {
+    SERVING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .and_then(|cache| cache.contexts.get(&(*room, *hash)).cloned())
+}
+
 /// Locally signed material verified by the same v2 proof primitives. Only the final
 /// contiguous publication transaction may attach it to the newly active roots.
 pub(crate) struct LocalHistoryPublication<'a> {
@@ -1470,6 +1525,16 @@ impl Read<'_> {
             )?
             .unwrap_or(0)
             >= through)
+    }
+    /// The position at which `author` terminated its feed, once that Termination is a held
+    /// source here (recorded at publication, `index_source_head`).
+    pub(crate) fn history_termination(&self, author: &Digest32) -> Result<Option<u64>> {
+        self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.terminations,
+            &hashed(author),
+        )
     }
     pub(crate) fn history_position_header(
         &self,

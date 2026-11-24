@@ -7,6 +7,59 @@ use crate::node::store::Store;
 
 pub(super) use crate::node::channel::pending_governance::{Completed, Prepared, Saved, Work};
 
+/// **Test-only**: the named file holds one room id (base32). While it exists and that room owes
+/// the key rotation an applied removal starts, its governance turns do not start the rotation;
+/// the first such turn writes `<file>.engaged`. A post refused because the rotation is owed
+/// writes `<file>.met`. Removing the file lets the next sweep save the rotation.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_ROOM_ROTATION_ENV: &str = "VOX_TEST_HOLD_ROOM_ROTATION_FILE";
+
+#[cfg(feature = "test-knobs")]
+async fn room_rotation_held(room: &Digest32, continuation: &Retained) -> bool {
+    let Some(path) = std::env::var_os(TEST_HOLD_ROOM_ROTATION_ENV).filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    let named = crate::node::link::b32_encode(room);
+    if std::fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        != Some(named.as_str())
+    {
+        return false;
+    }
+    let owed = continuation
+        .instance
+        .lock()
+        .await
+        .room_removal_rotation_needed(&continuation.lifetime.store)
+        .unwrap_or(false);
+    if owed {
+        let mut engaged = path;
+        engaged.push(".engaged");
+        let _ = std::fs::write(engaged, named);
+    }
+    owed
+}
+
+#[cfg(feature = "test-knobs")]
+pub(super) fn note_room_rotation_met(error: &crate::error::Error) {
+    if !matches!(
+        error,
+        crate::error::Error::StreamRefused(reason)
+            if *reason == "room authorization keys are rotating"
+    ) {
+        return;
+    }
+    if let Some(mut met) =
+        std::env::var_os(TEST_HOLD_ROOM_ROTATION_ENV).filter(|path| !path.is_empty())
+    {
+        met.push(".met");
+        let _ = std::fs::write(met, b"met");
+    }
+}
+
 impl Work {
     pub(super) fn prepare(
         self,
@@ -931,9 +984,24 @@ impl Node {
         mut continuation: Retained,
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
+        #[cfg(feature = "test-knobs")]
+        let rotation_held = room_rotation_held(&room, &continuation).await;
         let After::Turn(turn) = &mut continuation.after else {
             return;
         };
+        // Apparatus: the turn goes on as one whose owed rotation is not ready yet, and the next
+        // sweep looks again, so the removal stays applied while its rotation stays unsaved.
+        #[cfg(feature = "test-knobs")]
+        if rotation_held
+            && turn.ready
+            && !matches!(
+                turn.stage,
+                TurnStage::RoomRotation | TurnStage::RoomDriveRotation
+            )
+        {
+            self.governance_work.again = true;
+            turn.stage = TurnStage::RoomDriveRotation;
+        }
         if turn.ready
             && !matches!(
                 turn.stage,

@@ -296,6 +296,7 @@ impl SemanticProjection {
             // falls through to the existing logic; an undecided body waits, never renders.
             let eligible = eligible
                 && (generation == 0
+                    || governance::render_every_body()
                     || match view.recipient_body_eligibility(
                         &channel.me(),
                         entry,

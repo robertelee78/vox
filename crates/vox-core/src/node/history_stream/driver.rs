@@ -81,14 +81,27 @@ async fn handshake_and_pull(
     // The authenticated peer already has the room-bound preamble and fixed mode.
     // Pipeline WANT/HAVE so a Public announcement need not wait behind bytes on
     // the reverse path. Validate the peer's HELLO before accepting its response.
+    // A head-bound request carries the canonical body of the asker's own held head (ADR-053 P);
+    // the asker still verifies every response under that exact signed head.
+    let target = match query.target_head() {
+        Some(head) => Some(receiver.request_target(io.job(), head).await?),
+        None => None,
+    };
+    #[cfg(feature = "test-knobs")]
+    let (query, target, abandon) = hostile_target(query, target);
     let want = Frame::Want {
         request: preamble.request,
         query: query.clone(),
+        target,
     };
     let encoded = want.encode_required(io.job())?;
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
+    #[cfg(feature = "test-knobs")]
+    if abandon {
+        return Err(Error::Unreachable("hostile history request abandoned"));
+    }
     let mut announcement = None;
     let mut catalog_announcement = None;
     let mut offered_availability = None;
@@ -141,4 +154,40 @@ async fn handshake_and_pull(
         }
     }
     Ok(result)
+}
+
+/// `VOX_TEST_CYCLE_TARGETS_FILE`: while the file exists this node is a hostile asker for the
+/// ADR-053 P guards. Every head-bound request names an unsigned target it does not hold, in
+/// turn: a forged root of its own head's size, a size past any holder, and two smaller sizes
+/// with forged roots, the second abandoned right after the request is sent. Each is said once
+/// on stderr.
+#[cfg(feature = "test-knobs")]
+fn hostile_target(
+    mut query: Query,
+    target: Option<crate::log::history::HeadTarget>,
+) -> (Query, Option<crate::log::history::HeadTarget>, bool) {
+    static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let hostile = std::env::var_os("VOX_TEST_CYCLE_TARGETS_FILE")
+        .is_some_and(|path| std::path::Path::new(&path).exists());
+    let Some(mut forged) = target.filter(|_| hostile) else {
+        return (query, target, false);
+    };
+    let count = SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let size = forged.root.leaves.max(1);
+    match count % 4 {
+        0 => forged.root.hash[0] ^= 1,
+        1 => forged.root.leaves = size + 1_000_000,
+        _ => {
+            forged.root.leaves = 1 + (count / 4) % size;
+            forged.root.controls = 0;
+            forged.root.hash = crate::hash::sha256(&count.to_be_bytes());
+        }
+    }
+    query.retarget(forged.id());
+    eprintln!(
+        "vox: hostile target sent variant={} size={}",
+        count % 4,
+        forged.root.leaves
+    );
+    (query, Some(forged), count % 4 == 3)
 }
