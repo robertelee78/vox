@@ -1344,6 +1344,264 @@ fn a_newcomer_reads_a_short_history_once_each_in_order() {
     newcomer_reads_the_whole_history(tmp.path(), BACKLOG, PAGE);
 }
 
+/// The members who keep posting while alice reads, each a post, a second's pause, a post.
+const BUSY_AUTHORS: [&str; 3] = ["bob", "carol", "dave"];
+/// Alice's own history: past one page of a plain read (200 rows) and many `--hashes` pages (64).
+const BUSY_BACKLOG: usize = 300;
+/// Reads of each kind while the others post. A read takes tens of milliseconds in release, so
+/// twenty of each lasted about as long as three posts of each member; fifty span many more.
+const BUSY_READS: usize = 50;
+
+/// **A read is not refused because someone else posted** (ledger 95). Alice holds a history of
+/// several pages; three members keep posting, each a post, a second's pause, a post; once each
+/// has had posts accepted and alice shows them, alice reads it the three ways
+/// that take more than one request: `vox room read --unread`, `vox room read --hashes`, and a
+/// reply by a prefix of an old message (`vox room post --re PREFIX`, which scans every page).
+/// A message that arrives changes no row already read, so none of them may be refused, and
+/// each must give what a person expects: the unread messages, the whole order, the reply
+/// posted to the message named. On main 4e16a0da7 (five members) 124, 174 and 8 of 200 such
+/// reads were refused "the room changed while reading". Mutant
+/// `VOX_MUTANT_READ_REFUSES_ARRIVALS` (the daemon compares what an arrival moves again): refused.
+#[test]
+#[ignore = "four real vox daemons, three members posting while one reads; CI runs it in release"]
+fn a_reader_is_not_refused_while_others_keep_posting() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let alice = tmp.path().join("alice");
+    let authors: Vec<std::path::PathBuf> = BUSY_AUTHORS
+        .iter()
+        .map(|name| tmp.path().join(name))
+        .collect();
+    for d in std::iter::once(&alice).chain(&authors) {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let fingerprint = |dir: &Path| {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
+        out.trim().to_owned()
+    };
+    let alice_fp = fingerprint(&alice);
+    for (dir, name) in authors.iter().zip(BUSY_AUTHORS) {
+        let fp = fingerprint(dir);
+        for (who, whom, called) in [(&alice, &fp, name), (dir, &alice_fp, "alice")] {
+            let (ok, _, err) = vox(who, &["trust", "add", whom, "--name", called], None);
+            assert!(
+                ok,
+                "PRODUCT (staging): `vox trust add` of {called} failed: {err}"
+            );
+        }
+    }
+
+    let _alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "busy"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    for i in 1..=BUSY_BACKLOG {
+        let (ok, _, err) = vox(&alice, &["room", "post", &room, &format!("busy {i}")], None);
+        assert!(ok, "PRODUCT (staging): alice's post {i} was refused: {err}");
+    }
+    // The reply's target: alice's first post, below the newest page; a prefix only it has.
+    let rows = room_rows(&alice, &room);
+    let target = rows
+        .iter()
+        .find(|row| row["text"].as_str() == Some("busy 1"))
+        .and_then(|row| row["entry_hash"].as_str())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's paged read lacks her first post"))
+        .to_owned();
+    let prefix = target[..20].to_owned();
+    assert!(
+        rows.iter()
+            .filter(|row| row["entry_hash"]
+                .as_str()
+                .is_some_and(|h| h.starts_with(&prefix)))
+            .count()
+            == 1,
+        "APPARATUS: the reply prefix {prefix} is not unique among alice's rows"
+    );
+
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap_or(link.trim())
+        .to_owned();
+    let mut daemons = Vec::new();
+    for (dir, name) in authors.iter().zip(BUSY_AUTHORS) {
+        daemons.push(daemon(dir, name));
+        attached(dir, name);
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): {name}'s join was refused: {out}{err}"
+        );
+    }
+
+    // Each member keeps posting until alice has read: a post, a second's pause, a post.
+    let stop = Arc::new(AtomicBool::new(false));
+    let posted = Arc::new(AtomicUsize::new(0));
+    let posters: Vec<_> = authors
+        .iter()
+        .zip(BUSY_AUTHORS)
+        .map(|(dir, name)| {
+            let (dir, room, stop, posted) = (
+                dir.clone(),
+                room.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&posted),
+            );
+            std::thread::spawn(move || {
+                // (attempts, time spent posting, first refusal): diagnostics only.
+                let mut n = 0usize;
+                let mut spent = Duration::ZERO;
+                let mut refusal = None;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let asked = Instant::now();
+                    let (ok, out, err) = vox(
+                        &dir,
+                        &["room", "post", &room, &format!("{name} says {n}")],
+                        None,
+                    );
+                    spent += asked.elapsed();
+                    if ok {
+                        posted.fetch_add(1, Ordering::Relaxed);
+                    } else if refusal.is_none() {
+                        refusal = Some(format!("{name}: {}{}", out.trim(), err.trim()));
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                (n, spent, refusal)
+            })
+        })
+        .collect();
+    // Staging: the members' first posts are behind them (three accepted for each, on average) and
+    // alice shows every member's posts before she reads.
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "read", &room], None);
+        if ok
+            && posted.load(Ordering::Relaxed) >= 3 * BUSY_AUTHORS.len()
+            && BUSY_AUTHORS
+                .iter()
+                .all(|name| out.contains(&format!("{name} says")))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let hashes_line = |line: &str| {
+        let mut fields = line.split_whitespace();
+        fields.next().is_some_and(|h| h.len() == 52)
+            && fields
+                .next()
+                .is_some_and(|c| c.chars().all(|c| c.is_ascii_digit()))
+            && fields.next().is_none()
+    };
+    let mut refused = Vec::new();
+    let mut held_before = None;
+    let mut held_after = 0;
+    let posted_before = posted.load(Ordering::Relaxed);
+    for i in 1..=BUSY_READS {
+        let (ok, out, err) = vox(&alice, &["room", "read", &room, "--unread"], None);
+        if ok {
+            assert!(
+                BUSY_AUTHORS
+                    .iter()
+                    .all(|name| out.contains(&format!("{name} says"))),
+                "PRODUCT: alice's `vox room read --unread` did not show the members' unread \
+                 messages: {out}{err}"
+            );
+        } else {
+            refused.push(format!("--unread #{i}: {}", err.trim()));
+        }
+        let (ok, out, err) = vox(&alice, &["room", "read", &room, "--hashes"], None);
+        if ok {
+            let lines: Vec<&str> = out.lines().collect();
+            assert!(
+                lines.len() > BUSY_BACKLOG && lines.iter().all(|line| hashes_line(line)),
+                "PRODUCT: alice's `vox room read --hashes` is not the room's whole order \
+                 ({} lines): {out}{err}",
+                lines.len()
+            );
+            held_before.get_or_insert(lines.len());
+            held_after = lines.len();
+        } else {
+            refused.push(format!("--hashes #{i}: {}", err.trim()));
+        }
+        let text = format!("busy reply {i}");
+        let (ok, out, err) = vox(
+            &alice,
+            &["room", "post", &room, "--re", &prefix, &text],
+            None,
+        );
+        if !ok {
+            refused.push(format!("--re #{i}: {}{}", out.trim(), err.trim()));
+        }
+    }
+    let posted_during = posted.load(Ordering::Relaxed) - posted_before;
+    stop.store(true, Ordering::Relaxed);
+    for poster in posters {
+        let (attempts, spent, refusal) = poster
+            .join()
+            .unwrap_or_else(|_| panic!("APPARATUS: a posting thread panicked"));
+        println!(
+            "[proof] a member tried {attempts} posts, {:?} each on average; first refused: \
+             {refusal:?}",
+            spent / u32::try_from(attempts.max(1)).unwrap_or(u32::MAX)
+        );
+    }
+    println!(
+        "[proof] while alice read {BUSY_READS} times each way, the members posted \
+         {posted_during}; her --hashes went from {held_before:?} to {held_after} entries; \
+         refused: {}",
+        refused.len()
+    );
+    for line in said(&alice, "alice")
+        .lines()
+        .filter(|line| line.contains(" engaged"))
+    {
+        println!("[proof] alice's daemon said: {line}");
+    }
+    assert!(
+        posted_during >= BUSY_AUTHORS.len() && held_before.is_none_or(|b| held_after > b),
+        "APPARATUS NO RESULT: nothing arrived while alice read (posted {posted_during}, \
+         --hashes {held_before:?} to {held_after})"
+    );
+    assert!(
+        refused.is_empty(),
+        "PRODUCT: in a room where {} members keep posting, alice's reads that take more than one \
+         request were refused although no row she had read changed: {refused:#?}",
+        BUSY_AUTHORS.len()
+    );
+    let replies = room_rows(&alice, &room)
+        .iter()
+        .filter(|row| row.to_string().contains("busy reply ") && row["envelope"]["re"] == target)
+        .count();
+    assert!(
+        replies == BUSY_READS,
+        "PRODUCT: {replies} of alice's {BUSY_READS} replies by the prefix {prefix} answer {target}"
+    );
+    drop(daemons);
+}
+
 /// The optional arm: half again past one sender-key generation (1,000 messages), from one author.
 #[cfg(feature = "optional-proofs")]
 #[test]

@@ -42,6 +42,7 @@ pub(crate) enum Query {
     },
     Governance(crate::node::api::GovernanceQuery),
     DisplayRevision,
+    ReadRevision,
     ArrivalHead,
     OperationPage {
         author: Digest32,
@@ -209,36 +210,62 @@ impl Selection {
 }
 
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
-/// This token rejects a changed room before another part of one Find answer is read.
+/// This token rejects, before another part of one answer is read, a room whose rows already
+/// read may have moved or changed: an entry moved by a late parent, a row taken away, returned
+/// or given its body, a body dropped, a reclassified row, a retention change, a rebuilt
+/// rendering. A message that merely arrives changes no row already read, so it is not here: one
+/// that sorts into the part already read is as if it had arrived just after the read. (So it
+/// compares `display_removals`, not `display_rewrite`, which also moves for such an arrival.)
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    facts: [u64; 8],
-    rendered_roots: [u64; 4],
+    facts: [u64; 9],
 }
 
 impl Revision {
     fn of(ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
+        #[allow(unused_mut)]
+        let mut facts = [
+            ch.display_removals,
+            ch.reorder_generation,
+            rendered.order().revision(),
+            ch.body_generation,
+            ch.classification_revision,
+            ch.effective_retention(),
+            ch.effective_step_retention(),
+            // The rendering's epoch: a rebuilt rendering re-times every row.
+            rendered.display_roots()[3],
+            // Whether "not received yet" rows are shown (ADR-036 H-4): pages gain or lose them.
+            u64::from(ch.owed_shown),
+        ];
+        #[cfg(feature = "test-knobs")]
+        {
+            if crate::node::mp11_mutant(
+                "VOX_MUTANT_READ_KEEPS_NOTHING",
+                "a read spanning requests compares nothing of the rows already read",
+            ) {
+                facts = [0; 9];
+            }
+            if crate::node::mp11_mutant(
+                "VOX_MUTANT_READ_REFUSES_ARRIVALS",
+                "a read spanning requests is refused when a message arrives",
+            ) {
+                let roots = rendered.display_roots();
+                facts[0] = facts[0]
+                    .wrapping_add(ch.generation)
+                    .wrapping_add(rendered.count()?)
+                    .wrapping_add(roots[0])
+                    .wrapping_add(roots[1]);
+            }
+        }
         Ok(Self {
             incarnation: ch.gen.clone(),
-            facts: [
-                ch.generation,
-                ch.display_rewrite,
-                rendered.count()?,
-                ch.reorder_generation,
-                ch.body_generation,
-                ch.classification_revision,
-                ch.effective_retention(),
-                ch.effective_step_retention(),
-            ],
-            rendered_roots: rendered.display_roots(),
+            facts,
         })
     }
     fn current(&self, ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
         let now = Self::of(ch, rendered)?;
-        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation)
-            && self.facts == now.facts
-            && self.rendered_roots == now.rendered_roots)
+        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.facts == now.facts)
     }
 }
 
@@ -453,6 +480,7 @@ impl View<'_> {
                 | Query::ViewRows { .. }
                 | Query::ViewRevision { .. }
                 | Query::DisplayRevision
+                | Query::ReadRevision
                 | Query::ArrivalHead
                 | Query::NoticeState
                 | Query::NoticeExact { .. }
@@ -1245,7 +1273,10 @@ impl View<'_> {
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
-            Query::DisplayRevision => {
+            // The display token moves with whatever a person could see change, an arrival too:
+            // a client caching a summary refreshes on it. The read token moves only when rows
+            // already read may have moved or changed: a read spanning requests compares it.
+            query @ (Query::DisplayRevision | Query::ReadRevision) => {
                 use sha2::{Digest, Sha256};
                 let revision = Revision::of(self.ch, &self.rendered)?;
                 let mut hash = Sha256::new();
@@ -1256,8 +1287,13 @@ impl View<'_> {
                 for fact in revision.facts {
                     hash.update(fact.to_be_bytes());
                 }
-                for root in revision.rendered_roots {
-                    hash.update(root.to_be_bytes());
+                if matches!(query, Query::DisplayRevision) {
+                    hash.update(self.ch.generation.to_be_bytes());
+                    hash.update(self.ch.display_rewrite.to_be_bytes());
+                    hash.update(self.rendered.count()?.to_be_bytes());
+                    for root in self.rendered.display_roots() {
+                        hash.update(root.to_be_bytes());
+                    }
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
@@ -1620,7 +1656,24 @@ impl View<'_> {
                 revision,
                 limit,
             } => {
-                let current = self.rendered.order().revision();
+                // Only an entry that moved breaks the cursor; an added one lands where the walk
+                // finds it or in the part already listed. Another saved room is another order.
+                let token = crate::hash::sha256_concat(&[
+                    &self.rendered.history_instance(),
+                    &self.rendered.order().revision().to_be_bytes(),
+                ]);
+                let mut current = [0; 8];
+                current.copy_from_slice(&token[..8]);
+                let current = u64::from_be_bytes(current);
+                #[cfg(feature = "test-knobs")]
+                let current = if crate::node::mp11_mutant(
+                    "VOX_MUTANT_READ_REFUSES_ARRIVALS",
+                    "a read spanning requests is refused when a message arrives",
+                ) {
+                    self.rendered.directory_revision()
+                } else {
+                    current
+                };
                 if revision.is_some_and(|r| r != current) {
                     return Err(Failure::Request(CHANGED));
                 }

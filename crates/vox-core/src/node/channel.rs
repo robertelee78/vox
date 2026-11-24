@@ -7022,6 +7022,8 @@ impl ChannelState {
         // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
         // stores nothing, one after it still stores the row.
         let mut logged: u64 = promotion.unwrap_or(0);
+        // A body for a held skeleton takes its "not received yet" placeholder away for its text.
+        let refilled = arrived.iter().any(|(_, _, _, refill)| refill.is_some());
         for (author, entry_hash, _, refill) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
@@ -7203,6 +7205,9 @@ impl ChannelState {
         // none when the write failed (the room is poisoned above), and a refused pass's rows too.
         self.gen
             .fetch_add(logged, std::sync::atomic::Ordering::Relaxed);
+        if refilled {
+            self.remove_display_rows();
+        }
         if promotion.is_some() {
             self.finish_entry_publication(store)?;
         }

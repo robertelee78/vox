@@ -375,11 +375,12 @@ impl From<&str> for PageFailure {
     }
 }
 
-/// Fence a multi-request visible page without retaining a database snapshot or lock.
+/// Fence a multi-request visible page without retaining a database snapshot or lock. The read
+/// token moves only when rows already read may have moved or changed, not when a message arrives.
 async fn page_revision(
     client: &mut IpcClient,
     room: Digest32,
-) -> Result<(u64, Digest32), PageFailure> {
+) -> Result<(Digest32, Digest32), PageFailure> {
     let body = client
         .exchange(&vox_core::node::snapshot::request_body())
         .await
@@ -393,12 +394,22 @@ async fn page_revision(
             _ => "the node did not answer the room's state".into(),
         });
     };
-    snapshot
+    let sessions = snapshot
         .open
         .into_iter()
         .find(|r| r.channel_id == room)
-        .map(|r| (r.display_revision, r.session_revision))
-        .ok_or_else(|| "the room is not open".into())
+        .map(|r| r.session_revision)
+        .ok_or("the room is not open")?;
+    match client
+        .request(&Request::RoomReadRevision { channel_id: room })
+        .await
+        .map_err(|e| format!("the room's state could not be read: {e}"))?
+    {
+        Frame::RoomDisplayRevision { revision } => Ok((revision, sessions)),
+        Frame::Error { reason } => Err(reason.into()),
+        Frame::NodeDetached { .. } => Err(PageFailure::Detached),
+        _ => Err("the node did not answer the room's state".into()),
+    }
 }
 
 #[derive(PartialEq, Eq)]

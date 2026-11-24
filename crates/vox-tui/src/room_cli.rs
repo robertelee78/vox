@@ -1816,7 +1816,7 @@ async fn reply_entry(
         )));
     }
     let display_revision = match client
-        .request(&Request::RoomDisplayRevision { channel_id: cid })
+        .request(&Request::RoomReadRevision { channel_id: cid })
         .await?
     {
         Frame::RoomDisplayRevision { revision } => revision,
@@ -1845,7 +1845,7 @@ async fn reply_entry(
         #[cfg(feature = "test-knobs")]
         hold_reply_prefix_after_first_page(before).await?;
         let current_revision = match client
-            .request(&Request::RoomDisplayRevision { channel_id: cid })
+            .request(&Request::RoomReadRevision { channel_id: cid })
             .await?
         {
             Frame::RoomDisplayRevision { revision } => revision,

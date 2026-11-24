@@ -350,6 +350,7 @@ const T_THREAD_SUMMARY_REQ: u64 = 7540;
 const T_THREAD_SUMMARY: u64 = 7541;
 const T_ROOM_DISPLAY_REVISION_REQ: u64 = 7542;
 const T_ROOM_DISPLAY_REVISION: u64 = 7543;
+const T_ROOM_READ_REVISION_REQ: u64 = 7544;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -1301,6 +1302,12 @@ pub enum Request {
         /// The selected node's room.
         channel_id: Digest32,
     },
+    /// The token a read spanning requests compares, as [`Frame::RoomDisplayRevision`]: it
+    /// moves when rows already read may have moved or changed, not when a message arrives.
+    RoomReadRevision {
+        /// The selected node's room.
+        channel_id: Digest32,
+    },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
     /// (V210-120): what a reader that reads a page at a time says is still waiting.
     Count {
@@ -1630,6 +1637,9 @@ impl Request {
                 e.array(2)
                     .uint(T_ROOM_DISPLAY_REVISION_REQ)
                     .bytes(channel_id);
+            }
+            Request::RoomReadRevision { channel_id } => {
+                e.array(2).uint(T_ROOM_READ_REVISION_REQ).bytes(channel_id);
             }
             Request::Unread { channel_id } => {
                 e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
@@ -2617,6 +2627,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::RoomDisplayRevision { channel_id })
+            }
+            (T_ROOM_READ_REVISION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomReadRevision { channel_id })
             }
             (T_UNREAD_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -8023,6 +8039,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Thread { channel_id, .. }
         | Request::ThreadSummary { channel_id, .. }
         | Request::RoomDisplayRevision { channel_id, .. }
+        | Request::RoomReadRevision { channel_id, .. }
         | Request::Count { channel_id, .. }
         | Request::Unread { channel_id, .. }
         | Request::Find { channel_id, .. }
@@ -8848,6 +8865,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id).await {
+                Ok(revision) => Frame::RoomDisplayRevision { revision },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::RoomReadRevision { channel_id } => {
+            match handle.room_read_revision(&channel_id).await {
                 Ok(revision) => Frame::RoomDisplayRevision { revision },
                 Err(reason) => Frame::Error { reason },
             }

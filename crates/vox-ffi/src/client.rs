@@ -34,32 +34,18 @@ use zeroize::Zeroizing;
 
 use crate::{digest, failed, input_fingerprint, VoxError};
 
-/// How many times a read under the room's fence is retried when the fence moved while it ran.
-/// The fence is the room's instance and display revision, and the revision moves with every
-/// row the room applies: under catch-up a row lands every few hundred milliseconds, and a single
-/// attempt almost always lost that race, so the app sat at "members loading" and said "refresh
-/// and try again" to a person (the decider's room, 2026-10-20).
-const FENCED_READ_ATTEMPTS: usize = 8;
-
 /// A read under the room's fence: `$body` runs with `$fence` bound and yields the read's value;
-/// if the fence or the acting node changed meanwhile, the read runs again, up to
-/// [`FENCED_READ_ATTEMPTS`] times, and is refused with `$message` when it keeps changing.
-/// Yields `(fence, value)`.
+/// if the fence or the acting node changed meanwhile, the read is refused with `$message`. The
+/// fence moves only when rows already read may have moved or changed, never because a message
+/// arrived. Yields `(fence, value)`.
 macro_rules! under_fence {
     ($c:expr, $channel_id:expr, $actor:expr, $message:expr, |$fence:ident| $body:block) => {{
-        let mut done = None;
-        for _ in 0..FENCED_READ_ATTEMPTS {
-            let $fence = room_read_fence($c, $channel_id).await?;
-            let value = $body;
-            if room_read_fence($c, $channel_id).await? == $fence && $c.me() == Some($actor) {
-                done = Some(($fence, value));
-                break;
-            }
+        let $fence = room_read_fence($c, $channel_id).await?;
+        let value = $body;
+        if room_read_fence($c, $channel_id).await? != $fence || $c.me() != Some($actor) {
+            return Err(failed($message));
         }
-        match done {
-            Some(read) => read,
-            None => return Err(failed($message)),
-        }
+        ($fence, value)
     }};
 }
 
@@ -2705,7 +2691,7 @@ async fn room_read_fence(
         Frame::ArrivalHead { head } => head.instance,
         other => return Err(unexpected(&other)),
     };
-    let revision = match ask(client, &Request::RoomDisplayRevision { channel_id }).await? {
+    let revision = match ask(client, &Request::RoomReadRevision { channel_id }).await? {
         Frame::RoomDisplayRevision { revision } => revision,
         other => return Err(unexpected(&other)),
     };
@@ -5005,12 +4991,19 @@ impl VoxClient {
         .map_err(|e| failed(e.to_string()))?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let (fence, page) = under_fence!(
+            let (fence, (display, page)) = under_fence!(
                 c,
                 channel_id,
                 actor,
                 "The room changed while reading its work board. Refresh and retry.",
                 |fence| {
+                    // The page's cache token, taken before it: a message arriving after it moves
+                    // the token the app compares, so the page is read again, never kept stale.
+                    let display = match ask(c, &Request::RoomDisplayRevision { channel_id }).await?
+                    {
+                        Frame::RoomDisplayRevision { revision } => revision,
+                        other => return Err(unexpected(&other)),
+                    };
                     let page: Page = match ask(
                         c,
                         &Request::WorkBoard {
@@ -5024,7 +5017,7 @@ impl VoxClient {
                             .map_err(|_| failed("Invalid daemon work-board page."))?,
                         other => return Err(unexpected(&other)),
                     };
-                    page
+                    (display, page)
                 }
             );
             let mut rows = Vec::with_capacity(page.rows.len());
@@ -5050,7 +5043,7 @@ impl VoxClient {
             Ok(MemberWorkPage {
                 node: b32_encode(&actor),
                 instance: fence.0.to_vec(),
-                revision: b32_encode(&fence.1),
+                revision: b32_encode(&display),
                 refresh_at: page.cursor.valid_until,
                 rows,
                 next: page

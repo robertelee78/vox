@@ -1137,9 +1137,13 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     );
 
     // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
-    // change the room through a second shipped CLI, then let it continue. It must refuse the
-    // stale scan and post nothing. Mutant: remove the display-revision comparison; the reply is
-    // posted against a collection that never existed as one room view.
+    // change the room through a second shipped CLI, then let it continue (ledger 95).
+    // - A message that only arrives changes no row the scan has read: the reply resolves and is
+    //   posted. Mutant `VOX_MUTANT_READ_REFUSES_ARRIVALS` (the arrival fields compared again):
+    //   the scan is refused because someone posted.
+    // - A retention change changes what the rows already read are: the scan is refused and
+    //   posts nothing. Mutant `VOX_MUTANT_READ_KEEPS_NOTHING`: the reply is posted against pages
+    //   that were never one room view.
     #[cfg(feature = "test-knobs")]
     {
         test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
@@ -1155,53 +1159,115 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
                     .then_some((entry.clone(), prefix.to_owned()))
             })
             .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
-        let hold = tmp.path().join("reply-prefix.hold");
-        let reached = hold.with_extension("reached");
-        std::fs::write(&hold, b"hold")
-            .expect("APPARATUS: could not stage the reply-prefix scan hold");
+        // `vox room post --re PREFIX TEXT`, held after its first page while `change` runs.
+        let held_scan = |text: &str, change: &dyn Fn() -> String| {
+            let hold = tmp.path().join(format!("{text}.hold"));
+            let reached = hold.with_extension("reached");
+            std::fs::write(&hold, b"hold")
+                .expect("APPARATUS: could not stage the reply-prefix scan hold");
+            let (scan_data, scan_cfg, scan_room, scan_hold) =
+                (data.clone(), cfg.clone(), room.clone(), hold.clone());
+            let (prefix, text) = (changing_prefix.clone(), text.to_owned());
+            let scan = std::thread::spawn(move || {
+                vox_with_env(
+                    &scan_data,
+                    &scan_cfg,
+                    &["room", "post", &scan_room, "--re", &prefix, &text],
+                    None,
+                    &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
+                )
+            });
+            while !reached.exists() {
+                assert!(
+                    !scan.is_finished(),
+                    "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let changed = change();
+            std::fs::remove_file(&hold)
+                .expect("APPARATUS: could not release the staged reply-prefix scan");
+            let result = scan
+                .join()
+                .expect("APPARATUS: reply-prefix command thread panicked");
+            // Diagnostic: a mutant the daemon engaged says so in its stderr.
+            for line in std::fs::read_to_string(&daemon_err)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(" engaged"))
+            {
+                println!("[proof] the daemon said: {line}");
+            }
+            (changed, result)
+        };
+        let rows_now = || {
+            let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+            assert!(ok, "PRODUCT: room read failed: {rows}{err}");
+            rows.lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                        panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
 
-        let scan_data = data.clone();
-        let scan_cfg = cfg.clone();
-        let scan_room = room.clone();
-        let scan_hold = hold.clone();
-        let scan = std::thread::spawn(move || {
-            vox_with_env(
-                &scan_data,
-                &scan_cfg,
-                &[
-                    "room",
-                    "post",
-                    &scan_room,
-                    "--re",
-                    &changing_prefix,
-                    "PREFIX-CHANGED-SCAN",
-                ],
-                None,
-                &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
-            )
+        let (arrived, (ok, out, err)) = held_scan("PREFIX-SCAN-PAST-AN-ARRIVAL", &|| {
+            post(&["PREFIX-ARRIVES-WHILE-SCANNED"])
         });
-        while !reached.exists() {
-            assert!(
-                !scan.is_finished(),
-                "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let changed = post(&["PREFIX-CHANGES-WHILE-SCANNED"]);
-        std::fs::remove_file(&hold)
-            .expect("APPARATUS: could not release the staged reply-prefix scan");
-        let (changed_ok, changed_out, changed_err) = scan
-            .join()
-            .expect("APPARATUS: reply-prefix command thread panicked");
         assert!(
-            !changed_ok && changed_err.contains("room changed"),
-            "PRODUCT: reply-prefix scan accepted stale pages after room entry {changed} changed revision while resolving {changing_target}: {changed_out}{changed_err}"
+            ok,
+            "PRODUCT: a reply-prefix scan was refused because message {arrived} arrived while it \
+             read; no row it had read changed: {out}{err}"
         );
-        let (read_ok, after_changed, read_err) =
-            vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+        let reply = rows_now()
+            .into_iter()
+            .find(|row| row.to_string().contains("PREFIX-SCAN-PAST-AN-ARRIVAL"));
         assert!(
-            read_ok && !after_changed.contains("PREFIX-CHANGED-SCAN"),
-            "PRODUCT: stale reply-prefix scan posted after the room changed: {after_changed}{read_err}"
+            reply
+                .as_ref()
+                .is_some_and(|row| row["envelope"]["re"] == changing_target),
+            "PRODUCT: the reply-prefix scan that read past an arrival did not reply to \
+             {changing_target}: {reply:?}"
+        );
+
+        let (changed, (ok, out, err)) = held_scan("PREFIX-SCAN-PAST-A-RETENTION-CHANGE", &|| {
+            let notices = |rows: &str| rows.matches("vox.room.notice/1").count();
+            let read_notices = || {
+                let (ok, out, err) = vox(
+                    &data,
+                    &cfg,
+                    &["room", "read", &room, "--json", "--notices"],
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT (staging): room read --notices failed: {out}{err}"
+                );
+                notices(&out)
+            };
+            let before = read_notices();
+            let (ok, out, err) = vox(&data, &cfg, &["room", "retention", &room, "1w"], None);
+            assert!(
+                ok,
+                "PRODUCT (staging): vox room retention 1w failed: {out}{err}"
+            );
+            // The room has applied it when its notice is read: only then does the scan read on.
+            while read_notices() == before {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            "a retention of one week".to_owned()
+        });
+        assert!(
+            !ok && err.contains("room changed"),
+            "PRODUCT: reply-prefix scan accepted pages read before {changed} changed the rows it \
+             had read, while resolving {changing_target}: {out}{err}"
+        );
+        assert!(
+            rows_now().iter().all(|row| !row
+                .to_string()
+                .contains("PREFIX-SCAN-PAST-A-RETENTION-CHANGE")),
+            "PRODUCT: a refused reply-prefix scan posted its reply"
         );
     }
     #[cfg(not(feature = "test-knobs"))]
