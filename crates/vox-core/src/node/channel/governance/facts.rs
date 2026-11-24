@@ -17,15 +17,20 @@ const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
 pub(super) const FORK_LOCATOR: u64 = 1 << 63;
-/// The derived index's own format. 5 adds the canonical projection fingerprint used to publish
-/// semantic revisions only after the authorized fold completes. 4 (v0.4.6, ADR-037 R2c) added
-/// the control settlement queue.
+/// The derived index's own format. 6 (ADR-053 MP-6/MP-11) marks an index whose eligibility
+/// decisions were made under the cut that keeps what a removal's remover held, with every shown
+/// row reconciled with them; a format-5 header is read as is and, in a room with a removal,
+/// begins a new authority generation (see `Header::parse`), so the existing refold recomputes
+/// every decision and `advance` takes away or brings back the shown rows they change. 5 adds the
+/// canonical projection fingerprint used to publish semantic revisions only after the authorized
+/// fold completes. 4 (v0.4.6, ADR-037 R2c) added the control settlement queue.
 /// A format-3 header (every release through v0.4.5) is read as is, with the new queue empty,
 /// and `prepare` fills that queue from the pending rows and reseals the header at the current
 /// version: the
 /// index is migrated in place, never rebuilt from the source log, so an upgrade does not pay a
 /// cold scan of a large store for a derived queue it can compute from the rows it already has.
-pub(super) const HEADER_VERSION: u64 = 5;
+pub(super) const HEADER_VERSION: u64 = 6;
+const HEADER_VERSION_BEFORE_REMOVAL_TIP: u64 = 5;
 const HEADER_VERSION_WITH_CONTROL_QUEUE: u64 = 4;
 const HEADER_VERSION_BEFORE_CONTROL_QUEUE: u64 = 3;
 
@@ -327,21 +332,20 @@ impl Header {
             return Err(invalid("governance header format"));
         }
         let version = d.uint()?;
-        if !matches!(
-            version,
-            HEADER_VERSION
-                | HEADER_VERSION_WITH_CONTROL_QUEUE
-                | HEADER_VERSION_BEFORE_CONTROL_QUEUE
-        ) || (version == HEADER_VERSION && arity != 23)
-            || (version != HEADER_VERSION && arity != 22)
-        {
+        let fingerprinted = matches!(version, HEADER_VERSION | HEADER_VERSION_BEFORE_REMOVAL_TIP);
+        let known = fingerprinted
+            || matches!(
+                version,
+                HEADER_VERSION_WITH_CONTROL_QUEUE | HEADER_VERSION_BEFORE_CONTROL_QUEUE
+            );
+        if !known || arity != if fingerprinted { 23 } else { 22 } {
             return Err(invalid("governance header format"));
         }
         let next = d.uint()?;
         // Format 3 had every table but the control settlement queue, which is read as empty.
         let stored = d.array()?;
         if stored != TABLES
-            && !(version == HEADER_VERSION && (41..TABLES).contains(&stored))
+            && !(version == HEADER_VERSION_BEFORE_REMOVAL_TIP && (41..TABLES).contains(&stored))
             && !(version == HEADER_VERSION_WITH_CONTROL_QUEUE && stored == 40)
             && !(version == HEADER_VERSION_BEFORE_CONTROL_QUEUE && stored == 39)
         {
@@ -371,7 +375,7 @@ impl Header {
         let revision = d.uint()?;
         let queue_serial = d.uint()?;
         let display_revision = d.uint()?;
-        let projection = if version == HEADER_VERSION {
+        let projection = if fingerprinted {
             d.bytes()?
                 .try_into()
                 .map_err(|_| invalid("governance projection fingerprint"))?
@@ -433,9 +437,15 @@ impl Header {
         // A header sealed before RecipientCuts existed may hold a finished membership fold that
         // never wrote those rows. Only a room with an indexed removal can need one: begin a new
         // authority generation there, exactly as an expiry does, so every stamped row reads
-        // Refreshing until the existing driver refolds and stamps it.
+        // Refreshing until the existing driver refolds and stamps it. A header sealed before
+        // format 6 holds eligibility decisions made under the cut before ADR-053 MP-6, and shown
+        // rows never reconciled with them (MP-11): the same new generation recomputes every
+        // decision, and `advance` retracts or restores each shown row it changes. The first seal
+        // at format 6 records it; a crash before then begins the generation again at the next
+        // open, and one after it leaves the generation unfolded for the driver to finish.
         let authority_generation = if initialized
-            && stored <= Table::RecipientCuts as usize
+            && (stored <= Table::RecipientCuts as usize
+                || (version != HEADER_VERSION && !super::no_reconcile_mutant()))
             && roots[Table::MemberRemovals as usize] != 0
         {
             authority_generation

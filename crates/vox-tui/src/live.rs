@@ -1183,9 +1183,12 @@ impl DaemonCore {
                 if let Some(t) = me.timeline.as_mut() {
                     t.stale = true;
                 }
-            } else if n > 0 {
+            } else {
+                // A Synced with no new row may still have taken rows away (ADR-053 MP-11).
                 me.unread.entry(channel_id).or_default().dirty = true;
-                *me.arrived.entry(channel_id).or_insert(0) += n;
+                if n > 0 {
+                    *me.arrived.entry(channel_id).or_insert(0) += n;
+                }
             }
         };
         match ev {

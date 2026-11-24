@@ -164,6 +164,7 @@ impl ChannelState {
         let mut retraction = Ok(());
         if completed.retracted {
             self.remove_display_rows();
+            self.display_news = true;
             match self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)

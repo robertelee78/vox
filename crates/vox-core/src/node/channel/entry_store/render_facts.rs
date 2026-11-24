@@ -863,6 +863,41 @@ impl Write<'_, '_> {
         )?;
         self.set_render_roots(roots)
     }
+    /// ADR-053 MP-11: bring back a row an ineligibility decision took away (`remove_rendered`,
+    /// `remove_read_receipt`), now that its author's eligibility is decided true again, from the
+    /// plaintext this node still retains for it. The row gets what `put_rendered` gives a row
+    /// shown for the first time, with `shown` as its visibility time; a read receipt gets its
+    /// references back. A row already shown, one this node holds no retained plaintext for
+    /// (never rendered, expired) and a Session row are left alone. True when a row came back.
+    pub(crate) fn restore_rendered(&mut self, hash: &Digest32, shown: u64) -> Result<bool> {
+        let Some(cache) = self.retention(hash)?.and_then(|tracked| tracked.cache_id) else {
+            return Ok(false);
+        };
+        let roots = self.render_roots()?;
+        let source = Source::Batch(self.batch);
+        if source
+            .render_fact(self.sek, self.channel, roots.rendered.hash, &hashed(hash))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let bytes = source
+            .open(self.sek, self.channel, SegmentKind::PlaintextCache, cache)?
+            .ok_or(invalid("retained cache missing"))?;
+        match super::super::parse_cache(&bytes)? {
+            super::super::CacheRow::Text(mut row) if row.entry_hash == *hash => {
+                row.arrival = cache;
+                self.put_rendered(&row, shown)?;
+                Ok(true)
+            }
+            super::super::CacheRow::Read(row) if row.entry_hash == *hash => {
+                self.put_read_receipt(&row, cache)?;
+                Ok(false)
+            }
+            super::super::CacheRow::Session(_) => Ok(false),
+            _ => Err(invalid("retained cache hash differs")),
+        }
+    }
     pub(super) fn move_rendered(
         &mut self,
         roots: &mut super::Roots,

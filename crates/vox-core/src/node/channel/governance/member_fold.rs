@@ -1170,10 +1170,12 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
 
 /// Advance at most one causal eligibility decision step. Source replay has a
 /// fixed receipt tail; later appends are independently queued at frontier completion.
-/// An entry decided ineligible as its author's content is added to `ineligible` (MP-11).
+/// Every entry decided as its author's content is added to `decided` with its decision, so the
+/// shown rows follow it (MP-11): an ineligible one leaves, an eligible one retracted before
+/// comes back.
 pub(super) fn advance_eligibility(
     writer: &mut Write<'_, '_>,
-    ineligible: &mut Vec<Digest32>,
+    decided: &mut Vec<(Digest32, bool)>,
 ) -> Result<bool> {
     use super::facts::Cursor;
     if writer.eligibility_replaying() {
@@ -1260,8 +1262,8 @@ pub(super) fn advance_eligibility(
             .uint(u64::from(eligible));
         let record = writer.save_record(old, &e.finish())?;
         writer.put(table, key, Some(record))?;
-        if stage == 0 && !eligible {
-            ineligible.push(hash);
+        if stage == 0 {
+            decided.push((hash, eligible));
         }
         if stage == 0 {
             let entry = writer.entry(log)?;

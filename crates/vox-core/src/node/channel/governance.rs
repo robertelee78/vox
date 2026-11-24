@@ -662,7 +662,8 @@ pub(super) use view::{Display, View};
 pub(super) struct Progress {
     pub ready: bool,
     pub pending: bool,
-    /// This turn took already shown rows away (MP-11); the room's readers must notice.
+    /// This turn took already shown rows away or brought retained ones back (MP-11); the room's
+    /// readers must notice.
     pub retracted: bool,
 }
 
@@ -853,8 +854,10 @@ pub(super) fn advance(
             // MP-11 (ADR-053): a message this node already shows and that an eligibility
             // decision now proves not acceptable (its author outside a removal's cut) leaves the
             // conversation in the same transaction as the decision, so counts, pages and threads
-            // never name it again.
-            let mut ineligible = Vec::new();
+            // never name it again; one taken away before and decided acceptable again (a
+            // removal its remover's authority no longer carries) comes back from the plaintext
+            // this node retains, in the same transaction.
+            let mut decided = Vec::new();
             if fold_ready {
                 for _ in 0..FOLD_STEPS {
                     if started.elapsed() >= FOLD_BUDGET || !writer.causal_settled()? {
@@ -864,7 +867,7 @@ pub(super) fn advance(
                     if !writer.causal_settled()? {
                         break;
                     }
-                    let worked = member_fold::advance_eligibility(&mut writer, &mut ineligible)?;
+                    let worked = member_fold::advance_eligibility(&mut writer, &mut decided)?;
                     if !replayed && !worked {
                         break;
                     }
@@ -873,16 +876,21 @@ pub(super) fn advance(
             writer.seal()?;
             #[cfg(feature = "test-knobs")]
             if keep_rows_mutant() {
-                ineligible.clear();
+                decided.clear();
             }
-            if !ineligible.is_empty() {
+            if !decided.is_empty() {
+                let shown = super::shown_now();
                 let mut index = entries.write(&mut batch, sek, room)?;
-                for hash in &ineligible {
-                    if index.has_rendered(hash)? {
-                        index.remove_rendered(hash)?;
+                for (hash, eligible) in &decided {
+                    if !eligible {
+                        if index.has_rendered(hash)? {
+                            index.remove_rendered(hash)?;
+                            retracted = true;
+                        }
+                        index.remove_read_receipt(hash)?;
+                    } else if !no_restore_mutant() && index.restore_rendered(hash, shown)? {
                         retracted = true;
                     }
-                    index.remove_read_receipt(hash)?;
                 }
                 index.seal()?;
             }
@@ -922,4 +930,43 @@ fn keep_rows_mutant() -> bool {
         on
     });
     *ON
+}
+
+/// `VOX_MUTANT_MP11_NO_RESTORE`: a retracted row stays away when its author's eligibility is
+/// decided true again. Says so once when the daemon first reads it.
+fn no_restore_mutant() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VOX_MUTANT_MP11_NO_RESTORE").is_some();
+            if on {
+                eprintln!("vox: VOX_MUTANT_MP11_NO_RESTORE engaged: retracted rows stay away");
+            }
+            on
+        });
+        *ON
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    false
+}
+
+/// `VOX_MUTANT_MP11_NO_RECONCILE`: an index sealed before format 6 is opened without the new
+/// authority generation that recomputes its decisions (`facts::Header::parse`). Says so once
+/// when the daemon first reads it.
+fn no_reconcile_mutant() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VOX_MUTANT_MP11_NO_RECONCILE").is_some();
+            if on {
+                eprintln!(
+                    "vox: VOX_MUTANT_MP11_NO_RECONCILE engaged: an older index keeps its decisions"
+                );
+            }
+            on
+        });
+        *ON
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    false
 }
