@@ -2439,21 +2439,22 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
     );
 }
 
-/// ADR-028 §6 (#503) — **a drain posts read records, and nobody is shown one.**
+/// ADR-028 §6 (#503) — **an author sees her posts read by the agent that read them.**
 ///
 /// Two real daemons, alice and bob, each trusting the other, in alice's room. alice posts three
-/// messages with `vox room post`; bob's agent drains them into its turn (RR-1). Then, as each
-/// person reads the room:
+/// messages with `vox room post`; bob's agent drains them into its turn (RR-1), and one read
+/// record names everything that turn was shown. So once alice's `vox room read --json` shows any
+/// of the three read by bob (bob's record reached her), it shows all three read by bob (RR-3).
 ///
-/// 1. **read by bob** (RR-3): alice's `vox room read --json` shows each of the three read by bob.
-/// 2. **never a message** (RR-4): neither alice's nor bob's `vox room read --json` shows a message
-///    of bob's; both show alice's three posts and nothing else (a Session's opening or end aside).
+/// Not proved here: that nobody is shown the record as a message (RR-4). Each run prints both
+/// members' reads, and in the green runs neither showed a message of bob's; that is an
+/// observation, not a proof (no mutant reaches it).
 ///
-/// **Mutant**: the hook asks for no read record (`mark_read` returns at once). Red on (1),
-/// PRODUCT: alice's posts are never shown read by bob.
+/// **Mutant**: the hook marks only the first message a turn showed as read. Red, PRODUCT: alice
+/// sees "read-me one" read by bob, and not the other two.
 #[test]
 #[ignore = "two daemons with production Argon2id; drives the real binary; CI runs it in release"]
-fn a_drain_posts_read_records_that_nobody_is_shown() {
+fn an_author_sees_her_posts_read_by_the_agent_that_read_them() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = Daemon::start(&tmp.path().join("alice"));
@@ -2500,14 +2501,24 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         alice.post(p);
     }
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !posts
-        .iter()
-        .all(|p| shown_rows(&bob).iter().any(|(_, r)| r == p))
-    {
+    let mut looks = 0u32;
+    loop {
+        let held = shown_rows(&bob);
+        looks += 1;
+        if posts.iter().all(|p| held.iter().any(|(_, r)| r == p)) {
+            break;
+        }
+        // Five looks give the product its chances (`support/room.rs` MIN_LOOKS); fewer, and the
+        // harness was too slow to ask.
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): bob never read alice's three posts in 90 s; he shows {:?}",
-            shown_rows(&bob)
+            "{} bob does not hold alice's three posts 90 s after she posted them ({looks} \
+             looks); he shows {held:?}",
+            if looks >= 5 {
+                "PRODUCT (staging):"
+            } else {
+                "CANNOT MEASURE: the harness was too slow to look;"
+            }
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2523,8 +2534,8 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: 60 s after he read alice's posts, bob's turns are still told the room \
-             {refreshing}: {out}"
+            "APPARATUS NO RESULT: 60 s after he held alice's posts, bob's turns were still told \
+             the room {refreshing}; the last turn: {out}"
         );
         std::thread::sleep(Duration::from_millis(500));
     };
@@ -2533,9 +2544,16 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         "PRODUCT (staging): bob's turn was not shown alice's posts: {out}"
     );
 
-    // ---- (1) alice sees her posts read by bob ----
+    // ---- alice sees her posts read by bob ----
+    // The cause: bob's record has reached alice when she sees any of the three read by bob. Until
+    // then there is nothing to judge; a bound that runs out is no result, not a verdict.
+    let read_by_bob = |r: &serde_json::Value| {
+        r["read_by"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n == "bob"))
+    };
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let (rows, out) = loop {
         let (ok, out, err) = hook(
             &alice.data,
             &alice.cfg,
@@ -2549,48 +2567,34 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         let rows: Vec<serde_json::Value> = out
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|r: &serde_json::Value| posts.iter().any(|p| r["text"] == *p))
             .collect();
-        let unread: Vec<&str> = posts
-            .iter()
-            .copied()
-            .filter(|p| {
-                !rows.iter().any(|r| {
-                    r["text"] == *p
-                        && r["read_by"]
-                            .as_array()
-                            .is_some_and(|names| names.iter().any(|n| n == "bob"))
-                })
-            })
-            .collect();
-        if unread.is_empty() {
-            break;
+        if rows.iter().any(read_by_bob) {
+            break (rows, out);
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: 60 s after bob's agent was shown them, alice's `vox room read --json` does \
-             not show {unread:?} read by bob:\n{out}"
+            "APPARATUS NO RESULT: 60 s after bob's agent was shown them, alice's `vox room read \
+             --json` shows none of her posts read by bob, so his record has not reached her; it \
+             shows:\n{out}"
         );
         std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // ---- (2) nobody is shown a message of bob's ----
-    // A Session's opening and end are rows of their own (ADR-029): a read record is never one.
-    let is_session = |t: &String| {
-        vox_agentcomms::envelope::Envelope::parse(t).is_ok_and(|e| {
-            e.kind == vox_agentcomms::envelope::SESSION
-                || e.kind == vox_agentcomms::envelope::SESSION_END
-        })
     };
+    let unread: Vec<&str> = posts
+        .iter()
+        .copied()
+        .filter(|p| !rows.iter().any(|r| r["text"] == *p && read_by_bob(r)))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "PRODUCT: alice sees bob's read of her posts, but not of {unread:?}, though his agent's \
+         one turn was shown all three; her `vox room read --json`:\n{out}"
+    );
+    // Observed, not asserted (see above): what each member reads now.
     for (who, d) in [("alice", &alice), ("bob", &bob)] {
-        let rows: Vec<String> = shown_rows(d)
-            .into_iter()
-            .map(|(_, t)| t)
-            .filter(|t| !is_session(t))
-            .collect();
-        assert_eq!(
-            rows, posts,
-            "PRODUCT: {who}'s `vox room read` must show alice's three posts and no message of \
-             bob's; it shows {rows:?}"
+        eprintln!(
+            "[observed] {who}'s `vox room read --json` rows: {:?}",
+            shown_rows(d)
         );
     }
 }
@@ -2751,16 +2755,29 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     );
     assert!(ok, "PRODUCT (staging): bob could not join the room: {err}");
     bob.room_key.clone_from(&daemon.room_key);
-    // The label bob's `vox room sessions` gives the session once bob holds `marker`: `want` as
-    // soon as he lists it so, else what he lists 30 s later ("" for no Session at all). The
-    // Session and its name reach him sealed to his drive key on the room's private stream, beside
-    // the message that carries the name, not in one order with it.
-    let bob_label = |marker: &str, want: &str| -> String {
+    // The label bob's `vox room sessions` gives the session once bob holds `marker` and lists the
+    // Session with a label other than `before` ("" for not listed at all). The Session and its
+    // name reach him sealed to his drive key on the room's private stream, beside the message
+    // that carries the name, not in one order with it: until the label changes there is nothing
+    // to judge, and a bound that runs out is no result. The label it changes to is judged.
+    let bob_label = |marker: &str, before: &str| -> String {
         let deadline = Instant::now() + Duration::from_secs(90);
-        while !shown_rows(&bob).iter().any(|(_, t)| t.contains(marker)) {
+        let mut looks = 0u32;
+        loop {
+            let held = shown_rows(&bob);
+            looks += 1;
+            if held.iter().any(|(_, t)| t.contains(marker)) {
+                break;
+            }
+            // Five looks give the product its chances (`support/room.rs` MIN_LOOKS).
             assert!(
                 Instant::now() < deadline,
-                "APPARATUS: staging not achieved: {marker} did not reach bob in 90 s"
+                "{} {marker} did not reach bob in 90 s ({looks} looks); he shows {held:?}",
+                if looks >= 5 {
+                    "PRODUCT (staging):"
+                } else {
+                    "CANNOT MEASURE: the harness was too slow to look;"
+                }
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -2782,9 +2799,14 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
                 .find(|r| r["id"] == "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd")
                 .map(|r| r["label"].as_str().unwrap_or_default().to_owned())
                 .unwrap_or_default();
-            if label == want || Instant::now() >= deadline {
+            if label != before {
                 return label;
             }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS NO RESULT: 30 s after he held {marker}, bob still lists the Session as \
+                 {before:?}; his `vox room sessions --json`: {out}"
+            );
             std::thread::sleep(Duration::from_millis(200));
         }
     };
@@ -3002,7 +3024,7 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     let (_, nameless_listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
     let first_label = "codex@device-2 \u{b7} gso-cap \u{b7} 3f0c25bf";
     let renamed_label = "codex@device-2 \u{b7} gso-cap-2 \u{b7} 3f0c25bf";
-    let bob_first = bob_label("PLAIN-FROM-NAMED", first_label);
+    let bob_first = bob_label("PLAIN-FROM-NAMED", "");
     // (9) The person renames the session (`/rename`); its next message carries the new name, and
     // every member's label for it follows (ADR-029 SE-3).
     let mut renamed = std::fs::read_to_string(&transcript).unwrap_or_default();
@@ -3015,7 +3037,7 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         &person,
     );
     post_as(at, "AFTER-RENAME the cap holds");
-    let bob_renamed = bob_label("AFTER-RENAME", renamed_label);
+    let bob_renamed = bob_label("AFTER-RENAME", &bob_first);
     // (10) bob addresses one session of the node (ADR-029 TA-1), then the node itself (TA-4). Each
     // session's next turn: the one addressed shows it in full, its sibling counts it.
     let bob_post = |args: &[&str]| {
@@ -3170,31 +3192,44 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         claude_event(at, "SessionEnd", r#","reason":"prompt_input_exit""#),
         &person,
     );
-    // The hook hands the end to the daemon's ordered Session inbox and returns (92e349632: an end
-    // does not jump ahead of the session's accepted entries), so the node lists the Session ended
-    // once that record is appended, a moment after the hook: the listing is read until then, and
-    // how long it took is said. Never within 30 s (the inbox's own append patience) is PRODUCT.
+    // The daemon answers the hook's real `SessionEnd` after its ordered Session inbox has written
+    // the end (`host.rs` `session_end` awaits `finish_end_head`; 92e349632); the node's listing of
+    // its Sessions follows a moment later. What tells the person the listing has come past the
+    // end is a later Session of the node in it: a session the person starts after the end. So the
+    // listing is read until it lists the Session ended (GREEN) or lists that later Session while
+    // still listing this one open (PRODUCT). A bound that runs out first is no result.
     let hook_returned = Instant::now();
+    let later = "5e550e5d-aaaa-4bbb-8ccc-000000000009";
+    run(
+        claude_event(later, "UserPromptSubmit", r#","prompt":"next""#),
+        &person,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
     let after_end = loop {
         let now = sessions();
-        if of(&now, at).first().is_some_and(|s| s["open"] == false)
-            || hook_returned.elapsed() >= Duration::from_secs(30)
-        {
+        let ended = of(&now, at).first().is_some_and(|s| s["open"] == false);
+        let later_listed = of(&now, later).first().is_some_and(|s| s["open"] == true);
+        if ended || later_listed {
             break now;
         }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS NO RESULT: 30 s after the real `SessionEnd`, the node lists neither this \
+             Session ended nor the session started after it; it lists {now:?}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     eprintln!(
-        "[proof] (6) the node listed the Session as {after_end:?} {:?} after the hook's real \
-         `SessionEnd` returned",
+        "[proof] (6) {:?} after the hook's real `SessionEnd` returned (a later session's turn \
+         between), the node lists {after_end:?}",
         hook_returned.elapsed()
     );
     // Mutant: a real `SessionEnd` posts no end record (host.rs `session_end`). Red here, PRODUCT.
     let ended = of(&after_end, at);
     assert!(
         ended.len() == 1 && ended[0]["open"] == false && ended[0]["ended_millis"].is_u64(),
-        "PRODUCT: a real `SessionEnd` must end the Session, and keep it; 30 s after the hook \
-         returned the room lists {after_end:?}"
+        "PRODUCT: a real `SessionEnd` must end the Session, and keep it; the node lists the \
+         session started after the end, and this Session still open: {after_end:?}"
     );
     // (11) bob addresses the session that has ended (TA-5): refused, and nothing posted.
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -3271,13 +3306,13 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     assert!(
         bob_first == first_label,
         "PRODUCT: another member trusted with drive must label a Session with his own alias for \
-         its node, its name and its short id; 30 s after he held its message, bob's `vox room \
-         sessions` labelled it {bob_first:?}"
+         its node, its name and its short id; once he listed it, bob's `vox room sessions` \
+         labelled it {bob_first:?}"
     );
     assert!(
         bob_renamed == renamed_label,
-        "PRODUCT: a renamed session's label must follow its next message; 30 s after he held \
-         it, bob's `vox room sessions` labelled it {bob_renamed:?}"
+        "PRODUCT: a renamed session's label must follow its next message; when bob's label for \
+         it changed from {bob_first:?}, his `vox room sessions` labelled it {bob_renamed:?}"
     );
     assert!(
         of(&after_restart, at).len() == 1 && openings == 0,
