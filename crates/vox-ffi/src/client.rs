@@ -4449,49 +4449,6 @@ impl VoxClient {
         })
     }
 
-    /// One bounded page of readable thread replies in arrival order, matching `thread_summary`.
-    /// Opaque owed rows have no readable thread metadata and are not included. Empty `since`
-    /// starts the thread; the next request follows the last returned id. An empty page finishes
-    /// the read. A cursor removed by retention is an explicit error; reload from the beginning.
-    /// This does not drain later pages or read another room.
-    ///
-    /// # Errors
-    /// A malformed id, an invalid cursor, or the node's refusal.
-    pub async fn read_thread_page(
-        &self,
-        room: String,
-        root: String,
-        since: String,
-    ) -> Result<Vec<RoomMessage>, VoxError> {
-        let channel_id = digest(&room, "room id")?;
-        let root = digest(&root, "thread root")?;
-        let since = if since.is_empty() {
-            None
-        } else {
-            Some(digest(&since, "message id")?)
-        };
-        on_held!(self, |c| {
-            let names = names(c).await?;
-            let me = c.me().map(|f| b32_encode(&f));
-            match ask(
-                c,
-                &Request::Thread {
-                    channel_id,
-                    root,
-                    since,
-                },
-            )
-            .await?
-            {
-                Frame::Rows { rows } => Ok(rows
-                    .iter()
-                    .map(|r| rendered(r, &names, me.as_deref()))
-                    .collect()),
-                other => Err(unexpected(&other)),
-            }
-        })
-    }
-
     /// Read one bounded thread window: neither cursor starts at the first replies, `before`
     /// moves earlier, and `after` moves later. Pass the held room instance on continuations.
     /// Retention of a cursor is an explicit refusal; it never silently jumps to another page.

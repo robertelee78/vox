@@ -469,6 +469,12 @@ pub async fn structured(
             "too many names for a bounded coordination read".into(),
         ));
     }
+    // Each next page follows the last row's arrival as a position, never its hash, which the
+    // node refuses once it names a message that came back (ADR-053 MP-11).
+    let instance = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(crate::client::unexpected(&other)),
+    };
     // At most `MAX_FIND` names to a request, types and ids together.
     let room = vox_core::node::ipc::MAX_FIND
         .saturating_sub(types.len())
@@ -478,7 +484,7 @@ pub async fn structured(
         if t.is_empty() && ids.is_empty() {
             continue;
         }
-        let mut cursor = None;
+        let mut resume: Option<HistoryCursor> = None;
         loop {
             let page = match ask(
                 client,
@@ -486,7 +492,8 @@ pub async fn structured(
                     channel_id,
                     types: t.iter().map(|t| (*t).to_owned()).collect(),
                     ops: ids.to_vec(),
-                    since: cursor,
+                    since: None,
+                    resume,
                 },
             )
             .await?
@@ -494,13 +501,16 @@ pub async fn structured(
                 Frame::Rows { rows } => rows,
                 other => return Err(crate::client::unexpected(&other)),
             };
-            let Some(last) = page.last().map(|row| row.entry_hash) else {
+            let (Some(first), Some(last)) = (page.first(), page.last()) else {
                 break;
             };
-            if cursor == Some(last) {
+            if resume.is_some_and(|at| first.arrival <= at.arrival) {
                 return Err(AppError::Usage("coordination page did not advance".into()));
             }
-            cursor = Some(last);
+            resume = Some(HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            });
             for row in page {
                 if seen.contains(&row.entry_hash) {
                     continue;
@@ -661,7 +671,20 @@ pub async fn wake_context(
     let mut seen: std::collections::HashSet<Digest32> =
         found.iter().map(|r| r.entry_hash).collect();
     let mut rows = found;
-    let after = read_all(client, channel_id, Some(oldest)).await?;
+    // From the oldest by arrival; from the room's first message when the node refuses it as a
+    // message that came back after a removal took it away (ADR-053 MP-11): it arrived again,
+    // after replies made to it before.
+    let after = match client
+        .read_rows(channel_id, Some(oldest))
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::Rows { rows } => rows,
+        Frame::Error { reason } if reason.ends_with(vox_core::node::ipc::CAME_BACK) => {
+            read_all(client, channel_id, None).await?
+        }
+        other => return Err(crate::client::unexpected(&other)),
+    };
     rows.extend(after.into_iter().filter(|r| seen.insert(r.entry_hash)));
     Ok(rows)
 }

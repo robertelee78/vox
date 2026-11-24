@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
 use vox_core::hash::Digest32;
-use vox_core::node::api::{Fault, MessageRow, NodeEvent};
+use vox_core::node::api::{Fault, HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonEvent, DaemonFrame, DaemonRequest, DetachCause, Refusal,
     UseNode,
@@ -411,7 +411,10 @@ struct ThreadSummary {
 
 struct OpenThread {
     root: Digest32,
-    since: Option<Digest32>,
+    /// Where the page shown starts: after this arrival, or the thread's first reply.
+    since: Option<HistoryCursor>,
+    /// The saved copy of the room its pages were read in.
+    instance: Option<[u8; 16]>,
     next: bool,
     rows: Vec<MessageRow>,
     projected: Option<Projected>,
@@ -2595,10 +2598,19 @@ impl DaemonCore {
         let Some(thread) = self.thread.as_ref().filter(|t| t.stale) else {
             return;
         };
+        // A page continues after the last reply's arrival in the saved copy its first page was
+        // read in, never after its hash, which the node refuses once it names a message that
+        // came back after a removal took it away (ADR-053 MP-11).
         let (root, since, next) = (
             thread.root,
             if thread.next {
-                thread.rows.last().map(|r| r.entry_hash)
+                thread
+                    .instance
+                    .zip(thread.rows.last())
+                    .map(|(instance, r)| HistoryCursor {
+                        instance,
+                        arrival: r.arrival,
+                    })
             } else {
                 thread.since
             },
@@ -2607,16 +2619,34 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let Some(answer) = until_stopped(
-            &self.rt,
-            &self.stop,
-            conn.client.request(&Request::Thread {
-                channel_id: cid,
-                root,
-                since,
-            }),
-        ) else {
+        let Some(answer) = until_stopped(&self.rt, &self.stop, async {
+            let instance = match since {
+                Some(at) => at.instance,
+                None => match conn
+                    .client
+                    .request(&Request::ArrivalHead { channel_id: cid })
+                    .await?
+                {
+                    Frame::ArrivalHead { head } => head.instance,
+                    other => return Ok((other, None)),
+                },
+            };
+            let page = conn
+                .client
+                .request(&Request::Thread {
+                    channel_id: cid,
+                    root,
+                    since: None,
+                    resume: since,
+                })
+                .await?;
+            Ok::<_, vox_core::error::Error>((page, Some(instance)))
+        }) else {
             return;
+        };
+        let (answer, instance) = match answer {
+            Ok((page, instance)) => (Ok(page), instance),
+            Err(e) => (Err(e), None),
         };
         match self.answered(answer) {
             Ok(Frame::Rows { rows }) => {
@@ -2628,6 +2658,7 @@ impl DaemonCore {
                         self.notice = Some("No further replies in this thread".to_owned());
                     } else {
                         thread.since = since;
+                        thread.instance = instance;
                         thread.rows = rows.into_iter().filter(|r| r.entry_hash != root).collect();
                         thread.projected = None;
                         thread.more = !thread.rows.is_empty();
@@ -4238,6 +4269,7 @@ impl CoreHandle for DaemonCore {
                     self.thread = root.map(|root| OpenThread {
                         root,
                         since: None,
+                        instance: None,
                         next: false,
                         rows: Vec::new(),
                         projected: None,

@@ -1013,7 +1013,8 @@ pub struct RoomTailArgs {
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// Start after this position (`@<arrival>:<instance>`, as `vox room read` prints for the
-    /// next page) or this entry hash — the full 52 characters — rather than at the live edge.
+    /// next page and a stopped tail prints to resume from) or this entry hash — the full 52
+    /// characters — rather than at the live edge.
     /// A hash naming a message that came back after a removal took it away is refused: its
     /// place in arrival moved.
     #[arg(long)]

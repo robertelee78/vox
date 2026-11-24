@@ -3101,6 +3101,7 @@ async fn plumbing_after(client: &mut IpcClient, channel_id: Digest32, arrival: u
                 .collect(),
             ops: Vec::new(),
             since: None,
+            resume: None,
         })
         .await
     {
@@ -4492,13 +4493,16 @@ async fn read_room(
             threads.insert(root);
             continue;
         }
-        let mut since = None;
+        // Each next page follows the last reply's arrival as a position, never its hash, which
+        // the node refuses once it names a message that came back (ADR-053 MP-11).
+        let mut resume: Option<HistoryCursor> = None;
         loop {
             let history = match client
                 .request(&Request::Thread {
                     channel_id,
                     root,
-                    since,
+                    since: None,
+                    resume,
                 })
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))?
@@ -4513,13 +4517,16 @@ async fn read_room(
                 threads.insert(root);
                 break;
             }
-            let Some(last) = history.last() else {
+            let (Some(first), Some(last)) = (history.first(), history.last()) else {
                 break;
             };
-            if since == Some(last.entry_hash) {
+            if resume.is_some_and(|at| first.arrival <= at.arrival) {
                 return Err(AppError::Usage("ipc thread page did not advance".into()));
             }
-            since = Some(last.entry_hash);
+            resume = Some(HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            });
         }
     }
 

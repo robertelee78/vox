@@ -2908,8 +2908,10 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
 /// need neither a second delivery route nor a lifetime set of already printed hashes.
 ///
 /// Duplicates across a restart are permitted and gaps are not: the caller persists its last
-/// entry hash after processing and resumes with `--since`. A removed room instance refuses
-/// explicitly rather than applying an old arrival position to a new room.
+/// entry hash after processing and resumes with `--since`; when the tail stops, it prints the
+/// command that resumes from its own last position (`--since @<arrival>:<instance>`), which a
+/// message that comes back after a removal took it away cannot move (ADR-053 MP-11). A removed
+/// room instance refuses explicitly rather than applying an old arrival position to a new room.
 ///
 /// With `--json`, rows are `vox.room.row/1`; a newly conflicting operation also re-emits its
 /// earlier rows with `conflict`, so the consumer learns of the change from the stream alone.
@@ -2925,8 +2927,9 @@ pub async fn tail(
     use vox_core::node::api::NodeEvent;
 
     let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
+    // Where this tail is: the head, the position supplied, then each row delivered. It is what
+    // the resume command printed when the tail stops continues from.
     let mut cursor = tail_head(&mut lookup, channel_id).await?;
-    let mut shown = TailRows::default();
     if let Some(since) = since {
         // A position is taken as given, in this saved room only. A message id resolves to the
         // position it stands for; the node refuses one naming a message that came back after
@@ -2943,7 +2946,7 @@ pub async fn tail(
                 }
                 at
             }
-            coord::Since::Message(hash) => {
+            coord::Since::Message(_) => {
                 let at = coord::feed(&mut lookup, channel_id, since, 1)
                     .await?
                     .ok_or_else(|| AppError::Usage("cursor not in this room's timeline".into()))?
@@ -2954,7 +2957,6 @@ pub async fn tail(
                             .into(),
                     ));
                 }
-                shown.last = Some(hash);
                 at
             }
         };
@@ -2991,7 +2993,7 @@ pub async fn tail(
                     after: cursor,
                 })
                 .await
-                .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?
+                .map_err(|e| tail_stopped(paths, room, cursor, json, &e.to_string()))?
             {
                 Frame::ArrivalPage {
                     rows,
@@ -2999,7 +3001,7 @@ pub async fn tail(
                     next,
                 } => (rows, instance, next),
                 Frame::Error { reason } => {
-                    return Err(tail_stopped(paths, room, shown.last, json, &reason))
+                    return Err(tail_stopped(paths, room, cursor, json, &reason))
                 }
                 other => return Err(crate::client::unexpected(&other)),
             };
@@ -3024,18 +3026,17 @@ pub async fn tail(
             }
             for row in rows {
                 let arrival = row.arrival;
-                shown
-                    .deliver(
-                        &mut lookup,
-                        channel_id,
-                        &room_key,
-                        cursor.instance,
-                        row,
-                        &mut out,
-                        json,
-                    )
-                    .await
-                    .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?;
+                deliver_tail_row(
+                    &mut lookup,
+                    channel_id,
+                    &room_key,
+                    cursor.instance,
+                    row,
+                    &mut out,
+                    json,
+                )
+                .await
+                .map_err(|e| tail_stopped(paths, room, cursor, json, &e.to_string()))?;
                 cursor.arrival = arrival;
             }
             if let Some(next) = next {
@@ -3060,7 +3061,7 @@ pub async fn tail(
                     return Err(tail_stopped(
                         paths,
                         room,
-                        shown.last,
+                        cursor,
                         json,
                         "the room closed on this node",
                     ));
@@ -3078,15 +3079,9 @@ pub async fn tail(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    return Err(tail_stopped(
-                        paths,
-                        room,
-                        shown.last,
-                        json,
-                        "the node stopped",
-                    ))
+                    return Err(tail_stopped(paths, room, cursor, json, "the node stopped"))
                 }
-                Err(e) => return Err(tail_stopped(paths, room, shown.last, json, &e.to_string())),
+                Err(e) => return Err(tail_stopped(paths, room, cursor, json, &e.to_string())),
             }
         }
     }
@@ -3107,10 +3102,12 @@ async fn tail_head(
     }
 }
 
+/// Why the tail stopped, and the command that resumes it from `at`, its last position: the one
+/// it was given or started from until a row is delivered, then the last row delivered.
 fn tail_stopped(
     paths: &Paths,
     room: &str,
-    last: Option<Digest32>,
+    at: vox_core::node::api::HistoryCursor,
     json: bool,
     reason: &str,
 ) -> AppError {
@@ -3124,10 +3121,9 @@ fn tail_stopped(
         "room".to_owned(),
         "tail".to_owned(),
         room.to_owned(),
+        "--since".to_owned(),
+        coord::Since::At(at).text(),
     ];
-    if let Some(hash) = last {
-        words.extend(["--since".to_owned(), b32_encode(&hash)]);
-    }
     if json {
         words.push("--json".to_owned());
     }
@@ -3135,55 +3131,44 @@ fn tail_stopped(
     AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}`"))
 }
 
-/// Only a resume hint survives delivery. Operation context is bounded and scoped to one
-/// arriving row, then dropped; unchanged event wakes never query that context again.
-#[derive(Default)]
-struct TailRows {
-    last: Option<Digest32>,
-}
-
-impl TailRows {
-    #[allow(clippy::too_many_arguments)]
-    async fn deliver(
-        &mut self,
-        lookup: &mut IpcClient,
-        channel_id: Digest32,
-        room_key: &str,
-        instance: [u8; 16],
-        row: vox_core::node::api::MessageRow,
-        out: &mut std::io::StdoutLock<'_>,
-        json: bool,
-    ) -> Result<(), AppError> {
-        if row.owed {
-            return Err(AppError::Usage(
-                "the tail received an unreadable arrival".into(),
-            ));
-        }
-        if !json {
-            // Session lifecycle records remain absent from the plain conversation.
-            if !crate::agent_hook::is_session_record(&row) {
-                writeln!(out, "{}", plain_row(&row))?;
-                out.flush()?;
-            }
-        } else if let Some(envelope) = Envelope::parse(&row.text)
-            .ok()
-            .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
-        {
-            let mut operation =
-                TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope)
-                    .await?;
-            operation.emit(room_key, &row, out)?;
-        } else {
-            writeln!(
-                out,
-                "{}",
-                row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
-            )?;
+/// Print one arriving row. Operation context is bounded and scoped to that row, then dropped;
+/// unchanged event wakes never query that context again.
+async fn deliver_tail_row(
+    lookup: &mut IpcClient,
+    channel_id: Digest32,
+    room_key: &str,
+    instance: [u8; 16],
+    row: vox_core::node::api::MessageRow,
+    out: &mut std::io::StdoutLock<'_>,
+    json: bool,
+) -> Result<(), AppError> {
+    if row.owed {
+        return Err(AppError::Usage(
+            "the tail received an unreadable arrival".into(),
+        ));
+    }
+    if !json {
+        // Session lifecycle records remain absent from the plain conversation.
+        if !crate::agent_hook::is_session_record(&row) {
+            writeln!(out, "{}", plain_row(&row))?;
             out.flush()?;
         }
-        self.last = Some(row.entry_hash);
-        Ok(())
+    } else if let Some(envelope) = Envelope::parse(&row.text)
+        .ok()
+        .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
+    {
+        let mut operation =
+            TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope).await?;
+        operation.emit(room_key, &row, out)?;
+    } else {
+        writeln!(
+            out,
+            "{}",
+            row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
+        )?;
+        out.flush()?;
     }
+    Ok(())
 }
 
 /// One exact operation's completed disk staging. Only one bounded row page and scalar

@@ -801,6 +801,20 @@ impl View<'_> {
                     "cursor not among this room's selected messages",
                 ));
             }
+            // As `Query::Read`: a message that came back (MP-11) arrived again, past what
+            // arrived while it was away, so its hash no longer says where a reader was.
+            if self
+                .rendered
+                .read_index()
+                .retention(&hash)?
+                .is_some_and(|tracked| tracked.returned)
+                && !crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_FILTERED_HASH",
+                    "a filtered or thread read from a message that came back is answered",
+                )
+            {
+                return Err(Failure::Request(crate::node::ipc::CAME_BACK));
+            }
             let arrival = self
                 .rendered
                 .fact(&hash)?

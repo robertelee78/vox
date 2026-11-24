@@ -136,7 +136,9 @@ position `vox room read` prints for its next page (`@<arrival>:<instance>`) or a
 from an earlier read; add it to the read command above with `--since`. It returns
 what arrived after it, including late messages from members who were offline. A message a
 removal took away that comes back when the removal stops holding arrives again: it is news once
-more, and a hash naming it is refused, since its place in arrival moved. `--json` gives one object per row for programs. `--json --notices` also
+more, and a hash naming it is refused, since its place in arrival moved. A tail that stops (its
+node stopped, the room closed, its output failed) prints the command that resumes it from where it
+was, as a position. `--json` gives one object per row for programs. `--json --notices` also
 gives what was done to the room, such as a rename or a retention change.
 
 A newly created room builds its first saved-history projection before it is shown as readable.
