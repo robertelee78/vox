@@ -1528,6 +1528,52 @@ fn mp10_reached(holder: &Worker, carol: &Worker, id: &str, text: &str) {
     }
 }
 
+/// `remover` holds `text`, `author`'s post, before `author` goes and is removed: a removal keeps
+/// the removed member's posts up to the last one its remover held (ADR-053 MP-6), and one it never
+/// held is gone from every reader, its author included (MP-11). `author` posts `text` again every
+/// few seconds, as `mp10_delivered` does (a sender's chain is released with a fresh post), until
+/// `remover` shows it. Judged by `remover`'s sync rounds toward `author`: three completed after
+/// the second post without it is PRODUCT (staging); fewer than three in 300 s is APPARATUS NO
+/// RESULT.
+fn mp10_held_by(remover: &Worker, author: &Worker, id: &str, text: &str) {
+    let started = Instant::now();
+    let rounds = || mp10_rounds_toward(&remover.vox(None, &["status", "--json"]).json(), author);
+    let mut second: Option<u64> = None;
+    let mut posts = 0u32;
+    loop {
+        setup(author, &["room", "post", id, text]);
+        posts += 1;
+        if posts == 2 {
+            second = Some(rounds());
+        }
+        for _ in 0..3 {
+            let read = remover.vox(None, &["room", "read", id]);
+            if read.ok && read.stdout.contains(text) {
+                return;
+            }
+            let now = rounds();
+            if let Some(from) = second {
+                assert!(
+                    now < from + 3,
+                    "PRODUCT (staging): {} completed {} sync rounds toward {} after the second \
+                     post of {text}, and holds none of the {posts}: {read:?}",
+                    remover.name,
+                    now - from,
+                    author.name
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "APPARATUS NO RESULT (staging): in 300 s {} did not complete three sync rounds \
+                 toward {} after the second post of {text} (rounds now {now}, from {second:?})",
+                remover.name,
+                author.name
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
 /// Through `holder`, carol shows none of `gap` and every one of `before` while her sync rounds
 /// toward it complete three more times. Showing any of `gap` is the RED verdict, named `red`; it
 /// is given once three more rounds have completed after the first such text, naming every one
@@ -1629,7 +1675,12 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
             );
         }
     }
-    setup(&room.workers[CAROL], &["room", "post", id, &before[CAROL]]);
+    mp10_held_by(
+        &room.workers[ALICE],
+        &room.workers[CAROL],
+        id,
+        &before[CAROL],
+    );
     let before: Vec<&str> = before.iter().map(String::as_str).collect();
     room.workers[CAROL].stop_daemon();
     // Bodies carol never saw, on the chains she holds, written before her removal.
