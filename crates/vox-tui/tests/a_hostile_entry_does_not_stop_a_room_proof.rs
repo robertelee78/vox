@@ -993,12 +993,33 @@ fn shows_owed(
         assert!(
             started.elapsed() < Duration::from_secs(600),
             "APPARATUS NO RESULT: in 600 s {}'s rounds toward {} went {from} -> {rounds}, fewer \
-             than 30",
+             than 30; its sync with {}: {}",
             m.name,
-            source.name
+            source.name,
+            source.name,
+            sync_with(m, source)
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// `m`'s `vox status --json` sync rows for `peer` (counts, failures, last failure, backoff), as
+/// the product says them: what a staging stop quotes.
+fn sync_with(m: &Member, peer: &Member) -> String {
+    let status = m.status();
+    let rows: Vec<&serde_json::Value> = status["sync"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| {
+                    r["peer"]
+                        .as_str()
+                        .is_some_and(|x| peer.fp.starts_with(x) || x.starts_with(&peer.fp))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&rows).unwrap_or_default()
 }
 
 /// After a verdict: `m`'s `vox status --json` counts exactly the rows its read shows.
@@ -1102,7 +1123,9 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
     owed_mutant();
     test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    // The daemons' own logs stay for a diagnosis when the runner asks (`VOX_PROOF_KEEP_DIRS`).
+    tmp.disable_cleanup(std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some());
     let root = tmp.path();
     let (anchor_d, spec) = anchor(root);
     let alice = Member::new(root, "alice");
@@ -1154,8 +1177,21 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
     signal_took(&anchor_d, "-STOP", "the anchor");
     let posted = "carol, before bob's removal";
     carol.post(&room, posted);
-    if let Err(e) = arrives(&mallory, &room, posted) {
-        panic!("PRODUCT (staging): mallory never had carol's post: {e}");
+    // Staging: mallory takes carol's post from carol directly (both run; the others are stopped
+    // and hang rather than refuse), waited on by mallory's completed rounds toward carol.
+    match within_rounds(&mallory, &carol, 30, "staging, mallory", || {
+        reads(&mallory, &room, posted).unwrap_or(false)
+    }) {
+        Ok(true) => {}
+        Ok(false) => panic!(
+            "APPARATUS NO RESULT (staging): within 30 of mallory's completed rounds toward carol \
+             she does not read carol's post; mallory's sync with carol: {}",
+            sync_with(&mallory, &carol)
+        ),
+        Err(e) => panic!(
+            "{e}; mallory's sync with carol: {}",
+            sync_with(&mallory, &carol)
+        ),
     }
     let hc =
         hash_of(&carol, &room, posted).expect("PRODUCT (staging): carol's read lacks her post");
@@ -1174,7 +1210,9 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
         _ => panic!(
             "APPARATUS NO RESULT (staging): within 30 rounds toward mallory, his only source, bob \
              did not show carol's stripped post as not received yet, or his status counts no rows \
-             ({rows_with:?}), so the held phase cannot be staged: {seen:?}"
+             ({rows_with:?}), so the held phase cannot be staged: {seen:?}; bob's sync with \
+             mallory: {}",
+            sync_with(&bob, &mallory)
         ),
     }
 
