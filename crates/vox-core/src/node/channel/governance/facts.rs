@@ -440,13 +440,16 @@ impl Header {
         // Refreshing until the existing driver refolds and stamps it. A header sealed before
         // format 6 holds eligibility decisions made under the cut before ADR-053 MP-6, and shown
         // rows never reconciled with them (MP-11): the same new generation recomputes every
-        // decision, and `advance` retracts or restores each shown row it changes. The first seal
-        // at format 6 records it; a crash before then begins the generation again at the next
-        // open, and one after it leaves the generation unfolded for the driver to finish.
-        let authority_generation = if initialized
-            && (stored <= Table::RecipientCuts as usize
+        // decision, and `advance` retracts or restores each shown row it changes. That one holds
+        // whether or not source replay is caught up: a store stopped mid catch-up keeps its
+        // removals and completed decisions, and replaying ordinary content alone never moves
+        // authority. The new generation is sealed with format 6 in one header, so the marker is
+        // never consumed without it: a crash before that seal begins the generation again at the
+        // next open, and one after it leaves the generation unfolded for the driver to finish
+        // once replay completes.
+        let authority_generation = if roots[Table::MemberRemovals as usize] != 0
+            && ((initialized && stored <= Table::RecipientCuts as usize)
                 || (version != HEADER_VERSION && !super::no_reconcile_mutant()))
-            && roots[Table::MemberRemovals as usize] != 0
         {
             authority_generation
                 .checked_add(1)

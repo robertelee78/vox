@@ -461,6 +461,9 @@ const T_SESSION_JOIN: u64 = 8748;
 const T_ROOM_VIEW_REVISION: u64 = 8749;
 const T_MEMBER_HELLOS_REQ: u64 = 8752;
 const T_MEMBER_HELLOS: u64 = 8753;
+// ADR-053 MP-11: retained rows this node does not show now, in an arrival range a reader passed.
+const T_WITHHELD_REQ: u64 = 8754;
+const T_WITHHELD: u64 = 8755;
 /// Rows per bounded current-member HELLO metadata page.
 pub const MEMBER_HELLO_ROWS: usize = 64;
 const T_ROOM_PAGE_REQ: u64 = 5492;
@@ -573,6 +576,21 @@ pub enum Request {
         entries: Vec<crate::node::api::FooterSelection>,
         /// At most 8 per recipient kind for a batch, or 64 for one card.
         limit: usize,
+    },
+    /// ADR-053 MP-11: the retained messages of a room this node does not show now (a removal
+    /// took them away) whose arrival lies after the cursor `since` and at or before `through`,
+    /// at most [`MAX_FIND`], as [`Frame::Withheld`]. An arrival reader asks it for the range it
+    /// passes, so it can take one that comes back at its original arrival behind its cursor.
+    Withheld {
+        /// The room.
+        channel_id: Digest32,
+        /// The reader's cursor, a row this node shows; when absent, the range starts after
+        /// `after` (an arrival reader's numeric cursor; zero is the room's first arrival).
+        since: Option<Digest32>,
+        /// The arrival the range starts after when `since` is absent.
+        after: u64,
+        /// The last arrival the reader passed.
+        through: u64,
     },
     /// The selected room's saved instance and newest readable arrival, without loading bodies.
     ArrivalHead {
@@ -1405,6 +1423,20 @@ impl Request {
                     encode_optional_u64(&mut e, selection.pulled_after);
                 }
             }
+            Request::Withheld {
+                channel_id,
+                since,
+                after,
+                through,
+            } => {
+                e.array(5)
+                    .uint(T_WITHHELD_REQ)
+                    .bytes(channel_id)
+                    // An absent cursor is the empty byte string, as in `Read`.
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]))
+                    .uint(*after)
+                    .uint(*through);
+            }
             Request::ArrivalHead { channel_id } => {
                 e.array(2).uint(T_ARRIVAL_HEAD_REQ).bytes(channel_id);
             }
@@ -2221,6 +2253,27 @@ impl Request {
                 let channel_id = digest(&mut d)?;
                 d.finish()?;
                 Ok(Request::ArrivalHead { channel_id })
+            }
+            (T_WITHHELD_REQ, 5) => {
+                let channel_id = digest(&mut d)?;
+                let raw = d.bytes()?;
+                let since = if raw.is_empty() {
+                    None
+                } else {
+                    Some(
+                        raw.try_into()
+                            .map_err(|_| Error::MalformedIpc("withheld cursor"))?,
+                    )
+                };
+                let after = d.uint()?;
+                let through = d.uint()?;
+                d.finish()?;
+                Ok(Request::Withheld {
+                    channel_id,
+                    since,
+                    after,
+                    through,
+                })
             }
             (T_ARRIVAL_PAGE_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -3330,6 +3383,11 @@ pub enum Frame {
         /// This cursor has no dependency on retaining the newest message body.
         head: crate::node::api::HistoryCursor,
     },
+    /// What a [`Request::Withheld`] asked for: `(entry hash, arrival)`, first to last.
+    Withheld {
+        /// The messages withheld in the range.
+        entries: Vec<(Digest32, u64)>,
+    },
     /// A bounded arrival page. A different instance requires an explicit client reanchor.
     ArrivalPage {
         /// Complete readable rows, in strictly increasing local arrival order.
@@ -3731,6 +3789,12 @@ impl Frame {
             Frame::ArrivalHead { head } => {
                 e.array(2).uint(T_ARRIVAL_HEAD);
                 encode_history_cursor(&mut e, *head);
+            }
+            Frame::Withheld { entries } => {
+                e.array(2).uint(T_WITHHELD).array(entries.len());
+                for (h, arrival) in entries {
+                    e.array(2).bytes(h).uint(*arrival);
+                }
             }
             Frame::ArrivalPage {
                 rows,
@@ -4790,6 +4854,21 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             return Ok(Frame::ArrivalHead {
                 head: history_cursor(d)?,
             });
+        }
+        (T_WITHHELD, 2) => {
+            let n = d.array()?;
+            if n > MAX_FIND {
+                return Err(Error::MalformedIpc("withheld count"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedIpc("withheld entry arity"));
+                }
+                let h = digest(d)?;
+                entries.push((h, d.uint()?));
+            }
+            return Ok(Frame::Withheld { entries });
         }
         (T_THREAD_PAGE, 4) => {
             let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
@@ -7300,6 +7379,7 @@ async fn serve_requests(
             Frame::Rows { .. }
                 | Frame::OperationPage { .. }
                 | Frame::ArrivalPage { .. }
+                | Frame::Withheld { .. }
                 | Frame::FilteredRows { .. }
                 | Frame::MemberHellos(..)
                 | Frame::RoomPage { .. }
@@ -7900,6 +7980,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Post { channel_id, .. }
         | Request::PostAt { channel_id, .. }
         | Request::Read { channel_id, .. }
+        | Request::Withheld { channel_id, .. }
         | Request::Order { channel_id, .. }
         | Request::Roster { channel_id, .. }
         | Request::MemberObservation { channel_id, .. }
@@ -8147,6 +8228,31 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 other => Frame::Error {
                     reason: other.to_string(),
                 },
+            }
+        }
+        Request::Withheld {
+            channel_id,
+            since,
+            after,
+            through,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Withheld {
+                        since,
+                        after,
+                        through,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Withheld(entries)) => Frame::Withheld { entries },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::ArrivalHead { channel_id } => {

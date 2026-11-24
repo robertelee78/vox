@@ -2264,9 +2264,11 @@ fn a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open(
     }
     let carol = &mut room.workers[2];
     carol.exe = support::VOX.to_owned();
+    let opened = Instant::now();
     carol.restart_daemon_as(support::VOX, &env, &tmp.path().join("carol-upgraded.err"));
     let carol: &Worker = carol;
     let (open, first) = poll(carol, &["room", "read", id], WITHIN, |o| o.ok);
+    let first_read = opened.elapsed();
     let status = carol.vox(None, &["status", "--json"]);
     println!(
         "[proof] carol's first answered read on the vox under test (open={open}): later posts \
@@ -2276,6 +2278,9 @@ fn a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open(
         status.json()["governance_pending"],
         first
     );
+    // A number for the notes, not a verdict: how long the reconcile took to show, and what
+    // carol's reads and roster answered meanwhile.
+    let (mut old_reads, mut refreshing, mut asked) = (0u32, 0u32, 0u32);
     let mut settled_and_shown = 0;
     loop {
         let roster = carol.vox(None, &["room", "roster", id]);
@@ -2283,7 +2288,18 @@ fn a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open(
         let status = carol.vox(None, &["status", "--json"]);
         let idle = status.ok && status.json()["governance_pending"] == false;
         let read = carol.vox(None, &["room", "read", id]);
+        asked += 1;
+        refreshing += u32::from(!roster.ok && roster.stderr.contains("refreshing"));
+        old_reads += u32::from(read.ok && read.stdout.contains("MP11U-BOB-AFTER"));
         if removed && read.ok && !read.stdout.contains("MP11U-BOB-AFTER") {
+            println!(
+                "[measure] carol's reconcile at first open: first answered read {:?} after her \
+                 daemon started, reconciled rows first shown {:?} after it; of {asked} rounds, \
+                 {old_reads} reads answered with the rows as they were and {refreshing} roster \
+                 answers said refreshing",
+                first_read,
+                opened.elapsed()
+            );
             break;
         }
         settled_and_shown = if removed && idle && read.ok {
@@ -2563,6 +2579,190 @@ fn a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds() {
         "PRODUCT: dave's room did not reopen after a restart: {read:?}"
     );
     check(dave, "after dave's daemon restarted");
+}
+
+/// One turn of `vox agent hook` on `w` for `session` in room `id`, as Claude Code's hook runs it:
+/// what it injects.
+fn hook_turn(w: &Worker, id: &str, session: &str) -> String {
+    let input = format!(r#"{{"session_id":"{session}","cwd":"/tmp"}}"#);
+    let o = w.vox_in(
+        None,
+        &["agent", "hook", "--node", "default", "--room", &id[..8]],
+        Some(&input),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT: {}'s `vox agent hook` for session {session} failed: {o:?}",
+        w.name
+    );
+    o.stdout
+}
+
+/// ADR-053 MP-11 (review of #1393): a message a removal took away, that comes back once the
+/// removal no longer holds, is news to an agent session that never got it, even though the
+/// session's cursor moved past where it arrived while it was away; exactly once. A session that
+/// got it before it was taken away does not get it again. Staging as
+/// `a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds`: bob, a delegated
+/// admin, removes carol; alice, the creator, takes bob's admin away unaware; dave applies the
+/// removal first and the revocation later. dave's agent sessions: "unseen" reads before carol's
+/// later post and again, after the removal, past a later post of bob's; "seen" reads it first.
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
+    watchdog::arm();
+    let mutants = mp11_mutants(&["VOX_MUTANT_MP11_NO_WITHHELD"]);
+    let env = knob_env(&mutants);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    setup(alice, &["room", "admin", "add", id, &bob.b32()]);
+    let (admin, listed) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(&bob.b32())
+    });
+    assert!(
+        admin,
+        "APPARATUS: bob's delegation was not staged: {listed:?}"
+    );
+    dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-mp11h.err"));
+    for reader in [&*bob, &*carol, &*dave] {
+        mp6_post_until_read(alice, reader, id, "MP11H-READY");
+    }
+    mp6_quiet(&[alice, bob, carol, dave]);
+    let seen = "MP11H-CAROL-SEEN";
+    setup(carol, &["room", "post", id, seen]);
+    mp6_all_shown(&[bob, dave], id, &[seen], "carol's first post");
+    mp6_quiet(&[alice, bob, carol, dave]);
+    let first = hook_turn(dave, id, "mp11h-unseen");
+    assert!(
+        first.contains(seen),
+        "PRODUCT (staging): dave's session \"unseen\" was not told carol's first post: {first}"
+    );
+    bob.stop_daemon_cleanly();
+    let later = "MP11H-CAROL-GONE";
+    setup(carol, &["room", "post", id, later]);
+    mp6_all_shown(&[alice, dave], id, &[later], "carol's later post");
+    mp6_quiet(&[alice, carol, dave]);
+    let had = hook_turn(dave, id, "mp11h-seen");
+    assert!(
+        had.matches(later).count() == 1,
+        "PRODUCT (staging): dave's session \"seen\" was not told carol's later post once: {had}"
+    );
+    println!(
+        "[proof] dave's session \"seen\" was told carol's later post; \"unseen\" read before it"
+    );
+    alice.stop_daemon_cleanly();
+    carol.stop_daemon_cleanly();
+    dave.stop_daemon_cleanly();
+    bob.restart_daemon(&tmp.path().join("bob-alone.err"));
+    let removal = unchanged_busy_retry(bob, &["room", "remove-member", id, &carol.b32()]);
+    assert!(
+        removal.ok,
+        "PRODUCT (staging): the delegated admin could not remove carol: {removal:?}"
+    );
+    bob.stop_daemon_cleanly();
+    alice.restart_daemon(&tmp.path().join("alice-alone.err"));
+    setup(alice, &["room", "admin", "remove", id, &bob.b32()]);
+    let (revoked, listed) = poll(alice, &["room", "admin", "list", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&bob.b32())
+    });
+    assert!(
+        revoked,
+        "PRODUCT (staging): alice still lists bob as an admin: {listed:?}"
+    );
+    alice.stop_daemon_cleanly();
+    bob.restart_daemon(&tmp.path().join("bob-back.err"));
+    dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-removal.err"));
+    let mut settled_and_shown = 0;
+    loop {
+        let roster = dave.vox(None, &["room", "roster", id]);
+        let removed = roster.ok && !roster.stdout.contains(&carol.b32());
+        let status = dave.vox(None, &["status", "--json"]);
+        let idle = status.ok && status.json()["governance_pending"] == false;
+        let read = dave.vox(None, &["room", "read", id]);
+        if removed && read.ok && read.stdout.contains(seen) && !read.stdout.contains(later) {
+            break;
+        }
+        settled_and_shown = if removed && idle && read.ok {
+            settled_and_shown + 1
+        } else {
+            0
+        };
+        assert!(
+            settled_and_shown < 2,
+            "PRODUCT [MP11 retract]: dave applied bob's removal of carol and reports no \
+             governance work queued, yet does not show exactly her post bob held: {}",
+            read.stdout
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let past = "MP11H-BOB-AFTER";
+    setup(bob, &["room", "post", id, past]);
+    mp6_all_shown(&[dave], id, &[past], "bob's post after the removal");
+    mp6_quiet(&[bob, dave]);
+    let away = hook_turn(dave, id, "mp11h-unseen");
+    assert!(
+        away.contains(past) && !away.contains(later),
+        "PRODUCT (staging): while carol's later post was away, dave's session \"unseen\" must be \
+         told bob's later post and not hers: {away}"
+    );
+    println!(
+        "[proof] while carol's later post was away, dave's session \"unseen\" read past it to \
+         bob's later post"
+    );
+    alice.restart_daemon(&tmp.path().join("alice-back.err"));
+    let mut settled_and_absent = 0;
+    loop {
+        let roster = dave.vox(None, &["room", "roster", id]);
+        let member = roster.ok && roster.stdout.contains(&carol.b32());
+        let status = dave.vox(None, &["status", "--json"]);
+        let idle = status.ok && status.json()["governance_pending"] == false;
+        let read = dave.vox(None, &["room", "read", id]);
+        if member && read.ok && read.stdout.contains(later) {
+            break;
+        }
+        settled_and_absent = if member && idle && read.ok {
+            settled_and_absent + 1
+        } else {
+            0
+        };
+        assert!(
+            settled_and_absent < 2,
+            "PRODUCT [MP11 restore]: alice's revocation of bob reached dave and carol is on his \
+             roster again, he reports no governance work queued, yet her post the removal took \
+             away is still absent: {}",
+            read.stdout
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    mp6_quiet(&[alice, bob, dave]);
+    let back = hook_turn(dave, id, "mp11h-unseen");
+    assert!(
+        back.matches(later).count() == 1,
+        "PRODUCT [MP11 hook]: carol's later post is shown again on dave, and his session \
+         \"unseen\" never got it, yet its next turn told it {} times: {back}",
+        back.matches(later).count()
+    );
+    let again = hook_turn(dave, id, "mp11h-unseen");
+    assert!(
+        !again.contains(later),
+        "PRODUCT [MP11 hook twice]: dave's session \"unseen\" was told carol's returned post a \
+         second time: {again}"
+    );
+    let other = hook_turn(dave, id, "mp11h-seen");
+    assert!(
+        other.contains(past) && !other.contains(later),
+        "PRODUCT [MP11 hook twice]: dave's session \"seen\", told carol's later post before it \
+         was taken away, must be told bob's later post and not hers again: {other}"
+    );
+    println!(
+        "[proof] once carol's later post came back: session \"unseen\" was told it once and not \
+         again; session \"seen\" was told bob's later post and not hers again"
+    );
 }
 
 #[test]

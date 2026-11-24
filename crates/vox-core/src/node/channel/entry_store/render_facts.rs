@@ -1243,6 +1243,51 @@ impl RenderView<'_> {
             .visible_summary(self.roots().arrival, false, Some((&bound, false)), false)?
             .count)
     }
+    /// ADR-053 MP-11: the retained messages whose arrival lies in `(after, through]` that this
+    /// node does not show now (a removal took them away), with their arrival, at most `limit`.
+    /// An arrival reader that passes this range without them learns which ones it never got,
+    /// so it can take one when it comes back at its original arrival (`restore_rendered`),
+    /// behind a cursor that has moved on. Reads only the plaintext rows in the range.
+    pub(crate) fn withheld_between(
+        &self,
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(Digest32, u64)>> {
+        let (sek, channel) = (self.order.read.sek, self.order.read.channel);
+        let source = self.source();
+        let mut out = Vec::new();
+        let mut at = after;
+        while out.len() < limit {
+            let Some(id) =
+                self.snapshot()
+                    .segment_id_after(channel, SegmentKind::PlaintextCache, Some(at))?
+            else {
+                break;
+            };
+            if id > through {
+                break;
+            }
+            at = id;
+            let Some(bytes) = source.open(sek, channel, SegmentKind::PlaintextCache, id)? else {
+                continue;
+            };
+            let super::super::CacheRow::Text(row) = super::super::parse_cache(&bytes)? else {
+                continue;
+            };
+            let hash = row.entry_hash;
+            if source
+                .render_fact(sek, channel, self.roots().hash, &hashed(&hash))?
+                .is_none()
+                && self
+                    .retention(&hash)?
+                    .is_some_and(|tracked| tracked.cache_id == Some(id))
+            {
+                out.push((hash, id));
+            }
+        }
+        Ok(out)
+    }
     fn root(&self, filter: Option<&Filter>, display: bool) -> Result<u64> {
         match filter {
             Some(filter) => Ok(self

@@ -102,6 +102,14 @@ pub(crate) enum Query {
         before: Option<Digest32>,
         limit: usize,
     },
+    /// ADR-053 MP-11: the retained messages this node does not show now whose arrival lies
+    /// after the cursor `since` (after the arrival `after` when absent) and at or before
+    /// `through`. Answered as [`Reply::Withheld`].
+    Withheld {
+        since: Option<Digest32>,
+        after: u64,
+        through: u64,
+    },
     Count {
         since: Option<Digest32>,
     },
@@ -178,6 +186,8 @@ pub(crate) enum Reply {
         revision: Revision,
     },
     Exact(MessageRow),
+    /// `(entry hash, arrival)` of each message [`Query::Withheld`] found, first to last.
+    Withheld(Vec<(Digest32, u64)>),
 }
 
 /// A union or intersection of concrete sealed indexes. A page may finish its work
@@ -461,6 +471,7 @@ impl View<'_> {
                 | Query::Arrival { .. }
                 | Query::Filtered { .. }
                 | Query::Read { .. }
+                | Query::Withheld { .. }
                 | Query::Older { .. }
                 | Query::Exact { .. }
         ) {
@@ -1663,6 +1674,24 @@ impl View<'_> {
                 }
                 Ok(Reply::Rows(rows))
             }
+            Query::Withheld {
+                since,
+                after,
+                through,
+            } => {
+                let after = match since {
+                    Some(h) => self.mark(h, true, cursor_error)?.arrival,
+                    None => after,
+                };
+                if no_withheld_mutant() {
+                    return Ok(Reply::Withheld(Vec::new()));
+                }
+                Ok(Reply::Withheld(self.rendered.withheld_between(
+                    after,
+                    through,
+                    crate::node::ipc::MAX_FIND,
+                )?))
+            }
             Query::Older { before, limit } => {
                 let mut cursor = match before {
                     Some(h) => {
@@ -2028,4 +2057,23 @@ impl ChannelState {
         };
         Ok(Some((created, expires)))
     }
+}
+
+/// `VOX_MUTANT_MP11_NO_WITHHELD`: the node names no withheld message to an arrival reader, so a
+/// message that comes back behind its cursor is never news to it. Says so once when the daemon
+/// first reads it.
+fn no_withheld_mutant() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VOX_MUTANT_MP11_NO_WITHHELD").is_some();
+            if on {
+                eprintln!("vox: VOX_MUTANT_MP11_NO_WITHHELD engaged: no withheld message is named");
+            }
+            on
+        });
+        *ON
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    false
 }

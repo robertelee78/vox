@@ -707,6 +707,9 @@ const HASH_LINE: u64 = 53;
 const AHEAD_WINDOW: usize = 128;
 const PULLING_PAGE: u64 = 64;
 const PULLING_SCAN_DIR: &str = "pulling-scan";
+/// Under the cursors: per room and session, the messages its cursor passed while the node did
+/// not show them (ADR-053 MP-11), sorted hash lines.
+const WITHHELD_DIR: &str = "withheld";
 
 fn saved_hash(line: &[u8; 53]) -> std::io::Result<Digest32> {
     let bad = || {
@@ -3273,6 +3276,16 @@ struct RoomDrain {
     pulling: Pulling,
     /// Only this prefix is contiguous; speculative urgent rows must not skip unseen gaps.
     contiguous: usize,
+    /// The messages this session's cursor passed while the node did not show them (a removal
+    /// took them away, ADR-053 MP-11), saved so one that comes back behind the cursor is
+    /// news once ([`WITHHELD_DIR`]).
+    withheld: SavedHashes,
+    /// What the node said it withholds in the range this read covers: `(hash, arrival)`.
+    passed: Vec<(Digest32, u64)>,
+    /// Saved withheld messages the node shows again: at the head of [`Self::fresh`] when news.
+    returned: std::collections::BTreeSet<Digest32>,
+    /// The arrival of [`Self::since`] when this read moved it past pages of its own posts.
+    since_arrival: Option<u64>,
 }
 
 impl RoomDrain {
@@ -3349,6 +3362,46 @@ impl RoomDrain {
             };
         }
         let (cursor, add, remove) = self.read_to(shown);
+        // A message the cursor passes while it is withheld is saved before the cursor moves; one
+        // that came back leaves the record once shown (or once it is not news to this session).
+        let through = cursor
+            .and_then(|c| self.rows.iter().find(|r| r.entry_hash == c))
+            .map(|r| r.arrival)
+            .or(self.since_arrival);
+        let room = vox_core::node::ipc::MAX_FIND
+            .saturating_sub(usize::try_from(self.withheld.len).unwrap_or(usize::MAX));
+        let passed: std::collections::BTreeSet<Digest32> = through
+            .map(|through| {
+                self.passed
+                    .iter()
+                    // One this read returned was delivered here, whatever the node says now.
+                    .filter(|(hash, arrival)| {
+                        *arrival <= through && !self.rows.iter().any(|r| r.entry_hash == *hash)
+                    })
+                    .map(|(hash, _)| *hash)
+                    .take(room)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let unshown: std::collections::BTreeSet<Digest32> =
+            self.fresh[shown..].iter().map(|r| r.entry_hash).collect();
+        let back: std::collections::BTreeSet<Digest32> =
+            self.returned.difference(&unshown).copied().collect();
+        if let Err(e) = self.withheld.merge(
+            &under_cursors(paths, &self.key, session, WITHHELD_DIR),
+            None,
+            &passed,
+            &back,
+        ) {
+            eprintln!(
+                "vox agent hook: could not record the messages withheld from this session: {e}"
+            );
+            return if strict {
+                Err(AppError::Usage(e.to_string()))
+            } else {
+                Ok(())
+            };
+        }
         if let Err(e) = save_read(
             paths,
             &self.key,
@@ -4244,6 +4297,9 @@ async fn read_room(
             first_arrivals(client, channel_id, page).await?
         }
     };
+    // Where this read starts: the range it covers runs from here (ADR-053 MP-11).
+    let passed_from = since;
+    let mut since_arrival = None;
     // A page that is all this session's own posts is no news, but news may follow it: read on,
     // a page at a time, rather than make the agent wait a turn per page of its own posts.
     while rows.len() >= page && rows.iter().all(|r| is_own(r, me, &input.session_id)) {
@@ -4255,9 +4311,54 @@ async fn read_room(
             return Err(AppError::Usage("ipc rows page did not advance".into()));
         }
         since = from;
+        since_arrival = rows.last().map(|r| r.arrival);
         rows = more;
     }
     let contiguous = rows.len();
+    // **A message withheld when this session passed it is news when it comes back** (ADR-053
+    // MP-11): a removal can take a shown message away and a later decision bring it back at its
+    // original arrival, behind a cursor that moved on while it was away. The node names what it
+    // withholds in the range this read covers; the session saves those its cursor passes, and
+    // takes each once the node shows it again. One delivered before it was taken away was never
+    // withheld from this session and is not saved, so it is not news twice.
+    let withheld = SavedHashes::open(
+        &under_cursors(paths, &room_key, &input.session_id, WITHHELD_DIR),
+        false,
+        false,
+    )?;
+    let through = rows[..contiguous]
+        .last()
+        .map(|r| r.arrival)
+        .or(since_arrival);
+    let passed = match through {
+        Some(through) => match client
+            .request(&Request::Withheld {
+                channel_id,
+                since: passed_from,
+                after: 0,
+                through,
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            Frame::Withheld { entries } => entries,
+            // A node that cannot say (one older than this vox) withholds nothing it can name.
+            Frame::Error { .. } => Vec::new(),
+            other => return Err(crate::client::unexpected(&other)),
+        },
+        None => Vec::new(),
+    };
+    let saved: Vec<Digest32> = (0..withheld.len)
+        .map(|at| withheld.entry(at))
+        .collect::<std::io::Result<_>>()?;
+    let returned_rows: Vec<vox_core::node::api::MessageRow> =
+        crate::coord::find(client, channel_id, &saved)
+            .await?
+            .into_iter()
+            .filter(|r| !r.owed && !rows.iter().any(|old| old.entry_hash == r.entry_hash))
+            .collect();
+    let returned: std::collections::BTreeSet<Digest32> =
+        returned_rows.iter().map(|r| r.entry_hash).collect();
     // What waits past the page read, counted by the node rather than read: said in the header
     // as before, so an agent still learns how far behind it is.
     let beyond = match rows.last() {
@@ -4344,7 +4445,7 @@ async fn read_room(
         notice = Some(notice.map_or_else(|| waiting.to_owned(), |old| format!("{old}\n{waiting}")));
     }
     let mut fresh = Vec::new();
-    for r in &rows {
+    for r in returned_rows.iter().chain(&rows) {
         if !r.owed
             && !is_own(r, me, &input.session_id)
             && !is_plumbing(r)
@@ -4558,6 +4659,10 @@ async fn read_room(
         beyond,
         notice,
         ahead,
+        withheld,
+        passed,
+        returned,
+        since_arrival,
         lost,
         refused,
         held_now,
