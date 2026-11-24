@@ -249,7 +249,33 @@ impl ChannelState {
                 "admission identity differs from the authenticated joiner",
             ));
         }
-        self.require_governance_ready(store, now)?;
+        let ready = self.require_governance_ready(store, now);
+        // Test-only (ledger 75): while `VOX_TEST_HOLD_JOIN_REFRESH_FILE` names a file that exists,
+        // a join admission is answered as this room's refreshing governance answers it; each
+        // admission answered "refreshing", held or not, appends its joiner to `<file>.met`.
+        #[cfg(feature = "test-knobs")]
+        let ready = match std::env::var_os("VOX_TEST_HOLD_JOIN_REFRESH_FILE") {
+            Some(hold) => {
+                let ready = if std::path::Path::new(&hold).exists() {
+                    Err(Error::Profile(governance::REFRESHING))
+                } else {
+                    ready
+                };
+                if ready.as_ref().is_err_and(governance::refreshing) {
+                    let mut met = hold;
+                    met.push(".met");
+                    let line = format!("{}\n", crate::node::link::b32_encode(&candidate.peer));
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(met)
+                        .and_then(|mut met| std::io::Write::write_all(&mut met, line.as_bytes()));
+                }
+                ready
+            }
+            None => ready,
+        };
+        ready?;
         let removed = self.is_member_removed(store, &candidate.peer)?;
         #[cfg(feature = "test-knobs")]
         let removed = removed

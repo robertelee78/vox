@@ -14671,30 +14671,64 @@ impl Node {
                     |identity, witness| async move {
                         // Hold the place and collect answering members' promises before admission.
                         let joiner = identity.fingerprint();
+                        // **A room still catching up is waited for, not refused** (ledger 75): a
+                        // member that has just restarted folds what it received into the room's
+                        // governance before it can admit anyone, and until then the admission is
+                        // answered "refreshing" (or "busy", while that fold's turn is being saved).
+                        // Both end by themselves, so the request is sent again when the room's next
+                        // publication completes, within the admission patience; a refused attempt
+                        // wrote nothing, and past the patience the joiner is refused as before.
+                        let patience = tokio::time::Instant::now()
+                            + crate::node::joinstream::ADMISSION_PATIENCE;
+                        #[cfg(feature = "test-knobs")]
+                        let waits = std::env::var_os("VOX_MUTANT_JOIN_REFRESH").is_none();
+                        #[cfg(not(feature = "test-knobs"))]
+                        let waits = true;
                         let promised = seat_round(&log_node, &admit_tx, channel_id, joiner).await?;
-                        let (ack, wait) = tokio::sync::oneshot::channel();
-                        let admitted = if admit_tx
-                            .send(NetEvent::JoinAdmit {
-                                channel_id,
-                                original: admission_room,
-                                attachment,
-                                peer,
-                                identity: Box::new(identity),
-                                witness: Box::new(witness),
-                                ack,
-                            })
-                            .await
-                            .is_ok()
-                        {
-                            // A dropped sender resolves this too, so a shutting-down actor cannot
-                            // strand a joiner mid-exchange; nothing admitted it, so it is refused.
-                            wait.await.unwrap_or(Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            )))
-                        } else {
-                            Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            ))
+                        let admitted = loop {
+                            // Armed before the request, so a publication completing while the
+                            // request is answered still wakes this wait.
+                            let published = match admission_room.upgrade() {
+                                Some(room) => Some(room.lock().await.history_publication_wake()),
+                                None => None,
+                            };
+                            let (ack, wait) = tokio::sync::oneshot::channel();
+                            let answer = if admit_tx
+                                .send(NetEvent::JoinAdmit {
+                                    channel_id,
+                                    original: admission_room.clone(),
+                                    attachment,
+                                    peer,
+                                    identity: Box::new(identity.clone()),
+                                    witness: Box::new(witness.clone()),
+                                    ack,
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                // A dropped sender resolves this too, so a shutting-down actor
+                                // cannot strand a joiner mid-exchange; nothing admitted it, so it
+                                // is refused.
+                                wait.await.unwrap_or(Err(Error::JoinRefused(
+                                    "the member stopped before it admitted the joiner",
+                                )))
+                            } else {
+                                Err(Error::JoinRefused(
+                                    "the member stopped before it admitted the joiner",
+                                ))
+                            };
+                            let settling = answer.as_ref().is_err_and(|error| {
+                                matches!(
+                                    fault_of(error),
+                                    Fault::GovernanceRefreshing | Fault::RoomChangePending
+                                )
+                            });
+                            let Some(published) = published.filter(|_| waits && settling) else {
+                                break answer;
+                            };
+                            if tokio::time::timeout_at(patience, published).await.is_err() {
+                                break answer;
+                            }
                         };
                         let abort = crate::node::seatstream::Abort { channel_id, joiner };
                         if admitted.is_ok() {

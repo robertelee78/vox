@@ -58,6 +58,18 @@
 //! The negative half — nothing sealed before a decision is ever read, and a generation spanning
 //! the decision is read from the decision on — is `a_member_reads_only_what_follows_trust_proof`.
 //!
+//! 3. **A join through a member that has just restarted gets in** (ledger 75). Alice's daemon is
+//!    stopped and started again, and bob and dave join through her at once while her room's
+//!    governance is still refreshing: the test-only `VOX_TEST_HOLD_JOIN_REFRESH_FILE` makes her
+//!    admission answer "refreshing", as a restarted member's does until its fold has caught up
+//!    (seen in the busy-room journey and reproduced on plain main by timing alone, 1 attempt in
+//!    18), until the proof sees both admissions meet it; then it is released and carol posts, the
+//!    room publication that a finished fold turn would be. Each `vox room join` must succeed —
+//!    each was refused with "a member accepted the passphrase but could not admit this identity;
+//!    remote admission may have occurred" — each newcomer is a member once, and from their return
+//!    each reads alice and carol and both read each within [`READY_WITHIN`]:
+//!    [`a_join_through_a_member_that_just_restarted_gets_in`].
+//!
 //! **Mutations, one per claim:**
 //! - a first-use refusal or wait on the room's convergence put back (a text post refused as
 //!   `RoomNotSynced` until the backlog is in, or delivery held until it is): the backlog room's
@@ -67,6 +79,8 @@
 //!   the live window — claim 2 red as `PRODUCT: … older page never arrived`;
 //! - the consent release covering no history (`history_plan` returns nothing): the 1,500-post arm
 //!   red with bob short of 1,500 once the pages are asked for.
+//! - the admitting member answering a join at once while its governance refreshes
+//!   (`VOX_MUTANT_JOIN_REFRESH`, read by alice's daemon): claim 3 red, bob's join refused.
 
 // Two blocking-or-optional arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The
 // 257-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
@@ -105,6 +119,9 @@ mod attach;
 
 #[path = "support/typed.rs"]
 mod typed;
+
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1354,6 +1371,336 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
         "PRODUCT: from the join's return, a newcomer must be read and must read within \
          {READY_WITHIN:?} whether the room is fresh or carrying a backlog (ADR-037 R1); over the \
          bound: {late:?}; every room: {measured:?}"
+    );
+}
+
+/// The test-only hold alice's restarted daemon reads (ledger 75): while its file exists, her join
+/// admissions are answered "room governance is refreshing"; each admission answered so, held or
+/// not, appends its joiner's fingerprint to `<file>.met`.
+const JOIN_REFRESH_HOLD: &str = "VOX_TEST_HOLD_JOIN_REFRESH_FILE";
+/// The mutant switch alice's daemon reads: a join admission is answered at once while the room's
+/// governance refreshes, as before ledger 75.
+const JOIN_REFRESH_MUTANT: &str = "VOX_MUTANT_JOIN_REFRESH";
+
+/// **A join through a member that has just restarted gets in** (claim 3, ledger 75). Alice and
+/// carol share a room; alice's daemon stops, carol posts, alice's daemon starts again on the same
+/// address, and bob and dave join through her at once while her admissions answer that the room's
+/// governance is refreshing. Each join must succeed, each newcomer is a member once, and from
+/// their return each reads alice and carol and both read each within [`READY_WITHIN`].
+#[test]
+#[ignore = "real vox daemons, a restart and a test-only hold; run with test-knobs in release"]
+fn a_join_through_a_member_that_just_restarted_gets_in() {
+    watchdog::arm();
+    let mutant = std::env::var(JOIN_REFRESH_MUTANT).ok();
+    let mut knobs = vec![JOIN_REFRESH_HOLD];
+    if mutant.is_some() {
+        knobs.push(JOIN_REFRESH_MUTANT);
+    }
+    test_knobs::require(&knobs);
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let (alice, carol) = (root.join("alice"), root.join("carol"));
+    let (bob, dave) = (root.join("bob"), root.join("dave"));
+    let dirs = [&alice, &carol, &bob, &dave];
+    let names = ["alice", "carol", "bob", "dave"];
+    for d in dirs {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+
+    // ---- four identities, each consenting to the others before any daemon runs ---------------
+    let mut fps = Vec::new();
+    for dir in dirs {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (i, dir) in dirs.iter().enumerate() {
+        for (j, name) in names.iter().enumerate() {
+            if i != j {
+                let (ok, _, err) = vox(dir, &["trust", "add", &fps[j], "--name", name], None);
+                assert!(
+                    ok,
+                    "PRODUCT (staging): `vox trust add` of {name} failed: {err}"
+                );
+            }
+        }
+    }
+
+    // ---- alice's room, carol in it, each reading the other -----------------------------------
+    let alice_first = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "restart",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let (ok, status, err) = vox(&alice, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox status --json` failed: {err}"
+    );
+    let listen = ports::loopback_listen(&status).unwrap_or_else(|| {
+        panic!("PRODUCT (staging): alice's `vox status --json` names no loopback address: {status}")
+    });
+    let _carol_daemon = daemon(&carol, "carol");
+    attached(&carol, "carol");
+    let (ok, out, err) = vox(
+        &carol,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): carol's `vox room join` failed: {out}{err}"
+    );
+    let before = "alice before her restart";
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, before], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's post was refused: {out}{err}"
+    );
+    let posted = Instant::now();
+    while !reads(&carol, &room, before) {
+        assert!(
+            posted.elapsed() < READY_WITHIN,
+            "PRODUCT (staging): carol, a member, did not read alice's post within {READY_WITHIN:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- alice stops; carol posts; alice starts again on her own address, the hold armed -----
+    alice_first.stop();
+    let (ok, out, err) = vox(
+        &carol,
+        &["room", "post", &room, "carol while alice was down"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): carol's post while alice was down was refused: {out}{err}"
+    );
+    let hold = root.join("join-refresh-hold");
+    std::fs::write(&hold, "hold").unwrap_or_else(|e| panic!("APPARATUS: writing the hold: {e}"));
+    let marker = |suffix: &str| {
+        let mut path = hold.clone().into_os_string();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    };
+    let hold_path = hold.to_str().expect("APPARATUS: a UTF-8 temp path");
+    let mut env = vec![(JOIN_REFRESH_HOLD, hold_path)];
+    if let Some(mutant) = &mutant {
+        env.push((JOIN_REFRESH_MUTANT, mutant.as_str()));
+    }
+    let listen = listen.to_string();
+    let mut alice_back = daemon_with(&alice, "alice-restarted", &["--listen", &listen], &env);
+    loop {
+        if let Ok(Some(exit)) = alice_back.0.try_wait() {
+            let said = said(&alice, "alice-restarted");
+            assert!(
+                !ports::bind_refused(&said),
+                "{}: {said}",
+                ports::APPARATUS_BIND
+            );
+            panic!("PRODUCT (staging): alice's restarted daemon exited {exit}: {said}");
+        }
+        if vox(&alice, &["room", "list"], None).0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- bob and dave join through alice at once while her refresh is held -----------------
+    let _newcomer_daemons = [daemon(&bob, "bob"), daemon(&dave, "dave")];
+    attached(&bob, "bob");
+    attached(&dave, "dave");
+    let file = |name: &str| {
+        std::fs::File::create(root.join(name))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {name}: {e}"))
+    };
+    let newcomers = [("bob", &bob, &fps[2]), ("dave", &dave, &fps[3])];
+    let mut joins: Vec<(&str, Child, Option<std::process::ExitStatus>)> = newcomers
+        .iter()
+        .map(|(who, dir, _)| {
+            let mut join = Command::new(VOX)
+                .args(["room", "join", "--passphrase-file", "-", &link])
+                .env("VOX_DATA_DIR", dir)
+                .env("VOX_CONFIG_DIR", dir.join("cfg"))
+                .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+                .env_remove("VOX_ROOM")
+                .env_remove("VOX_SESSION")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(file(&format!("{who}-join.out"))))
+                .stderr(Stdio::from(file(&format!("{who}-join.err"))))
+                .spawn()
+                .unwrap_or_else(|e| {
+                    panic!("APPARATUS: could not run {who}'s `vox room join`: {e}")
+                });
+            if let Err(e) = join
+                .stdin
+                .take()
+                .expect("APPARATUS: a piped stdin")
+                .write_all(format!("{ROOMPASS}\n").as_bytes())
+            {
+                eprintln!("[harness] {who}'s join did not take its passphrase: {e}");
+            }
+            (*who, join, None)
+        })
+        .collect();
+    // The newcomers whose admission met alice's refresh, as her daemon names them.
+    let met = || -> BTreeSet<String> {
+        std::fs::read_to_string(marker(".met"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    // Released once both admissions have met the refresh (or a join has already returned):
+    // carol's next post wakes alice's fold.
+    let mut released = false;
+    while joins.iter().any(|(_, _, exit)| exit.is_none()) {
+        for (_, join, exit) in &mut joins {
+            if exit.is_none() {
+                *exit = join.try_wait().ok().flatten();
+            }
+        }
+        if !released && (met().len() >= 2 || joins.iter().any(|(_, _, exit)| exit.is_some())) {
+            std::fs::remove_file(&hold).unwrap_or_else(|e| panic!("APPARATUS: release: {e}"));
+            let (ok, out, err) = vox(&carol, &["room", "post", &room, "carol wakes alice"], None);
+            assert!(
+                ok,
+                "PRODUCT (staging): carol's post was refused: {out}{err}"
+            );
+            released = true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let joined = Instant::now();
+    let alice_said: Vec<String> = said(&alice, "alice-restarted")
+        .lines()
+        .filter(|line| line.contains("join did not complete"))
+        .map(str::to_owned)
+        .collect();
+    let refused: Vec<String> = joins
+        .iter()
+        .filter(|(_, _, exit)| !exit.is_some_and(|exit| exit.success()))
+        .map(|(who, _, exit)| {
+            let said =
+                std::fs::read_to_string(root.join(format!("{who}-join.err"))).unwrap_or_default();
+            format!("{who} ({exit:?}):\n{said}")
+        })
+        .collect();
+    let met = met();
+    assert!(
+        !met.is_empty(),
+        "APPARATUS: no join admission met alice's governance refresh, so this run did not stage \
+         the window; joins refused: {refused:?}"
+    );
+    assert!(
+        refused.is_empty(),
+        "PRODUCT: a `vox room join` through alice, just restarted, was refused while her \
+         admissions answered that the room's governance is refreshing:\n{}\nalice's daemon said: {alice_said:?}",
+        refused.join("\n")
+    );
+    let unmet: Vec<&str> = newcomers
+        .iter()
+        .filter(|(_, _, fp)| !met.contains(fp.as_str()))
+        .map(|(who, _, _)| *who)
+        .collect();
+    assert!(
+        unmet.is_empty(),
+        "APPARATUS: the admission of {unmet:?} never met alice's governance refresh, so this run \
+         did not stage both joins in it"
+    );
+
+    // ---- each newcomer a member once, on the member that admitted them ---------------------
+    let (ok, status, err) = vox(&alice, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: alice's `vox status --json` failed: {err}");
+    let status: serde_json::Value = serde_json::from_str(&status)
+        .unwrap_or_else(|e| panic!("PRODUCT: alice's `vox status --json` is not JSON: {e}"));
+    let members: Vec<String> = status["rooms"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(&room)))
+        })
+        .and_then(|row| row["members"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (who, _, fp) in &newcomers {
+        let times = members.iter().filter(|id| id == fp).count();
+        assert!(
+            times == 1,
+            "PRODUCT: alice lists {who} {times} time(s) among the room's members: {members:?}"
+        );
+    }
+
+    // ---- from the joins' return: each newcomer reads alice and carol, and both read each ---
+    let (alice_after, carol_after) = ("alice after the joins", "carol after the joins");
+    for (dir, who, text) in [
+        (&alice, "alice", alice_after),
+        (&carol, "carol", carol_after),
+        (&bob, "bob", "bob is here"),
+        (&dave, "dave", "dave is here"),
+    ] {
+        let (ok, out, err) = vox(dir, &["room", "post", &room, text], None);
+        assert!(
+            ok,
+            "PRODUCT: {who}'s post after the joins was refused: {out}{err}"
+        );
+    }
+    let reader = |who: &str| match who {
+        "alice" => &alice,
+        "carol" => &carol,
+        "bob" => &bob,
+        _ => &dave,
+    };
+    let mut missing: Vec<(&str, &str)> = vec![
+        ("bob", alice_after),
+        ("bob", carol_after),
+        ("dave", alice_after),
+        ("dave", carol_after),
+        ("alice", "bob is here"),
+        ("carol", "bob is here"),
+        ("alice", "dave is here"),
+        ("carol", "dave is here"),
+    ];
+    while !missing.is_empty() && joined.elapsed() < READY_WITHIN {
+        missing.retain(|(who, text)| !reads(reader(who), &room, text));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        missing.is_empty(),
+        "PRODUCT: within {READY_WITHIN:?} of the joins returning, these were not read (reader, \
+         post): {missing:?}\nalice's daemon said: {}",
+        said(&alice, "alice-restarted")
+    );
+    println!(
+        "[proof] bob and dave joined through alice just back from a restart, both admissions \
+         having met her governance refresh; every way read {:?} after the joins returned",
+        joined.elapsed()
     );
 }
 
