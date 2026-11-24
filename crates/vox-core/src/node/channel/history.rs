@@ -550,6 +550,20 @@ impl View<'_> {
     fn is_owed(&self, hash: &Digest32) -> Result<bool> {
         Ok(self.owed_shown() && self.rendered.is_owed(hash)?)
     }
+    /// Whether `hash` is the position of a signed message whose body this node does not hold:
+    /// where a "not received yet" row stands, shown or not. A page cursor is a position, not a
+    /// claim that its row is shown: a placeholder hidden or refused since a client took it as
+    /// its cursor still anchors the next page, which is answered without the rows not shown.
+    fn owed_position(&self, hash: &Digest32) -> Result<bool> {
+        Ok(self.rendered.order().entry(hash)?.is_some_and(|entry| {
+            entry.payload.is_none()
+                && entry
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Content)
+        }))
+    }
     fn owed_before(&self, before: Option<(u64, Digest32)>) -> Result<u64> {
         if !self.owed_shown() {
             return Ok(0);
@@ -732,16 +746,17 @@ impl View<'_> {
         let filter = self.view_filter(view)?;
         let mut cursor = match before {
             Some(hash) => {
-                if !self.view_contains(&filter, &hash)? {
+                if self.view_contains(&filter, &hash)? {
+                    self.mark(
+                        hash,
+                        false,
+                        "cursor not among this room's selected messages",
+                    )?;
+                } else if !(matches!(filter, Filter::General) && self.owed_position(&hash)?) {
                     return Err(Failure::Request(
                         "cursor not among this room's selected messages",
                     ));
                 }
-                self.mark(
-                    hash,
-                    false,
-                    "cursor not among this room's selected messages",
-                )?;
                 self.rendered.order().key(&hash)?
             }
             None => None,
@@ -1692,7 +1707,10 @@ impl View<'_> {
             Query::Older { before, limit } => {
                 let mut cursor = match before {
                     Some(h) => {
-                        self.mark(h, false, cursor_error)?;
+                        // A placeholder's position anchors the page shown or not (`owed_position`).
+                        if !self.owed_position(&h)? {
+                            self.mark(h, false, cursor_error)?;
+                        }
                         self.rendered.order().key(&h)?
                     }
                     None => None,

@@ -1093,8 +1093,10 @@ fn quit(mut p: Proc, who: &str) {
 /// `test-knobs` build). Carol posts while bob, alice and the anchor are stopped; mallory takes
 /// it; carol's daemon ends for good; bob is resumed and takes it from mallory stripped. No node
 /// that runs again holds its body. Asserted on bob:
-/// 1. staging (else APPARATUS NO RESULT; the stripped arm owns this claim): within 30 completed
-///    rounds toward mallory, carol's post is shown as not received yet, and counted;
+/// 1. staging: within 30 of mallory's completed rounds toward carol she reads carol's post, and
+///    within 30 of bob's completed rounds toward mallory his read shows it as not received yet
+///    and his status counts it (else PRODUCT (staging), quoting the sync rows; rounds that do not
+///    complete: APPARATUS NO RESULT);
 /// 2. on bob's screen, nobody posting: his terminal app (`tests/pty/tui_marks_read.py`) shows
 ///    carol's post as not received yet beside her post he holds; alice and the anchor resume
 ///    (neither holds the body), bob's fold is held and alice renames the room. Once his read says
@@ -1184,8 +1186,9 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
     }) {
         Ok(true) => {}
         Ok(false) => panic!(
-            "APPARATUS NO RESULT (staging): within 30 of mallory's completed rounds toward carol \
-             she does not read carol's post; mallory's sync with carol: {}",
+            "PRODUCT (staging): over 30 of mallory's completed rounds toward carol, both running \
+             and trusting each other, she does not read carol's post; mallory's sync with carol: \
+             {}",
             sync_with(&mallory, &carol)
         ),
         Err(e) => panic!(
@@ -1208,10 +1211,9 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
     match &seen {
         Ok((owed, _, _)) if owed.contains(&hc) && rows_with.is_some() => {}
         _ => panic!(
-            "APPARATUS NO RESULT (staging): within 30 rounds toward mallory, his only source, bob \
-             did not show carol's stripped post as not received yet, or his status counts no rows \
-             ({rows_with:?}), so the held phase cannot be staged: {seen:?}; bob's sync with \
-             mallory: {}",
+            "PRODUCT (staging): over 30 of his completed rounds toward mallory, his only source, \
+             bob does not show carol's stripped post as not received yet, or his status counts no \
+             rows ({rows_with:?}): {seen:?}; bob's sync with mallory: {}",
             sync_with(&bob, &mallory)
         ),
     }
