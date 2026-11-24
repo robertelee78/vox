@@ -282,6 +282,9 @@ final class NodeModel: ObservableObject {
     private var roomOpened = false
     private var roomShowsInFlight = 0
     private static let roomWindowLimit = 128
+    /// An older window's last selection (room, view and saved room), in order, and which of it
+    /// came back unanswered: those are asked for again in their place (`readNewOnScreen`).
+    private var roomWindowSelection: (window: String, ids: [String], unanswered: Set<String>) = ("", [], [])
     @Published private var roomReadingOlder = false
     private var roomOlderRead = UUID()
 
@@ -1268,10 +1271,18 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Previews a live arrival set, counted per room: a preview read that began before one landed
+    /// must not replace it with an older message.
+    private var previewArrivals: [String: Int] = [:]
+
     /// Find the latest preview through bounded indexed pages. Coordination-only pages
     /// are skipped without collecting the intervening history in the window process.
+    /// A newest message older than the preview held replaces it only when no message landed
+    /// while this read was under way: the held one has then left the room (a removal took it
+    /// away, ADR-053 MP-11, or it expired), and with none left the row previews nothing.
     private func readLast(_ room: String) async {
         let epoch = nodeObservationEpoch
+        let arrivals = previewArrivals[room, default: 0]
         do {
             var page = try await client.roomRead(room: room)
             let instance = page.instance
@@ -1281,14 +1292,21 @@ final class NodeModel: ObservableObject {
                 guard page.instance == instance else {
                     throw VoxError.Failed(reason: "The saved room changed while reading its preview.")
                 }
+                let current = previewArrivals[room, default: 0] == arrivals
                 if let shown = page.messages.last(where: Preview.shows) {
                     guard let i = rooms.firstIndex(where: { $0.id == room }),
-                          shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
+                          current || shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
                     let preview = Preview(shown, me: me)
                     if rooms[i].last != preview { rooms[i].last = preview }
                     return
                 }
-                guard let before = page.before else { return }
+                guard let before = page.before else {
+                    if current, let i = rooms.firstIndex(where: { $0.id == room }),
+                       rooms[i].last != nil {
+                        rooms[i].last = nil
+                    }
+                    return
+                }
                 let older = try await client.roomReadOlder(room: room, before: before)
                 guard older.before != before else {
                     throw VoxError.Failed(reason: "The room preview page did not advance.")
@@ -1472,16 +1490,39 @@ final class NodeModel: ObservableObject {
                 && epoch == nodeObservationEpoch && revision == roomMessageRevision
                 && follows == timelineFollowingNewest
         }
+        // The older window's selection is what it asked for, not only what came back: a row left
+        // out while it is not shown (a placeholder whose decision is open) is asked for again, in
+        // its place, and returns to the window once it is shown, also when nothing of the window
+        // is shown meanwhile. An older window is open while the newest is not followed and it
+        // shows rows or asked for some.
+        let window = instance.map { "\(id)|\(viewGeneration)|\($0.base64EncodedString())" }
+        let previous = window != nil && roomWindowSelection.window == window
+            ? roomWindowSelection : (window: window ?? "", ids: [], unanswered: Set<String>())
         do {
-            if !follows, let instance, !loaded.isEmpty {
+            if !follows, let instance, let window, !(loaded.isEmpty && previous.ids.isEmpty) {
+                let held = Set(loaded)
+                var before: [String: [String]] = [:], waiting: [String] = []
+                for prior in previous.ids {
+                    if held.contains(prior) {
+                        before[prior] = waiting
+                        waiting = []
+                    } else if previous.unanswered.contains(prior) {
+                        waiting.append(prior)
+                    }
+                }
+                let asked = Array((loaded.flatMap { (before[$0] ?? []) + [$0] } + waiting)
+                    .prefix(Self.roomWindowLimit))
                 let rows = try await retainedRoomEntries(room: id, view: view, instance: instance,
-                    ids: loaded, current: current)
+                    ids: asked, current: current)
                 guard current() else { return }
+                let returned = Set(rows.map(\.id))
+                roomWindowSelection = (window, asked, Set(asked.filter { !returned.contains($0) }))
                 let bounded = Self.boundedRoomRows(rows, newest: false)
                 if bounded.count < rows.count { roomHasNewer = true }
                 messages = bounded
                 // Exact selection's zero metadata is not a new history cursor/count.
             } else {
+                roomWindowSelection = ("", [], [])
                 let page = try await client.roomViewRead(room: id, view: view)
                 guard current() else { return }
                 roomInstance = page.instance
@@ -4194,10 +4235,13 @@ final class NodeModel: ObservableObject {
             notifier.post(message, room: room, roomName: name, me: me)
         }
         // The room's row previews it.
-        if Preview.shows(message), let i = rooms.firstIndex(where: { $0.id == room }),
-           message.createdMillis >= rooms[i].last?.millis ?? 0 {
-            let preview = Preview(message, me: me)
-            if rooms[i].last != preview { rooms[i].last = preview }
+        if Preview.shows(message) {
+            previewArrivals[room, default: 0] += 1
+            if let i = rooms.firstIndex(where: { $0.id == room }),
+               message.createdMillis >= rooms[i].last?.millis ?? 0 {
+                let preview = Preview(message, me: me)
+                if rooms[i].last != preview { rooms[i].last = preview }
+            }
         }
         if case .room(room) = selection, !roomReloadNeeded, !showingSession {
             // Ask for the captured view's bounded page instead of appending a generic event
@@ -4227,8 +4271,12 @@ final class NodeModel: ObservableObject {
     /// seen as it lands, so it is not notified.
     var lookingAt: String?
 
+    /// The node said something other than a new message: the room list and each open room's
+    /// preview are read again, and so is each open room's unread, which a removal can lower with
+    /// no message arriving (ADR-053 MP-11: the node says `Synced` with nothing applied).
     fileprivate func noticed(_ text: String) async {
         await refresh()
+        await reconcileUnread()
     }
 
     fileprivate enum ObservationStop {

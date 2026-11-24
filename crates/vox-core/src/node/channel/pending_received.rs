@@ -46,6 +46,9 @@ pub(crate) struct PendingReceived {
     late: bool,
     private: Vec<(Digest32, Digest32, u64)>,
     refill_recipient: bool,
+    /// A body-less signed message's "not received yet" row: `(created, expires, removal
+    /// generation)` decided at preparation (ADR-008 LS-33).
+    owed: Option<(u64, u64, u64)>,
     maintenance_now: crate::time::Ms,
 }
 
@@ -246,6 +249,10 @@ impl ChannelState {
                                 historical,
                             )?,
                     );
+                } else {
+                    // ADR-008 LS-33: a signed message whose body has not arrived is shown as
+                    // not received yet, in place, when its body is for this node.
+                    pending.owed = self.signed_owed_row(store, entry, now.get())?;
                 }
             }
         }
@@ -392,6 +399,7 @@ impl ChannelState {
                 Vec::new()
             },
             refill_recipient: false,
+            owed: None,
             maintenance_now: crate::time::Ms(self.now_hint),
         })
     }
@@ -862,6 +870,19 @@ impl PendingReceived {
                         }
                     }
                     on_admitted(&mut batch, hash)?;
+                }
+                if let (Some((created, expires, generation)), false) = (self.owed, is_refill) {
+                    // Written with the entry's effect, where its text would have been rendered;
+                    // a removal applied meanwhile leaves it to the retention sweep's decision.
+                    if entry.payload.is_none()
+                        && governance::removal_generation_in(&batch, &self.room)? == generation
+                    {
+                        let mut index = self.index.write(&mut batch, sek, &self.room)?;
+                        if index.missing_contains(&author, entry.skeleton.seq)? {
+                            index.set_owed(hash, Some((created, expires)))?;
+                        }
+                        index.seal()?;
+                    }
                 }
                 let progress = if !is_refill || admitted {
                     let mut index = self.index.write(&mut batch, sek, &self.room)?;

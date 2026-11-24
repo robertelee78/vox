@@ -240,7 +240,10 @@ Never put a real passphrase in a shell command, a model's context or a screensho
 ## Output, cursors and status
 
 `--json` gives structured output on the commands that list it in their help. A `--since` cursor is
-the whole entry hash from an earlier read. Session activity's `--before` and private attention's
+the position printed with an earlier page (`@<arrival>:<instance>`), or the whole entry hash from
+an earlier read. A message a removal took away can come back when the removal stops holding; it
+then arrives again, and a hash naming it is refused ("this message came back after it was taken
+away; …"): continue from the printed position instead. Session activity's `--before` and private attention's
 `--attention-after` are different cursors: use the exact continuation printed by that command,
 with the same node/room/Session. A preparing page, expired cursor or failed read does not prove
 an empty history. A nonzero exit status means read the command's message. Claims have their own [exit codes](agents.md#coordinate-ownership-not-a-second-progress-tracker).
@@ -304,7 +307,10 @@ mean zero network bytes.
 
 An ongoing `sync-failing` problem must clear after a successful current bounded or legacy
 completion. Historical `last_failure` values and cumulative failure counts remain diagnostic
-history, not current-health verdicts.
+history, not current-health verdicts. `last_failure_stands` says whether the last failure is
+still that peer's latest outcome; it turns false once a later round with the peer, in either
+direction, ends without error (its `completed` or `partial` count grows). Plain status names a
+peer's last failure only while it stands.
 
 Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
 the problem.

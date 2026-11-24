@@ -990,9 +990,12 @@ pub(crate) struct DisplayStamp {
     session_revision: u64,
     retention: (u64, u64),
     expires_at: Option<u64>,
-    /// How many of the rows shown stand for a body not received yet (V030-10).
+    /// How many rows stand for a body not received yet (V030-10), shown or not.
     owed_count: u64,
-    pub(crate) owed: bool,
+    /// Whether those rows are shown and counted: their decision stands
+    /// ([`ChannelState::owed_rows_shown`]); a row whose decision is open is neither (ADR-036
+    /// H-4). A change of it is a change of the timeline, so the display revision moves with it.
+    owed: bool,
 }
 
 impl DisplayStamp {
@@ -1002,7 +1005,23 @@ impl DisplayStamp {
     /// FX-22; #995).
     #[must_use]
     pub(crate) fn rows(&self) -> u64 {
-        self.rendered_count.saturating_add(self.owed_count)
+        if self.owed {
+            self.rendered_count.saturating_add(self.owed_count)
+        } else {
+            self.rendered_count
+        }
+    }
+
+    /// A stamp kept from an earlier publication while the room cannot be published again
+    /// (governance refreshing), with its "not received yet" rows shown as `owed_shown` says now
+    /// ([`ChannelState::owed_rows_shown`]); `None` when that changes nothing.
+    #[must_use]
+    pub(crate) fn owed_shown(&self, owed_shown: bool) -> Option<Self> {
+        let owed = owed_shown && self.owed_count != 0;
+        (owed != self.owed).then(|| Self {
+            owed,
+            ..self.clone()
+        })
     }
 }
 
@@ -1349,6 +1368,8 @@ pub struct ChannelState {
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     projection_state: history::State,
+    /// Which governance the "not received yet" rows were last decided under (in memory).
+    owed_decided: history::OwedDecided,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
@@ -1360,6 +1381,10 @@ pub struct ChannelState {
     /// Readable rows removed from the rendered prefix (pruning, retention, missing-position
     /// cleanup); a late arrival that only reorders the prefix leaves it alone.
     display_removals: u64,
+    /// A governance turn took shown rows away or brought retained ones back (ADR-053 MP-11)
+    /// since the node last said so: what it says as [`crate::node::api::NodeEvent::Synced`] with
+    /// nothing applied, so a client re-reads the room's preview and unread.
+    display_news: bool,
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     entries: entry_store::EntryIndex,
@@ -2321,12 +2346,14 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -2964,6 +2991,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: match restart.projection.as_deref() {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
@@ -2973,6 +3001,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation,
             legacy_cache_trusted: None,
@@ -3469,12 +3498,14 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -5641,7 +5672,9 @@ impl ChannelState {
         }
         self.entries.committed();
         self.forks_kept = kept;
-        Ok(())
+        // As `finish_history_begin`: a newly kept fork proof withdraws read authority and the
+        // "not received yet" decisions taken under the governance before it.
+        self.retire_governance()
     }
 
     /// The members this room holds back for equivocating (V210-63): each `(author, seq)` where
@@ -5981,7 +6014,8 @@ impl ChannelState {
                 retention: (self.effective_retention(), self.effective_step_retention()),
                 expires_at: rendered.next_owed_expiry()?,
                 owed_count,
-                owed: owed_count != 0,
+                // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
+                owed: owed_count != 0 && self.owed_rows_shown(),
             },
             read_summary_stamp: ReadSummaryStamp {
                 reads: rendered.read_roots()?,
@@ -6460,6 +6494,7 @@ impl ChannelState {
                 first_seen_ms: now_ms,
                 claimed_ms,
                 cache_id: None,
+                returned: false,
             }),
         )
     }
@@ -7621,6 +7656,12 @@ impl ChannelState {
         news.sort_unstable();
         news.dedup();
         news
+    }
+
+    /// Whether a governance turn changed this room's shown rows since the last call
+    /// (`display_news`).
+    pub fn take_display_news(&mut self) -> bool {
+        std::mem::take(&mut self.display_news)
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its

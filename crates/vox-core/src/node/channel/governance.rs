@@ -662,6 +662,9 @@ pub(super) use view::{Display, View};
 pub(super) struct Progress {
     pub ready: bool,
     pub pending: bool,
+    /// This turn took already shown rows away or brought retained ones back (MP-11); the room's
+    /// readers must notice.
+    pub retracted: bool,
 }
 
 /// Initialize only the derived directory. Authoritative source rows are neither
@@ -719,6 +722,7 @@ pub(super) fn progress(store: &Store, sek: &Sek, room: &Digest32, now: u64) -> R
     Ok(Progress {
         ready: read.ready(now)?,
         pending: read.pending() || !read.current_ready()?,
+        retracted: false,
     })
 }
 
@@ -838,6 +842,8 @@ fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Res
 /// One actor turn of work. Source and causal work both progress before ordering,
 /// rather than draining all newly received rows while starving older obligations.
 /// No future complete-page vector or borrowed snapshot survives this function.
+/// `next_log` is the room's shared log/cache allocator: a row that comes back takes its new
+/// arrival from it (MP-11), and the caller installs what it advanced to.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn advance(
     store: &Store,
@@ -848,6 +854,7 @@ pub(super) fn advance(
     root: &Digest32,
     me: &Digest32,
     now: u64,
+    next_log: &mut u64,
 ) -> Result<Progress> {
     let current = progress(store, sek, room, now)?;
     if current.ready && !current.pending {
@@ -861,10 +868,12 @@ pub(super) fn advance(
         return Ok(Progress {
             ready: current.ready,
             pending: false,
+            retracted: false,
         });
     }
     advance_source(store, entries, sek, room, authors, root, me)?;
     advance_frontiers(store, entries, sek, room)?;
+    let mut retracted = false;
     {
         let input = entries.read(store, sek, room)?;
         let mut batch = store.batch()?;
@@ -891,6 +900,13 @@ pub(super) fn advance(
                     break;
                 }
             }
+            // MP-11 (ADR-053): a message this node already shows and that an eligibility
+            // decision now proves not acceptable (its author outside a removal's cut) leaves the
+            // conversation in the same transaction as the decision, so counts, pages and threads
+            // never name it again; one taken away before and decided acceptable again (a
+            // removal its remover's authority no longer carries) comes back from the plaintext
+            // this node retains, in the same transaction.
+            let mut decided = Vec::new();
             if fold_ready {
                 for _ in 0..FOLD_STEPS {
                     if started.elapsed() >= FOLD_BUDGET || !writer.causal_settled()? {
@@ -900,17 +916,42 @@ pub(super) fn advance(
                     if !writer.causal_settled()? {
                         break;
                     }
-                    let worked = member_fold::advance_eligibility(&mut writer)?;
+                    let worked = member_fold::advance_eligibility(&mut writer, &mut decided)?;
                     if !replayed && !worked {
                         break;
                     }
                 }
             }
             writer.seal()?;
+            #[cfg(feature = "test-knobs")]
+            if keep_rows_mutant() {
+                decided.clear();
+            }
+            if !decided.is_empty() {
+                let shown = super::shown_now();
+                let mut index = entries.write(&mut batch, sek, room)?;
+                for (hash, eligible) in &decided {
+                    if !eligible {
+                        if index.has_rendered(hash)? {
+                            index.remove_rendered(hash)?;
+                            retracted = true;
+                        }
+                        index.remove_read_receipt(hash)?;
+                    } else if !no_restore_mutant()
+                        && index.restore_rendered(hash, shown, next_log)?
+                    {
+                        retracted = true;
+                    }
+                }
+                index.seal()?;
+            }
             batch.commit()?;
         }
     }
-    progress(store, sek, room, now)
+    Ok(Progress {
+        retracted,
+        ..progress(store, sek, room, now)?
+    })
 }
 
 /// At most this many order/evaluation phase steps, and at most this long, per governance turn.
@@ -926,4 +967,57 @@ fn fold_held() -> bool {
     std::env::var_os(TEST_FOLD_HOLD_ENV)
         .filter(|path| !path.is_empty())
         .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
+/// `VOX_MUTANT_MP11_KEEP_ROWS`: a shown row stays when its author's eligibility is decided
+/// false (before MP-11). Says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn keep_rows_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_MP11_KEEP_ROWS").is_some();
+        if on {
+            eprintln!("vox: VOX_MUTANT_MP11_KEEP_ROWS engaged: ineligible shown rows stay");
+        }
+        on
+    });
+    *ON
+}
+
+/// `VOX_MUTANT_MP11_NO_RESTORE`: a retracted row stays away when its author's eligibility is
+/// decided true again. Says so once when the daemon first reads it.
+fn no_restore_mutant() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VOX_MUTANT_MP11_NO_RESTORE").is_some();
+            if on {
+                eprintln!("vox: VOX_MUTANT_MP11_NO_RESTORE engaged: retracted rows stay away");
+            }
+            on
+        });
+        *ON
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    false
+}
+
+/// `VOX_MUTANT_MP11_NO_RECONCILE`: an index sealed before format 6 is opened without the new
+/// authority generation that recomputes its decisions (`facts::Header::parse`). Says so once
+/// when the daemon first reads it.
+fn no_reconcile_mutant() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VOX_MUTANT_MP11_NO_RECONCILE").is_some();
+            if on {
+                eprintln!(
+                    "vox: VOX_MUTANT_MP11_NO_RECONCILE engaged: an older index keeps its decisions"
+                );
+            }
+            on
+        });
+        *ON
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    false
 }

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
 use vox_core::hash::Digest32;
-use vox_core::node::api::{Fault, MessageRow, NodeEvent};
+use vox_core::node::api::{Fault, HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonEvent, DaemonFrame, DaemonRequest, DetachCause, Refusal,
     UseNode,
@@ -411,7 +411,10 @@ struct ThreadSummary {
 
 struct OpenThread {
     root: Digest32,
-    since: Option<Digest32>,
+    /// Where the page shown starts: after this arrival, or the thread's first reply.
+    since: Option<HistoryCursor>,
+    /// The saved copy of the room its pages were read in.
+    instance: Option<[u8; 16]>,
     next: bool,
     rows: Vec<MessageRow>,
     projected: Option<Projected>,
@@ -446,6 +449,21 @@ struct MemberPlatforms {
 const DECISIONS_SHOWN: usize = 500;
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
+
+/// `VOX_TEST_OWED_ROW=marked` (proofs only, a `test-knobs` build): the TUI submits the messages
+/// it shows as not received yet with the rest of what it showed, as it did before they were left
+/// out of read marks. Silent: the TUI's stderr is its terminal.
+#[cfg(feature = "test-knobs")]
+fn read_marks_owed() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("VOX_TEST_OWED_ROW").is_ok_and(|mode| mode == "marked")
+    });
+    *ON
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn read_marks_owed() -> bool {
+    false
+}
 
 /// A [`DaemonCore::shown`] the node did not take.
 struct MarkRefused {
@@ -1183,9 +1201,12 @@ impl DaemonCore {
                 if let Some(t) = me.timeline.as_mut() {
                     t.stale = true;
                 }
-            } else if n > 0 {
+            } else {
+                // A Synced with no new row may still have taken rows away (ADR-053 MP-11).
                 me.unread.entry(channel_id).or_default().dirty = true;
-                *me.arrived.entry(channel_id).or_insert(0) += n;
+                if n > 0 {
+                    *me.arrived.entry(channel_id).or_insert(0) += n;
+                }
             }
         };
         match ev {
@@ -2592,10 +2613,19 @@ impl DaemonCore {
         let Some(thread) = self.thread.as_ref().filter(|t| t.stale) else {
             return;
         };
+        // A page continues after the last reply's arrival in the saved copy its first page was
+        // read in, never after its hash, which the node refuses once it names a message that
+        // came back after a removal took it away (ADR-053 MP-11).
         let (root, since, next) = (
             thread.root,
             if thread.next {
-                thread.rows.last().map(|r| r.entry_hash)
+                thread
+                    .instance
+                    .zip(thread.rows.last())
+                    .map(|(instance, r)| HistoryCursor {
+                        instance,
+                        arrival: r.arrival,
+                    })
             } else {
                 thread.since
             },
@@ -2604,16 +2634,34 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let Some(answer) = until_stopped(
-            &self.rt,
-            &self.stop,
-            conn.client.request(&Request::Thread {
-                channel_id: cid,
-                root,
-                since,
-            }),
-        ) else {
+        let Some(answer) = until_stopped(&self.rt, &self.stop, async {
+            let instance = match since {
+                Some(at) => at.instance,
+                None => match conn
+                    .client
+                    .request(&Request::ArrivalHead { channel_id: cid })
+                    .await?
+                {
+                    Frame::ArrivalHead { head } => head.instance,
+                    other => return Ok((other, None)),
+                },
+            };
+            let page = conn
+                .client
+                .request(&Request::Thread {
+                    channel_id: cid,
+                    root,
+                    since: None,
+                    resume: since,
+                })
+                .await?;
+            Ok::<_, vox_core::error::Error>((page, Some(instance)))
+        }) else {
             return;
+        };
+        let (answer, instance) = match answer {
+            Ok((page, instance)) => (Ok(page), instance),
+            Err(e) => (Err(e), None),
         };
         match self.answered(answer) {
             Ok(Frame::Rows { rows }) => {
@@ -2625,6 +2673,7 @@ impl DaemonCore {
                         self.notice = Some("No further replies in this thread".to_owned());
                     } else {
                         thread.since = since;
+                        thread.instance = instance;
                         thread.rows = rows.into_iter().filter(|r| r.entry_hash != root).collect();
                         thread.projected = None;
                         thread.more = !thread.rows.is_empty();
@@ -3811,10 +3860,20 @@ impl CoreHandle for DaemonCore {
             self.thread_roots = roots;
             self.threads_stale = true;
         }
-        // Each message is told to the node once; the node keeps what it has recorded.
+        // Each message is told to the node once; the node keeps what it has recorded. A message
+        // not received yet was not read: the node refuses a batch naming one, so it is left out
+        // (as the agent hook leaves it out), and is told once its text has taken its place.
+        let owed: BTreeSet<Digest32> = self
+            .timeline
+            .as_ref()
+            .into_iter()
+            .flat_map(|t| t.rows.iter())
+            .filter(|r| r.owed && !read_marks_owed())
+            .map(|r| r.entry_hash)
+            .collect();
         let new: Vec<Digest32> = entries
             .iter()
-            .filter(|h| !self.marked.contains(*h))
+            .filter(|h| !self.marked.contains(*h) && !owed.contains(*h))
             .copied()
             .collect();
         if new.is_empty() {
@@ -4235,6 +4294,7 @@ impl CoreHandle for DaemonCore {
                     self.thread = root.map(|root| OpenThread {
                         root,
                         since: None,
+                        instance: None,
                         next: false,
                         rows: Vec::new(),
                         projected: None,

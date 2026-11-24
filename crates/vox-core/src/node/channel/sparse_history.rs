@@ -895,19 +895,24 @@ impl ChannelState {
     }
 
     pub(super) fn require_history_source_boundary(&self, entry: &Entry) -> Result<()> {
-        if entry.skeleton.channel_id != self.channel_id
-            || !self.admission.is_admitted(
-                &self.channel_id,
-                entry.skeleton.epoch,
-                &entry.skeleton.author_id,
-            )
-            || self.dag.is_frozen(&entry.skeleton.author_id)
-        {
+        if !self.history_source_admissible(entry) {
             return Err(Error::MalformedGovernance(
                 "history source room, epoch or author boundary changed",
             ));
         }
         Ok(())
+    }
+
+    /// Whether this node would still admit a body of `entry` as a history source: its room, its
+    /// epoch's admission of its author, and its author not frozen by a fork proof.
+    pub(super) fn history_source_admissible(&self, entry: &Entry) -> bool {
+        entry.skeleton.channel_id == self.channel_id
+            && self.admission.is_admitted(
+                &self.channel_id,
+                entry.skeleton.epoch,
+                &entry.skeleton.author_id,
+            )
+            && !self.dag.is_frozen(&entry.skeleton.author_id)
     }
 
     pub(crate) fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
@@ -1510,6 +1515,12 @@ impl ChannelState {
             self.dag.install_verified_fork(proof);
             self.forks_kept = completed.kept;
             self.entries.committed();
+            // The proof froze its author and `note_fork_in` started a governance replay: what was
+            // decided under the governance before it no longer stands. Read authority and every
+            // "not received yet" decision go with the fork's installation, before the read
+            // resource is published again, as for any governance change (`OwedDecided` starts a
+            // new turn once governance is current again).
+            self.retire_governance()?;
         }
         if completed.poison {
             if let Err(error) = &completed.result {

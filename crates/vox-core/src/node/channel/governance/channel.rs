@@ -633,6 +633,7 @@ impl ChannelState {
         self.now_hint = self.now_hint.max(now.get());
         let was_ready = self.governance_ready;
         let updated = (|| -> Result<GovernanceProgress> {
+            let mut next_log = self.next_log_id;
             let state = super::advance(
                 store,
                 &self.entries,
@@ -642,7 +643,10 @@ impl ChannelState {
                 &self.genesis.creator_pubkey().fingerprint(),
                 &self.me(),
                 now.get(),
-            )?;
+                &mut next_log,
+            );
+            self.install_next_log(next_log);
+            let state = state?;
             let mut changed = false;
             let mut consent_ready = false;
             if state.ready {
@@ -653,6 +657,9 @@ impl ChannelState {
                     || (!was_ready && consent_ready);
                 self.governance_display = display;
                 self.governance_ready = consent_ready;
+                if changed {
+                    self.owed_decided.governance_changed();
+                }
             }
             Ok(GovernanceProgress {
                 // Irreversible work needs the current checked disk fold, not merely the retained

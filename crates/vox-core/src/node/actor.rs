@@ -839,7 +839,7 @@ fn note_served(
         Ok(_) => counts.partial += 1,
         Err(error) => {
             counts.failed += 1;
-            counts.last_failure = Some(error.to_string());
+            counts.note_failure(error.to_string());
         }
     });
 }
@@ -12506,7 +12506,7 @@ impl Node {
                         .collect();
                     for room in rooms {
                         crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
-                            c.last_failure = Some(why.clone());
+                            c.note_failure(why.clone());
                             c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                             c.failing_since.get_or_insert_with(std::time::Instant::now);
                         });
@@ -13784,7 +13784,7 @@ impl Node {
                         &self.sync_book,
                         channel_id,
                         peer,
-                        |status| status.last_failure = Some(reason),
+                        |status| status.note_failure(reason),
                     );
                 }
                 self.say_session_news(&channel_id).await;
@@ -18615,7 +18615,7 @@ impl Node {
                 }
                 Some(f) => {
                     c.failed += 1;
-                    c.last_failure = Some(f.to_string());
+                    c.note_failure(f.to_string());
                     c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                     c.failing_since.get_or_insert_with(std::time::Instant::now);
                 }
@@ -24676,7 +24676,7 @@ impl Node {
                 drop(slot);
                 self.private_pulls.remove(&key);
                 crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                    status.last_failure = Some(error.to_string())
+                    status.note_failure(error.to_string());
                 });
                 return;
             }
@@ -24685,8 +24685,9 @@ impl Node {
         else {
             self.private_pulls.remove(&key);
             crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                status.last_failure =
-                    Some("private page reservation is smaller than its page envelope".into())
+                status.note_failure(
+                    "private page reservation is smaller than its page envelope".into(),
+                );
             });
             return;
         };
@@ -24982,23 +24983,33 @@ impl Node {
 
     /// Say [`NodeEvent::SessionEntry`] once for each session of the room `channel_id` with an
     /// entry placed since it was last said (ADR-029 CL-2): its entries are not room messages, so no
-    /// other event tells a client of them.
+    /// other event tells a client of them. And say [`NodeEvent::Synced`], with nothing applied,
+    /// once a governance turn took shown rows away or brought retained ones back since it was last
+    /// said (ADR-053 MP-11): no row arrived, so no other event tells a client to read the room's
+    /// preview and unread again.
     async fn say_session_news(&self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let news = {
+        let (news, display) = {
             let mut ch = shared.lock().await;
             // A room this identity left is out of sight (ADR-023 RL-8.1a): nothing of it is said.
             if is_leaving(&ch) {
                 return;
             }
-            ch.take_session_news()
+            (ch.take_session_news(), ch.take_display_news())
         };
         for session_id in news {
             let _ = self.event_tx.send(NodeEvent::SessionEntry {
                 channel_id: *channel_id,
                 session_id,
+            });
+        }
+        if display {
+            let _ = self.event_tx.send(NodeEvent::Synced {
+                channel_id: *channel_id,
+                applied: 0,
+                rendered: 0,
             });
         }
     }
@@ -25499,13 +25510,31 @@ impl Node {
                     // Preserve the last successful view during bounded Session catch-up.
                     // Actual I/O failure still poisons and follows existing recovery.
                     detail_failed(&mut ch, &error);
-                    let kept = self
+                    let mut kept = self
                         .fresh_details
                         .get(id)
                         .map(|(_, detail)| detail)
-                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
+                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id))
+                        .cloned();
+                    // A kept "not received yet" row is shown and counted only while its decision
+                    // stands now (ADR-036 H-4). That is a change of the timeline, so the display
+                    // revision moves with it, both ways: a client showing the kept page reads it
+                    // again (the terminal app reads its timeline again only then). The detail so
+                    // changed supersedes a fresh one.
+                    if let Some(detail) = kept.as_mut() {
+                        if let Some(stamp) = detail.display_stamp.owed_shown(ch.owed_rows_shown()) {
+                            detail.display_stamp = stamp;
+                            if !crate::node::channel::history::owed_display_unmoved() {
+                                detail.display_revision = self
+                                    .display_sequence
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            read.insert(*id);
+                        }
+                    }
                     // The rows as last published, with the detail kept or the summary kept.
                     let rows = kept
+                        .as_ref()
                         .map(|detail| detail.display_stamp.rows())
                         .or_else(|| {
                             prev.channels
@@ -25515,8 +25544,7 @@ impl Node {
                         })
                         .unwrap_or(0);
                     summaries.insert(*id, summary_of(&ch, rows));
-                    if let Some(detail) = kept {
-                        let mut detail = detail.clone();
+                    if let Some(mut detail) = kept {
                         detail.projection_failure = Some(error.to_string());
                         detail.history_read = ch.history_read_resource();
                         detail.history_read_revision = detail

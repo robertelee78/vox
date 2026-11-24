@@ -50,8 +50,47 @@
 //! 2. with Mallory his only source, Bob shows both posts as not received yet: the envelopes were
 //!    taken and Alice's feed goes on past the first (precondition: Bob completed a sync round
 //!    with Mallory while Alice was stopped, else PRODUCT (staging));
-//! 3. once Alice is back, Bob reads both, and shows nothing as not received yet;
-//! 4. and still reads them after his daemon restarts.
+//! 3. Bob's terminal app (his real `vox tui` in a pty, read through pyte,
+//!    `tests/pty/tui_marks_read.py`) shows Alice's first post, held and unread, beside the two
+//!    placeholders: his node marks the first post read (`vox room read --unread` no longer lists
+//!    it) while the placeholders are shown (a placeholder is not read; his node refuses a
+//!    read-mark batch naming one whole, which the act asks for over his control socket first and
+//!    quotes, so a terminal app that sent one would leave the first post unread);
+//! 4. once Alice is back, Bob reads both, and shows nothing as not received yet; Alice's node
+//!    says her first post is read by bob;
+//! 5. and still reads them after his daemon restarts.
+//!
+//! On the history path (rooms with authenticated history) the "not received yet" row is written
+//! with the entry's effect, where its text would have been shown, once Bob's own decision says the
+//! body is for him (ADR-036 H-4); before that change Bob took the envelope and showed nothing
+//! (ledger 74).
+//!
+//! ## A placeholder whose decision is open ([`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`])
+//! Carol's post is held stripped by Bob, and no running node holds its body. First, with nobody
+//! posting, Bob's terminal app shows it as not received yet; his fold is held while he takes
+//! Alice's rename of the room: once his read and status hide it, his terminal app does too. Then,
+//! his fold still held, Alice removes Bob and readmits him, so the post (written before his
+//! removal, never held) is outside his readmission cut: once his read says the room is still
+//! folding its control entries, no placeholder is shown or counted; released and restarted,
+//! still none.
+//!
+//! ## A body its only holder no longer keeps ([`a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet`])
+//! The honest case of the same rule (LS-33: a node ships no body it no longer holds). All run the
+//! shipped binary. The room keeps a week; Carol's node keeps a minute (`cfg/retention`, ADR-023
+//! decision 2). Bob is stopped, Alice posts, Carol takes it and a minute later lets its body go;
+//! Alice and the anchor are stopped and Bob resumed, so Carol, who serves the envelope and answers
+//! the body as not held, is his only holder.
+//!
+//! Carol stops showing the post when it expires (her read hides an expired row), and her node
+//! drops its body only at its retention worker's next prune; until then it still serves the text.
+//! So Bob is resumed only once Carol's `vox status --json` says she no longer holds the post: her
+//! `holds_through` of Alice, which had reached the post, falls below it. That is read from her
+//! rendered-message index, which the prune removes the row from in the same store batch that
+//! drops the body (APPARATUS when it does not, within the minute's bound). Asserted:
+//! 1. Bob shows Alice's post as not received yet, in its place right after her first, without its
+//!    text, and his `vox status --json` counts it as a row;
+//! 2. once Alice is back, Bob reads the post, shows it no longer as not received yet, and his row
+//!    count stays the same (the text took the placeholder's row).
 //!
 //! ## A member that terminated its feed and hides it ([`a_post_after_a_hidden_termination_is_never_shown`])
 //! ADR-053 MP-10 (c). Mallory first runs as an ordinary member (mode `correct`) and posts; then her
@@ -104,13 +143,28 @@
 //! - no binding check of a governance body (`VOX_PROOF_GOV_BINDING=unchecked`): the misbound arm
 //!   goes red at (1), Bob takes the grant;
 //! - `VOX_PROOF_TERMINATION=unchecked`: the hidden-termination arm goes red at (2);
-//! - `VOX_PROOF_TERMINATION=admitted`: the hidden-termination arm goes red at (1), non-citable.
+//! - `VOX_PROOF_TERMINATION=admitted`: the hidden-termination arm goes red at (1), non-citable;
+//! - `VOX_MUTANT_OWED_ROW=unwritten` (Bob's daemon gets `VOX_TEST_OWED_ROW=unwritten`: no "not
+//!   received yet" row is written for a body-less signed message): the stripped arm goes red at
+//!   (2), and the kept-less arm at (1);
+//! - `VOX_MUTANT_OWED_ROW=marked` (Bob's terminal app gets it: it submits placeholders with the
+//!   rest of what it showed): the stripped arm goes red at (3);
+//! - `VOX_MUTANT_OWED_ROW=undecided` (rows are shown while their decision is open): the
+//!   undecided arm goes red at (2), while held;
+//! - `VOX_MUTANT_OWED_ROW=unmoved` (while governance refreshes, hiding or showing a kept
+//!   placeholder does not move the room's display revision): the undecided arm goes red at (2),
+//!   bob's terminal app still showing the placeholder his read hides.
+//!
+//! Every owed-row mutant, the switch and its value, is checked for in the `vox` under test first
+//! (`test_knobs::require`): a `vox` that does not read it says CANNOT MEASURE.
 
 #![cfg(unix)]
 
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
 
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -200,6 +254,60 @@ fn owed_rows(m: &Member, room: &str) -> Vec<String> {
         .collect()
 }
 
+/// The rows `m` reports for `room` in `vox status --json` (`entries`): every row `vox room read`
+/// pages through, a message not received yet counting as its placeholder.
+fn room_rows(m: &Member, room: &str) -> Option<u64> {
+    m.status()["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
+}
+
+/// The "not received yet" mutants the runner may select with `VOX_MUTANT_OWED_ROW`, each given
+/// to the reader's daemon as `VOX_TEST_OWED_ROW` (`marked` to the reader's terminal app instead):
+/// `unwritten` (no row is written), `unchecked` (one for every body-less message), `undecided`
+/// (rows are shown while their decision is open), `marked` (the terminal app submits placeholders
+/// with its read marks), `unmoved` (hiding or showing a kept placeholder while governance
+/// refreshes does not move the room's display revision).
+const OWED_MUTANTS: [&str; 5] = ["unwritten", "unchecked", "undecided", "marked", "unmoved"];
+
+/// The runner's owed-row mutant, if it selected one. A `vox` that does not read the switch
+/// cannot run it: CANNOT MEASURE, never a green run of the unmutated product. Each owed-row act
+/// asks this first, before any staging (a Mac staging of a default `vox` stops sooner, at its
+/// private Keychain, without naming the switch).
+fn owed_mutant() -> Option<&'static str> {
+    let mode = std::env::var("VOX_MUTANT_OWED_ROW")
+        .ok()
+        .filter(|m| !m.is_empty())?;
+    let mode = OWED_MUTANTS
+        .into_iter()
+        .find(|m| *m == mode)
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE (precondition unmet): VOX_MUTANT_OWED_ROW={mode:?} names none of \
+                 this act's mutants {OWED_MUTANTS:?}"
+            )
+        });
+    test_knobs::require(&["VOX_TEST_OWED_ROW", mode]);
+    Some(mode)
+}
+
+/// The reader's daemon, given the runner's owed-row mutant ([`owed_mutant`]) as
+/// `VOX_TEST_OWED_ROW`. The runner's variable reaches no other daemon.
+fn reader_daemon(m: &Member, spec: &str) -> Proc {
+    reader_daemon_with(m, spec, &[])
+}
+
+/// [`reader_daemon`] with `env` too.
+fn reader_daemon_with(m: &Member, spec: &str, env: &[(&str, &str)]) -> Proc {
+    let mut env = env.to_vec();
+    if let Some(mode) = owed_mutant().filter(|mode| *mode != "marked") {
+        env.push(("VOX_TEST_OWED_ROW", mode));
+    }
+    m.daemon_with_anchor(Some(spec), &env)
+}
+
 /// The entry hash `m` shows `text` under in `room`, from the first column of `vox room read`.
 fn hash_of(m: &Member, room: &str, text: &str) -> Option<String> {
     let (_, out, _) = m.vox(&["room", "read", room], None);
@@ -256,6 +364,110 @@ fn set_aside(m: &Member) -> Vec<String> {
         .flat_map(|r| r["entries"].as_array().cloned().unwrap_or_default())
         .filter_map(|e| e.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Which of `texts` `m`'s node has unread in `room` (`vox room read --unread`, which marks
+/// nothing); `Err` quotes a read that failed.
+fn unread_of<'a>(m: &Member, room: &str, texts: &[&'a str]) -> Result<Vec<&'a str>, String> {
+    let (ok, out, err) = m.vox(&["room", "read", room, "--unread"], None);
+    if !ok {
+        return Err(format!("`vox room read --unread` failed: {out}{err}"));
+    }
+    Ok(texts
+        .iter()
+        .copied()
+        .filter(|t| out.lines().any(|l| l.ends_with(t)))
+        .collect())
+}
+
+/// `m`'s real `vox tui` (`tests/pty/tui_marks_read.py`, through pyte), on its attached node: it
+/// waits until the room's timeline shows `want` and a message not received yet, then stays open
+/// showing both until `marked` says the node took what it showed, at most [`ARRIVES_WITHIN`],
+/// and gives the screen it showed. The runner's `marked` mutant goes to the TUI only. A TUI that
+/// never showed both within the driver's bound is APPARATUS NO RESULT: its node showed both
+/// already, and elapsed time is no verdict on the TUI.
+fn terminal_marks(
+    m: &Member,
+    root: &std::path::Path,
+    want: &str,
+    mut marked: impl FnMut() -> bool,
+) -> String {
+    terminal(m, root, want, Duration::from_secs(120), |_| {
+        let t = Instant::now();
+        while t.elapsed() < ARRIVES_WITHIN && !marked() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    })
+}
+
+/// [`terminal_marks`]'s terminal app, kept open at most `keep` once it showed both, while
+/// `while_shown` runs with a reader of what its timeline shows now (`None` before the driver's
+/// first look); the screen it showed first.
+fn terminal(
+    m: &Member,
+    root: &std::path::Path,
+    want: &str,
+    keep: Duration,
+    while_shown: impl FnOnce(&dyn Fn() -> Option<String>),
+) -> String {
+    let cues = root.join(format!("{}-tui-cues", m.name));
+    std::fs::create_dir_all(&cues).expect("APPARATUS: could not make the TUI's cue directory");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_marks_read.py");
+    let args: Vec<String> = vec![
+        env!("CARGO_BIN_EXE_vox").to_owned(),
+        m.dir.to_string_lossy().into_owned(),
+        m.dir.join("cfg").to_string_lossy().into_owned(),
+        cues.to_string_lossy().into_owned(),
+        want.to_owned(),
+        m.name.to_owned(),
+        owed_mutant()
+            .filter(|mode| *mode == "marked")
+            .unwrap_or("-")
+            .to_owned(),
+        keep.as_secs().to_string(),
+    ];
+    // The driver's own budget grows by what `keep` adds to its default 120 s; so does its bound.
+    let bound = pty_driver::BOUND + keep.saturating_sub(Duration::from_secs(120));
+    let driver = std::thread::spawn(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        pty_driver::run_within(script, &args, bound)
+    });
+    // The driver cues `shown` once the timeline shows both, then waits for `done`.
+    while !cues.join("shown").exists() && !driver.is_finished() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let shown = cues.join("shown").exists();
+    if shown {
+        // The TUI stays open, drawing; the driver writes what its timeline shows on every look.
+        let screen = || std::fs::read_to_string(cues.join("screen")).ok();
+        while_shown(&screen);
+    }
+    std::fs::write(cues.join("done"), b"").expect("APPARATUS: could not cue the TUI driver");
+    let out = driver
+        .join()
+        .expect("APPARATUS: the TUI driver thread panicked");
+    let tag = format!("{} SHOWN:", m.name);
+    match (shown, out.code) {
+        _ if !out.has_verdict(m.name) => panic!(
+            "APPARATUS: the TUI driver for {} ended with no verdict (exit {:?}, stage {:?}): {}",
+            m.name, out.code, out.stage, out.stdout
+        ),
+        (true, Some(0)) => out
+            .stdout
+            .split_once(&tag)
+            .map_or_else(|| out.stdout.clone(), |(_, s)| s.to_owned()),
+        (false, Some(1)) if out.stdout.contains(" NO RESULT: ") => {
+            panic!(
+                "APPARATUS NO RESULT: {}'s terminal app: {}",
+                m.name, out.stdout
+            )
+        }
+        _ => panic!(
+            "APPARATUS: the TUI driver for {} ended without its verdict (exit {:?}, stage {:?}): \
+             {}",
+            m.name, out.code, out.stage, out.stdout
+        ),
+    }
 }
 
 #[test]
@@ -359,6 +571,7 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
 fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
     const MODE: &str = "strip-payload";
     watchdog::arm();
+    owed_mutant();
     let sender = mutant_sender();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
@@ -371,7 +584,7 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
         b.trust(a);
     }
     let alice_d = alice.daemon(Some(&spec));
-    let bob_d = bob.daemon(Some(&spec));
+    let bob_d = reader_daemon(&bob, &spec);
     let mallory_d = mallory.daemon_mutant(&sender, MODE, Some(&spec));
     let room = alice.create("stripped");
     let link = alice.invite(&room);
@@ -469,6 +682,52 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
         bob.vox(&["room", "read", &room], None).1
     );
 
+    // ---- bob's terminal app shows the room: what it showed is read, the placeholders aside --
+    // Alice's first post is held whole and unread (`vox room read` marks nothing); her two later
+    // posts are shown as not received yet beside it.
+    assert_eq!(
+        unread_of(&bob, &room, &[warm]),
+        Ok(vec![warm]),
+        "PRODUCT (staging): bob's node does not have alice's first post unread before his \
+         terminal app shows it"
+    );
+    // What a client that names every row it shows asks for: bob's node refuses the batch whole
+    // (`pending_text/read.rs`), so it marks nothing of it.
+    let refused = {
+        let mut reader = bob.reader();
+        let id = reader.room(&room);
+        let rows = reader.rows(id);
+        reader.mark_read(id, rows.iter().map(|r| r.entry_hash).collect())
+    };
+    println!(
+        "[proof] stripped: a read-mark batch of every row bob's node shows, placeholders \
+         included, is answered {refused:?}"
+    );
+    assert!(
+        matches!(refused, vox_core::node::ipc::Frame::Error { .. })
+            && unread_of(&bob, &room, &[warm]) == Ok(vec![warm]),
+        "CANNOT MEASURE: bob's node took a read-mark batch naming a message not received yet \
+         ({refused:?}), so a terminal app that sends one is not refused"
+    );
+    let shown = terminal_marks(&bob, root, warm, || {
+        unread_of(&bob, &room, &[warm]) == Ok(Vec::new())
+    });
+    println!("[proof] stripped: bob's terminal app showed:\n{shown}");
+    let still = unread_of(&bob, &room, &[warm]);
+    println!(
+        "[proof] stripped: once bob's terminal app showed alice's first post beside {} \
+         placeholders, his node has it unread: {still:?}",
+        posts.len()
+    );
+    assert_eq!(
+        still,
+        Ok(Vec::new()),
+        "PRODUCT: bob's terminal app showed alice's first post beside her posts not received \
+         yet, and his node still has it unread {ARRIVES_WITHIN:?} later: the read marks of what \
+         it showed were not taken (his node answers a batch naming a message not received yet \
+         {refused:?})"
+    );
+
     // ---- alice comes back: bob asks again and gets her posts whole --------------------------
     signal_took(&alice_d, "-CONT", "alice");
     signal_took(&anchor_d, "-CONT", "the anchor");
@@ -495,8 +754,32 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
          bob reads: {:?}",
         bob.vox(&["room", "read", &room], None).1
     );
+    // Alice, back, sees bob's read record for the post his terminal app showed him.
+    let read_by = |m: &Member| -> Vec<String> {
+        let (_, out, _) = m.vox(&["room", "read", &room, "--json"], None);
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|row| row["text"] == warm)
+            .and_then(|row| row["read_by"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let t = Instant::now();
+    let mut readers = read_by(&alice);
+    while t.elapsed() < ARRIVES_WITHIN && !readers.iter().any(|r| r == "bob") {
+        std::thread::sleep(Duration::from_millis(250));
+        readers = read_by(&alice);
+    }
+    println!("[proof] stripped: alice's node says her first post is read by {readers:?}");
+    assert!(
+        readers.iter().any(|r| r == "bob"),
+        "PRODUCT: bob's terminal app showed alice's first post and his node marked it read, and \
+         alice's node never says it is read by bob within {ARRIVES_WITHIN:?}: {readers:?}"
+    );
     drop(bob_d);
-    let _bob_d = bob.daemon(Some(&spec));
+    let _bob_d = reader_daemon(&bob, &spec);
     let reopened = arrives(&bob, &room, posts[1]);
     println!("[proof] stripped: after a restart bob reads it: {reopened:?}");
     if let Err(e) = &reopened {
@@ -506,6 +789,771 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
             bob.status()
         );
     }
+}
+
+/// Over three more completed sync rounds of `m` toward `peer`, `seen()` names nothing; else the
+/// first thing it named, once three more rounds have completed after it. Rounds that never
+/// complete within 600 s is APPARATUS NO RESULT.
+fn none_over_rounds(
+    m: &Member,
+    peer: &Member,
+    phase: &str,
+    mut seen: impl FnMut() -> Option<String>,
+) -> Option<String> {
+    let first = rounds_toward(&m.status(), peer);
+    let started = Instant::now();
+    let mut red: Option<(String, u64)> = None;
+    loop {
+        let rounds = rounds_toward(&m.status(), peer);
+        if red.is_none() {
+            red = seen().map(|what| (what, rounds));
+        }
+        match &red {
+            Some((what, at)) if rounds >= at + 3 => return Some(what.clone()),
+            None if rounds >= first + 3 => return None,
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT ({phase}): in 600 s {}'s rounds toward {} went {first} -> \
+             {rounds}, fewer than three more",
+            m.name,
+            peer.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// What `vox room read` says before its rows while the node holds a control entry its governance
+/// fold has not folded yet (`vox-tui` `room_cli.rs`, ADR-037 R3): its page is provisional.
+const STILL_FOLDING: &str = "this room is still folding its control entries";
+
+/// Carol's post that bob holds whole, beside which his terminal app shows her post not received
+/// yet ([`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`]).
+const SCREEN_WANT: &str = "carol, while everyone is up";
+
+/// Until `done()` says so, or `n` more of `m`'s sync rounds toward `peer` have completed: whether
+/// it said so. Rounds that do not complete within 600 s: `Err`, APPARATUS NO RESULT.
+fn within_rounds(
+    m: &Member,
+    peer: &Member,
+    n: u64,
+    phase: &str,
+    mut done: impl FnMut() -> bool,
+) -> Result<bool, String> {
+    let first = rounds_toward(&m.status(), peer);
+    let started = Instant::now();
+    loop {
+        let rounds = rounds_toward(&m.status(), peer);
+        if done() {
+            return Ok(true);
+        }
+        if rounds >= first + n {
+            return Ok(false);
+        }
+        if started.elapsed() >= Duration::from_secs(600) {
+            return Err(format!(
+                "APPARATUS NO RESULT ({phase}): in 600 s {}'s rounds toward {} went {first} -> \
+                 {rounds}, fewer than {n} more",
+                m.name, peer.name
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Step (2) of [`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`], while bob's
+/// terminal app shows carol's post `hash` as not received yet beside [`SCREEN_WANT`] (`screen`:
+/// what its timeline shows now). Nobody posts; bob's fold stays held. `Err`: the red, labelled.
+fn leaves_the_screen_while_held(
+    alice: &Member,
+    bob: &Member,
+    room: &str,
+    hash: &str,
+    hold: &std::path::Path,
+    rows_with: Option<u64>,
+    screen: &dyn Fn() -> Option<String>,
+) -> Result<(), String> {
+    use vox_core::node::api::NOT_RECEIVED_YET;
+    // A timeline that does not show carol's post held whole is no answer.
+    let gone =
+        || screen().is_some_and(|s| s.contains(SCREEN_WANT) && !s.contains(NOT_RECEIVED_YET));
+    let now = || screen().unwrap_or_default();
+    // Held: alice renames the room, a governance entry that changes nothing of carol's post for
+    // bob, and bob takes it without folding it.
+    std::fs::write(hold, b"hold").map_err(|e| format!("APPARATUS: could not arm the hold: {e}"))?;
+    let (ok, out, err) = admin(alice, &["room", "rename", room, "undecided-held"]);
+    if !ok {
+        return Err(format!(
+            "PRODUCT (staging): alice's `vox room rename` failed: {out}{err}"
+        ));
+    }
+    let started = Instant::now();
+    loop {
+        let (ok, out, err) = bob.vox(&["room", "read", room], None);
+        if ok && err.contains(STILL_FOLDING) {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(600) {
+            return Err(format!(
+                "APPARATUS NO RESULT: in 600 s bob's read never said {STILL_FOLDING:?} (alice's \
+                 rename, his fold held); last read: {}",
+                format!("{out}{err}").trim()
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let mut last = None;
+    let hidden = within_rounds(bob, alice, 3, "held, read", || {
+        let read = read_rows(bob, room);
+        let counted = room_rows(bob, room);
+        let hidden = read
+            .as_ref()
+            .is_ok_and(|(owed, _, _)| !owed.iter().any(|h| h == hash))
+            && counted.is_some_and(|rows| Some(rows) < rows_with);
+        last = Some((read, counted));
+        hidden
+    })?;
+    if !hidden {
+        return Err(format!(
+            "PRODUCT: a placeholder whose decision is open is shown: over three rounds toward \
+             alice with her rename unfolded (his fold held), bob's read and status still show \
+             carol's post as not received yet (with the placeholder: {rows_with:?} rows): \
+             {last:?}"
+        ));
+    }
+    println!("[proof] undecided: held, bob's read and status hide it: {last:?}");
+    let gone = within_rounds(bob, alice, 10, "held, screen", gone)?;
+    println!(
+        "[proof] undecided: held, bob's terminal app shows:\n{}",
+        now()
+    );
+    if !gone {
+        return Err(format!(
+            "PRODUCT: bob's read and status no longer show carol's post as not received yet (his \
+             governance refreshing, nobody posting), and over 10 more of his completed rounds \
+             toward alice his terminal app still shows it:\n{}",
+            now()
+        ));
+    }
+    Ok(())
+}
+
+/// `m`'s `vox room read` of `room` now: the entry hashes it shows as not received yet, the rows
+/// it shows, and the read itself. `Err` quotes a read that failed: never taken for "nothing
+/// shown".
+fn read_rows(m: &Member, room: &str) -> Result<(Vec<String>, u64, String), String> {
+    let (ok, out, err) = m.vox(&["room", "read", room], None);
+    if !ok {
+        return Err(format!(
+            "`vox room read` failed: {}",
+            format!("{out}{err}").trim()
+        ));
+    }
+    // A row is `<entry> <author> <text>`; a notice (`! …`) is not.
+    let rows: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            l.split(' ').next().is_some_and(|first| {
+                first.len() >= 8 && first.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+        })
+        .collect();
+    let owed = rows
+        .iter()
+        .filter(|l| l.ends_with(vox_core::node::api::NOT_RECEIVED_YET))
+        .filter_map(|l| l.split(' ').next().map(str::to_owned))
+        .collect();
+    Ok((owed, rows.len() as u64, out))
+}
+
+/// Wait until `m` shows `hash` as not received yet, or 30 more of its sync rounds toward `source`
+/// (the only holder of the envelope it can reach) have completed; its last read either way, for
+/// the caller's verdict. Rounds that do not complete within 600 s is APPARATUS NO RESULT. (A
+/// body-less entry does not advance a reader's verified prefix of its author, so no status count
+/// says the envelope was taken: the row is the witness.)
+fn shows_owed(
+    m: &Member,
+    room: &str,
+    hash: &str,
+    source: &Member,
+) -> Result<(Vec<String>, u64, String), String> {
+    let started = Instant::now();
+    let from = rounds_toward(&m.status(), source);
+    loop {
+        let read = read_rows(m, room);
+        let rounds = rounds_toward(&m.status(), source);
+        if read
+            .as_ref()
+            .is_ok_and(|(owed, _, _)| owed.iter().any(|h| h == hash))
+            || rounds >= from + 30
+        {
+            return read;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT: in 600 s {}'s rounds toward {} went {from} -> {rounds}, fewer \
+             than 30; its sync with {}: {}",
+            m.name,
+            source.name,
+            source.name,
+            sync_with(m, source)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `m`'s `vox status --json` sync rows for `peer` (counts, failures, last failure, backoff), as
+/// the product says them: what a staging stop quotes.
+fn sync_with(m: &Member, peer: &Member) -> String {
+    let status = m.status();
+    let rows: Vec<&serde_json::Value> = status["sync"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| {
+                    r["peer"]
+                        .as_str()
+                        .is_some_and(|x| peer.fp.starts_with(x) || x.starts_with(&peer.fp))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&rows).unwrap_or_default()
+}
+
+/// After a verdict: `m`'s `vox status --json` counts exactly the rows its read shows.
+fn counts_what_it_shows(m: &Member, room: &str, arm: &str) {
+    let read = read_rows(m, room);
+    let counted = room_rows(m, room);
+    println!("[proof] {arm}: bob's status counts {counted:?} rows; his read: {read:?}");
+    match read {
+        Ok((_, shown, out)) => assert_eq!(
+            counted,
+            Some(shown),
+            "PRODUCT: bob's `vox status --json` counts {counted:?} rows of the room, and his read \
+             shows {shown}:\n{out}"
+        ),
+        Err(e) => panic!("PRODUCT: bob's read failed after the verdict: {e}"),
+    }
+}
+
+/// Retry an admin verb the product answers with its explicit "made no change, still applying"
+/// instruction, for up to a minute; the last answer.
+fn admin(m: &Member, args: &[&str]) -> (bool, String, String) {
+    let t = Instant::now();
+    loop {
+        let (ok, out, err) = m.vox(args, None);
+        let said = format!("{out}\n{err}");
+        let unchanged = said.contains(
+            "a previous change to this room is still being applied; this request made no change",
+        ) || said
+            .contains(vox_core::node::api::Fault::GovernanceRefreshing.explain());
+        if ok || !unchanged || t.elapsed() >= Duration::from_secs(60) {
+            return (ok, out, err);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait until `m`'s `vox room roster` lists `who` (`listed`) or does not; a red when it never
+/// does within [`ARRIVES_WITHIN`].
+fn roster_lists(m: &Member, room: &str, who: &Member, listed: bool, what: &str) {
+    let t = Instant::now();
+    loop {
+        let (ok, out, err) = m.vox(&["room", "roster", room], None);
+        if ok && out.contains(&who.fp) == listed {
+            return;
+        }
+        assert!(
+            t.elapsed() < ARRIVES_WITHIN,
+            "PRODUCT (staging): {}'s roster never {what} {}: {out}{err}",
+            m.name,
+            who.name
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// End `p` as a person quits it (SIGTERM), waiting for it to exit.
+fn quit(mut p: Proc, who: &str) {
+    p.signal("-TERM");
+    let t = Instant::now();
+    while !p.state().starts_with("it exited") {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "APPARATUS: {who}'s daemon did not exit within 60 s of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// ADR-036 H-4: a placeholder whose decision is open is not shown. Alice (the room's admin),
+/// carol, mallory (`strip-payload`) and bob, whose daemon reads `VOX_TEST_FOLD_HOLD_FILE` (a
+/// `test-knobs` build). Carol posts while bob, alice and the anchor are stopped; mallory takes
+/// it; carol's daemon ends for good; bob is resumed and takes it from mallory stripped. No node
+/// that runs again holds its body. Asserted on bob:
+/// 1. staging: within 30 of mallory's completed rounds toward carol she reads carol's post, and
+///    within 30 of bob's completed rounds toward mallory his read shows it as not received yet
+///    and his status counts it (else PRODUCT (staging), quoting the sync rows; rounds that do not
+///    complete: APPARATUS NO RESULT);
+/// 2. on bob's screen, nobody posting: his terminal app (`tests/pty/tui_marks_read.py`) shows
+///    carol's post as not received yet beside her post he holds; alice and the anchor resume
+///    (neither holds the body), bob's fold is held and alice renames the room. Once his read says
+///    the room is still folding, within three completed rounds toward alice his read and status
+///    hide the placeholder, and within ten more his terminal app does. His fold stays held;
+/// 3. with bob and mallory stopped, alice removes bob and readmits him: a body written before
+///    his removal that he never held is outside his readmission cut, not for him (ADR-053
+///    MP-10). He is resumed;
+/// 4. once his own read says the room is still folding control entries it holds (alice's rename,
+///    removal and readmission of him, unfolded: his verified prefix of alice does not pass an
+///    entry his held fold has not decided, so it is no witness), over three completed rounds
+///    toward alice he shows no placeholder for carol's post and does not count one;
+/// 5. the hold released and his daemon restarted (a released hold does not wake a held fold by
+///    itself, `governance.rs`, `advance`): once he reads alice's post made after his readmission,
+///    over three more rounds he still shows none, and his status counts exactly the rows his
+///    read shows.
+///
+/// RED at (2) when a row whose decision is open is still shown, in his read or status
+/// (`VOX_MUTANT_OWED_ROW=undecided`), or on his screen once his read hides it
+/// (`VOX_MUTANT_OWED_ROW=unmoved`).
+#[test]
+#[ignore = "real daemons against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
+fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
+    const MODE: &str = "strip-payload";
+    watchdog::arm();
+    owed_mutant();
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
+    let sender = mutant_sender();
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    // The daemons' own logs stay for a diagnosis when the runner asks (`VOX_PROOF_KEEP_DIRS`).
+    tmp.disable_cleanup(std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some());
+    let root = tmp.path();
+    let (anchor_d, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let carol = Member::new(root, "carol");
+    let mallory = Member::new(root, "mallory");
+    for (a, b) in [
+        (&alice, &bob),
+        (&alice, &carol),
+        (&alice, &mallory),
+        (&bob, &carol),
+        (&bob, &mallory),
+        (&carol, &mallory),
+    ] {
+        a.trust(b);
+        b.trust(a);
+    }
+    let hold = root.join("bob-fold-hold");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 hold path")
+        .to_owned();
+    let alice_d = alice.daemon(Some(&spec));
+    let bob_d = reader_daemon_with(&bob, &spec, &[("VOX_TEST_FOLD_HOLD_FILE", &hold_path)]);
+    let carol_d = carol.daemon(Some(&spec));
+    let mallory_d = mallory.daemon_mutant(&sender, MODE, Some(&spec));
+    let room = alice.create("undecided");
+    let link = alice.invite(&room);
+    bob.join(&link, "undecided");
+    carol.join(&link, "undecided");
+    mallory.join(&link, "undecided");
+    // Each author posts first while everyone is up, so the post bob later takes only from mallory
+    // is not her first: with no earlier post taken whole, his verified prefix of her stays below it.
+    for (author, warm) in [
+        (&alice, "alice, while everyone is up"),
+        (&carol, SCREEN_WANT),
+    ] {
+        author.post(&room, warm);
+        for m in [&alice, &bob, &carol, &mallory] {
+            if let Err(e) = arrives(m, &room, warm) {
+                panic!("PRODUCT (staging): {} never read {warm:?} ({e})", m.name);
+            }
+        }
+    }
+
+    // ---- (1) carol's post, whose body only she and mallory hold -------------------------------
+    signal_took(&bob_d, "-STOP", "bob");
+    signal_took(&alice_d, "-STOP", "alice");
+    signal_took(&anchor_d, "-STOP", "the anchor");
+    let posted = "carol, before bob's removal";
+    carol.post(&room, posted);
+    // Staging: mallory takes carol's post from carol directly (both run; the others are stopped
+    // and hang rather than refuse), waited on by mallory's completed rounds toward carol.
+    match within_rounds(&mallory, &carol, 30, "staging, mallory", || {
+        reads(&mallory, &room, posted).unwrap_or(false)
+    }) {
+        Ok(true) => {}
+        Ok(false) => panic!(
+            "PRODUCT (staging): over 30 of mallory's completed rounds toward carol, both running \
+             and trusting each other, she does not read carol's post; mallory's sync with carol: \
+             {}",
+            sync_with(&mallory, &carol)
+        ),
+        Err(e) => panic!(
+            "{e}; mallory's sync with carol: {}",
+            sync_with(&mallory, &carol)
+        ),
+    }
+    let hc =
+        hash_of(&carol, &room, posted).expect("PRODUCT (staging): carol's read lacks her post");
+    drop(carol_d);
+    signal_took(&bob_d, "-CONT", "bob");
+    let seen = shows_owed(&bob, &room, &hc, &mallory);
+    assert!(
+        announced(&mallory_d, MODE),
+        "APPARATUS (the mutant peer): mallory's daemon never announced {MODE:?}:\n{}",
+        mallory_d.transcript()
+    );
+    let rows_with = room_rows(&bob, &room);
+    println!("[proof] undecided: bob's read: {seen:?}; his status counts {rows_with:?} rows");
+    match &seen {
+        Ok((owed, _, _)) if owed.contains(&hc) && rows_with.is_some() => {}
+        _ => panic!(
+            "PRODUCT (staging): over 30 of his completed rounds toward mallory, his only source, \
+             bob does not show carol's stripped post as not received yet, or his status counts no \
+             rows ({rows_with:?}): {seen:?}; bob's sync with mallory: {}",
+            sync_with(&bob, &mallory)
+        ),
+    }
+
+    // ---- (2) on bob's screen: held, the placeholder goes with nobody posting -------------------
+    // Nobody posts in this phase. Alice and the anchor resume; neither holds the body (both were
+    // stopped while carol posted, and carol's daemon is gone).
+    signal_took(&alice_d, "-CONT", "alice");
+    signal_took(&anchor_d, "-CONT", "the anchor");
+    let mut verdict = Ok(());
+    let first = terminal(
+        &bob,
+        root,
+        SCREEN_WANT,
+        Duration::from_secs(900),
+        |screen| {
+            verdict =
+                leaves_the_screen_while_held(&alice, &bob, &room, &hc, &hold, rows_with, screen);
+        },
+    );
+    println!("[proof] undecided: bob's terminal app showed first:\n{first}");
+    if let Err(red) = verdict {
+        panic!("{red}");
+    }
+
+    // ---- (3) alice removes bob and readmits him -----------------------------------------------
+    signal_took(&bob_d, "-STOP", "bob");
+    signal_took(&mallory_d, "-STOP", "mallory");
+    for (verb, listed, what) in [
+        ("remove-member", false, "stopped listing"),
+        ("readmit-member", true, "listed again"),
+    ] {
+        let (ok, out, err) = admin(&alice, &["room", verb, &room, &bob.fp]);
+        assert!(
+            ok,
+            "PRODUCT (staging): alice's `vox room {verb}` of bob failed: {out}{err}"
+        );
+        roster_lists(&alice, &room, &bob, listed, what);
+    }
+    // Bob's fold is still held from (2), alice's rename unfolded.
+    signal_took(&bob_d, "-CONT", "bob");
+
+    // ---- (4) held: bob holds alice's removal and readmission of him, unfolded ---------------------
+    let started = Instant::now();
+    loop {
+        let (ok, out, err) = bob.vox(&["room", "read", &room], None);
+        if ok && err.contains(STILL_FOLDING) {
+            println!("[proof] undecided: held, bob's read says {STILL_FOLDING:?}:\n{out}");
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT: in 600 s bob's read never said {STILL_FOLDING:?} (alice's \
+             removal and readmission of him, his fold held); last read: {}\nbob's status: {}",
+            format!("{out}{err}").trim(),
+            bob.status()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let mut worked = (0u32, None);
+    let red = none_over_rounds(&bob, &alice, "held", || {
+        let counted = room_rows(&bob, &room);
+        let read = read_rows(&bob, &room);
+        match &read {
+            Ok(_) => worked.0 += 1,
+            Err(e) => worked.1 = Some(e.clone()),
+        }
+        let shown = read.as_ref().is_ok_and(|(owed, _, _)| owed.contains(&hc));
+        (shown || counted.is_some_and(|rows| Some(rows) >= rows_with)).then(|| {
+            format!(
+                "while bob's governance is held with alice's removal and readmission of him \
+                 unfolded, he shows carol's post as not received yet: {shown}; his status counts \
+                 {counted:?} rows (with the placeholder: {rows_with:?})\nbob's read: {read:?}"
+            )
+        })
+    });
+    println!(
+        "[proof] undecided: held, over three rounds toward alice ({} reads worked, last failure \
+         {:?}): {}",
+        worked.0,
+        worked.1,
+        red.as_deref().unwrap_or("no placeholder shown or counted")
+    );
+    if let Some(red) = red {
+        panic!("PRODUCT: a placeholder whose decision is open is shown: {red}");
+    }
+    assert!(
+        worked.0 > 0,
+        "CANNOT MEASURE: no `vox room read` of bob's worked while his fold was held: {:?}",
+        worked.1
+    );
+
+    // ---- (5) released: decided, carol's post is not for bob ------------------------------------
+    std::fs::remove_file(&hold).expect("APPARATUS: could not release bob's fold hold");
+    quit(bob_d, "bob");
+    let _bob_d = reader_daemon(&bob, &spec);
+    let after = "alice, after bob's readmission";
+    let started = Instant::now();
+    loop {
+        alice.post(&room, after);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) && !reads(&bob, &room, after).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if reads(&bob, &room, after).unwrap_or(false) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "APPARATUS NO RESULT: in 300 s after the hold, bob never read alice's post made after \
+             his readmission\nbob's status: {}",
+            bob.status()
+        );
+    }
+    let red = none_over_rounds(&bob, &alice, "released", || match read_rows(&bob, &room) {
+        Err(e) => Some(format!("bob's read failed: {e}")),
+        Ok((owed, _, out)) => owed.contains(&hc).then(|| {
+            format!(
+                "once decided, bob shows carol's post, outside his readmission cut, as not \
+                 received yet\nbob reads:\n{out}"
+            )
+        }),
+    });
+    println!(
+        "[proof] undecided: released, over three rounds toward alice: {}",
+        red.as_deref().unwrap_or("no placeholder shown")
+    );
+    if let Some(red) = red {
+        panic!("PRODUCT: {red}");
+    }
+    counts_what_it_shows(&bob, &room, "undecided");
+    drop(mallory_d);
+}
+
+/// How long a node that keeps a minute may take to let a message go: stop showing it, and drop
+/// its body.
+const KEPT_A_MINUTE_GOES_WITHIN: Duration = Duration::from_secs(150);
+
+/// The latest position of `of`'s feed that `m` holds a message of, as `m`'s `vox status --json`
+/// says (`holds_through`, `Channel::holds_through`): read from `m`'s rendered-message index, which
+/// a retention prune removes a message from in the same store batch that drops its body
+/// (`channel/pending_retention.rs`, `Step::Prune`). `m`'s read hides an expired message before
+/// that; this does not.
+fn holds_through(m: &Member, room: &str, of: &Member) -> Option<u64> {
+    member_row(&m.status(), room, of)["holds_through"].as_u64()
+}
+
+#[test]
+#[ignore = "real daemons and an anchor, a node that keeps a minute (about four minutes); CI runs it in release"]
+fn a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet() {
+    watchdog::arm();
+    owed_mutant();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let root = tmp.path();
+    let (anchor_d, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let carol = Member::new(root, "carol");
+    for (a, b) in [(&alice, &bob), (&alice, &carol), (&bob, &carol)] {
+        a.trust(b);
+        b.trust(a);
+    }
+    // Carol's node keeps a minute, whatever the room keeps (ADR-023 decision 2).
+    std::fs::write(carol.dir.join("cfg").join("retention"), "default 60\n")
+        .expect("APPARATUS: carol's node retention file");
+    let alice_d = alice.daemon(Some(&spec));
+    let bob_d = reader_daemon(&bob, &spec);
+    let _carol_d = carol.daemon(Some(&spec));
+    let room = alice.create("kept-less");
+    let (ok, out, err) = alice.vox(&["room", "retention", &room, "1w"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's vox room retention 1w: {out}{err}"
+    );
+    let link = alice.invite(&room);
+    bob.join(&link, "kept-less");
+    carol.join(&link, "kept-less");
+    let warm = "alice, while everyone is up";
+    alice.post(&room, warm);
+    for m in [&bob, &carol] {
+        if let Err(e) = arrives(m, &room, warm) {
+            panic!(
+                "PRODUCT (staging): {} never read alice's first post: {e}",
+                m.name
+            );
+        }
+    }
+    let rows_before = room_rows(&bob, &room);
+    // Alice's own latest message, her first post: what she holds of her feed by her status.
+    let warm_at = holds_through(&alice, &room, &alice).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT (staging): alice's `vox status --json` names no message of her own feed she \
+             holds, after posting: {}",
+            alice.status()
+        )
+    });
+
+    // ---- bob is away; alice posts; carol takes it and, a minute later, lets its body go ----
+    signal_took(&bob_d, "-STOP", "bob");
+    let post = "alice, while bob was away";
+    alice.post(&room, post);
+    if let Err(e) = arrives(&carol, &room, post) {
+        panic!("PRODUCT (staging): carol never read alice's post: {e}");
+    }
+    let hash = hash_of(&alice, &room, post)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's own read does not show her post"));
+    // The post's position in alice's feed: her latest message once her status is past her first.
+    let t = Instant::now();
+    let post_at = loop {
+        match holds_through(&alice, &room, &alice) {
+            Some(n) if n > warm_at => break n,
+            through if t.elapsed() >= ARRIVES_WITHIN => panic!(
+                "PRODUCT (staging): alice reads her post, and her `vox status --json` still names \
+                 her first as the latest message she holds of her feed after {ARRIVES_WITHIN:?} \
+                 (holds_through {through:?}, her first at {warm_at})"
+            ),
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    };
+    // Carol stops showing the post when it expires; her node drops its body at its retention
+    // worker's next prune, and serves the text until then. Bob is resumed only after that: once
+    // her status, having said she holds alice's feed through the post, says she holds less.
+    let t = Instant::now();
+    let mut held = false;
+    let mut hidden = None;
+    let (shown_until, at_hide, gone, through) = loop {
+        let through = holds_through(&carol, &room, &alice);
+        held |= through == Some(post_at);
+        if hidden.is_none() {
+            match reads(&carol, &room, post) {
+                Ok(false) => hidden = Some((t.elapsed(), through)),
+                Ok(true) => {}
+                Err(e) => panic!("PRODUCT (staging): carol's read failed: {e}"),
+            }
+        }
+        if let Some((at, at_hide)) = hidden.filter(|_| held && through.is_none_or(|n| n < post_at))
+        {
+            break (at, at_hide, t.elapsed(), through);
+        }
+        if t.elapsed() >= KEPT_A_MINUTE_GOES_WITHIN {
+            match hidden {
+                None => panic!(
+                    "PRODUCT (staging): carol's node keeps a minute and still shows alice's post \
+                     after {} s",
+                    t.elapsed().as_secs()
+                ),
+                Some((at, _)) if held => panic!(
+                    "APPARATUS: carol stopped showing alice's post {} s after she read it, and {} \
+                     s after, her `vox status --json` still says she holds alice's feed through \
+                     it (holds_through {through:?}, the post at {post_at}): her node has not \
+                     dropped its body, so bob cannot be resumed with carol not holding it",
+                    at.as_secs(),
+                    t.elapsed().as_secs()
+                ),
+                Some(_) => panic!(
+                    "APPARATUS: carol's `vox status --json` never said she holds alice's feed \
+                     through the post in {} s (holds_through {through:?}, the post at \
+                     {post_at}), so whether her node dropped its body cannot be seen",
+                    t.elapsed().as_secs()
+                ),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    println!(
+        "[proof] kept less: carol stopped showing alice's post {:.1} s after she read it, her \
+         status then holding alice's feed through {at_hide:?} (the post at {post_at}); her node \
+         dropped its body {:.1} s after she read it (holds_through {through:?}): it held the text \
+         {:.1} s after it no longer showed it",
+        shown_until.as_secs_f64(),
+        gone.as_secs_f64(),
+        gone.saturating_sub(shown_until).as_secs_f64()
+    );
+    // Alice and the anchor hold the body; with both stopped, carol is bob's only holder.
+    signal_took(&alice_d, "-STOP", "alice");
+    signal_took(&anchor_d, "-STOP", "the anchor");
+    signal_took(&bob_d, "-CONT", "bob");
+
+    // ---- bob shows it in place as not received yet, and counts it ---------------------------
+    let t = Instant::now();
+    let mut owed = false;
+    while t.elapsed() < ARRIVES_WITHIN * 2 {
+        owed = owed_rows(&bob, &room).contains(&hash);
+        if owed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (_, shown, _) = bob.vox(&["room", "read", &room], None);
+    assert!(
+        owed,
+        "PRODUCT: carol, bob's only holder, no longer keeps the body of alice's post, which has \
+         not expired for bob (the room keeps a week), and bob does not show it as not received \
+         yet\nbob reads: {shown:?}\nbob's status: {}",
+        bob.status()
+    );
+    let lines: Vec<&str> = shown.lines().collect();
+    let at_warm = lines.iter().position(|l| l.ends_with(warm));
+    let at_owed = lines.iter().position(|l| l.starts_with(hash.as_str()));
+    assert!(
+        matches!((at_warm, at_owed), (Some(w), Some(o)) if o == w + 1),
+        "PRODUCT: bob does not show alice's post as not received yet in its place, right after \
+         her first: {shown:?}"
+    );
+    assert!(
+        !shown.contains(post),
+        "PRODUCT: bob shows the text of a post whose body never reached him: {shown:?}"
+    );
+    let rows_owed = room_rows(&bob, &room);
+    assert_eq!(
+        rows_owed,
+        rows_before.map(|n| n + 1),
+        "PRODUCT: bob's `vox status` does not count the post not received yet as a row ({rows_before:?} before)"
+    );
+    println!(
+        "[proof] kept less: with carol his only holder, bob shows alice's post as not received \
+         yet in its place; rows {rows_before:?} -> {rows_owed:?}"
+    );
+
+    // ---- alice comes back: bob asks again and shows the text in its place --------------------
+    signal_took(&alice_d, "-CONT", "alice");
+    signal_took(&anchor_d, "-CONT", "the anchor");
+    if let Err(e) = arrives(&bob, &room, post) {
+        panic!(
+            "PRODUCT: bob never read alice's post once she was back ({e}): the body he was owed \
+             was not asked for again\nbob reads: {:?}",
+            bob.vox(&["room", "read", &room], None).1
+        );
+    }
+    let (_, shown, _) = bob.vox(&["room", "read", &room], None);
+    assert!(
+        !owed_rows(&bob, &room).contains(&hash),
+        "PRODUCT: bob reads alice's post and still shows it as not received yet: {shown:?}"
+    );
+    assert_eq!(
+        room_rows(&bob, &room),
+        rows_owed,
+        "PRODUCT: the text took the placeholder's row, so bob's row count must not change: {shown:?}"
+    );
+    println!("[proof] kept less: alice back, bob reads her post in its place:\n{shown}");
 }
 
 #[test]

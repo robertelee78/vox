@@ -1006,7 +1006,9 @@ impl Value {
                 6 => Ok(Self::Operation(render_facts::OperationFact::read(d)?)),
                 _ => Err(invalid("entry page value kind")),
             },
-            6 if d.uint()? == 5 => Ok(Self::Retained(retention_facts::read_fact(d)?)),
+            arity @ (6 | 7) if d.uint()? == 5 => {
+                Ok(Self::Retained(retention_facts::read_fact(d, arity)?))
+            }
             _ => Err(invalid("entry page value kind")),
         }
     }

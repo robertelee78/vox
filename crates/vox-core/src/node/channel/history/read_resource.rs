@@ -33,6 +33,9 @@ pub(super) struct ReadFacts {
     consent: Option<Arc<governance::ConsentFacts>>,
     governance_ready: bool,
     governance_until: u64,
+    /// Every "not received yet" row was decided under the governance now current
+    /// (`ChannelState::owed_decided`); the reader also needs governance current at read time.
+    pub owed_shown: bool,
 }
 impl ReadFacts {
     pub(super) fn capture(ch: &ChannelState) -> Self {
@@ -71,6 +74,7 @@ impl ReadFacts {
             consent: ch.consent_facts().ok(),
             governance_ready: ch.governance_ready,
             governance_until: ch.governance_display.valid_until,
+            owed_shown: ch.governance_ready && ch.owed_decided.shown(),
         }
     }
     pub(super) fn channel_id(&self) -> &Digest32 {
@@ -126,6 +130,7 @@ impl ReadFacts {
             && self.legacy_cache_trusted == other.legacy_cache_trusted
             && self.governance_ready == other.governance_ready
             && self.governance_until == other.governance_until
+            && self.owed_shown == other.owed_shown
             && match (&self.consent, &other.consent) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
@@ -331,6 +336,7 @@ impl ReadResource {
             || facts.members != members
             || facts.governance_ready != ch.governance_ready
             || facts.governance_until != ch.governance_display.valid_until
+            || facts.owed_shown != (ch.governance_ready && ch.owed_decided.shown())
             || !same_consent
             || trusted.is_some_and(|trusted| facts.legacy_cache_trusted.as_ref() != Some(trusted));
         facts.retention = retention;
@@ -341,6 +347,7 @@ impl ReadResource {
         facts.consent = consent;
         facts.governance_ready = ch.governance_ready;
         facts.governance_until = ch.governance_display.valid_until;
+        facts.owed_shown = ch.governance_ready && ch.owed_decided.shown();
         facts.now_hint = facts.now_hint.max(ch.now_hint);
         if let Some(trusted) = trusted {
             if facts.legacy_cache_trusted.as_ref() != Some(trusted) {
