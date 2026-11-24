@@ -133,6 +133,49 @@ impl ChannelState {
         }
         Ok(())
     }
+
+    /// What ordinary rendering decides for a received signed Content body on this node
+    /// ([`SemanticProjection::prepare`]): `Some(true)` it is shown, `Some(false)` it is not for
+    /// this node, `None` not decidable yet (it waits, never shown). The author's eligibility for
+    /// the entry; once this node knows its own applied removal, its own readmission cut (#1171),
+    /// unless `readable` says this exact body is already readable here; and the author's consent
+    /// to this reader after the author's reset. A "not received yet" row is shown by this same
+    /// decision (ADR-036 H-4), so a check added here holds for both.
+    pub(super) fn body_render_decision(
+        &self,
+        view: &governance::View<'_>,
+        generation: u64,
+        entry: &Entry,
+        now: u64,
+        readable: impl FnOnce() -> Result<bool>,
+    ) -> Result<Option<bool>> {
+        match view.content_eligibility(entry)? {
+            governance::ContentEligibility::Eligible => {}
+            governance::ContentEligibility::Ineligible => return Ok(Some(false)),
+            governance::ContentEligibility::Refreshing => return Ok(None),
+        }
+        // #1171: once this node knows its own applied removal, it renders no newly received old
+        // body, whoever relayed it. Plaintext it already rendered or cached falls through to the
+        // existing logic; an undecided body waits, never renders.
+        if generation != 0 {
+            match view.recipient_body_eligibility(&self.me(), entry, now)? {
+                governance::ContentEligibility::Eligible => {}
+                _ if readable()? => {}
+                governance::ContentEligibility::Ineligible => return Ok(Some(false)),
+                governance::ContentEligibility::Refreshing => return Ok(None),
+            }
+        }
+        let author = entry.skeleton.author_id;
+        if author != self.me() {
+            match self.consent_facts() {
+                Ok(facts) if !facts.can_read(&self.me(), &author) => return Ok(Some(false)),
+                Ok(_) => {}
+                Err(error) if governance::refreshing(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(true))
+    }
 }
 
 pub(crate) struct PreparedContent {
@@ -284,32 +327,17 @@ impl SemanticProjection {
                 }
                 Err(error) => return Err(error),
             };
-            let eligible = match view.content_eligibility(entry)? {
-                governance::ContentEligibility::Eligible => true,
-                governance::ContentEligibility::Ineligible => false,
-                governance::ContentEligibility::Refreshing => {
-                    return Err(Error::Profile(governance::REFRESHING));
-                }
-            };
-            // #1171: once this node knows its own applied removal, it renders no newly
-            // received old body, whoever relayed it. Plaintext it already rendered or cached
-            // falls through to the existing logic; an undecided body waits, never renders.
-            let eligible = eligible
-                && (generation == 0
-                    || governance::render_every_body()
-                    || match view.recipient_body_eligibility(
-                        &channel.me(),
-                        entry,
-                        channel.now_hint,
-                    )? {
-                        governance::ContentEligibility::Eligible => true,
-                        _ if self.already_readable(channel, store, &hash)? => true,
-                        governance::ContentEligibility::Ineligible => false,
-                        governance::ContentEligibility::Refreshing => {
-                            return Err(Error::Profile(governance::REFRESHING));
-                        }
-                    });
+            // `VOX_TEST_MP10_RENDER_EVERY_BODY` (boundary 2 off) reaches this render gate only,
+            // never a "not received yet" row.
+            let decided =
+                channel.body_render_decision(&view, generation, entry, channel.now_hint, || {
+                    Ok(governance::render_every_body()
+                        || self.already_readable(channel, store, &hash)?)
+                })?;
             drop(view);
+            let Some(eligible) = decided else {
+                return Err(Error::Profile(governance::REFRESHING));
+            };
             governance::check_removal_generation(store, &channel.sek, &self.room, generation)?;
             Ok((generation, eligible))
         })();
@@ -367,18 +395,6 @@ impl SemanticProjection {
         historical: bool,
     ) -> Result<PreparedOutcome> {
         let own = author == channel.me();
-        if !own {
-            match channel.consent_facts() {
-                Ok(facts) if !facts.can_read(&channel.me(), &author) => {
-                    return Ok(PreparedOutcome::Applied)
-                }
-                Ok(_) => {}
-                Err(error) if governance::refreshing(&error) => {
-                    return Ok(PreparedOutcome::Deferred)
-                }
-                Err(error) => return Err(error),
-            }
-        }
         let Ok(message) = GroupMessage::from_wire(payload) else {
             return Ok(PreparedOutcome::Applied);
         };

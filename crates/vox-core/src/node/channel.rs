@@ -986,9 +986,12 @@ pub(crate) struct DisplayStamp {
     session_revision: u64,
     retention: (u64, u64),
     expires_at: Option<u64>,
-    /// How many of the rows shown stand for a body not received yet (V030-10).
+    /// How many rows stand for a body not received yet (V030-10), shown or not.
     owed_count: u64,
-    pub(crate) owed: bool,
+    /// Whether those rows are shown and counted: their decision stands
+    /// ([`ChannelState::owed_rows_shown`]); a row whose decision is open is neither (ADR-036
+    /// H-4). A change of it is a change of the timeline, so the display revision moves with it.
+    owed: bool,
 }
 
 impl DisplayStamp {
@@ -998,7 +1001,23 @@ impl DisplayStamp {
     /// FX-22; #995).
     #[must_use]
     pub(crate) fn rows(&self) -> u64 {
-        self.rendered_count.saturating_add(self.owed_count)
+        if self.owed {
+            self.rendered_count.saturating_add(self.owed_count)
+        } else {
+            self.rendered_count
+        }
+    }
+
+    /// A stamp kept from an earlier publication while the room cannot be published again
+    /// (governance refreshing), with its "not received yet" rows shown as `owed_shown` says now
+    /// ([`ChannelState::owed_rows_shown`]); `None` when that changes nothing.
+    #[must_use]
+    pub(crate) fn owed_shown(&self, owed_shown: bool) -> Option<Self> {
+        let owed = owed_shown && self.owed_count != 0;
+        (owed != self.owed).then(|| Self {
+            owed,
+            ..self.clone()
+        })
     }
 }
 
@@ -1345,6 +1364,8 @@ pub struct ChannelState {
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     projection_state: history::State,
+    /// Which governance the "not received yet" rows were last decided under (in memory).
+    owed_decided: history::OwedDecided,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
@@ -2318,6 +2339,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -2961,6 +2983,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: match restart.projection.as_deref() {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
@@ -3466,6 +3489,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -5638,7 +5662,9 @@ impl ChannelState {
         }
         self.entries.committed();
         self.forks_kept = kept;
-        Ok(())
+        // As `finish_history_begin`: a newly kept fork proof withdraws read authority and the
+        // "not received yet" decisions taken under the governance before it.
+        self.retire_governance()
     }
 
     /// The members this room holds back for equivocating (V210-63): each `(author, seq)` where
@@ -5978,7 +6004,8 @@ impl ChannelState {
                 retention: (self.effective_retention(), self.effective_step_retention()),
                 expires_at: rendered.next_owed_expiry()?,
                 owed_count,
-                owed: owed_count != 0,
+                // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
+                owed: owed_count != 0 && self.owed_rows_shown(),
             },
             read_summary_stamp: ReadSummaryStamp {
                 reads: rendered.read_roots()?,

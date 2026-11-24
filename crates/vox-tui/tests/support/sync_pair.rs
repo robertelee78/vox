@@ -639,6 +639,45 @@ impl Reader {
         self.texts(room).iter().any(|t| t == text)
     }
 
+    /// Every row the room shows now, every page of it, messages not received yet included. A
+    /// read that fails is a red, as in [`Reader::texts`].
+    pub fn rows(&mut self, room: vox_core::hash::Digest32) -> Vec<vox_core::node::api::MessageRow> {
+        match self.rt.block_on(self.client.read_rows(room, None)) {
+            Ok(Frame::Rows { rows }) => rows,
+            Ok(other) => panic!(
+                "PRODUCT: {}'s node refused to read room {}: {other:?}",
+                self.who,
+                vox_core::node::link::b32_encode(&room)
+            ),
+            Err(e) => panic!(
+                "CANNOT MEASURE: the harness's control-socket read of {}'s node failed: {e}",
+                self.who
+            ),
+        }
+    }
+
+    /// Ask the node to record `entries` of the room as read, in one `MarkRead` batch, as a client
+    /// does for what it showed; the node's answer.
+    pub fn mark_read(
+        &mut self,
+        room: vox_core::hash::Digest32,
+        entries: Vec<vox_core::hash::Digest32>,
+    ) -> Frame {
+        let request = Request::MarkRead {
+            channel_id: room,
+            entries,
+        };
+        self.rt
+            .block_on(self.client.request(&request))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "CANNOT MEASURE: the harness's read-mark request over {}'s control socket \
+                     failed: {e}",
+                    self.who
+                )
+            })
+    }
+
     /// The author of the latest post in the room whose text contains `needle`.
     pub fn author_of(
         &mut self,

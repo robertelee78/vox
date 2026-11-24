@@ -282,6 +282,9 @@ final class NodeModel: ObservableObject {
     private var roomOpened = false
     private var roomShowsInFlight = 0
     private static let roomWindowLimit = 128
+    /// An older window's last selection (room, view and saved room), in order, and which of it
+    /// came back unanswered: those are asked for again in their place (`readNewOnScreen`).
+    private var roomWindowSelection: (window: String, ids: [String], unanswered: Set<String>) = ("", [], [])
     @Published private var roomReadingOlder = false
     private var roomOlderRead = UUID()
 
@@ -1487,16 +1490,39 @@ final class NodeModel: ObservableObject {
                 && epoch == nodeObservationEpoch && revision == roomMessageRevision
                 && follows == timelineFollowingNewest
         }
+        // The older window's selection is what it asked for, not only what came back: a row left
+        // out while it is not shown (a placeholder whose decision is open) is asked for again, in
+        // its place, and returns to the window once it is shown, also when nothing of the window
+        // is shown meanwhile. An older window is open while the newest is not followed and it
+        // shows rows or asked for some.
+        let window = instance.map { "\(id)|\(viewGeneration)|\($0.base64EncodedString())" }
+        let previous = window != nil && roomWindowSelection.window == window
+            ? roomWindowSelection : (window: window ?? "", ids: [], unanswered: Set<String>())
         do {
-            if !follows, let instance, !loaded.isEmpty {
+            if !follows, let instance, let window, !(loaded.isEmpty && previous.ids.isEmpty) {
+                let held = Set(loaded)
+                var before: [String: [String]] = [:], waiting: [String] = []
+                for prior in previous.ids {
+                    if held.contains(prior) {
+                        before[prior] = waiting
+                        waiting = []
+                    } else if previous.unanswered.contains(prior) {
+                        waiting.append(prior)
+                    }
+                }
+                let asked = Array((loaded.flatMap { (before[$0] ?? []) + [$0] } + waiting)
+                    .prefix(Self.roomWindowLimit))
                 let rows = try await retainedRoomEntries(room: id, view: view, instance: instance,
-                    ids: loaded, current: current)
+                    ids: asked, current: current)
                 guard current() else { return }
+                let returned = Set(rows.map(\.id))
+                roomWindowSelection = (window, asked, Set(asked.filter { !returned.contains($0) }))
                 let bounded = Self.boundedRoomRows(rows, newest: false)
                 if bounded.count < rows.count { roomHasNewer = true }
                 messages = bounded
                 // Exact selection's zero metadata is not a new history cursor/count.
             } else {
+                roomWindowSelection = ("", [], [])
                 let page = try await client.roomViewRead(room: id, view: view)
                 guard current() else { return }
                 roomInstance = page.instance

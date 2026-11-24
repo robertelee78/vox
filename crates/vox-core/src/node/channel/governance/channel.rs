@@ -657,6 +657,9 @@ impl ChannelState {
                     || (!was_ready && consent_ready);
                 self.governance_display = display;
                 self.governance_ready = consent_ready;
+                if changed {
+                    self.owed_decided.governance_changed();
+                }
             }
             Ok(GovernanceProgress {
                 // Irreversible work needs the current checked disk fold, not merely the retained

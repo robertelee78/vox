@@ -25276,13 +25276,31 @@ impl Node {
                     // Preserve the last successful view during bounded Session catch-up.
                     // Actual I/O failure still poisons and follows existing recovery.
                     detail_failed(&mut ch, &error);
-                    let kept = self
+                    let mut kept = self
                         .fresh_details
                         .get(id)
                         .map(|(_, detail)| detail)
-                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
+                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id))
+                        .cloned();
+                    // A kept "not received yet" row is shown and counted only while its decision
+                    // stands now (ADR-036 H-4). That is a change of the timeline, so the display
+                    // revision moves with it, both ways: a client showing the kept page reads it
+                    // again (the terminal app reads its timeline again only then). The detail so
+                    // changed supersedes a fresh one.
+                    if let Some(detail) = kept.as_mut() {
+                        if let Some(stamp) = detail.display_stamp.owed_shown(ch.owed_rows_shown()) {
+                            detail.display_stamp = stamp;
+                            if !crate::node::channel::history::owed_display_unmoved() {
+                                detail.display_revision = self
+                                    .display_sequence
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            read.insert(*id);
+                        }
+                    }
                     // The rows as last published, with the detail kept or the summary kept.
                     let rows = kept
+                        .as_ref()
                         .map(|detail| detail.display_stamp.rows())
                         .or_else(|| {
                             prev.channels
@@ -25292,8 +25310,7 @@ impl Node {
                         })
                         .unwrap_or(0);
                     summaries.insert(*id, summary_of(&ch, rows));
-                    if let Some(detail) = kept {
-                        let mut detail = detail.clone();
+                    if let Some(mut detail) = kept {
                         detail.projection_failure = Some(error.to_string());
                         detail.history_read = ch.history_read_resource();
                         detail.history_read_revision = detail
