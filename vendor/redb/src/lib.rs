@@ -99,7 +99,7 @@ pub use table::{
     Entry, ExtractIf, OccupiedEntry, OwnedAccessGuard, OwnedRange, Range, ReadOnlyTable,
     ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata, Table, TableStats, VacantEntry,
 };
-pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
+pub use transactions::{DatabaseStats, Durability, ReadTransaction, Space, WriteTransaction};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
 pub use types::{Key, MutInPlaceValue, TypeName, Value};
 

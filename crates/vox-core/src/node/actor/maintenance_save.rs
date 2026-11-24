@@ -1051,11 +1051,25 @@ impl Node {
         channel.note_publication_complete();
         drop(channel);
         // A prune is what frees space: give it back now, not at the next start, once this
-        // room's save has let go of the view it kept for readers (RG-13).
-        if installable && matches!(&result, Ok(Saved::Retention(installed)) if installed.pruned > 0)
+        // room's save has let go of the view it kept for readers (RG-13). A private drive's
+        // expiry is the same retention deletion, completed as its own kind.
+        #[cfg(feature = "test-knobs")]
+        let untriggered = matches!(
+            &result,
+            Ok(Saved::Private(private_save::Saved::Expired { .. }))
+        ) && crate::node::computer::fx28_mutant("rg13-no-drive-expiry");
+        #[cfg(not(feature = "test-knobs"))]
+        let untriggered = false;
+        if installable
+            && !untriggered
+            && matches!(
+                &result,
+                Ok(Saved::Retention(pending_retention::Installed { pruned, .. })
+                    | Saved::Private(private_save::Saved::Expired { pruned }))
+                    if *pruned > 0
+            )
         {
-            let store = Arc::clone(&pending.store);
-            tokio::task::spawn_blocking(move || store.give_back_space(false));
+            pending.store.give_back_space();
         }
         if installable
             && matches!(

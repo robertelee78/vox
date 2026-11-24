@@ -684,7 +684,9 @@ impl Node {
             .filter(|_| ready)
             .map(Profile::store_handle)
         {
-            tokio::task::spawn_blocking(move || store.give_back_space(true));
+            #[cfg(feature = "test-knobs")]
+            store.hold_read_for_proof();
+            store.give_back_space();
         }
         drop(returned.exclusive);
         drop(returned._secret);

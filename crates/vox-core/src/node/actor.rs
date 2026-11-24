@@ -7897,7 +7897,25 @@ impl Node {
                 later.push(release);
             }
         }
-        let _ = reply.send(self.status_report(&budget));
+        let report = self.status_report(&budget);
+        // What the store holds is measured under its writer, which a give-back step may hold:
+        // never on the actor (RG-13).
+        match self.profile.as_ref().map(Profile::store_handle) {
+            Some(store) => {
+                tokio::spawn(async move {
+                    let mut report = report;
+                    report.store = match tokio::task::spawn_blocking(move || store.space()).await {
+                        Ok(Ok(space)) => space.map(Ok),
+                        Ok(Err(error)) => Some(Err(error.to_string())),
+                        Err(error) => Some(Err(error.to_string())),
+                    };
+                    let _ = reply.send(report);
+                });
+            }
+            None => {
+                let _ = reply.send(report);
+            }
+        }
         for release in later {
             if self.bounded_sync.accept_pool_release(release) {
                 self.sched_rooms.insert(release.room);

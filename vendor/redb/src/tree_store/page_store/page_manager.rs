@@ -1856,6 +1856,16 @@ impl TransactionalMemory {
         self.storage.flush()?;
 
         if shrunk {
+            // Vox: the crash proof's second kill point, the smaller layout durable and the file
+            // not yet truncated; the same marker parks after a move's table relocation
+            #[cfg(feature = "vox-test-knobs")]
+            if let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
+                std::fs::write(&marker, "smaller layout committed before truncation")
+                    .map_err(crate::StorageError::from)?;
+                while std::path::Path::new(&marker).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
             self.storage.resize(header.layout().len())?;
         }
         // Everything this stood in for is now durable: durable_commit() flushed the allocation
@@ -2427,6 +2437,13 @@ impl TransactionalMemory {
         }
 
         Ok(count)
+    }
+
+    /// Vox: free bytes at the end of the last region, which a trim gives back.
+    pub(crate) fn trailing_free_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        let last = state.header.layout().num_regions() - 1;
+        u64::from(state.get_region(last).trailing_free_pages()) * u64::from(self.page_size)
     }
 
     pub(crate) fn get_page_size(&self) -> usize {

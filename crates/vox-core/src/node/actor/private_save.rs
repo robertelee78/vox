@@ -58,9 +58,15 @@ pub(super) enum Saved {
     ControlImport,
     PrivateExpiry,
     Imported,
-    Expired,
+    /// A private drive's expiry, with how many records it removed (RG-13 gives space back).
+    Expired {
+        pruned: usize,
+    },
     ExpiryUnavailable,
-    Announcement { count: usize, complete: bool },
+    Announcement {
+        count: usize,
+        complete: bool,
+    },
     Page(Page),
     Flow(Box<pending_upgrade::PageFlow>),
     PageFinished(pending_upgrade::PageResult),
@@ -437,9 +443,13 @@ impl Completed {
             Self::Import(completed) => channel
                 .finish_pending_control_import(completed)
                 .map(|_| Saved::Imported),
-            Self::Expiry(completed) => channel
-                .finish_pending_retention(store, completed)
-                .map(|_| Saved::Expired),
+            Self::Expiry(completed) => {
+                channel
+                    .finish_pending_retention(store, completed)
+                    .map(|installed| Saved::Expired {
+                        pruned: installed.pruned,
+                    })
+            }
             Self::Announcement(completed) => channel
                 .finish_pending_legacy_announcement(store, *completed)
                 .map(|(count, complete)| Saved::Announcement { count, complete }),
@@ -450,7 +460,9 @@ impl Completed {
         match self {
             Self::Native { completed, kind } => native_saved(completed.result?, kind),
             Self::Import(completed) => completed.result.map(|_| Saved::Imported),
-            Self::Expiry(completed) => completed.result.map(|_| Saved::Expired),
+            Self::Expiry(completed) => completed.result.map(|installed| Saved::Expired {
+                pruned: installed.pruned,
+            }),
             Self::Announcement(completed) => completed
                 .into_result()
                 .map(|(count, complete)| Saved::Announcement { count, complete }),

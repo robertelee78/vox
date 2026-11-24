@@ -278,22 +278,26 @@ history remains available while the room recovers.
 **Confirm:** the room can save a new post again, and `vox room read` shows that post together
 with its previously saved messages.
 
-## The daemon log says it is giving back disk space
+## vox status or the daemon log says it is giving back disk space
 
 The store file follows what it holds while the daemon runs. New pages are taken from the
 lowest free space, the file grows by a quarter rather than doubling, and an ordinary save
 trims the end of the file once a quarter of the file there is free. When retention removes
-expired messages, and once after a node becomes Ready, the daemon checks whether the file
-is larger than 1.25 times what it holds by at least 64 MiB. If it is, the daemon moves the
-highest pages down and trims the file. The daemon log then says `giving back disk space`
-with the file and held bytes, and then `store file is now ... bytes` with the number of
-steps, the time the pass took and the longest time writes waited. Reading never waits. Posts
-and other writes wait for one step of the pass at a time, so `vox status` and waiting
-commands say nothing about it. Startup no longer compacts before Ready.
+expired messages or expired private Session steps, and once after a node becomes Ready, the
+daemon checks whether the file is larger than 1.25 times what it holds by at least 64 MiB.
+If it is, the daemon moves the highest pages down and trims the file. `vox status` shows each
+store as `store NODE (PATH): file F bytes; holds H bytes; free disk: D bytes`, and adds
+`giving back disk space` while a pass runs (`--json`: `held_bytes`, `giving_back`). The daemon
+log says `giving back disk space` with the file and held bytes, and then `store file is now
+... bytes` with the number of steps, the time the pass took and the longest time writes
+waited. Reading never waits. Posts and other writes wait for one step of the pass at a time,
+and one step moves at most 16 MiB of pages, so a large store takes more steps rather than
+longer ones. Choosing which pages to move still reads every page of the store's tables, so a
+step grows slowly with the store. Startup no longer compacts before Ready.
 
-If a read that began before a step can still see the moved pages, that step does not
-shrink the file and the pass stops. The space comes back at the first save after that read
-ends, or at the next retention removal.
+If a read that began before a step can still see the pages the pass moved, the pass stops
+there and `vox status` says `giving back disk space when reads end` (`--json`:
+`waiting_for_reads`). When such a read ends, the pass goes on by itself.
 
 If the pass fails, the daemon log names the node and the storage error
 (`store compaction skipped: ...; continuing`). The node stays Ready and its rooms stay
