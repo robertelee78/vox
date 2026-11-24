@@ -274,7 +274,7 @@ impl ChannelState {
             return Err(Error::StreamRefused("this node was removed from the room"));
         }
         if self.room_removal_rotation_needed(store)? {
-            return Err(Error::StreamRefused("room authorization keys are rotating"));
+            return Err(Error::StreamRefused(crate::node::channel::KEYS_ROTATING));
         }
         governance::check_removal_generation(
             store,
@@ -955,15 +955,32 @@ impl PendingText {
             )?;
             self.cleanup(store)?;
         }
+        // ADR-053 MP-10 (c): the attacker terminates its own feed and posts on past it.
+        #[cfg(feature = "mutant-sender")]
+        if crate::log::sync::mutant::terminates_now() {
+            self.append(
+                store,
+                signer,
+                Vec::new(),
+                EntryKind::Content,
+                SignedEntryKind::Termination,
+                None,
+                &[],
+                None,
+            )?;
+            self.cleanup(store)?;
+        }
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let payload = self.sender.encrypt(&plaintext)?.to_wire();
         #[cfg(feature = "mutant-sender")]
         let payload = crate::log::sync::mutant::authored(payload);
+        // `author-misbound`: a real consent grant, signed with kind Governance, whose body names
+        // an epoch 7 past the entry's own, so a reader reaches the governance binding check.
         #[cfg(feature = "mutant-sender")]
-        let payload = if crate::log::sync::mutant::misbound() {
+        let (payload, kind, signed_kind) = if crate::log::sync::mutant::misbound() {
             let (iteration, key) = self.sender.current_position();
             let skdm = self.sender.skdm_for(signer, iteration, key)?;
-            crate::governance::membership::issue_consent_grant(
+            let grant = crate::governance::membership::issue_consent_grant(
                 signer,
                 &self.room,
                 self.epoch + 7,
@@ -971,10 +988,13 @@ impl PendingText {
                 &skdm,
                 self.history_mode,
             )?
-            .to_wire()
+            .to_wire();
+            (grant, EntryKind::Governance, SignedEntryKind::Governance)
         } else {
-            payload
+            (payload, EntryKind::Content, SignedEntryKind::Content)
         };
+        #[cfg(not(feature = "mutant-sender"))]
+        let (kind, signed_kind) = (EntryKind::Content, SignedEntryKind::Content);
         let rendered = Rendered {
             entry_hash: [0; 32],
             author: signer.fingerprint(),
@@ -989,8 +1009,8 @@ impl PendingText {
             store,
             signer,
             payload,
-            EntryKind::Content,
-            SignedEntryKind::Content,
+            kind,
+            signed_kind,
             Some(rendered),
             &[],
             None,
@@ -1105,7 +1125,7 @@ impl PendingText {
                     algo_ids: [algo::COMPOSITE_ED25519_ML_DSA_65, algo::AES_256_GCM],
                     payload_hash: sha256(&payload),
                     payload_len: payload.len() as u64,
-                    end_of_feed: false,
+                    end_of_feed: signed_kind == SignedEntryKind::Termination,
                     claimed_ms: self.now_millis,
                     seen,
                 },

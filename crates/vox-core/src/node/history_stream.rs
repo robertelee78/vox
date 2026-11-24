@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::feed::MAX_SEQ;
 use crate::log::history::{
-    ConsistencyProof, ControlRangeProof, Descriptor, InclusionProof, MAX_CHUNK_BYTES,
+    ConsistencyProof, ControlRangeProof, Descriptor, HeadTarget, InclusionProof, MAX_CHUNK_BYTES,
     MAX_CONTEXT_AUTHORS, MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES, MAX_PAGE_ENTRIES,
     MAX_PAYLOAD_BYTES, MAX_RESPONSE_BYTES,
 };
@@ -36,9 +36,11 @@ pub const DONE_RESERVE: usize = 512;
 pub(crate) const AUTHORIZATION_CHANGED: &str = "history authorization changed before publication";
 // One frame tag plus the canonical CBOR encoding of any u8 mode bitmap.
 const MAX_HELLO_FRAME_BYTES: usize = 3;
-// Tag + outer pair + request ID + the largest canonical Query (Page). Query's bounded u64 and
-// digest fields make this an exact structural maximum, independent of peer input.
-const MAX_WANT_FRAME_BYTES: usize = 160;
+// Tag + outer triple + request ID + the largest canonical Query (KeyBody) + the one-element
+// target option and the canonical head body of a head-bound query (ADR-053 P). Query's bounded
+// u64 and digest fields and the fixed head body make this an exact structural maximum,
+// independent of peer input.
+const MAX_WANT_FRAME_BYTES: usize = 160 + 1 + HeadTarget::MAX_BYTES;
 // Tag and a conservatively maximal CBOR array header. Each locally materialized HAVE hint is an
 // array header, two 32-byte byte strings (each with a maximal CBOR length header), and one u64.
 // The decoder still reserves the full attacker-sized envelope before reading any variable frame;
@@ -225,8 +227,12 @@ async fn serve_request(
         transport::Read::Busy => return Err(Error::Unreachable("history WANT reader busy")),
     };
     overhead += next.wire_len();
-    let query = match next.frame()? {
-        Frame::Want { request, query } if request == preamble.request => query,
+    let (query, target) = match next.frame()? {
+        Frame::Want {
+            request,
+            query,
+            target,
+        } if request == preamble.request => (query, target),
         Frame::Cancel(request) if request == preamble.request => {
             let done = Frame::Done {
                 request,
@@ -255,6 +261,7 @@ async fn serve_request(
         io,
         preamble,
         query,
+        target,
         overhead,
         inbox,
         inbox_generation,
@@ -385,6 +392,29 @@ pub enum Query {
 }
 
 impl Query {
+    /// The asker's head a provider resolves to answer this query (ADR-053 P). Such a request
+    /// carries the head's canonical body as its target; every other query carries none. KeyBody
+    /// names the asker's head too, but its provider serves only its own exact validated source.
+    pub fn target_head(&self) -> Option<Digest32> {
+        match self {
+            Self::Header { head, .. }
+            | Self::Proof { head, .. }
+            | Self::Entry { head, .. }
+            | Self::Page { head, .. } => Some(*head),
+            _ => None,
+        }
+    }
+    /// Name another head in a head-bound query (test-knobs: the hostile asker of the P guards).
+    #[cfg(feature = "test-knobs")]
+    fn retarget(&mut self, target: Digest32) {
+        if let Self::Header { head, .. }
+        | Self::Proof { head, .. }
+        | Self::Entry { head, .. }
+        | Self::Page { head, .. } = self
+        {
+            *head = target;
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Inventory | Self::Head(_) | Self::Context(_) => {}
@@ -714,6 +744,8 @@ pub enum Frame<'a> {
     Want {
         request: RequestId,
         query: Query,
+        /// The canonical body of the query's head when it is head-bound (`Query::target_head`).
+        target: Option<HeadTarget>,
     },
     Meta {
         request: RequestId,
@@ -860,9 +892,20 @@ impl<'a> Frame<'a> {
                 }
                 0x02
             }
-            Self::Want { request, query } => {
-                e.array(2).bytes(request);
+            Self::Want {
+                request,
+                query,
+                target,
+            } => {
+                if query.target_head() != target.map(|target| target.id()) {
+                    return Err(invalid("history request target differs from its head"));
+                }
+                e.array(3).bytes(request);
                 query.encode(&mut e)?;
+                e.array(usize::from(target.is_some()));
+                if let Some(target) = target {
+                    target.encode(&mut e);
+                }
                 0x03
             }
             Self::Meta { request, object } => {
@@ -1079,10 +1122,22 @@ impl<'a> Frame<'a> {
                 }
             }
             0x03 => {
-                arity(&mut d, 2)?;
+                arity(&mut d, 3)?;
+                let request = request_id(&mut d)?;
+                let query = Query::decode(&mut d)?;
+                let target = match d.array()? {
+                    0 => None,
+                    1 => Some(HeadTarget::decode(&mut d)?),
+                    _ => return Err(invalid("history request target count")),
+                };
+                // The body must hash to the named head: an unsigned selector, never authority.
+                if query.target_head() != target.map(|target| target.id()) {
+                    return Err(invalid("history request target differs from its head"));
+                }
                 Self::Want {
-                    request: request_id(&mut d)?,
-                    query: Query::decode(&mut d)?,
+                    request,
+                    query,
+                    target,
                 }
             }
             0x06 => {

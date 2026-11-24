@@ -214,7 +214,8 @@ impl ChannelState {
                     expired_at(t.base(), self.now_hint, ttl)
                 });
                 if expired
-                    || decision != governance::ContentEligibility::Eligible
+                    || (decision != governance::ContentEligibility::Eligible
+                        && !governance::send_every_body())
                     || !self.session_body_allowed(
                         Transaction::Snapshot(&store.snapshot()?),
                         &entry,

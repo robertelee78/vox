@@ -119,6 +119,11 @@ pub(crate) struct AnnouncementReceipt {
 /// across quanta; another deferred flow may advance metadata but cannot reset that body. Each
 /// slot's release wakes the flows waiting for it (`released`), so a flow that found its slot
 /// held by a sibling waits for that exact edge rather than retrying at a Busy cadence.
+///
+/// A flow that is not running holds no slot whose body still waits on a peer, unless its last
+/// turn moved that body's bytes on the port it runs on next
+/// ([`Flow::release_waiting_body_slots`]). Its durable partial body stays in the node's one
+/// staging record; the next claimant ends it through `ensure_stage`'s existing cancel/reclaim.
 #[derive(Default)]
 pub(crate) struct BodySlots {
     owners: StdMutex<[Option<RequestId>; 3]>,
@@ -153,6 +158,19 @@ impl BodySlots {
             self.wakes[index].notify_waiters();
         }
     }
+    /// The holder of slot `purpose` renews its request: same ownership, no release edge.
+    fn rename(&self, purpose: Purpose, old: RequestId, new: RequestId, key_body: bool) {
+        let Some(index) = body_slot(purpose, key_body) else {
+            return;
+        };
+        let mut slots = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slots[index] == Some(old) {
+            slots[index] = Some(new);
+        }
+    }
     /// The next release of slot `index`. Subscribe before checking the slot, so a release
     /// between the failed claim and the wait is not lost.
     fn released(&self, index: usize) -> std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>> {
@@ -160,6 +178,51 @@ impl BodySlots {
         wake.as_mut().enable();
         wake
     }
+}
+/// `VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT`: a flow that stops while its body waits on a peer
+/// keeps that body slot, as before. Says so once on stderr when it first keeps one.
+#[cfg(feature = "test-knobs")]
+fn parked_flow_keeps_body_slot_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT").is_some()
+    });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT engaged: a stopped flow kept the \
+                 body slot of a body waiting on a peer"
+            );
+        });
+    }
+    *ON
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn parked_flow_keeps_body_slot_mutant() -> bool {
+    false
+}
+/// `VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY`: when staging fails after `ensure_stage` renewed the
+/// body's request, the popped task and its retry owner keep the old request, as before. Says so
+/// once on stderr when it first does.
+#[cfg(feature = "test-knobs")]
+fn renewal_kept_from_retry_mutant(failed: bool) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY").is_some()
+    });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON && failed {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY engaged: a staging error kept the renewed \
+                 request from the retry owner"
+            );
+        });
+    }
+    *ON && failed
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn renewal_kept_from_retry_mutant(_failed: bool) -> bool {
+    false
 }
 fn body_slot(purpose: Purpose, key_body: bool) -> Option<usize> {
     if key_body && purpose == Purpose::Control {
@@ -927,6 +990,10 @@ impl Flow {
             || self.publication_wait
             || self.byte_pressure.is_some()
             || self.owners.iter().any(Option::is_some)
+            // A partial kept without its slot (`release_waiting_body_slots`) is still this
+            // stack's body owner.
+            || self.live.is_some()
+            || self.control.is_some()
             || self.tasks.len() >= MAX_TASKS
             || self.tasks.iter().chain(self.replay.iter()).any(|task| {
                 matches!(
@@ -1508,6 +1575,82 @@ impl Flow {
             cancellation.cancel();
         }
     }
+    /// Give back the live and control body slots whose body still waits on wire bytes (its exact
+    /// Entry ask is retained on this stack). The partial body stays in the node's one durable
+    /// staging record: the flow's next `ensure_stage` claims the slot again and resumes at the
+    /// saved offset, or, when another claimant ended that partial meanwhile, fetches that one
+    /// body again under a fresh request. A complete body is not given back: its local
+    /// continuation needs no peer. The key slot keeps its retirement rule (`cancel`).
+    pub(crate) fn release_waiting_body_slots(&mut self) {
+        for (index, purpose) in [(0, Purpose::Live), (1, Purpose::Control)] {
+            let Some(owner) = self.owners[index] else {
+                continue;
+            };
+            let waits = self.tasks.iter().chain(self.replay.iter()).any(|task| {
+                task.request == owner
+                    && task.purpose == purpose
+                    && matches!(
+                        task.operation,
+                        Operation::Wire(Query::Entry { .. })
+                            | Operation::ResumeWire(Query::Entry { .. })
+                    )
+            });
+            if !waits || parked_flow_keeps_body_slot_mutant() {
+                continue;
+            }
+            self.owners[index] = None;
+            self.slots.release(purpose, owner, false);
+        }
+    }
+    /// A fresh request for one body whose staging activation another claimant ended while this
+    /// flow held no slot: the retained Entry ask and its local Entry owner move to it together,
+    /// so the new activation passes `history_demand`'s fresh-request guard and the owner's
+    /// staged admission matches it. Other tasks of the old request keep it.
+    fn renew_body_request(&mut self, old: RequestId, purpose: Purpose) -> Result<RequestId> {
+        let fresh = request_id()?;
+        for task in self.tasks.iter_mut().chain(self.replay.iter_mut()) {
+            if task.request != old || task.purpose != purpose {
+                continue;
+            }
+            match &mut task.operation {
+                Operation::Wire(Query::Entry { .. })
+                | Operation::ResumeWire(Query::Entry { .. }) => {
+                    task.request = fresh;
+                }
+                Operation::Local(LocalStep::Entry { request, .. }) if *request == old => {
+                    *request = fresh;
+                    task.request = fresh;
+                }
+                _ => {}
+            }
+        }
+        if self.request == old {
+            self.request = fresh;
+        }
+        if self.selected_request == Some(old) {
+            self.selected_request = Some(fresh);
+        }
+        Ok(fresh)
+    }
+    /// Test-only: the kind of the ask on top of this flow's stack (the one a reroute moves).
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn retained_ask(&self) -> &'static str {
+        match self.tasks.last().map(|task| &task.operation) {
+            Some(Operation::Wire(query) | Operation::ResumeWire(query)) => match query {
+                Query::Entry { .. } => "entry",
+                Query::Page { .. } => "page",
+                Query::KeyBody { .. } => "key-body",
+                Query::Header { .. } => "header",
+                Query::Proof { .. } => "proof",
+                Query::Head(_) => "head",
+                Query::Context(_) => "context",
+                Query::Inventory => "inventory",
+                Query::KeyAvailability { .. } => "key-availability",
+            },
+            Some(_) => "local",
+            None => "none",
+        }
+    }
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
@@ -2013,9 +2156,9 @@ impl Flow {
             self.authorization_changed = true;
             result = Ok(());
         }
-        // Busy is a retained exact need. A count of turns can neither revoke the body slot nor
-        // dispose its root; the semantic response/progress edge is the only thing that advances
-        // it, while the actor's named Busy backoff prevents spinning between those edges.
+        // Busy is a retained exact need. A count of turns cannot dispose its root; the semantic
+        // response/progress edge is the only thing that advances it, while the actor's named
+        // Busy backoff prevents spinning between those edges.
         // A successful partial turn keeps this exact owner inside the returned Flow, allowing a
         // sparse source and its later semantic effect to share one durability debt. Every path
         // which stops carrying the flow forward settles first; a failure keeps the Flow owned by
@@ -2030,6 +2173,14 @@ impl Flow {
             if result.is_ok() {
                 settlement?;
             }
+        }
+        // The one place a flow stops running. Unless this turn moved body bytes and the flow
+        // runs next on this same port, its next turn waits on a peer (a Busy answer, a refusal,
+        // a move to another member's port or back to its origin, a failed exchange) or on local
+        // work; no other body of this daemon may wait behind that. A close of the peer's
+        // connection while the flow is parked gives the slots back too (the actor).
+        if result.is_err() || !self.body_progress || self.reroute.is_some() || self.route_complete {
+            self.release_waiting_body_slots();
         }
         result
     }
@@ -2303,7 +2454,7 @@ impl Flow {
     #[allow(clippy::too_many_arguments)]
     async fn execute_task(
         &mut self,
-        task: Task,
+        mut task: Task,
         source: Source,
         store: Arc<Store>,
         conn: &VoxConnection,
@@ -2476,6 +2627,12 @@ impl Flow {
                     head,
                     size: target_through,
                 });
+                // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): the head's
+                // control closure goes below its ordinary-body work instead of above it, so a
+                // body is fetched and validated while a control under the head is withheld.
+                if crate::node::channel::governance::termination_admitted() {
+                    self.push_control_closure(&task, window)?;
+                }
                 if !window.complete() {
                     self.live_visited = true;
                     // Each staged body needs a fresh demand ID, even though its enclosing
@@ -2877,7 +3034,23 @@ impl Flow {
             Operation::Wire(mut query) | Operation::ResumeWire(mut query) => {
                 let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
                 if resuming_wire && body {
-                    if let Some(staging) = self.stage(task.purpose) {
+                    // A flow that gave its slot back while parked may find its partial ended by
+                    // another claimant; `ensure_stage` below starts that body again.
+                    let ended = match self.stage(task.purpose) {
+                        Some(staging)
+                            if body_slot(task.purpose, self.key_body_root.is_some())
+                                .is_some_and(|index| self.owners[index].is_none()) =>
+                        {
+                            let snapshot = inspect(&staging.context, job).await?;
+                            let active = staging
+                                .active
+                                .lock()
+                                .map_err(|_| Error::Profile("history activation lock failed"))?;
+                            snapshot.is_none_or(|snapshot| !active.matches(snapshot.state()))
+                        }
+                        _ => false,
+                    };
+                    if let Some(staging) = self.stage(task.purpose).filter(|_| !ended) {
                         let snapshot = inspect(&staging.context, job)
                             .await?
                             .ok_or(Error::Profile("history retry state missing"))?;
@@ -2984,10 +3157,29 @@ impl Flow {
                 }
                 if let Query::Entry { head, seq, .. } = query {
                     if task.purpose != Purpose::History {
-                        match self
-                            .ensure_stage(task.purpose, task.request, head, seq, job)
-                            .await?
+                        let mut request = task.request;
+                        let start = self
+                            .ensure_stage(task.purpose, &mut request, head, seq, job)
+                            .await;
+                        // `ensure_stage` renews the body's request in one in-memory step (the
+                        // slot, its owner, the retained Entry ask and its local owner) before
+                        // any fallible staging step. The popped task and its retry owner take
+                        // that identity before an error propagates: byte pressure and the Busy
+                        // refusals restore `retry_task`, and a retry under the old request
+                        // would wait on the slot its own renewed identity holds.
+                        if request != task.request
+                            && !renewal_kept_from_retry_mutant(start.is_err())
                         {
+                            if let Some(retry) = retry_task
+                                .as_mut()
+                                .filter(|retry| retry.request == task.request)
+                            {
+                                retry.request = request;
+                            }
+                            task.request = request;
+                        }
+                        let start = start?;
+                        match start {
                             StageStart::Ready => {}
                             StageStart::Waiting => {
                                 self.push(task)?;
@@ -4024,10 +4216,17 @@ impl Flow {
         }
         Ok(())
     }
+    /// Claim `purpose`'s body slot and stage the body at `head`/`seq`. When another claimant
+    /// ended this flow's partial while the flow held no slot (`release_waiting_body_slots`),
+    /// the body starts again under a fresh request: the slot, its owner, the retained Entry ask
+    /// and its local owner are renamed and the fresh request is written back to `request` in
+    /// one step, which can fail only before it changes anything (`request_id`) and comes before
+    /// any fallible staging step; the caller carries `request` to the popped task and its retry
+    /// owner whether this returns `Ok` or `Err`.
     async fn ensure_stage(
         &mut self,
         purpose: Purpose,
-        request: RequestId,
+        request: &mut RequestId,
         head: Digest32,
         seq: u64,
         job: &Job,
@@ -4037,24 +4236,62 @@ impl Flow {
         // edge, for every slot, not a Busy wait (measured when it was judged Busy: four readers,
         // 90 restarts of a reader's flow on the author's port in 60 s, ~100 rows each).
         let wake = body_slot(purpose, is_key).map(|index| self.slots.released(index));
-        if !self.slots.claim(purpose, request, is_key) {
+        if !self.slots.claim(purpose, *request, is_key) {
             self.slot_wait = wake.map(|wake| {
                 wake as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
             });
             return Ok(StageStart::Waiting);
         }
         if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
-            self.owners[index] = Some(request);
+            self.owners[index] = Some(*request);
         }
         if let Some(staging) = self.stage(purpose) {
             let snapshot = inspect(&staging.context, job)
                 .await?
                 .ok_or(Error::Profile("current history state missing"))?;
-            if snapshot.state().bounds.head == head && snapshot.state().bounds.lo == seq {
-                return Ok(StageStart::Ready);
+            let current = staging
+                .active
+                .lock()
+                .map_err(|_| Error::Profile("history activation lock failed"))?
+                .matches(snapshot.state());
+            if current {
+                if snapshot.state().bounds.head == head && snapshot.state().bounds.lo == seq {
+                    return Ok(StageStart::Ready);
+                }
+                return Err(Error::Profile("current body slot belongs to another entry"));
             }
-            return Err(Error::Profile("current body slot belongs to another entry"));
+            // The slot now held again is this flow's; the record is another claimant's or ended.
+            // That claimant owns its cleanup. This body starts again from its first byte under a
+            // fresh request: the ended one may never be activated again.
+            match purpose {
+                Purpose::Live => self.live = None,
+                Purpose::Control => self.control = None,
+                Purpose::History => {}
+            }
+            let fresh = self.renew_body_request(*request, purpose)?;
+            self.slots.rename(purpose, *request, fresh, is_key);
+            if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
+                self.owners[index] = Some(fresh);
+            }
+            *request = fresh;
+            #[cfg(feature = "test-knobs")]
+            {
+                eprintln!("history body renewed purpose={purpose:?}");
+                // Proof-only: the staging after a renewal answers byte pressure once, while the
+                // file exists, as its first byte reservation (`demand::inspect`) does when the
+                // pool is full.
+                if let Some(path) = std::env::var_os("VOX_TEST_RENEWAL_PRESSURE_FILE") {
+                    if std::fs::remove_file(&path).is_ok() {
+                        eprintln!(
+                            "vox: VOX_TEST_RENEWAL_PRESSURE_FILE answered byte pressure after a \
+                             renewal"
+                        );
+                        return Err(Error::HistoryCapacity(Box::new(job.byte_pressure(1)?)));
+                    }
+                }
+            }
         }
+        let request = *request;
         let context = match purpose {
             Purpose::Live => self
                 .live_context

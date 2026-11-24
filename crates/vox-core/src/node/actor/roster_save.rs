@@ -258,6 +258,10 @@ impl Node {
                 }
             }
         }
+        #[cfg(feature = "test-knobs")]
+        if let Some(computer) = &self.computer {
+            computer.hold_publications_for_join_proof(&identity.fingerprint());
+        }
         let work = Work::Join {
             candidate: Box::new(pending_roster::JoinCandidate {
                 peer,

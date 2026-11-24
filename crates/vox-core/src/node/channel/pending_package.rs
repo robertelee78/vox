@@ -7,6 +7,25 @@ use crate::node::prekeys::OneTimeReservation;
 pub(crate) use super::key_package_queue::{Pending as PendingPackage, Progress};
 pub(crate) type SessionSlot = Arc<std::sync::Mutex<Option<crate::pairwise::session::Session>>>;
 
+/// `VOX_MUTANT_MP10_KEYS=<boundary>` (ADR-053 MP-10, proofs only): switch one key boundary off
+/// at its own line so its act can show it is the only thing in the way. Says so once.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn key_boundary_off(boundary: &str) -> bool {
+    static MODE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        let mode = std::env::var("VOX_MUTANT_MP10_KEYS").ok();
+        if let Some(mode) = &mode {
+            eprintln!("vox: VOX_MUTANT_MP10_KEYS={mode} engaged: that key boundary is off");
+        }
+        mode
+    });
+    MODE.as_deref() == Some(boundary)
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn key_boundary_off(_boundary: &str) -> bool {
+    false
+}
+
 pub(crate) struct OutboundFrame {
     pub(crate) frame: Vec<u8>,
     pub(crate) one_time_prekey: Option<u64>,
@@ -345,7 +364,9 @@ impl ChannelState {
                 }
                 // #1171: once this node knows its own removal, a package whose signed causal
                 // past lacks its cut is old key material, whichever peer relayed it.
-                let eligible = if self.is_member_removed(store, &pending.author)? {
+                let eligible = if key_boundary_off("package-open") {
+                    true
+                } else if self.is_member_removed(store, &pending.author)? {
                     false
                 } else {
                     match self.content_eligibility(store, &entry)? {
@@ -524,7 +545,9 @@ impl ChannelState {
         };
         let selected = (|| {
             let Some(skdm) = skdm else { return Ok(None) };
-            if self.is_member_removed(store, &skdm.body.author_id)? {
+            if !key_boundary_off("package-open")
+                && self.is_member_removed(store, &skdm.body.author_id)?
+            {
                 return Err(Error::StreamRefused("sender key author is removed"));
             }
             if let Some((author, log)) = locator {
@@ -539,25 +562,28 @@ impl ChannelState {
                 if entry.skeleton.author_id != author {
                     return Err(Error::StreamRefused("key-package author is not eligible"));
                 }
-                match self.content_eligibility(store, &entry)? {
-                    governance::ContentEligibility::Eligible => {}
-                    governance::ContentEligibility::Ineligible => {
-                        return Err(Error::StreamRefused("key-package author is not eligible"));
+                // MP-10 boundary 3: the author and readmission decisions; the knob removes both.
+                if !key_boundary_off("package-open") {
+                    match self.content_eligibility(store, &entry)? {
+                        governance::ContentEligibility::Eligible => {}
+                        governance::ContentEligibility::Ineligible => {
+                            return Err(Error::StreamRefused("key-package author is not eligible"));
+                        }
+                        governance::ContentEligibility::Refreshing => {
+                            return Err(Error::Profile(governance::REFRESHING));
+                        }
                     }
-                    governance::ContentEligibility::Refreshing => {
-                        return Err(Error::Profile(governance::REFRESHING));
-                    }
-                }
-                // #1171: old key material for this once-removed node is never installed.
-                match self.recipient_body_eligibility(store, &self.me(), &entry)? {
-                    governance::ContentEligibility::Eligible => {}
-                    governance::ContentEligibility::Ineligible => {
-                        return Err(Error::StreamRefused(
-                            "key package predates this node's readmission",
-                        ));
-                    }
-                    governance::ContentEligibility::Refreshing => {
-                        return Err(Error::Profile(governance::REFRESHING));
+                    // #1171: old key material for this once-removed node is never installed.
+                    match self.recipient_body_eligibility(store, &self.me(), &entry)? {
+                        governance::ContentEligibility::Eligible => {}
+                        governance::ContentEligibility::Ineligible => {
+                            return Err(Error::StreamRefused(
+                                "key package predates this node's readmission",
+                            ));
+                        }
+                        governance::ContentEligibility::Refreshing => {
+                            return Err(Error::Profile(governance::REFRESHING));
+                        }
                     }
                 }
             }

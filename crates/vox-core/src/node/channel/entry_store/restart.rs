@@ -267,7 +267,7 @@ pub(super) fn advance(state: &mut PublishedFeed, entry: &Entry) -> Result<()> {
     }
     state.seq = entry.skeleton.seq;
     state.hash = entry.entry_hash();
-    state.ended = entry.skeleton.end_of_feed;
+    state.ended = crate::log::feed::ends_feed(entry);
     if let Some(payload) = entry
         .payload
         .as_deref()
