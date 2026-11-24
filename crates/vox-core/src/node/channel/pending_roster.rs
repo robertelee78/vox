@@ -249,32 +249,9 @@ impl ChannelState {
                 "admission identity differs from the authenticated joiner",
             ));
         }
-        let ready = self.require_governance_ready(store, now);
-        // Test-only (ledger 75): while `VOX_TEST_HOLD_JOIN_REFRESH_FILE` names a file that exists,
-        // a join admission is answered as this room's refreshing governance answers it; each
-        // admission answered "refreshing", held or not, appends its joiner to `<file>.met`.
+        let ready = self.require_governance_ready(store, now).map(drop);
         #[cfg(feature = "test-knobs")]
-        let ready = match std::env::var_os("VOX_TEST_HOLD_JOIN_REFRESH_FILE") {
-            Some(hold) => {
-                let ready = if std::path::Path::new(&hold).exists() {
-                    Err(Error::Profile(governance::REFRESHING))
-                } else {
-                    ready
-                };
-                if ready.as_ref().is_err_and(governance::refreshing) {
-                    let mut met = hold;
-                    met.push(".met");
-                    let line = format!("{}\n", crate::node::link::b32_encode(&candidate.peer));
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(met)
-                        .and_then(|mut met| std::io::Write::write_all(&mut met, line.as_bytes()));
-                }
-                ready
-            }
-            None => ready,
-        };
+        let ready = join_refresh_hold("", Some(&candidate.peer), ready);
         ready?;
         let removed = self.is_member_removed(store, &candidate.peer)?;
         #[cfg(feature = "test-knobs")]
@@ -299,6 +276,38 @@ impl ChannelState {
         });
         Ok(pending)
     }
+}
+
+/// Test-only (ledger 75): `VOX_TEST_HOLD_JOIN_REFRESH_FILE` names a file. While it exists a join's
+/// admission is answered as a refreshing room's governance answers it, and while `<file>.seat`
+/// exists so is a join's seat (`door` "" or ".seat"). Each door's "refreshing" answer, held or not,
+/// appends its joiner to `<file>.met` or `<file>.seat.met`; a waiting join's recheck passes no
+/// joiner and records nothing.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn join_refresh_hold(
+    door: &str,
+    joiner: Option<&Digest32>,
+    ready: Result<()>,
+) -> Result<()> {
+    let Some(mut hold) = std::env::var_os("VOX_TEST_HOLD_JOIN_REFRESH_FILE") else {
+        return ready;
+    };
+    hold.push(door);
+    let ready = if std::path::Path::new(&hold).exists() {
+        Err(Error::Profile(governance::REFRESHING))
+    } else {
+        ready
+    };
+    if let Some(joiner) = joiner.filter(|_| ready.as_ref().is_err_and(governance::refreshing)) {
+        hold.push(".met");
+        let line = format!("{}\n", crate::node::link::b32_encode(joiner));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(hold)
+            .and_then(|mut met| std::io::Write::write_all(&mut met, line.as_bytes()));
+    }
+    ready
 }
 
 impl Prepared {
