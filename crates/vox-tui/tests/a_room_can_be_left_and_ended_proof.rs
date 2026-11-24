@@ -2598,74 +2598,55 @@ fn hook_turn(w: &Worker, id: &str, session: &str) -> String {
     o.stdout
 }
 
-/// ADR-053 MP-11 (review of #1393): a message a removal took away, that comes back once the
-/// removal no longer holds, is news to an agent session that never got it, even though the
-/// session's cursor moved past where it arrived while it was away; exactly once. A session that
-/// got it before it was taken away does not get it again. Staging as
-/// `a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds`: bob, a delegated
-/// admin, removes carol; alice, the creator, takes bob's admin away unaware; dave applies the
-/// removal first and the revocation later. dave's agent sessions: "unseen" reads before carol's
-/// later post and again, after the removal, past a later post of bob's; "seen" reads it first.
-#[test]
-#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
-fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
-    watchdog::arm();
-    let mutants = mp11_mutants(&["VOX_MUTANT_MP11_NO_WITHHELD"]);
-    let env = knob_env(&mutants);
-    let rt = runtime();
-    let tmp = support::diagnostic_tempdir();
-    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
-    let id = room.id.clone();
-    let id = id.as_str();
-    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+/// The full entry hash of the row of `w`'s newest page whose text says `tag`.
+fn row_hash(rt: &tokio::runtime::Runtime, w: &Worker, cid: [u8; 32], tag: &str) -> String {
+    use vox_core::node::ipc::{Frame, Request};
+    let Frame::RoomPage { rows, .. } = ipc(
+        rt,
+        w,
+        Request::RoomPage {
+            channel_id: cid,
+            before: None,
+            limit: 64,
+        },
+    ) else {
+        panic!("PRODUCT (staging): {}'s newest page was refused", w.name)
+    };
+    let row = rows
+        .iter()
+        .find(|row| row.text.contains(tag))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): {} shows no {tag}: {rows:?}", w.name));
+    vox_core::node::link::b32_encode(&row.entry_hash)
+}
+
+/// Stage the removal that takes carol's later posts away on dave and the revocation that brings
+/// them back, as `a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds` does:
+/// bob, a delegated admin, removes carol while alice, carol and dave are stopped; alice, alone,
+/// takes bob's admin away; dave, restarted with `env`, applies bob's removal first. Returns once
+/// dave shows `kept` and not `gone`. Each of alice, bob, carol and dave runs on entry, bob only
+/// on return.
+fn mp11n_removed(
+    workers: &mut [Worker],
+    id: &str,
+    env: &[(&str, &str)],
+    tmp: &std::path::Path,
+    kept: &str,
+    gone: &str,
+) {
+    let [alice, bob, carol, dave] = workers else {
         unreachable!()
     };
-    setup(alice, &["room", "admin", "add", id, &bob.b32()]);
-    let (admin, listed) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
-        o.ok && o.stdout.contains(&bob.b32())
-    });
-    assert!(
-        admin,
-        "APPARATUS: bob's delegation was not staged: {listed:?}"
-    );
-    dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-mp11h.err"));
-    for reader in [&*bob, &*carol, &*dave] {
-        mp6_post_until_read(alice, reader, id, "MP11H-READY");
-    }
-    mp6_quiet(&[alice, bob, carol, dave]);
-    let seen = "MP11H-CAROL-SEEN";
-    setup(carol, &["room", "post", id, seen]);
-    mp6_all_shown(&[bob, dave], id, &[seen], "carol's first post");
-    mp6_quiet(&[alice, bob, carol, dave]);
-    let first = hook_turn(dave, id, "mp11h-unseen");
-    assert!(
-        first.contains(seen),
-        "PRODUCT (staging): dave's session \"unseen\" was not told carol's first post: {first}"
-    );
-    bob.stop_daemon_cleanly();
-    let later = "MP11H-CAROL-GONE";
-    setup(carol, &["room", "post", id, later]);
-    mp6_all_shown(&[alice, dave], id, &[later], "carol's later post");
-    mp6_quiet(&[alice, carol, dave]);
-    let had = hook_turn(dave, id, "mp11h-seen");
-    assert!(
-        had.matches(later).count() == 1,
-        "PRODUCT (staging): dave's session \"seen\" was not told carol's later post once: {had}"
-    );
-    println!(
-        "[proof] dave's session \"seen\" was told carol's later post; \"unseen\" read before it"
-    );
     alice.stop_daemon_cleanly();
     carol.stop_daemon_cleanly();
     dave.stop_daemon_cleanly();
-    bob.restart_daemon(&tmp.path().join("bob-alone.err"));
+    bob.restart_daemon(&tmp.join("bob-alone.err"));
     let removal = unchanged_busy_retry(bob, &["room", "remove-member", id, &carol.b32()]);
     assert!(
         removal.ok,
         "PRODUCT (staging): the delegated admin could not remove carol: {removal:?}"
     );
     bob.stop_daemon_cleanly();
-    alice.restart_daemon(&tmp.path().join("alice-alone.err"));
+    alice.restart_daemon(&tmp.join("alice-alone.err"));
     setup(alice, &["room", "admin", "remove", id, &bob.b32()]);
     let (revoked, listed) = poll(alice, &["room", "admin", "list", id], WITHIN, |o| {
         o.ok && !o.stdout.contains(&bob.b32())
@@ -2675,8 +2656,8 @@ fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
         "PRODUCT (staging): alice still lists bob as an admin: {listed:?}"
     );
     alice.stop_daemon_cleanly();
-    bob.restart_daemon(&tmp.path().join("bob-back.err"));
-    dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-removal.err"));
+    bob.restart_daemon(&tmp.join("bob-back.err"));
+    dave.restart_daemon_as(support::VOX, env, &tmp.join("dave-removal.err"));
     let mut settled_and_shown = 0;
     loop {
         let roster = dave.vox(None, &["room", "roster", id]);
@@ -2684,8 +2665,8 @@ fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
         let status = dave.vox(None, &["status", "--json"]);
         let idle = status.ok && status.json()["governance_pending"] == false;
         let read = dave.vox(None, &["room", "read", id]);
-        if removed && read.ok && read.stdout.contains(seen) && !read.stdout.contains(later) {
-            break;
+        if removed && read.ok && read.stdout.contains(kept) && !read.stdout.contains(gone) {
+            return;
         }
         settled_and_shown = if removed && idle && read.ok {
             settled_and_shown + 1
@@ -2700,21 +2681,18 @@ fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let past = "MP11H-BOB-AFTER";
-    setup(bob, &["room", "post", id, past]);
-    mp6_all_shown(&[dave], id, &[past], "bob's post after the removal");
-    mp6_quiet(&[bob, dave]);
-    let away = hook_turn(dave, id, "mp11h-unseen");
-    assert!(
-        away.contains(past) && !away.contains(later),
-        "PRODUCT (staging): while carol's later post was away, dave's session \"unseen\" must be \
-         told bob's later post and not hers: {away}"
-    );
-    println!(
-        "[proof] while carol's later post was away, dave's session \"unseen\" read past it to \
-         bob's later post"
-    );
-    alice.restart_daemon(&tmp.path().join("alice-back.err"));
+}
+
+/// alice, back, brings the revocation to dave: returns once dave shows `gone` again.
+fn mp11n_returned(
+    alice: &mut Worker,
+    carol: &Worker,
+    dave: &Worker,
+    id: &str,
+    tmp: &std::path::Path,
+    gone: &str,
+) {
+    alice.restart_daemon(&tmp.join("alice-back.err"));
     let mut settled_and_absent = 0;
     loop {
         let roster = dave.vox(None, &["room", "roster", id]);
@@ -2722,8 +2700,8 @@ fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
         let status = dave.vox(None, &["status", "--json"]);
         let idle = status.ok && status.json()["governance_pending"] == false;
         let read = dave.vox(None, &["room", "read", id]);
-        if member && read.ok && read.stdout.contains(later) {
-            break;
+        if member && read.ok && read.stdout.contains(gone) {
+            return;
         }
         settled_and_absent = if member && idle && read.ok {
             settled_and_absent + 1
@@ -2739,30 +2717,424 @@ fn a_message_that_comes_back_is_news_once_to_an_agent_that_never_got_it() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    mp6_quiet(&[alice, bob, dave]);
-    let back = hook_turn(dave, id, "mp11h-unseen");
-    assert!(
-        back.matches(later).count() == 1,
-        "PRODUCT [MP11 hook]: carol's later post is shown again on dave, and his session \
-         \"unseen\" never got it, yet its next turn told it {} times: {back}",
-        back.matches(later).count()
+}
+
+/// ADR-053 MP-11, candidate N (review of #1393, `ruling-n.md`): **a message a removal took away
+/// that comes back arrives again**, and no reader skips what arrived while it was away.
+///
+/// Staging as `a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds`. alice
+/// posts a thread root; carol posts once, then M, a reply in the thread. dave's agent session
+/// "unseen" reads before M; "trap" is given M as the last thing it reads; a script reads on, a
+/// row at a time, from carol's first post through her reply and M, and keeps M's hash and the
+/// position `vox room read` prints for its next page. bob's removal of carol takes M away on
+/// dave; bob then replies H in the thread, and "unseen" reads it ("trap" does not); alice's
+/// revocation brings M back. Asserted on dave:
+/// - M is in its place in `vox room read` and in its thread, before H (`MP11 in place`,
+///   `MP11 thread`);
+/// - a post dave makes after the return is shown beside M (`MP11 allocator`: the arrival M took
+///   is not given out again);
+/// - after dave's daemon restarts, before either session's next turn: M once, in place
+///   (`MP11 restart`); "unseen", which never got M, is told it once (`MP11 arrives again`);
+///   "trap", whose position was M, is given H and M once each, H not skipped (`MP11 cursor`),
+///   and nothing of them again (`MP11 once`);
+/// - a cursor file the previous build wrote (a message id) is read once and saved as a
+///   position: one naming carol's first post gives H and M once each; one naming M says M came
+///   back and starts again from the room's first message, bounded like any turn (`MP11 old
+///   cursor`);
+/// - the script's hash of M is refused in plain words, no rows (`MP11 script hash`); the
+///   position it was printed gives H and M once each (`MP11 script position`);
+/// - a post after the restart is given once, and M not again (`MP11 allocator`).
+///
+/// `de48c97ee` (M comes back at its old arrival) is red at `MP11 arrives again`. Mutants, each red
+/// at its claim: `VOX_MUTANT_MP11_SAME_ARRIVAL` (M comes back at its old arrival) at `MP11
+/// arrives again`; `VOX_MUTANT_MP11_HASH_CURSOR` (the hook keeps a hash and the node answers it
+/// by M's new arrival) at `MP11 cursor`; `VOX_MUTANT_MP11_THREAD_ARRIVAL` (thread pages by
+/// arrival) at `MP11 thread`; `VOX_MUTANT_MP11_NO_HIGH_WATER` (the governance turn's allocator
+/// advance is not installed) at `MP11 allocator`.
+#[test]
+#[ignore = "four real daemons and an anchor, a removal and a concurrent revocation; run in release"]
+fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhile() {
+    watchdog::arm();
+    let mutants = mp11_mutants(&[
+        "VOX_MUTANT_MP11_SAME_ARRIVAL",
+        "VOX_MUTANT_MP11_HASH_CURSOR",
+        "VOX_MUTANT_MP11_THREAD_ARRIVAL",
+        "VOX_MUTANT_MP11_NO_HIGH_WATER",
+    ]);
+    let env = knob_env(&mutants);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let cid = room.cid;
+    let id = id.as_str();
+    {
+        let [alice, bob, carol, dave] = &mut room.workers[..] else {
+            unreachable!()
+        };
+        setup(alice, &["room", "admin", "add", id, &bob.b32()]);
+        let (admin, listed) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&bob.b32())
+        });
+        assert!(
+            admin,
+            "APPARATUS: bob's delegation was not staged: {listed:?}"
+        );
+        dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-mp11n.err"));
+        for reader in [&*bob, &*carol, &*dave] {
+            mp6_post_until_read(alice, reader, id, "MP11N-READY");
+        }
+        mp6_quiet(&[alice, bob, carol, dave]);
+    }
+    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    setup(alice, &["room", "post", id, "MP11N-ROOT"]);
+    let root = posted_root(&rt, alice, cid, "MP11N-ROOT");
+    let thread = vox_core::node::link::b32_encode(&root);
+    let reply = |body: &str| {
+        serde_json::json!({"v":1,"type":"say","hops":8,"body":body,"thread":thread}).to_string()
+    };
+    let seen = "MP11N-CAROL-SEEN";
+    setup(carol, &["room", "post", id, seen]);
+    mp6_all_shown(
+        &[bob, dave],
+        id,
+        &["MP11N-ROOT", seen],
+        "carol's first post",
     );
-    let again = hook_turn(dave, id, "mp11h-unseen");
+    mp6_quiet(&[alice, bob, carol, dave]);
+    let first = hook_turn(dave, id, "mp11n-unseen");
     assert!(
-        !again.contains(later),
-        "PRODUCT [MP11 hook twice]: dave's session \"unseen\" was told carol's returned post a \
-         second time: {again}"
+        first.contains(seen),
+        "PRODUCT (staging): dave's session \"unseen\" was not told carol's first post: {first}"
     );
-    let other = hook_turn(dave, id, "mp11h-seen");
+    bob.stop_daemon_cleanly();
+    // carol posts once every other node has seen bob go: while their connections to him are
+    // still closing, dave was once not offered her posts at all (fix3 `runs/n-first.log`).
+    let bob_fp = bob.b32();
+    for w in [&*alice, &*carol, &*dave] {
+        let (gone_from, status) = poll(w, &["status", "--json"], WITHIN, |o| {
+            o.ok && o.json()["rooms"].as_array().is_some_and(|rooms| {
+                rooms.iter().filter(|r| r["id"] == id).any(|r| {
+                    r["members"].as_array().is_some_and(|members| {
+                        members
+                            .iter()
+                            .any(|m| m["id"] == bob_fp.as_str() && m["connected"] == false)
+                    })
+                })
+            })
+        });
+        assert!(
+            gone_from,
+            "APPARATUS: {} still reports bob connected after his daemon stopped: {status:?}",
+            w.name
+        );
+    }
+    // carol replies in alice's thread, then posts M: an agent session is told M, and is not
+    // shown replies in threads it is not in, so M is the last thing "trap" is given. dave may
+    // take both in one window, and then M arrives first: nothing here depends on their order.
+    let (gone, gone_reply) = ("MP11N-CAROL-GONE", "MP11N-CAROL-REPLY");
+    setup(carol, &["room", "post", id, &reply(gone_reply)]);
+    setup(carol, &["room", "post", id, gone]);
+    mp6_all_shown(
+        &[alice, dave],
+        id,
+        &[gone_reply, gone],
+        "carol's reply and M",
+    );
+    mp6_quiet(&[alice, carol, dave]);
+    let had = hook_turn(dave, id, "mp11n-trap");
     assert!(
-        other.contains(past) && !other.contains(later),
-        "PRODUCT [MP11 hook twice]: dave's session \"seen\", told carol's later post before it \
-         was taken away, must be told bob's later post and not hers again: {other}"
+        had.matches(gone).count() == 1,
+        "PRODUCT (staging): dave's session \"trap\" was not given M once: {had}"
+    );
+    let seen_hash = row_hash(&rt, dave, cid, seen);
+    let gone_hash = row_hash(&rt, dave, cid, gone);
+    // The script reads one row at a time from carol's first post, as each page tells it to go
+    // on, until it has read her reply and M; it keeps where it was told to continue. What dave
+    // took after carol's first post besides them (a late post of alice's) is read on the way.
+    let (mut next_page, mut read) = (seen_hash.clone(), String::new());
+    for _ in 0..64 {
+        if read.contains(gone_reply) && read.contains(gone) {
+            break;
+        }
+        let page = setup(
+            dave,
+            &["room", "read", id, "--since", &next_page, "--limit", "1"],
+        );
+        next_page = page
+            .stderr
+            .split("--since ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|token| token.trim_matches(['\'', '"', '`']).to_owned())
+            .unwrap_or_else(|| {
+                panic!("PRODUCT (staging): the script's page printed no next page: {page:?}")
+            });
+        read.push_str(&page.stdout);
+    }
+    assert!(
+        read.contains(gone_reply) && read.contains(gone),
+        "PRODUCT (staging): reading on from carol's first post, the script never read her reply \
+         and M: {read}"
     );
     println!(
-        "[proof] once carol's later post came back: session \"unseen\" was told it once and not \
-         again; session \"seen\" was told bob's later post and not hers again"
+        "[proof] dave's session \"trap\" was given M last; a script read on from carol's first \
+         post through her reply and M, and was told to continue from {next_page}:\n{read}"
     );
+    mp11n_removed(&mut room.workers, id, &env, tmp.path(), seen, gone);
+    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    let (meanwhile, meanwhile_reply) = ("MP11N-BOB-MEANWHILE", "MP11N-BOB-REPLY");
+    setup(bob, &["room", "post", id, &reply(meanwhile_reply)]);
+    setup(bob, &["room", "post", id, meanwhile]);
+    mp6_all_shown(
+        &[dave],
+        id,
+        &[meanwhile_reply, meanwhile],
+        "bob's reply and H while M was away",
+    );
+    mp6_quiet(&[bob, dave]);
+    let away = hook_turn(dave, id, "mp11n-unseen");
+    assert!(
+        away.contains(meanwhile) && !away.contains(gone),
+        "PRODUCT (staging): while M was away, dave's session \"unseen\" must be told H and not \
+         M: {away}"
+    );
+    println!("[proof] while M was away, H arrived; \"unseen\" read it, \"trap\" did not");
+    mp11n_returned(alice, carol, dave, id, tmp.path(), gone);
+    mp6_quiet(&[alice, bob, dave]);
+    let in_place = |w: &Worker, claim: &str, when: &str| {
+        let read = w.vox(None, &["room", "read", id]);
+        let (m, h) = (read.stdout.find(gone), read.stdout.find(meanwhile));
+        assert!(
+            read.ok
+                && read.stdout.matches(gone).count() == 1
+                && matches!((m, h), (Some(m), Some(h)) if m < h),
+            "PRODUCT [{claim}]: {when}, dave's `vox room read` must show M once, in its place \
+             before H: {read:?}"
+        );
+    };
+    in_place(dave, "MP11 in place", "once M came back");
+    let shown = shown_of(&rt, dave, cid, root);
+    let at = |tag: &str| shown.thread.iter().position(|text| text.contains(tag));
+    assert!(
+        shown.replies == 2
+            && matches!((at(gone_reply), at(meanwhile_reply)), (Some(m), Some(h)) if m < h),
+        "PRODUCT [MP11 thread]: once carol's reply came back, dave's thread must list it in its \
+         place before bob's: replies {}, thread {:?}",
+        shown.replies,
+        shown.thread
+    );
+    println!(
+        "[proof] M came back in its place before H, and carol's reply before bob's in the thread"
+    );
+    let after = "MP11N-DAVE-Q";
+    setup(dave, &["room", "post", id, after]);
+    let both = dave.vox(None, &["room", "read", id]);
+    assert!(
+        both.ok && both.stdout.matches(gone).count() == 1 && both.stdout.contains(after),
+        "PRODUCT [MP11 allocator]: dave posted after M came back; he must show M and his post: \
+         {both:?}"
+    );
+    dave.stop_daemon_cleanly();
+    dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-restart.err"));
+    let (open, reopened) = poll(dave, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        open,
+        "PRODUCT: dave's room did not reopen after a restart: {reopened:?}"
+    );
+    in_place(dave, "MP11 restart", "after dave's daemon restarted");
+    let unseen = hook_turn(dave, id, "mp11n-unseen");
+    assert!(
+        unseen.matches(gone).count() == 1 && !unseen.contains(meanwhile),
+        "PRODUCT [MP11 arrives again]: M came back on dave, and his session \"unseen\" never got \
+         it, yet its next turn told it {} times (H {} times): {unseen}",
+        unseen.matches(gone).count(),
+        unseen.matches(meanwhile).count()
+    );
+    let trap = hook_turn(dave, id, "mp11n-trap");
+    assert!(
+        trap.matches(meanwhile).count() == 1 && trap.matches(gone).count() == 1,
+        "PRODUCT [MP11 cursor]: dave's session \"trap\" was last given M; M went, H arrived \
+         unread and M came back: its next turn must give H and M once each, yet gave H {} times \
+         and M {} times: {trap}",
+        trap.matches(meanwhile).count(),
+        trap.matches(gone).count()
+    );
+    let again = hook_turn(dave, id, "mp11n-trap");
+    assert!(
+        !again.contains(gone) && !again.contains(meanwhile),
+        "PRODUCT [MP11 once]: dave's session \"trap\" was given H or M again: {again}"
+    );
+    println!(
+        "[proof] after dave's restart: \"unseen\" was told M once; \"trap\" was given H and M \
+         once each (M a second time: it came back), then neither again"
+    );
+    // A cursor file the previous build wrote holds a message id. One naming carol's first post
+    // (never taken away) is read once by hash and saved as a position: the turn gives what came
+    // after it, H and M. One naming M, which came back, says so and starts again from the room's
+    // first message, bounded like any turn.
+    let room_key = vox_core::node::link::b32_encode(&cid);
+    let legacy = |session: &str, hash: &str| {
+        let file = dave.paths.cursor_file(&room_key, session);
+        std::fs::write(&file, format!("{hash}\n"))
+            .expect("APPARATUS: cannot write a previous build's cursor file");
+        let out = hook_turn(dave, id, session);
+        let saved = std::fs::read_to_string(&file).unwrap_or_default();
+        (out, saved)
+    };
+    let (kept, kept_saved) = legacy("mp11n-legacy-kept", &seen_hash);
+    assert!(
+        kept.matches(meanwhile).count() == 1
+            && kept.matches(gone).count() == 1
+            && !kept.contains("harness: ready")
+            && !kept.contains("was not found")
+            && kept_saved.starts_with('@'),
+        "PRODUCT [MP11 old cursor]: a previous build's cursor naming carol's first post must \
+         give H and M once each, not the room's first messages, and be saved as a position: \
+         {kept_saved:?} {kept}"
+    );
+    let (back, back_saved) = legacy("mp11n-legacy-back", &gone_hash);
+    let said = back.find(
+        "(Your read position in this room was not found — this message came back after it was \
+         taken away",
+    );
+    let first_row = back
+        .lines()
+        .find(|l| l.starts_with('['))
+        .and_then(|l| back.find(l));
+    assert!(
+        matches!((said, first_row), (Some(s), Some(r)) if s < r)
+            && back.contains("so this starts again from the room's first message.)")
+            && back.contains("harness: ready")
+            && back.matches(meanwhile).count() == 1
+            && back.matches(gone).count() == 1
+            && back_saved.starts_with('@'),
+        "PRODUCT [MP11 old cursor]: a previous build's cursor naming M, which came back, must say \
+         so before the room's first message and start from there, H and M once each, and be \
+         saved as a position: {back_saved:?} {back}"
+    );
+    println!(
+        "[proof] previous build's cursors: carol's first post read once by hash, saved as {}; \
+         M's said it came back and started again from the room's first message, saved as {}:\n{back}",
+        kept_saved.lines().next().unwrap_or_default(),
+        back_saved.lines().next().unwrap_or_default()
+    );
+    let by_hash = dave.vox(None, &["room", "read", id, "--since", &gone_hash]);
+    assert!(
+        !by_hash.ok
+            && by_hash.stderr.contains(
+                "this message came back after it was taken away; its place in arrival moved; \
+                 continue from the position printed with the last page",
+            )
+            && !by_hash.stdout.contains(gone)
+            && !by_hash.stdout.contains(meanwhile),
+        "PRODUCT [MP11 script hash]: a script holding M's hash must be refused in plain words, \
+         with no rows: {by_hash:?}"
+    );
+    let by_position = dave.vox(None, &["room", "read", id, "--since", &next_page]);
+    assert!(
+        by_position.ok
+            && by_position.stdout.matches(meanwhile).count() == 1
+            && by_position.stdout.matches(gone).count() == 1,
+        "PRODUCT [MP11 script position]: continuing from the position printed with its page, a \
+         script that read M must get H and M once each: {by_position:?}"
+    );
+    println!(
+        "[proof] the script's hash of M was refused: {:?}; its printed position gave H and M",
+        by_hash.stderr.trim()
+    );
+    let later = "MP11N-BOB-P";
+    setup(bob, &["room", "post", id, later]);
+    mp6_all_shown(&[dave], id, &[later], "bob's post after dave's restart");
+    let next = hook_turn(dave, id, "mp11n-trap");
+    assert!(
+        next.matches(later).count() == 1 && !next.contains(gone) && !next.contains(meanwhile),
+        "PRODUCT [MP11 allocator]: a post after dave's restart must be given once after M, and \
+         M not again: {next}"
+    );
+    println!("[proof] a post after the restart was given once, after M; M not again");
+}
+
+/// ADR-053 MP-11, candidate N: **a message that comes back keeps its original lifetime.** dave
+/// keeps messages 150 s (`retention`, his node's file). carol posts M; alice then posts C, so C
+/// expires after M on dave. bob's removal takes M away on dave and alice's revocation brings it
+/// back, before C expires. Asserted (`MP11 lifetime`): once dave no longer shows C, he no longer
+/// shows M. The verdict is that order, not a time: if C is gone before M comes back, the act
+/// cannot stage (APPARATUS). Mutant `VOX_MUTANT_MP11_FRESH_LIFETIME` (a returned row's age runs
+/// from its return) is red at `MP11 lifetime`.
+#[test]
+#[ignore = "four real daemons and an anchor, a removal, a revocation and a short retention"]
+fn a_message_that_comes_back_keeps_its_original_lifetime() {
+    watchdog::arm();
+    let mutants = mp11_mutants(&["VOX_MUTANT_MP11_FRESH_LIFETIME"]);
+    let env = knob_env(&mutants);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    {
+        let [alice, bob, carol, dave] = &mut room.workers[..] else {
+            unreachable!()
+        };
+        setup(alice, &["room", "admin", "add", id, &bob.b32()]);
+        let (admin, listed) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&bob.b32())
+        });
+        assert!(
+            admin,
+            "APPARATUS: bob's delegation was not staged: {listed:?}"
+        );
+        std::fs::write(dave.paths.retention_file(), "default 150\n")
+            .expect("APPARATUS: cannot write dave's retention");
+        dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-mp11l.err"));
+        for reader in [&*bob, &*carol, &*dave] {
+            mp6_post_until_read(alice, reader, id, "MP11L-READY");
+        }
+        mp6_quiet(&[alice, bob, carol, dave]);
+        bob.stop_daemon_cleanly();
+    }
+    let gone = "MP11L-CAROL-M";
+    let control = "MP11L-ALICE-C";
+    {
+        let [alice, _, carol, dave] = &mut room.workers[..] else {
+            unreachable!()
+        };
+        setup(carol, &["room", "post", id, gone]);
+        mp6_all_shown(&[alice, dave], id, &[gone], "carol's M");
+        setup(alice, &["room", "post", id, control]);
+        mp6_all_shown(&[dave], id, &[control], "alice's C, after M");
+        mp6_quiet(&[alice, carol, dave]);
+    }
+    mp11n_removed(&mut room.workers, id, &env, tmp.path(), control, gone);
+    let [alice, _, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    mp11n_returned(alice, carol, dave, id, tmp.path(), gone);
+    let back = setup(dave, &["room", "read", id]);
+    assert!(
+        back.stdout.contains(control),
+        "APPARATUS: alice's C expired on dave before M came back; the act could not stage a \
+         return before M's original expiry: {back:?}"
+    );
+    println!("[proof] M came back on dave while C, posted after it, was still kept");
+    let (expired, last) = poll(dave, &["room", "read", id], GONE + GONE, |o| {
+        o.ok && !o.stdout.contains(control)
+    });
+    assert!(
+        expired,
+        "APPARATUS: alice's C never expired on dave with a 150 s retention: {last:?}"
+    );
+    assert!(
+        !last.stdout.contains(gone),
+        "PRODUCT [MP11 lifetime]: alice's C, posted after carol's M, expired on dave, yet M, \
+         which came back, is still shown: it got a fresh lifetime: {last:?}"
+    );
+    println!("[proof] once C expired on dave, M (which came back) was gone too");
 }
 
 #[test]

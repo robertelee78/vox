@@ -865,12 +865,27 @@ impl Write<'_, '_> {
     }
     /// ADR-053 MP-11: bring back a row an ineligibility decision took away (`remove_rendered`,
     /// `remove_read_receipt`), now that its author's eligibility is decided true again, from the
-    /// plaintext this node still retains for it. The row gets what `put_rendered` gives a row
-    /// shown for the first time, with `shown` as its visibility time; a read receipt gets its
-    /// references back. A row already shown, one this node holds no retained plaintext for
-    /// (never rendered, expired) and a Session row are left alone. True when a row came back.
-    pub(crate) fn restore_rendered(&mut self, hash: &Digest32, shown: u64) -> Result<bool> {
-        let Some(cache) = self.retention(hash)?.and_then(|tracked| tracked.cache_id) else {
+    /// plaintext this node still retains for it. **A message that comes back arrives again**: its
+    /// retained plaintext is sealed again under a new arrival `next_log` takes from the room's
+    /// shared log/cache allocator, the old row is deleted, and the retention fact points at the
+    /// new one and is marked returned (a hash continuation naming it is refused, its place in
+    /// arrival moved). Every expiry input (log id, first sight, claimed time, step kind) stays:
+    /// it never gets a fresh lifetime. Its display key `(clock, hash)` and created time stay, so
+    /// it is back in its place in the conversation and its threads. The row gets what
+    /// `put_rendered` gives a row shown for the first time, with `shown` as its visibility time;
+    /// a read receipt gets its references back under its own row. A row already shown, one this
+    /// node holds no retained plaintext for (never rendered, expired) and a Session row are left
+    /// alone. True when a row came back.
+    pub(crate) fn restore_rendered(
+        &mut self,
+        hash: &Digest32,
+        shown: u64,
+        next_log: &mut u64,
+    ) -> Result<bool> {
+        let Some(mut tracked) = self.retention(hash)? else {
+            return Ok(false);
+        };
+        let Some(cache) = tracked.cache_id else {
             return Ok(false);
         };
         let roots = self.render_roots()?;
@@ -886,7 +901,38 @@ impl Write<'_, '_> {
             .ok_or(invalid("retained cache missing"))?;
         match super::super::parse_cache(&bytes)? {
             super::super::CacheRow::Text(mut row) if row.entry_hash == *hash => {
-                row.arrival = cache;
+                if crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_SAME_ARRIVAL",
+                    "a row that comes back keeps its old arrival",
+                ) {
+                    row.arrival = cache;
+                    self.put_rendered(&row, shown)?;
+                    return Ok(true);
+                }
+                let arrival = *next_log;
+                *next_log = arrival
+                    .checked_add(1)
+                    .ok_or(invalid("log allocator exhausted"))?;
+                let sealed = seal_segment(self.sek, SegmentKind::PlaintextCache, arrival, &bytes)?;
+                self.batch.put_segment(
+                    self.channel,
+                    SegmentKind::PlaintextCache,
+                    arrival,
+                    &sealed,
+                )?;
+                self.batch
+                    .delete_segment(self.channel, SegmentKind::PlaintextCache, cache)?;
+                tracked.cache_id = Some(arrival);
+                tracked.returned = true;
+                if crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_FRESH_LIFETIME",
+                    "a row that comes back gets a fresh lifetime",
+                ) {
+                    tracked.first_seen_ms = shown;
+                    tracked.claimed_ms = Some(shown);
+                }
+                self.set_retention(*hash, Some(tracked))?;
+                row.arrival = arrival;
                 self.put_rendered(&row, shown)?;
                 Ok(true)
             }
@@ -1242,51 +1288,6 @@ impl RenderView<'_> {
         Ok(self
             .visible_summary(self.roots().arrival, false, Some((&bound, false)), false)?
             .count)
-    }
-    /// ADR-053 MP-11: the retained messages whose arrival lies in `(after, through]` that this
-    /// node does not show now (a removal took them away), with their arrival, at most `limit`.
-    /// An arrival reader that passes this range without them learns which ones it never got,
-    /// so it can take one when it comes back at its original arrival (`restore_rendered`),
-    /// behind a cursor that has moved on. Reads only the plaintext rows in the range.
-    pub(crate) fn withheld_between(
-        &self,
-        after: u64,
-        through: u64,
-        limit: usize,
-    ) -> Result<Vec<(Digest32, u64)>> {
-        let (sek, channel) = (self.order.read.sek, self.order.read.channel);
-        let source = self.source();
-        let mut out = Vec::new();
-        let mut at = after;
-        while out.len() < limit {
-            let Some(id) =
-                self.snapshot()
-                    .segment_id_after(channel, SegmentKind::PlaintextCache, Some(at))?
-            else {
-                break;
-            };
-            if id > through {
-                break;
-            }
-            at = id;
-            let Some(bytes) = source.open(sek, channel, SegmentKind::PlaintextCache, id)? else {
-                continue;
-            };
-            let super::super::CacheRow::Text(row) = super::super::parse_cache(&bytes)? else {
-                continue;
-            };
-            let hash = row.entry_hash;
-            if source
-                .render_fact(sek, channel, self.roots().hash, &hashed(&hash))?
-                .is_none()
-                && self
-                    .retention(&hash)?
-                    .is_some_and(|tracked| tracked.cache_id == Some(id))
-            {
-                out.push((hash, id));
-            }
-        }
-        Ok(out)
     }
     fn root(&self, filter: Option<&Filter>, display: bool) -> Result<u64> {
         match filter {

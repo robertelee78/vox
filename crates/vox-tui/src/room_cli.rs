@@ -986,47 +986,31 @@ pub(crate) async fn post_structured(
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
     let unread = if is_result {
-        // What follows this session's drain cursor, read from there (V210-120); the whole room
-        // only if the node no longer holds that cursor.
-        let cursor = crate::agent_hook::load_cursor(paths, &room_key, &session);
-        let mut feed = cursor;
-        let mut after = None;
-        let mut unread = Vec::new();
-        loop {
-            let rows = match client
-                .request(&Request::Read {
-                    channel_id: cid,
-                    since: feed,
-                    after,
-                    limit: 200,
-                })
+        // What follows this session's drain position, read from there (V210-120); the whole room
+        // only if the node no longer holds it, or the cursor (one a build before positions
+        // saved) names a message that came back (ADR-053 MP-11).
+        let from_cursor = match crate::agent_hook::load_cursor(paths, &room_key, &session) {
+            Some(since) => coord::feed(&mut client, cid, since, 0)
+                .await
+                .ok()
+                .flatten()
+                .map(|feed| feed.rows),
+            None => None,
+        };
+        let rows = match from_cursor {
+            Some(rows) => rows,
+            None => match client
+                .read_rows(cid, None)
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))?
             {
                 Frame::Rows { rows } => rows,
-                Frame::Error { .. } if feed.is_some() => {
-                    feed = None;
-                    after = None;
-                    unread.clear();
-                    continue;
-                }
                 other => return Err(crate::client::unexpected(&other)),
-            };
-            let Some(next) = rows.last().map(|r| r.entry_hash) else {
-                break;
-            };
-            let mark = if feed.is_some() {
-                &mut feed
-            } else {
-                &mut after
-            };
-            if *mark == Some(next) {
-                return Err(AppError::Usage("the unread page did not advance".into()));
-            }
-            *mark = Some(next);
-            unread.extend(unread_addressed(&session, &posting, &rows));
-        }
-        unread
+            },
+        };
+        unread_addressed(&session, &posting, &rows)
+            .into_iter()
+            .collect()
     } else {
         Vec::new()
     };
@@ -2098,13 +2082,13 @@ fn refresh_wait_off() -> bool {
 async fn rows_of(
     client: &mut IpcClient,
     channel_id: Digest32,
-    since: Option<Digest32>,
+    since: Option<coord::Since>,
     before: Option<Digest32>,
     limit: usize,
     tagged: &Tagged,
 ) -> Result<Option<Vec<vox_core::node::api::MessageRow>>, AppError> {
     if tagged.tags.is_empty() {
-        if since.is_none() {
+        let Some(since) = since else {
             return match room_page_waiting(client, channel_id, before, limit as u64).await? {
                 vox_core::node::ipc::Frame::RoomPage {
                     rows,
@@ -2145,18 +2129,18 @@ async fn rows_of(
                 vox_core::node::ipc::Frame::Error { reason } => Err(AppError::Usage(reason)),
                 other => Err(crate::client::unexpected(&other)),
             };
-        }
+        };
         let limit = if limit == 0 {
             vox_core::node::ipc::SESSION_PAGE_ROWS
         } else {
             limit.min(vox_core::node::ipc::SESSION_PAGE_ROWS)
         };
-        let rows = coord::read_upto(client, channel_id, since, limit).await?;
-        if let Some(last) = rows
-            .as_ref()
-            .filter(|r| r.len() == limit)
-            .and_then(|r| r.last())
-        {
+        let Some(feed) = coord::feed(client, channel_id, since, limit).await? else {
+            return Ok(None);
+        };
+        // The next page continues from a position, the last row's arrival in this saved room:
+        // never from its hash, which moves when a message comes back (ADR-053 MP-11).
+        if let Some(last) = feed.rows.last().filter(|_| feed.rows.len() == limit) {
             eprintln!(
                 "For the next page: {}",
                 vox_text::shell::node_command(
@@ -2166,7 +2150,7 @@ async fn rows_of(
                         "read",
                         &id(&channel_id),
                         "--since",
-                        &id(&last.entry_hash)
+                        &coord::Since::At(feed.after(last)).text()
                     ],
                     client
                         .node_name()
@@ -2177,7 +2161,7 @@ async fn rows_of(
                 )
             );
         }
-        return Ok(rows);
+        return Ok(Some(feed.rows));
     }
     if let Some(bad) = tagged
         .tags
@@ -2396,7 +2380,7 @@ pub async fn read(
     };
     let since = match since {
         None => None,
-        Some(s) => Some(parse_cursor(s)?),
+        Some(s) => Some(parse_since(s)?),
     };
     let before = before.map(parse_cursor).transpose()?;
     if let Some(action) = history {
@@ -2458,7 +2442,7 @@ pub async fn read(
         }) else {
             return Err(AppError::Usage(format!(
                 "cursor {} is not in this room's timeline",
-                since.map(|c| id(&c)).unwrap_or_default()
+                since.map(|c| c.text()).unwrap_or_default()
             )));
         };
         let held_back = equivocations_in(paths, &channel_id).await;
@@ -2571,7 +2555,7 @@ pub async fn read(
     }) else {
         return Err(AppError::Usage(format!(
             "cursor {} is not in this room's timeline",
-            since.map(|c| id(&c)).unwrap_or_default()
+            since.map(|c| c.text()).unwrap_or_default()
         )));
     };
     let take = if take == 0 { usize::MAX } else { take };
@@ -2944,36 +2928,37 @@ pub async fn tail(
     let mut cursor = tail_head(&mut lookup, channel_id).await?;
     let mut shown = TailRows::default();
     if let Some(since) = since {
-        let hash = parse_cursor(since)?;
-        let row = match lookup
-            .request(&Request::Find {
-                channel_id,
-                entries: vec![hash],
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Rows { mut rows } if rows.len() == 1 && rows[0].entry_hash == hash => {
-                rows.remove(0)
+        // A position is taken as given, in this saved room only. A message id resolves to the
+        // position it stands for; the node refuses one naming a message that came back after
+        // a removal took it away (ADR-053 MP-11): its arrival moved past what came meanwhile.
+        let since = parse_since(since)?;
+        let at = match since {
+            coord::Since::At(at) => {
+                if at.instance != cursor.instance {
+                    return Err(AppError::Usage(
+                        "that position is from another saved copy of this room (it was removed \
+                         and joined again); tail without --since"
+                            .into(),
+                    ));
+                }
+                at
             }
-            Frame::Rows { .. } => {
-                return Err(AppError::Usage("cursor not in this room's timeline".into()))
+            coord::Since::Message(hash) => {
+                let at = coord::feed(&mut lookup, channel_id, since, 1)
+                    .await?
+                    .ok_or_else(|| AppError::Usage("cursor not in this room's timeline".into()))?
+                    .start;
+                if at.instance != cursor.instance {
+                    return Err(AppError::Usage(
+                        "the saved room changed while locating the cursor; run the command again"
+                            .into(),
+                    ));
+                }
+                shown.last = Some(hash);
+                at
             }
-            Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
         };
-        if row.owed || row.arrival == 0 {
-            return Err(AppError::Usage(
-                "cursor is not a readable arrival in this room".into(),
-            ));
-        }
-        if tail_head(&mut lookup, channel_id).await?.instance != cursor.instance {
-            return Err(AppError::Usage(
-                "the saved room changed while locating the cursor; run the command again".into(),
-            ));
-        }
-        cursor.arrival = row.arrival;
-        shown.last = Some(hash);
+        cursor.arrival = at.arrival;
     }
 
     // Both connections are held as the same node. The head predates registration, and the
@@ -3429,6 +3414,22 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
              characters in the first column of `vox room read`"
         ))
     })
+}
+
+/// Parse `--since`: a position `@<arrival>:<instance>`, as the line "For the next page" prints
+/// it, or a full entry hash. A position stays where it is; a hash names the arrival its message
+/// has now, and the node refuses one that came back after a removal took it away (ADR-053
+/// MP-11), since that arrival moved past what came meanwhile.
+fn parse_since(s: &str) -> Result<coord::Since, AppError> {
+    match coord::Since::position(s) {
+        Some(at) => Ok(at),
+        None if s.trim().starts_with('@') => Err(AppError::Usage(
+            "--since @… is a position: @<arrival>:<32 hex digits>, as \"For the next page\" \
+             prints it"
+                .into(),
+        )),
+        None => parse_cursor(s).map(coord::Since::Message),
+    }
 }
 
 // ---------------------------------------------------------------------------

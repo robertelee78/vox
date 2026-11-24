@@ -1297,6 +1297,7 @@ impl PendingText {
                         steps: false,
                         claimed_ms: Some(self.now_millis),
                         cache_id: None,
+                        returned: false,
                     }),
                 )?;
                 index.seal()?;
@@ -1342,6 +1343,7 @@ impl PendingText {
                         steps: false,
                         claimed_ms: Some(self.now_millis),
                         cache_id: Some(id),
+                        returned: false,
                     }),
                 )?;
                 index.seal()?;

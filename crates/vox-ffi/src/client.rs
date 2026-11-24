@@ -8332,7 +8332,6 @@ async fn follow_page(
     owner: &FollowOwner,
     room: Digest32,
     cursor: &mut HistoryCursor,
-    withheld: &mut std::collections::BTreeSet<Digest32>,
     listener: &dyn ClientListener,
 ) -> Result<FollowPage, String> {
     if !owner.current() {
@@ -8381,33 +8380,6 @@ async fn follow_page(
             n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last
         }) {
             return Err("the room's arrival continuation did not advance consistently".into());
-        }
-        // ADR-053 MP-11: what the node withholds in the range this page passes (a removal took
-        // it away) is remembered, so one shown again at its original arrival, behind this
-        // cursor, still reaches the app once (`follow_returned`). One this page carries was
-        // delivered here and is not remembered.
-        let through = next.map_or(last, |n| n.arrival);
-        if through > cursor.arrival {
-            if let Frame::Withheld { entries } = ask(
-                &mut h.client,
-                &Request::Withheld {
-                    channel_id: room,
-                    since: None,
-                    after: cursor.arrival,
-                    through,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            {
-                for (hash, _) in entries {
-                    if withheld.len() < vox_core::node::ipc::MAX_FIND
-                        && !rows.iter().any(|r| r.entry_hash == hash)
-                    {
-                        withheld.insert(hash);
-                    }
-                }
-            }
         }
         let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
         // Names are a separate exchange. A close/rejoin between the page and that exchange
@@ -8465,85 +8437,6 @@ async fn follow_page(
     })
 }
 
-/// ADR-053 MP-11: the messages this follower passed while the node withheld them and that the
-/// node shows again, behind the arrival cursor, each delivered once as it comes back. False
-/// when the observation became obsolete.
-async fn follow_returned(
-    held: &Slot,
-    owner: &FollowOwner,
-    room: Digest32,
-    cursor: &HistoryCursor,
-    withheld: &mut std::collections::BTreeSet<Digest32>,
-    listener: &dyn ClientListener,
-) -> Result<bool, String> {
-    if withheld.is_empty() || !owner.current() {
-        return Ok(owner.current());
-    }
-    let messages = {
-        let mut slot = held.lock().await;
-        let h = slot
-            .as_mut()
-            .filter(|h| owner.holds(h))
-            .ok_or_else(|| "the app released or changed its node".to_owned())?;
-        h.mend().await.map_err(|e| e.to_string())?;
-        if !owner.holds(h) {
-            return Err("the app's node identity changed".into());
-        }
-        let rows = match ask(
-            &mut h.client,
-            &Request::Find {
-                channel_id: room,
-                entries: withheld.iter().copied().collect(),
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        {
-            Frame::Rows { rows } => rows,
-            other => return Err(unexpected(&other).to_string()),
-        };
-        let rows: Vec<_> = rows
-            .into_iter()
-            .filter(|r| !r.owed && withheld.contains(&r.entry_hash))
-            .collect();
-        if rows.is_empty() {
-            return Ok(true);
-        }
-        match ask(&mut h.client, &Request::ArrivalHead { channel_id: room })
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            Frame::ArrivalHead { head } if head.instance == cursor.instance => {}
-            Frame::ArrivalHead { .. } => {
-                return Err(
-                    "the saved room changed; refreshing its history and restarting observation"
-                        .into(),
-                )
-            }
-            other => return Err(unexpected(&other).to_string()),
-        }
-        let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
-        let me = h.client.me().map(|f| b32_encode(&f));
-        for row in &rows {
-            withheld.remove(&row.entry_hash);
-        }
-        rows.iter()
-            .map(|row| rendered(row, &names, me.as_deref()))
-            .collect::<Vec<_>>()
-    };
-    for message in messages {
-        if !owner.current()
-            || !listener
-                .on_message(b32_encode(&room), cursor.instance.to_vec(), message)
-                .await
-            || !owner.current()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Events only wake durable arrival reads. Native consumption backpressures this one task;
 /// a slow listener does not create a body queue, task per message or lifetime dedup set.
 async fn follow(
@@ -8558,9 +8451,6 @@ async fn follow(
     if !owner.current() {
         return Ok(());
     }
-    // Per open room, what its arrival cursor passed while the node withheld it (ADR-053
-    // MP-11): at most `MAX_FIND` hashes a room, not a body queue or a delivered set.
-    let mut withheld: HashMap<Digest32, std::collections::BTreeSet<Digest32>> = HashMap::new();
     if reanchor {
         return Err("a room opened while observation started; refreshing its history and restarting observation".into());
     }
@@ -8568,16 +8458,7 @@ async fn follow(
     let initial_rooms: Vec<_> = cursors.keys().copied().collect();
     for (&room, cursor) in &mut cursors {
         loop {
-            match follow_page(
-                &held,
-                owner,
-                room,
-                cursor,
-                withheld.entry(room).or_default(),
-                listener,
-            )
-            .await?
-            {
+            match follow_page(&held, owner, room, cursor, listener).await? {
                 FollowPage::More => tokio::task::yield_now().await,
                 FollowPage::CaughtUp => break,
                 FollowPage::Obsolete => return Ok(()),
@@ -8599,8 +8480,6 @@ async fn follow(
             }
         }
         let mut sessions_in = Vec::new();
-        // A node turn with nothing applied can bring a withheld message back (ADR-053 MP-11).
-        let mut back = None;
         let rooms: Vec<Digest32> = match event {
             Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, .. }))) => {
                 sessions_in.push(channel_id);
@@ -8614,15 +8493,11 @@ async fn follow(
                 ev @ (NodeEvent::Synced { .. } | NodeEvent::SenderKeyReceived { .. }),
             ))) => {
                 let room = match &ev {
-                    NodeEvent::Synced {
-                        channel_id,
-                        rendered,
-                        ..
-                    } => {
-                        back = Some(*channel_id);
-                        (*rendered > 0).then_some(*channel_id)
-                    }
-                    NodeEvent::SenderKeyReceived { channel_id, .. } => Some(*channel_id),
+                    // A turn with nothing applied can still bring a message back after a
+                    // removal took it away (ADR-053 MP-11): it arrives again, past this cursor,
+                    // so the room's arrivals are read on every turn it reports.
+                    NodeEvent::Synced { channel_id, .. }
+                    | NodeEvent::SenderKeyReceived { channel_id, .. } => Some(*channel_id),
                     _ => None,
                 };
                 if !owner.notice(listener, ev.words()).await {
@@ -8656,7 +8531,6 @@ async fn follow(
                 | NodeEvent::RoomRemoved { channel_id }),
             ))) => {
                 cursors.remove(&channel_id);
-                withheld.remove(&channel_id);
                 seen.remove(&channel_id);
                 if !owner.notice(listener, ev.words()).await
                     || !owner.sessions(listener, channel_id).await
@@ -8699,7 +8573,6 @@ async fn follow(
                         .collect::<Vec<_>>()
                 };
                 cursors.retain(|room, _| open.contains(room));
-                withheld.retain(|room, _| open.contains(room));
                 seen.retain(|room, _| open.contains(room));
                 if open.iter().any(|room| !cursors.contains_key(room)) {
                     return Err("a room opened while events were missed; refreshing its history and restarting observation".into());
@@ -8724,26 +8597,10 @@ async fn follow(
                 continue;
             };
             loop {
-                match follow_page(
-                    &held,
-                    owner,
-                    room,
-                    cursor,
-                    withheld.entry(room).or_default(),
-                    listener,
-                )
-                .await?
-                {
+                match follow_page(&held, owner, room, cursor, listener).await? {
                     FollowPage::More => tokio::task::yield_now().await,
                     FollowPage::CaughtUp => break,
                     FollowPage::Obsolete => return Ok(()),
-                }
-            }
-        }
-        if let Some(room) = back {
-            if let (Some(cursor), Some(set)) = (cursors.get(&room), withheld.get_mut(&room)) {
-                if !follow_returned(&held, owner, room, cursor, set, listener).await? {
-                    return Ok(());
                 }
             }
         }

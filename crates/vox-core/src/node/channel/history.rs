@@ -102,14 +102,6 @@ pub(crate) enum Query {
         before: Option<Digest32>,
         limit: usize,
     },
-    /// ADR-053 MP-11: the retained messages this node does not show now whose arrival lies
-    /// after the cursor `since` (after the arrival `after` when absent) and at or before
-    /// `through`. Answered as [`Reply::Withheld`].
-    Withheld {
-        since: Option<Digest32>,
-        after: u64,
-        through: u64,
-    },
     Count {
         since: Option<Digest32>,
     },
@@ -186,8 +178,6 @@ pub(crate) enum Reply {
         revision: Revision,
     },
     Exact(MessageRow),
-    /// `(entry hash, arrival)` of each message [`Query::Withheld`] found, first to last.
-    Withheld(Vec<(Digest32, u64)>),
 }
 
 /// A union or intersection of concrete sealed indexes. A page may finish its work
@@ -471,7 +461,6 @@ impl View<'_> {
                 | Query::Arrival { .. }
                 | Query::Filtered { .. }
                 | Query::Read { .. }
-                | Query::Withheld { .. }
                 | Query::Older { .. }
                 | Query::Exact { .. }
         ) {
@@ -1461,6 +1450,12 @@ impl View<'_> {
                         "choose either earlier or later thread replies",
                     ));
                 }
+                // In the room's order, by the thread filter's display index: a reply that came
+                // back after a removal took it away (MP-11) arrived again but is in its place.
+                let display = !crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_THREAD_ARRIVAL",
+                    "a thread page is in arrival order",
+                );
                 let filter = Filter::Thread(root);
                 let anchor = before.or(after);
                 let mut cursor = if let Some(hash) = anchor {
@@ -1469,10 +1464,14 @@ impl View<'_> {
                             "cursor not among this room's thread replies",
                         ));
                     }
-                    let fact = self.rendered.fact(&hash)?.ok_or(Failure::Request(
+                    let key = if display {
+                        self.rendered.order().key(&hash)?
+                    } else {
+                        self.rendered.fact(&hash)?.map(|fact| (fact.cache, hash))
+                    };
+                    Some(key.ok_or(Failure::Request(
                         "cursor not among this room's thread replies",
-                    ))?;
-                    Some((fact.cache, hash))
+                    ))?)
                 } else {
                     None
                 };
@@ -1485,7 +1484,7 @@ impl View<'_> {
                 for _ in 0..crate::node::ipc::PAGE_ENTRIES {
                     let Some((key, _)) =
                         self.rendered
-                            .step(Some(&filter), false, cursor, backwards)?
+                            .step(Some(&filter), display, cursor, backwards)?
                     else {
                         break;
                     };
@@ -1517,7 +1516,7 @@ impl View<'_> {
                     Some(key)
                         if self
                             .rendered
-                            .step(Some(&filter), false, Some(key), true)?
+                            .step(Some(&filter), display, Some(key), true)?
                             .is_some() =>
                     {
                         Some(key.1)
@@ -1528,7 +1527,7 @@ impl View<'_> {
                     Some(key)
                         if self
                             .rendered
-                            .step(Some(&filter), false, Some(key), false)?
+                            .step(Some(&filter), display, Some(key), false)?
                             .is_some() =>
                     {
                         Some(key.1)
@@ -1636,8 +1635,25 @@ impl View<'_> {
                         "a read takes a cursor or a page mark, not both",
                     ));
                 }
+                // A cursor naming a message that came back (MP-11) is refused: it arrived again,
+                // and its new arrival is past what arrived while it was away.
                 let mut arrival = match since {
-                    Some(h) => Some(self.mark(h, true, cursor_error)?.arrival),
+                    Some(h) => {
+                        let row = self.mark(h, true, cursor_error)?;
+                        if self
+                            .rendered
+                            .read_index()
+                            .retention(&h)?
+                            .is_some_and(|tracked| tracked.returned)
+                            && !crate::node::mp11_mutant(
+                                "VOX_MUTANT_MP11_HASH_CURSOR",
+                                "a hash cursor naming a message that came back is answered",
+                            )
+                        {
+                            return Err(Failure::Request(crate::node::ipc::CAME_BACK));
+                        }
+                        Some(row.arrival)
+                    }
                     None => None,
                 };
                 let mut display = match after {
@@ -1673,24 +1689,6 @@ impl View<'_> {
                     rows.push(row);
                 }
                 Ok(Reply::Rows(rows))
-            }
-            Query::Withheld {
-                since,
-                after,
-                through,
-            } => {
-                let after = match since {
-                    Some(h) => self.mark(h, true, cursor_error)?.arrival,
-                    None => after,
-                };
-                if no_withheld_mutant() {
-                    return Ok(Reply::Withheld(Vec::new()));
-                }
-                Ok(Reply::Withheld(self.rendered.withheld_between(
-                    after,
-                    through,
-                    crate::node::ipc::MAX_FIND,
-                )?))
             }
             Query::Older { before, limit } => {
                 let mut cursor = match before {
@@ -2057,23 +2055,4 @@ impl ChannelState {
         };
         Ok(Some((created, expires)))
     }
-}
-
-/// `VOX_MUTANT_MP11_NO_WITHHELD`: the node names no withheld message to an arrival reader, so a
-/// message that comes back behind its cursor is never news to it. Says so once when the daemon
-/// first reads it.
-fn no_withheld_mutant() -> bool {
-    #[cfg(feature = "test-knobs")]
-    {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            let on = std::env::var_os("VOX_MUTANT_MP11_NO_WITHHELD").is_some();
-            if on {
-                eprintln!("vox: VOX_MUTANT_MP11_NO_WITHHELD engaged: no withheld message is named");
-            }
-            on
-        });
-        *ON
-    }
-    #[cfg(not(feature = "test-knobs"))]
-    false
 }

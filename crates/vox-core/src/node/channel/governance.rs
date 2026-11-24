@@ -796,6 +796,8 @@ fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Res
 /// One actor turn of work. Source and causal work both progress before ordering,
 /// rather than draining all newly received rows while starving older obligations.
 /// No future complete-page vector or borrowed snapshot survives this function.
+/// `next_log` is the room's shared log/cache allocator: a row that comes back takes its new
+/// arrival from it (MP-11), and the caller installs what it advanced to.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn advance(
     store: &Store,
@@ -806,6 +808,7 @@ pub(super) fn advance(
     root: &Digest32,
     me: &Digest32,
     now: u64,
+    next_log: &mut u64,
 ) -> Result<Progress> {
     let current = progress(store, sek, room, now)?;
     if current.ready && !current.pending {
@@ -888,7 +891,9 @@ pub(super) fn advance(
                             retracted = true;
                         }
                         index.remove_read_receipt(hash)?;
-                    } else if !no_restore_mutant() && index.restore_rendered(hash, shown)? {
+                    } else if !no_restore_mutant()
+                        && index.restore_rendered(hash, shown, next_log)?
+                    {
                         retracted = true;
                     }
                 }

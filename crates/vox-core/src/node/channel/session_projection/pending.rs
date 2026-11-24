@@ -45,6 +45,9 @@ pub(crate) struct PendingProjection {
     authors: BTreeMap<Digest32, CompositePublicKey>,
     policy: SourcePolicy,
     now: u64,
+    /// The room's shared log/cache allocator as prepared: a row that comes back takes its new
+    /// arrival from it in the governance turn (MP-11); the advanced mark is installed after.
+    next_log_id: u64,
     paused_views: bool,
     work: ProjectionWork,
     entries: entry_store::EntryIndex,
@@ -114,6 +117,7 @@ impl ChannelState {
                 step_retention: self.effective_step_retention(),
             },
             now: now.get(),
+            next_log_id: self.next_log_id,
             work,
             entries: entry_store::EntryIndex::default(),
             history_pin: Some(pin),
@@ -142,6 +146,11 @@ impl ChannelState {
         store: &Store,
         completed: CompletedProjection,
     ) -> Result<ProjectionProgress> {
+        // A committed governance turn may have taken arrivals from the shared allocator (a row
+        // that came back, MP-11), whether or not its result installs here.
+        if completed.pending.room == self.channel_id {
+            self.install_next_log(completed.pending.next_log_id);
+        }
         if !completed
             .pending
             .owner
@@ -253,6 +262,7 @@ impl ChannelState {
                 step_retention: self.effective_step_retention(),
             },
             now: now.get(),
+            next_log_id: self.next_log_id,
             work: ProjectionWork::Governance,
             paused_views: false,
             entries: entry_store::EntryIndex::default(),
@@ -276,7 +286,20 @@ impl ChannelState {
         completed: CompletedProjection,
     ) -> Result<()> {
         self.now_hint = self.now_hint.max(completed.pending.now);
+        self.install_next_log(completed.pending.next_log_id);
         self.install_projection_result(store, completed).map(|_| ())
+    }
+
+    /// The shared log/cache allocator's high-water mark after a governance turn that may have
+    /// taken arrivals from it (MP-11): never lowered, so no id is used twice.
+    pub(in crate::node::channel) fn install_next_log(&mut self, next_log_id: u64) {
+        if crate::node::mp11_mutant(
+            "VOX_MUTANT_MP11_NO_HIGH_WATER",
+            "a governance turn's allocator advance is not installed",
+        ) {
+            return;
+        }
+        self.next_log_id = self.next_log_id.max(next_log_id);
     }
 }
 
@@ -299,6 +322,7 @@ impl PendingProjection {
                         &self.root,
                         &self.me,
                         self.now,
+                        &mut self.next_log_id,
                     )?;
                     retracted = progress.retracted;
                     let mut ready = progress.ready;

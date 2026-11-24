@@ -6454,6 +6454,7 @@ impl ChannelState {
                 first_seen_ms: now_ms,
                 claimed_ms,
                 cache_id: None,
+                returned: false,
             }),
         )
     }
