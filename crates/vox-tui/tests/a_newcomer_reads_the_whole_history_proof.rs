@@ -11939,13 +11939,13 @@ mod rg1 {
     ///   (its stderr says `ask=entry`: a body ask moved). The holder posts; the newcomer must
     ///   read it. Then the author starts again and posts once; the newcomer's walk of that newer
     ///   head (or of a later one: the author writes on once it learns of the newcomer) moves the
-    ///   refused body asks to the author's port, now reachable. From that post on (the author's
-    ///   room is open again: while a restarted author reopens it, a round toward it may be
-    ///   refused "authenticator invalid") until that walk reaches position 1, no round of the
-    ///   newcomer toward the author or the holder may fail (`vox status --json` `sync`); a moved
-    ///   body ask that reuses a spent staging request fails "history request ID must be fresh".
-    ///   Then the newcomer must show every one of the author's thirty posts, the twenty the
-    ///   holder refused among them, once each and in order.
+    ///   refused body asks to the author's port, now reachable. From the author's start until
+    ///   that walk reaches position 1, no round of the newcomer toward the author or the holder
+    ///   may fail (`vox status --json` `sync` `failed`, `last_failure`), except one the author
+    ///   refused and the product asks again by itself (`RETRIED_REFUSALS`); a moved body ask
+    ///   that reuses a spent staging request fails "history request ID must be fresh", and that
+    ///   failure is never passed over. Then the newcomer must show every one of the author's
+    ///   thirty posts, the twenty the holder refused among them, once each and in order.
     /// - `Busy`: Busy (the holder's stderr says so); then the holder stops and the author starts
     ///   again; the newcomer must read, from the author, the last post the holder answered Busy
     ///   for.
@@ -12150,12 +12150,13 @@ mod rg1 {
                     std::fs::write(&pressure, "once")
                         .expect("APPARATUS: renewal-pressure staging file");
                 }
+                // Failed rounds are weighed from before the author starts again: its port takes
+                // up the moved body ask as soon as it is back, before its post is accepted.
+                let before = failed_rounds(&reader, &[&author, &holder]);
+                let back = Instant::now();
                 let _author_daemon = start(&author, &author_at, None);
                 eprintln!("[slot] author started again at {author_at}");
                 post(&author, &id, "SL-A-back", true);
-                // The post is accepted once the author's room is open again; rounds refused
-                // while it reopened the room ("authenticator invalid") are not counted.
-                let before = failed_rounds(&reader, &[&author, &holder]);
                 let posts: Vec<String> = (1..=POSTS).map(|n| format!("SL-A-{n:02}")).collect();
                 if renewed {
                     staged(
@@ -12181,15 +12182,21 @@ mod rg1 {
                     // to the author's port again, now reachable: it ends at position 1. The
                     // author may write on (its key for the newcomer, once it learns of it): a
                     // walk of any head from this one on counts.
-                    no_round_fails_until(
+                    let passed_over = no_round_fails_until(
                         &reader,
-                        &[&author, &holder],
+                        [&author, &holder],
                         &before,
-                        &err,
-                        &author,
+                        back,
+                        &id,
                         feed(),
                     );
                     shown_once_each_in_order(&reader, &id, &posts, None, &engaged, mutant_name);
+                    eprintln!(
+                        "[slot] the newcomer showed the author's thirty posts {:.1} s after the \
+                         author started again; failed rounds toward the author passed over: \
+                         {passed_over}",
+                        back.elapsed().as_secs_f64()
+                    );
                 }
                 assert!(
                     engaged(),
@@ -12207,9 +12214,10 @@ mod rg1 {
                     eprintln!(
                         "GREEN: with a flow moved to the stopped author's port, the newcomer \
                          reads the holder's post, and once the author is back its walk of the \
-                         author's newer head moves the refused body asks to the author without a \
-                         failed round, and it shows every post of the author, the refused ones \
-                         among them, once each and in order"
+                         author's newer head moves the refused body asks to the author with no \
+                         round failed but one the author refused and the product asks again by \
+                         itself, and it shows every post of the author, the refused ones among \
+                         them, once each and in order"
                     );
                 }
             }
@@ -12443,8 +12451,9 @@ mod rg1 {
         }
     }
 
-    /// Each peer's `failed` count in `reader`'s `vox status --json` (`sync`).
-    fn failed_rounds(reader: &Worker, peers: &[&Worker]) -> Vec<(u64, Value)> {
+    /// Each peer's `failed` count, `last_failure` and `backoff` in `reader`'s
+    /// `vox status --json` (`sync`).
+    fn failed_rounds(reader: &Worker, peers: &[&Worker]) -> Vec<(u64, Value, Value)> {
         let report = reader.vox(None, &["status", "--json"]);
         report.expect_ok("newcomer status");
         let report = report.json();
@@ -12458,27 +12467,57 @@ mod rg1 {
                 (
                     row.and_then(|row| row["failed"].as_u64()).unwrap_or(0),
                     row.map_or(Value::Null, |row| row["last_failure"].clone()),
+                    row.map_or(Value::Null, |row| row["backoff"].clone()),
                 )
             })
             .collect()
     }
 
+    /// The failure the `Moved` door is about, as `vox status --json` names it in `sync`
+    /// `last_failure`: a moved body ask that reuses a spent staging request.
+    const SPENT_REQUEST: &str = "history request ID must be fresh";
+
+    /// Refusals by the returned author that the newcomer asks again by itself, with no one doing
+    /// anything, as `vox status --json` names them in `sync` `last_failure`:
+    /// - `SessionBusy`: the author was running its own session of the room. The newcomer keeps
+    ///   the exact flow (`shelve_exact`) or re-arms its work, and asks again within 200 ms to 1 s
+    ///   (`BackoffKind::Busy`).
+    /// - `AuthenticatorInvalid`: the author refused the stream with the code that tells a peer
+    ///   nothing (its room not held yet, or the newcomer not yet a member it knows: the newcomer
+    ///   was admitted while it was stopped). The newcomer re-arms its work and asks again 30 s
+    ///   later (`BackoffKind::Policy`).
+    ///
+    /// Neither means a lost request; every other failure toward the author or the holder is
+    /// counted.
+    const RETRIED_REFUSALS: [&str; 2] = [
+        "the peer refused: the peer was busy syncing this room",
+        "the peer refused: authenticator invalid",
+    ];
+
     /// Until `reader`'s stderr says its walk of `author`'s feed under a head of `through` or more
     /// entries reached position 1, then once more: RED PRODUCT when a round of `reader` toward
-    /// any of `peers` failed since `before` (`vox status --json` `sync`: `failed`,
-    /// `last_failure`).
+    /// `author` or `holder` failed since `before` (`vox status --json` `sync`: `failed`,
+    /// `last_failure`), unless `author` refused it with one of [`RETRIED_REFUSALS`]; a failure
+    /// naming [`SPENT_REQUEST`] is never passed over. Status names only the last failure of a
+    /// peer, so it is read every 250 ms; a rise of more than one whose last is passed over is
+    /// said on stderr as such. Returns how many failed rounds toward `author` were passed over;
+    /// each one is said on stderr with the newcomer's backoff and whether the author lists the
+    /// newcomer as a member of `id`.
     fn no_round_fails_until(
         reader: &Worker,
-        peers: &[&Worker],
-        before: &[(u64, Value)],
-        err: &Path,
-        author: &Worker,
+        [author, holder]: [&Worker; 2],
+        before: &[(u64, Value, Value)],
+        back: Instant,
+        id: &str,
         through: u64,
-    ) {
+    ) -> u64 {
+        let err = reader.data.with_extension("err");
         let prefix = format!("live window passed author={} through=", author.b32());
+        let mut seen: Vec<u64> = before.iter().map(|(failed, _, _)| *failed).collect();
+        let mut passed_over = 0;
         let started = Instant::now();
         loop {
-            let done = std::fs::read_to_string(err)
+            let done = std::fs::read_to_string(&err)
                 .unwrap_or_default()
                 .lines()
                 .find(|line| {
@@ -12488,25 +12527,57 @@ mod rg1 {
                         .is_some_and(|head| head >= through)
                 })
                 .map(str::to_owned);
-            let now = failed_rounds(reader, peers);
-            for ((peer, (was, _)), (is, why)) in peers.iter().zip(before).zip(&now) {
+            let now = failed_rounds(reader, &[author, holder]);
+            for ((peer, was), (is, why, backoff)) in
+                [author, holder].iter().zip(&mut seen).zip(&now)
+            {
+                if *is <= *was {
+                    continue;
+                }
+                let reason = why.as_str().unwrap_or_default();
                 assert!(
-                    is <= was,
-                    "RED PRODUCT: a round of the newcomer toward {} failed (failed {was} -> \
-                     {is}) once the author was back: {why}",
+                    !reason.contains(SPENT_REQUEST),
+                    "RED PRODUCT: a round of the newcomer toward {} failed (failed {was} -> {is}) \
+                     once the author was back: a moved body ask reused a spent staging request: \
+                     {why}",
                     peer.name
                 );
+                assert!(
+                    std::ptr::eq(*peer, author) && RETRIED_REFUSALS.contains(&reason),
+                    "RED PRODUCT: a round of the newcomer toward {} failed (failed {was} -> {is}) \
+                     once the author was back, and not with a refusal of the author the product \
+                     asks again by itself: {why}",
+                    peer.name
+                );
+                let knows = try_status(author, id, None)
+                    .ok()
+                    .map(|room| member(&room, &reader.b32()).is_some());
+                eprintln!(
+                    "[slot] passed over {} failed round(s) toward {} at {:.2} s after the author \
+                     started again (failed {was} -> {is}){}: {why}; the newcomer's backoff toward \
+                     it {backoff}; the author lists the newcomer as a member: {knows:?}",
+                    is - *was,
+                    peer.name,
+                    back.elapsed().as_secs_f64(),
+                    if is - *was > 1 {
+                        "; status names the last of them only"
+                    } else {
+                        ""
+                    }
+                );
+                passed_over += is - *was;
+                *was = *is;
             }
             if let Some(walked) = done {
                 eprintln!("[slot] {walked}; failed rounds {now:?}");
-                return;
+                return passed_over;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(600),
                 "APPARATUS: NO RESULT after 600 s: the newcomer's stderr never said \
                  {prefix}<{through} or more> at=1 to=0; failed rounds {now:?}"
             );
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
