@@ -2219,6 +2219,17 @@ pub(super) const fn owed_rows_shown_undecided() -> bool {
     false
 }
 
+/// `VOX_TEST_OWED_ROW=unmoved` (proofs only): while governance refreshes, a kept publication
+/// hides or shows its "not received yet" rows again without moving the room's display revision.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn owed_display_unmoved() -> bool {
+    owed_row_mutant() == Some("unmoved")
+}
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn owed_display_unmoved() -> bool {
+    false
+}
+
 #[cfg(feature = "test-knobs")]
 fn owed_row_mutant() -> Option<&'static str> {
     static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
@@ -2226,6 +2237,7 @@ fn owed_row_mutant() -> Option<&'static str> {
             Ok("unwritten") => Some("unwritten"),
             Ok("unchecked") => Some("unchecked"),
             Ok("undecided") => Some("undecided"),
+            Ok("unmoved") => Some("unmoved"),
             _ => None,
         };
         if let Some(mode) = mode {

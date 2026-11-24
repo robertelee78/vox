@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""tui_marks_read.py <vox> <data_dir> <config_dir> <cue_dir> <want> <tag> <mode>
+"""tui_marks_read.py <vox> <data_dir> <config_dir> <cue_dir> <want> <tag> <mode> [<keep>]
 
 `vox tui` on a node that is attached already (so it asks for nothing), on its one room: once its
 timeline shows <want> and a message shown as "(not received yet)", this driver prints
 `<tag> SHOWN:` with the timeline and writes `shown` in <cue_dir>; then it keeps the TUI open,
-drawing, until the caller writes `done` there (at most 120 s), and quits it. What the TUI marked
-read meanwhile is the caller's to judge, from the node. <mode> other than `-` is given to the TUI
-as `VOX_TEST_OWED_ROW` (a proof's mutant, `test-knobs` builds only).
+drawing, until the caller writes `done` there (at most <keep> s, 120 by default), and quits it.
+While it is kept open, what the timeline shows now is in `screen` in <cue_dir>, written again on
+every look. What the TUI marked read or showed meanwhile is the caller's to judge. <mode> other
+than `-` is given to the TUI as `VOX_TEST_OWED_ROW` (a proof's mutant, `test-knobs` builds only).
 
 Exit 0 = the TUI showed both and was kept open; 1 = no result (`<tag> APPARATUS NO RESULT: <what>`:
 never attached, or never showed both, within the driver's bound: elapsed time is no verdict on the
@@ -20,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, is_attached, pane, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, CUE, WANT, TAG, MODE = sys.argv[1:8]
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240"))
+KEEP = int(sys.argv[8]) if len(sys.argv) > 8 else 120
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240")) + max(0, KEEP - 120)
 NOT_RECEIVED_YET = "(not received yet)"
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -33,10 +35,10 @@ if MODE != "-":
     env["VOX_TEST_OWED_ROW"] = MODE
 
 
-def cue(name):
+def cue(name, text=None):
     path = os.path.join(CUE, name)
     with open(path + ".tmp", "w") as f:
-        f.write(f"{time.time():.3f}")
+        f.write(f"{time.time():.3f}" if text is None else text)
     os.rename(path + ".tmp", path)
 
 
@@ -73,7 +75,12 @@ try:
     sys.stdout.flush()
     cue("shown")
     stage("kept open while the caller watches the node")
-    tui.until(lambda: os.path.exists(os.path.join(CUE, "done")), 120, 0.5)
+
+    def kept():
+        cue("screen", timeline())
+        return os.path.exists(os.path.join(CUE, "done"))
+
+    tui.until(kept, KEEP, 0.5)
     code = 0
     print(f"{TAG} PASS: the timeline showed {WANT!r} beside a message {NOT_RECEIVED_YET}")
     tui.key("q", 1)

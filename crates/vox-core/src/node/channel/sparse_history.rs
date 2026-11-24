@@ -1759,6 +1759,12 @@ impl ChannelState {
             self.dag.install_verified_fork(proof);
             self.forks_kept = completed.kept;
             self.entries.committed();
+            // The proof froze its author and `note_fork_in` started a governance replay: what was
+            // decided under the governance before it no longer stands. Read authority and every
+            // "not received yet" decision go with the fork's installation, before the read
+            // resource is published again, as for any governance change (`OwedDecided` starts a
+            // new turn once governance is current again).
+            self.retire_governance()?;
         }
         if completed.poison {
             if let Err(error) = &completed.result {

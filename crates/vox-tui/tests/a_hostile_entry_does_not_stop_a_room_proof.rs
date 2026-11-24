@@ -66,11 +66,13 @@
 //! (ledger 74).
 //!
 //! ## A placeholder whose decision is open ([`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`])
-//! Carol's post is held stripped by Bob, and no running node holds its body. Alice removes Bob and
-//! readmits him, so the post (written before his removal, never held) is outside his readmission
-//! cut. Bob's governance fold is held (`VOX_TEST_FOLD_HOLD_FILE`) while he takes Alice's removal
-//! and readmission: once his read says the room is still folding its control entries, no
-//! placeholder is shown or counted; released and restarted, still none.
+//! Carol's post is held stripped by Bob, and no running node holds its body. First, with nobody
+//! posting, Bob's terminal app shows it as not received yet; his fold is held while he takes
+//! Alice's rename of the room: once his read and status hide it, his terminal app does too. Then,
+//! his fold still held, Alice removes Bob and readmits him, so the post (written before his
+//! removal, never held) is outside his readmission cut: once his read says the room is still
+//! folding its control entries, no placeholder is shown or counted; released and restarted,
+//! still none.
 //!
 //! ## A body its only holder no longer keeps ([`a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet`])
 //! The honest case of the same rule (LS-33: a node ships no body it no longer holds). All run the
@@ -148,7 +150,10 @@
 //! - `VOX_MUTANT_OWED_ROW=marked` (Bob's terminal app gets it: it submits placeholders with the
 //!   rest of what it showed): the stripped arm goes red at (3);
 //! - `VOX_MUTANT_OWED_ROW=undecided` (rows are shown while their decision is open): the
-//!   undecided arm goes red at (3), while held.
+//!   undecided arm goes red at (2), while held;
+//! - `VOX_MUTANT_OWED_ROW=unmoved` (while governance refreshes, hiding or showing a kept
+//!   placeholder does not move the room's display revision): the undecided arm goes red at (2),
+//!   bob's terminal app still showing the placeholder his read hides.
 //!
 //! Every owed-row mutant, the switch and its value, is checked for in the `vox` under test first
 //! (`test_knobs::require`): a `vox` that does not read it says CANNOT MEASURE.
@@ -263,8 +268,9 @@ fn room_rows(m: &Member, room: &str) -> Option<u64> {
 /// to the reader's daemon as `VOX_TEST_OWED_ROW` (`marked` to the reader's terminal app instead):
 /// `unwritten` (no row is written), `unchecked` (one for every body-less message), `undecided`
 /// (rows are shown while their decision is open), `marked` (the terminal app submits placeholders
-/// with its read marks).
-const OWED_MUTANTS: [&str; 4] = ["unwritten", "unchecked", "undecided", "marked"];
+/// with its read marks), `unmoved` (hiding or showing a kept placeholder while governance
+/// refreshes does not move the room's display revision).
+const OWED_MUTANTS: [&str; 5] = ["unwritten", "unchecked", "undecided", "marked", "unmoved"];
 
 /// The runner's owed-row mutant, if it selected one. A `vox` that does not read the switch
 /// cannot run it: CANNOT MEASURE, never a green run of the unmutated product. Each owed-row act
@@ -386,6 +392,24 @@ fn terminal_marks(
     want: &str,
     mut marked: impl FnMut() -> bool,
 ) -> String {
+    terminal(m, root, want, Duration::from_secs(120), |_| {
+        let t = Instant::now();
+        while t.elapsed() < ARRIVES_WITHIN && !marked() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    })
+}
+
+/// [`terminal_marks`]'s terminal app, kept open at most `keep` once it showed both, while
+/// `while_shown` runs with a reader of what its timeline shows now (`None` before the driver's
+/// first look); the screen it showed first.
+fn terminal(
+    m: &Member,
+    root: &std::path::Path,
+    want: &str,
+    keep: Duration,
+    while_shown: impl FnOnce(&dyn Fn() -> Option<String>),
+) -> String {
     let cues = root.join(format!("{}-tui-cues", m.name));
     std::fs::create_dir_all(&cues).expect("APPARATUS: could not make the TUI's cue directory");
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_marks_read.py");
@@ -400,10 +424,13 @@ fn terminal_marks(
             .filter(|mode| *mode == "marked")
             .unwrap_or("-")
             .to_owned(),
+        keep.as_secs().to_string(),
     ];
+    // The driver's own budget grows by what `keep` adds to its default 120 s; so does its bound.
+    let bound = pty_driver::BOUND + keep.saturating_sub(Duration::from_secs(120));
     let driver = std::thread::spawn(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        pty_driver::run(script, &args)
+        pty_driver::run_within(script, &args, bound)
     });
     // The driver cues `shown` once the timeline shows both, then waits for `done`.
     while !cues.join("shown").exists() && !driver.is_finished() {
@@ -411,11 +438,9 @@ fn terminal_marks(
     }
     let shown = cues.join("shown").exists();
     if shown {
-        // The TUI stays open, showing both, while the caller watches what its node marked.
-        let t = Instant::now();
-        while t.elapsed() < ARRIVES_WITHIN && !marked() {
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        // The TUI stays open, drawing; the driver writes what its timeline shows on every look.
+        let screen = || std::fs::read_to_string(cues.join("screen")).ok();
+        while_shown(&screen);
     }
     std::fs::write(cues.join("done"), b"").expect("APPARATUS: could not cue the TUI driver");
     let out = driver
@@ -803,6 +828,117 @@ fn none_over_rounds(
 /// fold has not folded yet (`vox-tui` `room_cli.rs`, ADR-037 R3): its page is provisional.
 const STILL_FOLDING: &str = "this room is still folding its control entries";
 
+/// Carol's post that bob holds whole, beside which his terminal app shows her post not received
+/// yet ([`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`]).
+const SCREEN_WANT: &str = "carol, while everyone is up";
+
+/// Until `done()` says so, or `n` more of `m`'s sync rounds toward `peer` have completed: whether
+/// it said so. Rounds that do not complete within 600 s: `Err`, APPARATUS NO RESULT.
+fn within_rounds(
+    m: &Member,
+    peer: &Member,
+    n: u64,
+    phase: &str,
+    mut done: impl FnMut() -> bool,
+) -> Result<bool, String> {
+    let first = rounds_toward(&m.status(), peer);
+    let started = Instant::now();
+    loop {
+        let rounds = rounds_toward(&m.status(), peer);
+        if done() {
+            return Ok(true);
+        }
+        if rounds >= first + n {
+            return Ok(false);
+        }
+        if started.elapsed() >= Duration::from_secs(600) {
+            return Err(format!(
+                "APPARATUS NO RESULT ({phase}): in 600 s {}'s rounds toward {} went {first} -> \
+                 {rounds}, fewer than {n} more",
+                m.name, peer.name
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Step (2) of [`a_placeholder_is_not_shown_while_its_reader_cannot_decide_it`], while bob's
+/// terminal app shows carol's post `hash` as not received yet beside [`SCREEN_WANT`] (`screen`:
+/// what its timeline shows now). Nobody posts; bob's fold stays held. `Err`: the red, labelled.
+fn leaves_the_screen_while_held(
+    alice: &Member,
+    bob: &Member,
+    room: &str,
+    hash: &str,
+    hold: &std::path::Path,
+    rows_with: Option<u64>,
+    screen: &dyn Fn() -> Option<String>,
+) -> Result<(), String> {
+    use vox_core::node::api::NOT_RECEIVED_YET;
+    // A timeline that does not show carol's post held whole is no answer.
+    let gone =
+        || screen().is_some_and(|s| s.contains(SCREEN_WANT) && !s.contains(NOT_RECEIVED_YET));
+    let now = || screen().unwrap_or_default();
+    // Held: alice renames the room, a governance entry that changes nothing of carol's post for
+    // bob, and bob takes it without folding it.
+    std::fs::write(hold, b"hold").map_err(|e| format!("APPARATUS: could not arm the hold: {e}"))?;
+    let (ok, out, err) = admin(alice, &["room", "rename", room, "undecided-held"]);
+    if !ok {
+        return Err(format!(
+            "PRODUCT (staging): alice's `vox room rename` failed: {out}{err}"
+        ));
+    }
+    let started = Instant::now();
+    loop {
+        let (ok, out, err) = bob.vox(&["room", "read", room], None);
+        if ok && err.contains(STILL_FOLDING) {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(600) {
+            return Err(format!(
+                "APPARATUS NO RESULT: in 600 s bob's read never said {STILL_FOLDING:?} (alice's \
+                 rename, his fold held); last read: {}",
+                format!("{out}{err}").trim()
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let mut last = None;
+    let hidden = within_rounds(bob, alice, 3, "held, read", || {
+        let read = read_rows(bob, room);
+        let counted = room_rows(bob, room);
+        let hidden = read
+            .as_ref()
+            .is_ok_and(|(owed, _, _)| !owed.iter().any(|h| h == hash))
+            && counted.is_some_and(|rows| Some(rows) < rows_with);
+        last = Some((read, counted));
+        hidden
+    })?;
+    if !hidden {
+        return Err(format!(
+            "PRODUCT: a placeholder whose decision is open is shown: over three rounds toward \
+             alice with her rename unfolded (his fold held), bob's read and status still show \
+             carol's post as not received yet (with the placeholder: {rows_with:?} rows): \
+             {last:?}"
+        ));
+    }
+    println!("[proof] undecided: held, bob's read and status hide it: {last:?}");
+    let gone = within_rounds(bob, alice, 10, "held, screen", gone)?;
+    println!(
+        "[proof] undecided: held, bob's terminal app shows:\n{}",
+        now()
+    );
+    if !gone {
+        return Err(format!(
+            "PRODUCT: bob's read and status no longer show carol's post as not received yet (his \
+             governance refreshing, nobody posting), and over 10 more of his completed rounds \
+             toward alice his terminal app still shows it:\n{}",
+            now()
+        ));
+    }
+    Ok(())
+}
+
 /// `m`'s `vox room read` of `room` now: the entry hashes it shows as not received yet, the rows
 /// it shows, and the read itself. `Err` quotes a read that failed: never taken for "nothing
 /// shown".
@@ -938,20 +1074,26 @@ fn quit(mut p: Proc, who: &str) {
 /// that runs again holds its body. Asserted on bob:
 /// 1. staging (else APPARATUS NO RESULT; the stripped arm owns this claim): within 30 completed
 ///    rounds toward mallory, carol's post is shown as not received yet, and counted;
-/// 2. with bob and mallory stopped, alice removes bob and readmits him: a body written before
+/// 2. on bob's screen, nobody posting: his terminal app (`tests/pty/tui_marks_read.py`) shows
+///    carol's post as not received yet beside her post he holds; alice and the anchor resume
+///    (neither holds the body), bob's fold is held and alice renames the room. Once his read says
+///    the room is still folding, within three completed rounds toward alice his read and status
+///    hide the placeholder, and within ten more his terminal app does. His fold stays held;
+/// 3. with bob and mallory stopped, alice removes bob and readmits him: a body written before
 ///    his removal that he never held is outside his readmission cut, not for him (ADR-053
-///    MP-10). Bob's fold is held, and he is resumed;
-/// 3. once his own read says the room is still folding control entries it holds (alice's removal
-///    and readmission of him, unfolded: his verified prefix of alice does not pass an entry his
-///    held fold has not decided, so it is no witness), over three completed rounds toward alice
-///    he shows no placeholder for carol's post and does not count one;
-/// 4. the hold released and his daemon restarted (a released hold does not wake a held fold by
+///    MP-10). He is resumed;
+/// 4. once his own read says the room is still folding control entries it holds (alice's rename,
+///    removal and readmission of him, unfolded: his verified prefix of alice does not pass an
+///    entry his held fold has not decided, so it is no witness), over three completed rounds
+///    toward alice he shows no placeholder for carol's post and does not count one;
+/// 5. the hold released and his daemon restarted (a released hold does not wake a held fold by
 ///    itself, `governance.rs`, `advance`): once he reads alice's post made after his readmission,
 ///    over three more rounds he still shows none, and his status counts exactly the rows his
 ///    read shows.
 ///
-/// RED at (3) when a row whose decision is open is still shown
-/// (`VOX_MUTANT_OWED_ROW=undecided`).
+/// RED at (2) when a row whose decision is open is still shown, in his read or status
+/// (`VOX_MUTANT_OWED_ROW=undecided`), or on his screen once his read hides it
+/// (`VOX_MUTANT_OWED_ROW=unmoved`).
 #[test]
 #[ignore = "real daemons against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
 fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
@@ -996,7 +1138,7 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
     // is not her first: with no earlier post taken whole, his verified prefix of her stays below it.
     for (author, warm) in [
         (&alice, "alice, while everyone is up"),
-        (&carol, "carol, while everyone is up"),
+        (&carol, SCREEN_WANT),
     ] {
         author.post(&room, warm);
         for m in [&alice, &bob, &carol, &mallory] {
@@ -1036,11 +1178,30 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
         ),
     }
 
-    // ---- (2) alice removes bob and readmits him -----------------------------------------------
-    signal_took(&bob_d, "-STOP", "bob");
-    signal_took(&mallory_d, "-STOP", "mallory");
+    // ---- (2) on bob's screen: held, the placeholder goes with nobody posting -------------------
+    // Nobody posts in this phase. Alice and the anchor resume; neither holds the body (both were
+    // stopped while carol posted, and carol's daemon is gone).
     signal_took(&alice_d, "-CONT", "alice");
     signal_took(&anchor_d, "-CONT", "the anchor");
+    let mut verdict = Ok(());
+    let first = terminal(
+        &bob,
+        root,
+        SCREEN_WANT,
+        Duration::from_secs(900),
+        |screen| {
+            verdict =
+                leaves_the_screen_while_held(&alice, &bob, &room, &hc, &hold, rows_with, screen);
+        },
+    );
+    println!("[proof] undecided: bob's terminal app showed first:\n{first}");
+    if let Err(red) = verdict {
+        panic!("{red}");
+    }
+
+    // ---- (3) alice removes bob and readmits him -----------------------------------------------
+    signal_took(&bob_d, "-STOP", "bob");
+    signal_took(&mallory_d, "-STOP", "mallory");
     for (verb, listed, what) in [
         ("remove-member", false, "stopped listing"),
         ("readmit-member", true, "listed again"),
@@ -1052,10 +1213,10 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
         );
         roster_lists(&alice, &room, &bob, listed, what);
     }
-    std::fs::write(&hold, b"hold").expect("APPARATUS: could not arm bob's fold hold");
+    // Bob's fold is still held from (2), alice's rename unfolded.
     signal_took(&bob_d, "-CONT", "bob");
 
-    // ---- (3) held: bob holds alice's removal and readmission of him, unfolded ---------------------
+    // ---- (4) held: bob holds alice's removal and readmission of him, unfolded ---------------------
     let started = Instant::now();
     loop {
         let (ok, out, err) = bob.vox(&["room", "read", &room], None);
@@ -1105,7 +1266,7 @@ fn a_placeholder_is_not_shown_while_its_reader_cannot_decide_it() {
         worked.1
     );
 
-    // ---- (4) released: decided, carol's post is not for bob ------------------------------------
+    // ---- (5) released: decided, carol's post is not for bob ------------------------------------
     std::fs::remove_file(&hold).expect("APPARATUS: could not release bob's fold hold");
     quit(bob_d, "bob");
     let _bob_d = reader_daemon(&bob, &spec);

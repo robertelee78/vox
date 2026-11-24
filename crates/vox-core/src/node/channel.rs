@@ -986,9 +986,12 @@ pub(crate) struct DisplayStamp {
     session_revision: u64,
     retention: (u64, u64),
     expires_at: Option<u64>,
-    /// How many of the rows shown stand for a body not received yet (V030-10).
+    /// How many rows stand for a body not received yet (V030-10), shown or not.
     owed_count: u64,
-    pub(crate) owed: bool,
+    /// Whether those rows are shown and counted: their decision stands
+    /// ([`ChannelState::owed_rows_shown`]); a row whose decision is open is neither (ADR-036
+    /// H-4). A change of it is a change of the timeline, so the display revision moves with it.
+    owed: bool,
 }
 
 impl DisplayStamp {
@@ -998,20 +1001,23 @@ impl DisplayStamp {
     /// FX-22; #995).
     #[must_use]
     pub(crate) fn rows(&self) -> u64 {
-        self.rendered_count.saturating_add(self.owed_count)
-    }
-
-    /// [`Self::rows`] of a stamp kept from an earlier publication while the room cannot be
-    /// published again (governance refreshing): its "not received yet" rows count only while
-    /// their decision stands now (`owed_shown`, [`ChannelState::owed_rows_shown`]). A row whose
-    /// decision is open is neither shown nor counted (ADR-036 H-4).
-    #[must_use]
-    pub(crate) fn rows_kept(&self, owed_shown: bool) -> u64 {
-        if owed_shown {
-            self.rows()
+        if self.owed {
+            self.rendered_count.saturating_add(self.owed_count)
         } else {
             self.rendered_count
         }
+    }
+
+    /// A stamp kept from an earlier publication while the room cannot be published again
+    /// (governance refreshing), with its "not received yet" rows shown as `owed_shown` says now
+    /// ([`ChannelState::owed_rows_shown`]); `None` when that changes nothing.
+    #[must_use]
+    pub(crate) fn owed_shown(&self, owed_shown: bool) -> Option<Self> {
+        let owed = owed_shown && self.owed_count != 0;
+        (owed != self.owed).then(|| Self {
+            owed,
+            ..self.clone()
+        })
     }
 }
 
@@ -5649,7 +5655,9 @@ impl ChannelState {
         }
         self.entries.committed();
         self.forks_kept = kept;
-        Ok(())
+        // As `finish_history_begin`: a newly kept fork proof withdraws read authority and the
+        // "not received yet" decisions taken under the governance before it.
+        self.retire_governance()
     }
 
     /// The members this room holds back for equivocating (V210-63): each `(author, seq)` where
@@ -5976,12 +5984,7 @@ impl ChannelState {
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
-        // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
-        let owed_count = if self.owed_rows_shown() {
-            rendered.owed_before(None)?
-        } else {
-            0
-        };
+        let owed_count = rendered.owed_before(None)?;
         Ok(DisplayPublication {
             display_stamp: DisplayStamp {
                 incarnation: self.gen.clone(),
@@ -5994,7 +5997,8 @@ impl ChannelState {
                 retention: (self.effective_retention(), self.effective_step_retention()),
                 expires_at: rendered.next_owed_expiry()?,
                 owed_count,
-                owed: owed_count != 0,
+                // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
+                owed: owed_count != 0 && self.owed_rows_shown(),
             },
             read_summary_stamp: ReadSummaryStamp {
                 reads: rendered.read_roots()?,
