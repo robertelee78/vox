@@ -210,72 +210,46 @@ impl Selection {
 }
 
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
-/// This token rejects, before another part of one answer is read, a room whose rows already
-/// read may have moved or changed: an entry moved by a late parent, a row taken away, returned
-/// or given its body, a row expiring (left out of reads before it is removed), a row marked late
-/// by an arrival shown earlier than it (the clock stepped back), a body dropped, a reclassified
-/// row, a retention change, a rebuilt rendering. A message that merely arrives changes no row
-/// already read, so it is not here: one that sorts into the part already read is as if it had
-/// arrived just after the read. (So it compares `display_removals` and `shown_row_rewrites`, not
-/// `display_rewrite`, which also moves for such an arrival.)
+/// A read that takes several requests gives each row as it is when that request is answered:
+/// any row may change the instant after it is read, in one request or five. This token refuses
+/// such a read only when the order of rows it has already given changed (an entry moved by a
+/// late parent), which would show a row twice or skip it across pages anchored on an entry.
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    facts: [u64; 11],
+    order: u64,
 }
 
 impl Revision {
     fn of(ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
         #[allow(unused_mut)]
-        let mut facts = [
-            ch.display_removals,
-            ch.shown_row_rewrites,
-            ch.reorder_generation,
-            rendered.order().revision(),
-            ch.body_generation,
-            ch.classification_revision,
-            ch.effective_retention(),
-            ch.effective_step_retention(),
-            // The rendering's epoch: a rebuilt rendering re-times every row.
-            rendered.display_roots()[3],
-            // Whether "not received yet" rows are shown (ADR-036 H-4): pages gain or lose them.
-            u64::from(ch.owed_shown),
-            // Rows due by now, which reads leave out before they are removed.
-            rendered.due_count(
-                ch.now_hint,
-                ch.effective_retention(),
-                ch.effective_step_retention(),
-                ch.retention_floor,
-            )?,
-        ];
+        let mut order = rendered.order().revision();
         #[cfg(feature = "test-knobs")]
         {
-            if crate::node::mp11_mutant(
-                "VOX_MUTANT_READ_KEEPS_NOTHING",
-                "a read spanning requests compares nothing of the rows already read",
-            ) {
-                facts = [0; 11];
-            }
             if crate::node::mp11_mutant(
                 "VOX_MUTANT_READ_REFUSES_ARRIVALS",
                 "a read spanning requests is refused when a message arrives",
             ) {
-                let roots = rendered.display_roots();
-                facts[0] = facts[0]
-                    .wrapping_add(ch.generation)
-                    .wrapping_add(rendered.count()?)
-                    .wrapping_add(roots[0])
-                    .wrapping_add(roots[1]);
+                order = order.wrapping_add(ch.generation);
+            }
+            if ch.effective_retention() != 0
+                && crate::node::mp11_mutant(
+                    "VOX_MUTANT_READ_REFUSES_EXPIRY",
+                    "a read spanning requests in a room with a message lifetime is refused once \
+                     time has passed, when a row can expire",
+                )
+            {
+                order = order.wrapping_add(ch.now_hint);
             }
         }
         Ok(Self {
             incarnation: ch.gen.clone(),
-            facts,
+            order,
         })
     }
     fn current(&self, ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
         let now = Self::of(ch, rendered)?;
-        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.facts == now.facts)
+        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.order == now.order)
     }
 }
 
@@ -1284,8 +1258,8 @@ impl View<'_> {
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
             // The display token moves with whatever a person could see change, an arrival too:
-            // a client caching a summary refreshes on it. The read token moves only when rows
-            // already read may have moved or changed: a read spanning requests compares it.
+            // a client caching a summary refreshes on it. The read token moves only when the
+            // order of rows already read changed: a read spanning requests compares it.
             query @ (Query::DisplayRevision | Query::ReadRevision) => {
                 use sha2::{Digest, Sha256};
                 let revision = Revision::of(self.ch, &self.rendered)?;
@@ -1294,13 +1268,19 @@ impl View<'_> {
                 hash.update(self.ch.channel_id());
                 hash.update(self.rendered.history_instance());
                 hash.update(self.ch.incarnation.to_be_bytes());
-                for fact in revision.facts {
-                    hash.update(fact.to_be_bytes());
-                }
+                hash.update(revision.order.to_be_bytes());
                 if matches!(query, Query::DisplayRevision) {
-                    hash.update(self.ch.generation.to_be_bytes());
-                    hash.update(self.ch.display_rewrite.to_be_bytes());
-                    hash.update(self.rendered.count()?.to_be_bytes());
+                    for fact in [
+                        self.ch.generation,
+                        self.ch.display_rewrite,
+                        self.rendered.count()?,
+                        self.ch.body_generation,
+                        self.ch.classification_revision,
+                        self.ch.effective_retention(),
+                        self.ch.effective_step_retention(),
+                    ] {
+                        hash.update(fact.to_be_bytes());
+                    }
                     for root in self.rendered.display_roots() {
                         hash.update(root.to_be_bytes());
                     }

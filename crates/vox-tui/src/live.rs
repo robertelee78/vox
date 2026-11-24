@@ -376,36 +376,14 @@ impl From<&str> for PageFailure {
 }
 
 /// Fence a multi-request visible page without retaining a database snapshot or lock. The read
-/// token moves only when rows already read may have moved or changed, not when a message arrives.
-async fn page_revision(
-    client: &mut IpcClient,
-    room: Digest32,
-) -> Result<(Digest32, Digest32), PageFailure> {
-    let body = client
-        .exchange(&vox_core::node::snapshot::request_body())
-        .await
-        .map_err(|e| format!("the room's state could not be read: {e}"))?;
-    let Some(snapshot) = NodeSnapshot::from_bytes(&body)
-        .map_err(|e| format!("the room's state could not be read: {e}"))?
-    else {
-        return Err(match Frame::from_bytes(&body) {
-            Ok(Frame::NodeDetached { .. }) => PageFailure::Detached,
-            Ok(Frame::Error { reason }) => reason.into(),
-            _ => "the node did not answer the room's state".into(),
-        });
-    };
-    let sessions = snapshot
-        .open
-        .into_iter()
-        .find(|r| r.channel_id == room)
-        .map(|r| r.session_revision)
-        .ok_or("the room is not open")?;
+/// token moves only when the order of rows already read changed, not when a row changes.
+async fn page_revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32, PageFailure> {
     match client
         .request(&Request::RoomReadRevision { channel_id: room })
         .await
         .map_err(|e| format!("the room's state could not be read: {e}"))?
     {
-        Frame::RoomDisplayRevision { revision } => Ok((revision, sessions)),
+        Frame::RoomDisplayRevision { revision } => Ok(revision),
         Frame::Error { reason } => Err(reason.into()),
         Frame::NodeDetached { .. } => Err(PageFailure::Detached),
         _ => Err("the node did not answer the room's state".into()),

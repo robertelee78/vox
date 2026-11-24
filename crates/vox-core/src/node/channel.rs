@@ -1370,19 +1370,13 @@ pub struct ChannelState {
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
     display_order_revision: u64,
-    /// Highest shown time in this open incarnation (or above it), to notice a backwards
-    /// wall-clock step.
+    /// Highest shown time in this open incarnation, to notice a backwards wall-clock step.
     display_shown_at: u64,
     /// Changes that cannot extend the previous rendered prefix.
     display_rewrite: u64,
     /// Readable rows removed from the rendered prefix (pruning, retention, missing-position
     /// cleanup); a late arrival that only reorders the prefix leaves it alone.
     display_removals: u64,
-    /// Rewrites of rows already shown by an arrival: one shown at least [`LATE_AFTER_MS`] before
-    /// [`Self::display_shown_at`] (the wall clock stepped back) can mark rows already shown late
-    /// (`RenderView::display_timing`). An arrival that merely sorts below the newest row, at the
-    /// newest shown time, leaves it alone.
-    shown_row_rewrites: u64,
     /// A governance turn took shown rows away or brought retained ones back (ADR-053 MP-11)
     /// since the node last said so: what it says as [`crate::node::api::NodeEvent::Synced`] with
     /// nothing applied, so a client re-reads the room's preview and unread.
@@ -2352,7 +2346,6 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
-            shown_row_rewrites: 0,
             display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
@@ -3000,7 +2993,6 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
-            shown_row_rewrites: 0,
             display_news: false,
             entries,
             legacy_preparation,
@@ -3504,7 +3496,6 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
-            shown_row_rewrites: 0,
             display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
@@ -7031,8 +7022,6 @@ impl ChannelState {
         // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
         // stores nothing, one after it still stores the row.
         let mut logged: u64 = promotion.unwrap_or(0);
-        // A body for a held skeleton takes its "not received yet" placeholder away for its text.
-        let refilled = arrived.iter().any(|(_, _, _, refill)| refill.is_some());
         for (author, entry_hash, _, refill) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
@@ -7214,9 +7203,6 @@ impl ChannelState {
         // none when the write failed (the room is poisoned above), and a refused pass's rows too.
         self.gen
             .fetch_add(logged, std::sync::atomic::Ordering::Relaxed);
-        if refilled {
-            self.remove_display_rows();
-        }
         if promotion.is_some() {
             self.finish_entry_publication(store)?;
         }
@@ -8557,12 +8543,6 @@ impl ChannelState {
                 || fact.shown < self.display_shown_at
             {
                 self.invalidate_display();
-            }
-            // `late(R)` is R shown at or after the earliest shown time after it plus
-            // `LATE_AFTER_MS`: only an arrival this much older than a row already shown can
-            // lower that time enough to mark that row late.
-            if fact.shown.saturating_add(LATE_AFTER_MS) <= self.display_shown_at {
-                self.shown_row_rewrites = self.shown_row_rewrites.wrapping_add(1);
             }
             self.display_tail = Some(self.display_tail.map_or(key, |tail| tail.max(key)));
             self.display_shown_at = self.display_shown_at.max(fact.shown);

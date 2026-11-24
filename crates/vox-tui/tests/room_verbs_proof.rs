@@ -1136,14 +1136,16 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         "PRODUCT: unique older-page prefix {older_prefix} did not reply to canonical parent {older_target}: {canonical_parent}"
     );
 
-    // A selector's scan is one logical read. Hold the shipped CLI after its first page, change
-    // the room through a second shipped CLI, then let it continue (ledger 95).
-    // - A message that only arrives changes no row the scan has read: the reply resolves and is
-    //   posted. Mutant `VOX_MUTANT_READ_REFUSES_ARRIVALS` (the arrival fields compared again):
-    //   the scan is refused because someone posted.
-    // - A row the scan has read expires, and a plain read no longer shows it: the scan is
-    //   refused and posts nothing. Mutant `VOX_MUTANT_READ_KEEPS_NOTHING`: the reply is posted
-    //   against a page that is no longer the room.
+    // A selector's scan is one logical read: each page as it is when it is read, refused only
+    // when the order of what it already read changed. Hold the shipped CLI after its first page,
+    // change the room through a second shipped CLI, then let it continue (ledger 95).
+    // - A row the scan read expires, and a plain read no longer shows it. A reply naming another
+    //   row goes to it; mutant `VOX_MUTANT_READ_REFUSES_EXPIRY` (in a room with a lifetime,
+    //   refused once time has passed): refused. A reply naming the expired row is refused because
+    //   its target cannot be read, and nothing is posted; mutant
+    //   `VOX_MUTANT_REPLY_TO_UNREADABLE`: it is posted.
+    // - A message that only arrives: the reply resolves and is posted. Mutant
+    //   `VOX_MUTANT_READ_REFUSES_ARRIVALS`: the scan is refused because someone posted.
     #[cfg(feature = "test-knobs")]
     {
         test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
@@ -1159,45 +1161,62 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
                     .then_some((entry.clone(), prefix.to_owned()))
             })
             .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
-        // `vox room post ROOM --re PREFIX TEXT`, held after its first page while `change` runs.
-        let held_scan = |room: &str, prefix: &str, text: &str, change: &dyn Fn() -> String| {
-            let hold = tmp.path().join(format!("{text}.hold"));
-            let reached = hold.with_extension("reached");
-            std::fs::write(&hold, b"hold")
-                .expect("APPARATUS: could not stage the reply-prefix scan hold");
-            let (scan_data, scan_cfg, scan_hold) = (data.clone(), cfg.clone(), hold.clone());
-            let (room, prefix, text) = (room.to_owned(), prefix.to_owned(), text.to_owned());
-            let scan = std::thread::spawn(move || {
-                vox_with_env(
-                    &scan_data,
-                    &scan_cfg,
-                    &["room", "post", &room, "--re", &prefix, &text],
-                    None,
-                    &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
-                )
-            });
-            while !reached.exists() {
-                assert!(
-                    !scan.is_finished(),
-                    "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
-                );
-                std::thread::sleep(Duration::from_millis(10));
+        // `vox room post ROOM --re PREFIX TEXT` for each `(prefix, text)`, all held after their
+        // first page while `change` runs, then released together.
+        let held_scans = |room: &str, scans: &[(&str, &str)], change: &dyn Fn() -> String| {
+            let held: Vec<_> = scans
+                .iter()
+                .map(|&(prefix, text)| {
+                    let hold = tmp.path().join(format!("{text}.hold"));
+                    std::fs::write(&hold, b"hold")
+                        .expect("APPARATUS: could not stage the reply-prefix scan hold");
+                    let (scan_data, scan_cfg, scan_hold) =
+                        (data.clone(), cfg.clone(), hold.clone());
+                    let (room, prefix, text) =
+                        (room.to_owned(), prefix.to_owned(), text.to_owned());
+                    let scan = std::thread::spawn(move || {
+                        vox_with_env(
+                            &scan_data,
+                            &scan_cfg,
+                            &["room", "post", &room, "--re", &prefix, &text],
+                            None,
+                            &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
+                        )
+                    });
+                    (hold, scan)
+                })
+                .collect();
+            for (hold, scan) in &held {
+                while !hold.with_extension("reached").exists() {
+                    assert!(
+                        !scan.is_finished(),
+                        "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             let changed = change();
-            std::fs::remove_file(&hold)
-                .expect("APPARATUS: could not release the staged reply-prefix scan");
-            let result = scan
-                .join()
-                .expect("APPARATUS: reply-prefix command thread panicked");
-            // Diagnostic: a mutant the daemon engaged says so in its stderr.
-            for line in std::fs::read_to_string(&daemon_err)
-                .unwrap_or_default()
-                .lines()
+            for (hold, _) in &held {
+                std::fs::remove_file(hold)
+                    .expect("APPARATUS: could not release the staged reply-prefix scan");
+            }
+            let results: Vec<_> = held
+                .into_iter()
+                .map(|(_, scan)| {
+                    scan.join()
+                        .expect("APPARATUS: reply-prefix command thread panicked")
+                })
+                .collect();
+            // Diagnostic: a mutant the daemon or a scan engaged says so in its stderr.
+            let daemon_said = std::fs::read_to_string(&daemon_err).unwrap_or_default();
+            for line in std::iter::once(daemon_said.as_str())
+                .chain(results.iter().map(|(_, _, err)| err.as_str()))
+                .flat_map(str::lines)
                 .filter(|line| line.contains(" engaged"))
             {
-                println!("[proof] the daemon said: {line}");
+                println!("[proof] said: {line}");
             }
-            (changed, result)
+            (changed, results)
         };
         // A plain read, once it answers: a room removing expired messages says so until it has.
         let rows_now = |room: &str| loop {
@@ -1217,33 +1236,10 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
                 .collect::<Vec<_>>();
         };
 
-        let (arrived, (ok, out, err)) = held_scan(
-            &room,
-            &changing_prefix,
-            "PREFIX-SCAN-PAST-AN-ARRIVAL",
-            &|| post(&["PREFIX-ARRIVES-WHILE-SCANNED"]),
-        );
-        assert!(
-            ok,
-            "PRODUCT: a reply-prefix scan was refused because message {arrived} arrived while it \
-             read; no row it had read changed: {out}{err}"
-        );
-        let reply = rows_now(&room)
-            .into_iter()
-            .find(|row| row.to_string().contains("PREFIX-SCAN-PAST-AN-ARRIVAL"));
-        assert!(
-            reply
-                .as_ref()
-                .is_some_and(|row| row["envelope"]["re"] == changing_target),
-            "PRODUCT: the reply-prefix scan that read past an arrival did not reply to \
-             {changing_target}: {reply:?}"
-        );
-
         // A second room, of one page (with more, the oldest row of the first page, gone, would
         // anchor the next page and refuse it on its own). Its message lifetime is set before
-        // anything is posted, so only the expiry changes the room while the scan holds: a
-        // message, then `GAP` later the reply's target; the scan reads both and holds; the first
-        // expires, and a plain read shows it gone and the target still there.
+        // anything is posted: a message, then `GAP` later another; two scans read both and hold;
+        // the first expires, and a plain read shows it gone and the other still there.
         const LIFETIME_SECS: u64 = 16;
         const GAP: Duration = Duration::from_secs(LIFETIME_SECS / 2);
         let (ok, _, err) = vox(
@@ -1309,18 +1305,19 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             shown(&rows, &expires) && shown(&rows, &target),
             "APPARATUS: expiring-in-debug does not show {expires} and {target}: {rows:?}"
         );
-        let target_prefix = &target[..51];
-        let (changed, (ok, out, err)) = held_scan(
+        let (changed, results) = held_scans(
             &expiring,
-            target_prefix,
-            "PREFIX-SCAN-PAST-AN-EXPIRY",
+            &[
+                (&target[..51], "PREFIX-SCAN-PAST-AN-EXPIRY"),
+                (&expires[..51], "PREFIX-SCAN-TO-THE-EXPIRED"),
+            ],
             &|| {
                 loop {
                     let rows = rows_now(&expiring);
                     assert!(
                         shown(&rows, &target),
-                        "APPARATUS: the reply's target {target} expired before the scan was \
-                         released: the staging took longer than its {GAP:?} gap"
+                        "APPARATUS: {target} expired before the scans were released: the \
+                         staging took longer than its {GAP:?} gap"
                     );
                     if !shown(&rows, &expires) {
                         break;
@@ -1330,16 +1327,43 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
                 format!("message {expires} expired and a plain read no longer showed it")
             },
         );
+        let rows = rows_now(&expiring);
+        let posted = |text: &str| rows.iter().find(|row| row.to_string().contains(text));
+        let (ok, out, err) = &results[0];
         assert!(
-            !ok && err.contains("room changed"),
-            "PRODUCT: a reply-prefix scan accepted its page after {changed}, a row it had read, \
-             and resolved {target}: {out}{err}"
+            *ok && posted("PREFIX-SCAN-PAST-AN-EXPIRY")
+                .is_some_and(|row| row["envelope"]["re"] == target),
+            "PRODUCT: after {changed}, a reply-prefix scan that had read it did not reply to \
+             {target}; the order of what it read did not change: {out}{err}"
         );
+        let (ok, out, err) = &results[1];
         assert!(
-            rows_now(&expiring)
-                .iter()
-                .all(|row| !row.to_string().contains("PREFIX-SCAN-PAST-AN-EXPIRY")),
-            "PRODUCT: a refused reply-prefix scan posted its reply"
+            !ok && err.contains("cannot read that message")
+                && posted("PREFIX-SCAN-TO-THE-EXPIRED").is_none(),
+            "PRODUCT: after {changed}, a reply to it was not refused in plain words, or was \
+             posted: {out}{err}"
+        );
+
+        let (arrived, results) = held_scans(
+            &room,
+            &[(&changing_prefix, "PREFIX-SCAN-PAST-AN-ARRIVAL")],
+            &|| post(&["PREFIX-ARRIVES-WHILE-SCANNED"]),
+        );
+        let (ok, out, err) = &results[0];
+        assert!(
+            *ok,
+            "PRODUCT: a reply-prefix scan was refused because message {arrived} arrived while it \
+             read; no row it had read changed: {out}{err}"
+        );
+        let reply = rows_now(&room)
+            .into_iter()
+            .find(|row| row.to_string().contains("PREFIX-SCAN-PAST-AN-ARRIVAL"));
+        assert!(
+            reply
+                .as_ref()
+                .is_some_and(|row| row["envelope"]["re"] == changing_target),
+            "PRODUCT: the reply-prefix scan that read past an arrival did not reply to \
+             {changing_target}: {reply:?}"
         );
     }
     #[cfg(not(feature = "test-knobs"))]

@@ -174,8 +174,6 @@ impl ChannelState {
         if completed.retracted {
             self.remove_display_rows();
             self.display_news = true;
-            // A row given back was shown at its restoring time, before now (`governance.rs`).
-            self.display_shown_at = self.display_shown_at.max(super::super::shown_now());
             match self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)

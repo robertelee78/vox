@@ -690,7 +690,12 @@ pub(crate) fn reply_thread(
     explicit: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     if let Some(re) = re {
-        if known.is_none() {
+        if known.is_none()
+            && !vox_core::node::mp11_mutant(
+                "VOX_MUTANT_REPLY_TO_UNREADABLE",
+                "a reply is posted to a message this node cannot read",
+            )
+        {
             return Err(AppError::Usage(format!(
                 "cannot reply to {re}: this node cannot read that message; nothing was posted"
             )));

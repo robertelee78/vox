@@ -497,12 +497,6 @@ impl ChannelState {
                 if matches!(&work, Work::Effect { .. } | Work::Refill { .. }) {
                     self.gen.fetch_add(1, Ordering::Relaxed);
                 }
-                // A body given to a row already held takes its "not received yet" placeholder
-                // away for its text, wherever it sorts, newest included: a read spanning requests
-                // must notice, as it does any row taken away (`history::Revision`).
-                if matches!(&work, Work::Refill { .. }) {
-                    self.remove_display_rows();
-                }
                 if let Some(author) = available {
                     self.note_available(store, author)?;
                 }

@@ -1303,7 +1303,7 @@ pub enum Request {
         channel_id: Digest32,
     },
     /// The token a read spanning requests compares, as [`Frame::RoomDisplayRevision`]: it
-    /// moves when rows already read may have moved or changed, not when a message arrives.
+    /// moves when the order of rows already read changed, not when a message arrives.
     RoomReadRevision {
         /// The selected node's room.
         channel_id: Digest32,

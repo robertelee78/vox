@@ -36,8 +36,8 @@ use crate::{digest, failed, input_fingerprint, VoxError};
 
 /// A read under the room's fence: `$body` runs with `$fence` bound and yields the read's value;
 /// if the fence or the acting node changed meanwhile, the read is refused with `$message`. The
-/// fence moves only when rows already read may have moved or changed, never because a message
-/// arrived. Yields `(fence, value)`.
+/// fence moves only when the order of rows already read changed, never because a message
+/// arrived or a row changed. Yields `(fence, value)`.
 macro_rules! under_fence {
     ($c:expr, $channel_id:expr, $actor:expr, $message:expr, |$fence:ident| $body:block) => {{
         let $fence = room_read_fence($c, $channel_id).await?;

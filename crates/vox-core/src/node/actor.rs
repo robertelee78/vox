@@ -6021,8 +6021,8 @@ impl NodeHandle {
         .await
     }
 
-    /// The same, moving only when rows already read may have moved or changed: what a read
-    /// spanning requests compares, so a message that merely arrives does not refuse it.
+    /// The same, moving only when the order of rows already read changed: what a read spanning
+    /// requests compares, so a message that arrives or a row that changes does not refuse it.
     pub(crate) async fn room_read_revision(
         &self,
         channel_id: &Digest32,
@@ -26434,7 +26434,6 @@ async fn saved_history_query(
         let names = matches!(
             &query,
             crate::node::channel::history::Query::DisplayRevision
-                | crate::node::channel::history::Query::ReadRevision
         )
         .then(|| (view.trusted.clone(), view.presented.clone()));
         (
