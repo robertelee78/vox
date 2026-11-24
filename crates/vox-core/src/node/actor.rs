@@ -8316,11 +8316,12 @@ impl Node {
                     .iter()
                     .all(|deferred| deferred._permit.is_some());
             let allow_fresh_maintenance = self.fresh_maintenance_allowed();
+            let allow_governance = self.room_change_allowed();
             let maintenance_ready = self.room_preparation_work_ready()
+                || (allow_governance && self.governance_work.pending)
                 || (allow_fresh_maintenance
-                    && (self.governance_work.pending
-                        || (!self.legacy_cleanup_rooms.is_empty()
-                            && std::time::Instant::now() >= self.legacy_cleanup_due)
+                    && ((!self.legacy_cleanup_rooms.is_empty()
+                        && std::time::Instant::now() >= self.legacy_cleanup_due)
                         || self.key_package_work_ready()));
             let journal_computer = self.computer.clone();
             let journal_ready = async move {
@@ -8467,7 +8468,7 @@ impl Node {
                                 self.advance_legacy_cleanup().await;
                                 break;
                             }
-                            2 if allow_fresh_maintenance && self.governance_work.pending => {
+                            2 if allow_governance && self.governance_work.pending => {
                                 self.advance_governance_turn().await;
                                 self.publication_pending |= !self.publish_waiters.is_empty();
                                 self.publication_again |= !self.publish_waiters.is_empty();
@@ -10184,7 +10185,7 @@ impl Node {
             return;
         }
         use std::ops::Bound::{Excluded, Unbounded};
-        let allow_fresh = self.fresh_maintenance_allowed();
+        let allow_fresh = self.room_change_allowed();
         let next = match self.publication_after {
             Some(after) => self
                 .publish_waiters
@@ -21112,11 +21113,12 @@ impl Node {
 
     fn room_preparation_work_ready(&self) -> bool {
         let allow_fresh = self.fresh_maintenance_allowed();
+        let allow_publication = self.room_change_allowed();
         let now = std::time::Instant::now();
         (self.publication_pending
-            && ((allow_fresh && self.publish_waiters.is_empty())
+            && ((allow_publication && self.publish_waiters.is_empty())
                 || self.publish_waiters.iter().any(|(room, waiting)| {
-                    preparation_save::publication_eligible(self, room, waiting, allow_fresh)
+                    preparation_save::publication_eligible(self, room, waiting, allow_publication)
                 })))
             || self
                 .preparing_rooms
