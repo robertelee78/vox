@@ -421,12 +421,17 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         post(&eve_dir, &room, "eve", &format!("EQ-EVE-A-{i}"));
     }
     post(&frank_dir, &room, "frank", "EQ-FRANK-A-1");
-    for text in ["EQ-EVE-A-3", "EQ-FRANK-A-1"] {
-        assert!(
-            wait_reads(&bob_dir, &room, text, REACH),
-            "PRODUCT (staging): bob never read {text}, so the first side of the fork is not in place"
-        );
-    }
+    // Every post of eve's side, not only the last: eve's fork is at her first post's position,
+    // where bob's side must be opened (see `staged_reads_all`).
+    staged_reads_all(
+        &bob_dir,
+        &[&eve_dir, &frank_dir],
+        &room,
+        &["EQ-EVE-A-1", "EQ-EVE-A-2", "EQ-EVE-A-3", "EQ-FRANK-A-1"],
+        REACH,
+        "bob never read all of eve's and frank's first side, so the first side of the fork is not \
+         in place",
+    );
     stop(eve);
     stop(frank);
 
@@ -667,7 +672,8 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 // side, so nothing but the members' comparison of eve's signed heads can catch it. alice (the
 // creator) and dave hold neither side. A member out of a scene is stopped (SIGTERM, so it closes
 // its connections) and started again when a scene needs it; nobody's flows wait on a frozen peer.
-// A staging read is always made by a member started after the posts it reads.
+// A staging read is always made by a member started after the posts it reads, and waits until it
+// reads every post of the side, not only the last (`staged_reads_all`).
 //
 // - `..._when_the_two_members_meet`: bob and carol continue together. Each lists eve's
 //   equivocation in `vox status --json` and says it in `vox room read`; started again after
@@ -683,12 +689,15 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 //   fetches that head from dave by its id and catches the fork; carol then gets the fork proof
 //   from dave. dave, restarted, still reads side A and none of side B.
 // - `..._whose_prefixes_differ_below_a_matching_entry` (rule 7, arm d): eve and eve′ run the
-//   mutant sender build (`VOX_MUTANT_SENDER`, mode `split-chain`): eve′ appends eve's own entries
-//   for her first and third posts at their positions and its own for the second, so the root it
-//   signs holds eve's entry at the overlap position m above a different entry at m-1 (a signed
-//   tree that is not a chain: every entry names the one before it, a root does not). bob holds
-//   side A; started with eve′ running, the opening at m matches and only the prefix below it
-//   proves the fork. bob lists it and says it.
+//   mutant sender build (`VOX_MUTANT_SENDER`, mode `split-chain`): eve′ appends every entry eve
+//   signed on side A at its position except her second post's, where it signs its own, so the
+//   root it signs holds eve's entry at the overlap position m above a different one below it (a
+//   signed tree that is not a chain: every entry names the one before it, a root does not). bob
+//   holds side A; started with eve′ running, the opening at m matches and only the prefix below
+//   it proves the fork. bob lists it and says it. eve′'s own node compares as any member's does
+//   and would find the same split from bob's side A and list it, so bob would take its listed
+//   proof instead of walking: at the meeting bob gives eve′ only heads (staging knob
+//   `VOX_TEST_HEADS_ONLY_FILE`), and what bob lists is his own walk's.
 //
 // Mutants (`VOX_MUTANT_FORK`): `equal-size-only` (heads of different sizes are never compared)
 // turns `..._when_the_two_members_meet` and `..._through_a_member_who_meets_both` red;
@@ -697,6 +706,10 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 // unopenable; `second-head-unkept` (an unresolved head is neither kept nor listed) turns rule 6
 // red at bob; `terminal-header-only` (a matching entry at the overlap ends the comparison) turns
 // arm d red. (A withheld proof is never called a fork: a spike, not committed here; see the PR.)
+
+/// What eve posts on each side; a member holds a side once it reads all of it.
+const SIDE_A: [&str; 3] = ["UF-A-1", "UF-A-2", "UF-A-3"];
+const SIDE_B: [&str; 6] = ["UF-B-1", "UF-B-2", "UF-B-3", "UF-B-4", "UF-B-5", "UF-B-6"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Meeting {
@@ -762,17 +775,48 @@ fn room_read(data: &Path, room: &str) -> String {
     vox_once(data, &args(&["room", "read", room])).1
 }
 
-/// A staging read: `reader` reads `text`, which `poster` posted, within [`STAGE`]. A red is
-/// `PRODUCT (staging)`, never a verdict; both members' `vox status --json` go with it.
-fn staged_read(reader: &Path, poster: &Path, room: &str, text: &str, what: &str) {
-    if wait_reads(reader, room, text, STAGE) {
-        return;
+/// A staging read: one `vox room read` of `reader`'s shows every one of `texts`, which `posters`
+/// posted, within `within`. Every post of a side, not its last: a member that has read only a
+/// side's last post may hold only that position (a live window fetches the tip first and walks
+/// down), and the comparison an arm stages needs that side opened at the other side's size
+/// (m-a: carol held only position 15 of side B, so nobody running could open it at bob's 12).
+/// Not reached, the act has no result: `APPARATUS NO RESULT (staging)`, never a verdict; the
+/// members' `vox status --json` and what the reader still lacks go with it.
+fn staged_reads_all(
+    reader: &Path,
+    posters: &[&Path],
+    room: &str,
+    texts: &[&str],
+    within: Duration,
+    what: &str,
+) {
+    let deadline = Instant::now() + within;
+    let mut missing: Vec<&str>;
+    loop {
+        let read = room_read(reader, room);
+        missing = texts
+            .iter()
+            .copied()
+            .filter(|text| !read.contains(text))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
-    for (who, d) in [("reader", reader), ("poster", poster)] {
+    for (who, d) in
+        std::iter::once(("reader", reader)).chain(posters.iter().map(|d| ("poster", *d)))
+    {
         let (_, status, _) = vox_once(d, &args(&["status", "--json"]));
         eprintln!("[staging] the {who}'s status: {status}");
     }
-    panic!("PRODUCT (staging): {what}");
+    panic!(
+        "APPARATUS NO RESULT (staging): {what}: after {within:?} the reader still lacks \
+         {missing:?}"
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -781,7 +825,8 @@ fn unequal_fork(meeting: Meeting) {
     // The staging knobs an arm needs, and a mutant a run names, are in the `vox` under test.
     let mut knobs = match meeting {
         Meeting::Unresolved => vec!["VOX_TEST_NO_ACCEPTED_OPENING_FILE"],
-        Meeting::Direct | Meeting::ThroughDave | Meeting::PrefixDiffers => vec![],
+        Meeting::PrefixDiffers => vec!["VOX_TEST_HEADS_ONLY_FILE"],
+        Meeting::Direct | Meeting::ThroughDave => vec![],
     };
     if std::env::var_os("VOX_MUTANT_FORK").is_some() {
         knobs.push("VOX_MUTANT_FORK");
@@ -824,6 +869,8 @@ fn unequal_fork(meeting: Meeting) {
         (path, text)
     };
     let (sparse, sparse_path) = staging_file("sparse");
+    // Arm (d): bob, at the meeting, gives the peer named here (eve′) only heads.
+    let (heads_only, heads_only_path) = staging_file("heads-only");
     let dave_env = [("VOX_TEST_NO_ACCEPTED_OPENING_FILE", sparse_path.as_str())];
     // Arm (d): each copy of eve writes the entries it signs to its own directory; eve′ appends
     // `adopt-<seq>` (eve's entry) in place of its own at that position.
@@ -991,21 +1038,25 @@ fn unequal_fork(meeting: Meeting) {
         );
     }
     let bob = daemon("bob", &bob_dir, &spec, &idpass);
-    staged_read(
+    staged_reads_all(
         &bob_dir,
-        &eve_dir,
+        &[&eve_dir],
         &room,
-        "UF-A-3",
-        "bob never read UF-A-3, so the first side of the fork is not in place",
+        &SIDE_A,
+        STAGE,
+        "bob never read all of eve's side A, so the first side of the fork is not in place",
     );
     stop(eve);
     stop(bob);
 
     // ---- side B: eve′ posts six other posts alone; carol, started after, reads them -------------
-    // Arm (d): eve′ (the mutant signer, kept running: it alone holds its root) appends eve's
-    // entries of her first and third posts, and of any control before her second, at their
-    // positions, and its own for her second post's message. carol does not read it: an honest
-    // member refuses eve's third entry above eve′'s second, which it does not name.
+    // Arm (d): eve′ (the mutant signer, kept running: it alone holds its root) appends every entry
+    // eve signed on side A, her posts and any control she wrote before she stopped, at their
+    // positions, except her second post's, where it signs its own. eve may write a control after
+    // her last post (n-mut-d-terminal: at 12, after her third post at 11); left out, eve′'s root
+    // would differ from bob's side A at the overlap itself, and no prefix walk would be needed.
+    // carol does not read it: an honest member refuses eve's third entry above eve′'s second,
+    // which it does not name.
     let mut eve2_running = None;
     let mut carol_running = None;
     let mut below = 0;
@@ -1015,10 +1066,9 @@ fn unequal_fork(meeting: Meeting) {
             .copied()
             .max()
             .expect("APPARATUS (staging): eve's second post wrote no entry");
-        let adopted: Vec<u64> = eve_posts
-            .iter()
-            .flatten()
-            .copied()
+        // Read after eve stopped, so nothing she signed is missed.
+        let adopted: Vec<u64> = exported(&eve_entries)
+            .into_iter()
             .filter(|seq| *seq != below)
             .collect();
         for seq in &adopted {
@@ -1064,12 +1114,13 @@ fn unequal_fork(meeting: Meeting) {
              of forking it"
         );
         let carol = daemon("carol", &carol_dir, &spec, &idpass);
-        staged_read(
+        staged_reads_all(
             &carol_dir,
-            &eve2_dir,
+            &[&eve2_dir],
             &room,
-            "UF-B-6",
-            "carol never read UF-B-6, so the second side of the fork is not in place",
+            &SIDE_B,
+            STAGE,
+            "carol never read all of eve′'s side B, so the second side of the fork is not in place",
         );
         assert!(
             !reads(&carol_dir, &room, "UF-A-1"),
@@ -1148,9 +1199,13 @@ fn unequal_fork(meeting: Meeting) {
             // dave meets carol (side B) alone, then bob (side A) alone, restarts, then meets
             // carol again. bob and carol never run at the same time again.
             let dave = daemon_env("dave", &dave_dir, &spec, &idpass, &dave_env);
-            assert!(
-                wait_reads(&dave_dir, &room, "UF-B-6", STAGE),
-                "PRODUCT (staging): dave never read carol's copy of side B"
+            staged_reads_all(
+                &dave_dir,
+                &[&carol_dir],
+                &room,
+                &SIDE_B,
+                STAGE,
+                "dave never read all of carol's copy of side B",
             );
             stop(carol);
             let bob = daemon("bob", &bob_dir, &spec, &idpass);
@@ -1191,9 +1246,13 @@ fn unequal_fork(meeting: Meeting) {
             stop(carol);
             let bob = daemon("bob", &bob_dir, &spec, &idpass);
             let mut dave = daemon_env("dave", &dave_dir, &spec, &idpass, &dave_env);
-            assert!(
-                wait_reads(&dave_dir, &room, "UF-A-3", STAGE),
-                "PRODUCT (staging): dave never read bob's copy of side A"
+            staged_reads_all(
+                &dave_dir,
+                &[&bob_dir],
+                &room,
+                &SIDE_A,
+                STAGE,
+                "dave never read all of bob's copy of side A",
             );
             stop(bob);
             // From here dave keeps eve's accepted head but neither opens nor serves it.
@@ -1263,7 +1322,20 @@ fn unequal_fork(meeting: Meeting) {
         }
         Meeting::PrefixDiffers => {
             let eve2 = eve2_running.expect("APPARATUS: eve′ was staged with side B");
-            let bob = daemon("bob", &bob_dir, &spec, &idpass);
+            // bob gives eve′ only heads, consistency proofs and inventory, never a header, an
+            // inclusion proof or an entry: eve′ (whose node compares as any member's does) cannot
+            // open bob's side A, so it cannot find its own split and list it before bob does.
+            // What bob lists is then his own comparison's: the prefix walk below the matching
+            // entry (m-mut-d-terminal: with eve′ free to open side A, bob took eve′'s listed
+            // proof and the walk's mutant stayed green). bob's own asks are not touched.
+            std::fs::write(&heads_only, &eve_fp).expect("APPARATUS: cannot write a staging file");
+            let bob = daemon_env(
+                "bob",
+                &bob_dir,
+                &spec,
+                &idpass,
+                &[("VOX_TEST_HEADS_ONLY_FILE", heads_only_path.as_str())],
+            );
             let bob_list = wait_listed(&bob_dir, &room_id, &eve_fp, DETECT);
             let r = room_read(&bob_dir, &room);
             eprintln!("[proof] bob (side A) met eve′'s root: bob lists {bob_list:?}");
@@ -1273,14 +1345,13 @@ fn unequal_fork(meeting: Meeting) {
                  hers that holds his entry at the overlap above a different one: he lists \
                  {bob_list:?}"
             );
-            assert!(
+            // Printed, not asserted: this arm's mutant stops at the listing above, so neither line
+            // below would have a mutant of its own (ADR-018 §7).
+            eprintln!(
+                "[proof] observed, not asserted: bob places eve's equivocation at {below}: {}; his \
+                 `vox room read` says eve equivocated: {}",
                 bob_list.iter().any(|(a, p)| a == &eve_fp && *p == below),
-                "PRODUCT: bob does not place eve's equivocation at {below}, below the matching \
-                 entry, where the two roots hold different signed entries: {bob_list:?}"
-            );
-            assert!(
-                says_equivocated(&r, "eve", &eve_fp),
-                "PRODUCT: bob's `vox room read` does not say eve equivocated:\n{r}"
+                says_equivocated(&r, "eve", &eve_fp)
             );
             stop(eve2);
             drop((bob, carol_running));
