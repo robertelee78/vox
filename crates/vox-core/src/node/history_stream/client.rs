@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{
-    entry_store::sparse::CursorBinding, ChannelState, HistoryAdmissionRoom,
+    entry_store::sparse::CursorBinding, ChannelState, HistoryAdmissionRoom, ServedRoom,
 };
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
@@ -2823,7 +2823,7 @@ impl Receiver {
 /// comparing it with the accepted head (a request to that peer, which proved under it what it
 /// kept, or the fork the held openings already prove).
 fn listed_step(
-    room: &ChannelState,
+    room: &dyn ServedRoom,
     read: &crate::node::channel::entry_store::Read<'_>,
     hint: &super::HeadHint,
 ) -> Result<Option<Advanced>> {
@@ -2842,7 +2842,7 @@ fn listed_step(
 /// this node's reason to run its own inventory exchange with that peer, as a new head hint is
 /// (`server::answer`).
 pub(super) fn listing_wanted(
-    room: &ChannelState,
+    room: &dyn ServedRoom,
     store: &Store,
     forks: &[Digest32],
     unresolved: &[super::HeadHint],

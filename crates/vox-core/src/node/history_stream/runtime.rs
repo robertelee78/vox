@@ -294,6 +294,10 @@ pub(crate) struct Flow {
     /// the round reads the peer's board whatever kind of flow this is, until the bundle is
     /// held. Set by the actor at each start from the fact `vox status` reports as `key_waits`.
     pub(crate) wants_board: bool,
+    /// This node's own board records for the room (bundle, then address record), put on the
+    /// peer's board the first time a connection is used for the room (ledger 91). Set by the
+    /// actor at each start.
+    pub(crate) introduction: Arc<[Vec<u8>]>,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
     /// Exact required control root removed from the actor queue when this foreground flow was
@@ -591,6 +595,7 @@ impl Flow {
             own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
             wants_board: false,
+            introduction: Arc::from([]),
             departure_probe,
             archive_request: None,
             required_root: required,
@@ -804,6 +809,7 @@ impl Flow {
             own_recovery_progress: false,
             inventory: false,
             wants_board: false,
+            introduction: Arc::from([]),
             departure_probe: false,
             archive_request: Some(request),
             required_root: None,
@@ -3250,6 +3256,7 @@ impl Flow {
                     query.clone(),
                     fence,
                     deadline,
+                    &self.introduction,
                 )
                 .await;
                 // A server from v0.4.6 to v0.4.30 refuses a Live body more than 128 positions

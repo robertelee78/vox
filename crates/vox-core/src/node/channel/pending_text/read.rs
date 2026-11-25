@@ -144,7 +144,7 @@ impl ChannelState {
                 if shown.len() > crate::node::content::MAX_READ_HASHES {
                     return Err(Error::SizeLimitExceeded("read marks"));
                 }
-                if self.poisoned {
+                if self.poisoned.get() {
                     return Err(self.save_failure());
                 }
                 self.require_governance_display(store, now)?;
@@ -195,7 +195,7 @@ impl ChannelState {
                 Selected::Mark { reader: me, marks }
             }
             Work::Flush { interval_ms } => {
-                if self.poisoned {
+                if self.poisoned.get() {
                     return Err(self.save_failure());
                 }
                 if self.legacy_cache_only(store)? {
@@ -518,7 +518,7 @@ impl Completed {
             }
         }
         if let Some(error) = failed {
-            channel.poisoned = true;
+            channel.mark_poisoned();
             channel.save_error = Some(error);
         }
         self.saved

@@ -200,7 +200,7 @@ impl ChannelState {
         write: SessionWrite,
         now: crate::time::Ms,
     ) -> Result<PendingSession> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let delivered = matches!(&write, SessionWrite::Delivered { .. });
@@ -501,7 +501,7 @@ impl ChannelState {
                 .fetch_add(committed_rows, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(failure) = failure {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(failure);
         }
         self.history_publication_changed.notify_waiters();

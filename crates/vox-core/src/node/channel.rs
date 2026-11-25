@@ -84,9 +84,13 @@ mod own_historical_keys;
 mod own_history;
 pub(crate) mod own_writer_gate;
 mod proof_range;
+pub(crate) mod room_snapshot;
+pub(crate) use room_snapshot::{RoomSnapshot, RoomSnapshotCell, ServedRoom};
 mod receiver_overlay;
 mod receiver_releases;
-pub(crate) use proof_range::{bad_prefix, ProofRangeRestore, ProofRangeStep, ResolvedTarget};
+pub(crate) use proof_range::{
+    bad_prefix, serve_proof_range, ProofRangeRestore, ProofRangeStep, ResolvedTarget,
+};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
@@ -986,9 +990,12 @@ pub(crate) struct DisplayStamp {
     session_revision: u64,
     retention: (u64, u64),
     expires_at: Option<u64>,
-    /// How many of the rows shown stand for a body not received yet (V030-10).
+    /// How many rows stand for a body not received yet (V030-10), shown or not.
     owed_count: u64,
-    pub(crate) owed: bool,
+    /// Whether those rows are shown and counted: their decision stands
+    /// ([`ChannelState::owed_rows_shown`]); a row whose decision is open is neither (ADR-036
+    /// H-4). A change of it is a change of the timeline, so the display revision moves with it.
+    owed: bool,
 }
 
 impl DisplayStamp {
@@ -998,7 +1005,23 @@ impl DisplayStamp {
     /// FX-22; #995).
     #[must_use]
     pub(crate) fn rows(&self) -> u64 {
-        self.rendered_count.saturating_add(self.owed_count)
+        if self.owed {
+            self.rendered_count.saturating_add(self.owed_count)
+        } else {
+            self.rendered_count
+        }
+    }
+
+    /// A stamp kept from an earlier publication while the room cannot be published again
+    /// (governance refreshing), with its "not received yet" rows shown as `owed_shown` says now
+    /// ([`ChannelState::owed_rows_shown`]); `None` when that changes nothing.
+    #[must_use]
+    pub(crate) fn owed_shown(&self, owed_shown: bool) -> Option<Self> {
+        let owed = owed_shown && self.owed_count != 0;
+        (owed != self.owed).then(|| Self {
+            owed,
+            ..self.clone()
+        })
     }
 }
 
@@ -1345,6 +1368,8 @@ pub struct ChannelState {
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     projection_state: history::State,
+    /// Which governance the "not received yet" rows were last decided under (in memory).
+    owed_decided: history::OwedDecided,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
@@ -1457,7 +1482,7 @@ pub struct ChannelState {
     /// [`STAMP_LEAD_LIMIT_MILLIS`] ahead of the clock, which `stamp_after_held` did not stamp it
     /// after. Memory only, the newest [`SKIPPED_KEPT`]: a claim asks about its own post at once.
     skipped: std::collections::VecDeque<(Digest32, Vec<Digest32>)>,
-    poisoned: bool,
+    poisoned: room_snapshot::Poisoned,
     save_error: Option<String>,
     /// Only one synchronous authored append may hold this bounded metadata. No value
     /// is an accepted head until the existing entry/sender transaction commits.
@@ -1488,6 +1513,8 @@ pub struct ChannelState {
     gen: Arc<std::sync::atomic::AtomicU64>,
     /// Revocable committed history publication, independent of the mutable room lane.
     history_read: Option<Arc<history::ReadResource>>,
+    /// What answering another member reads instead of this room (see [`RoomSnapshot`]).
+    room_snapshot: Arc<RoomSnapshotCell>,
     /// Each author's in-memory jump over positions its live walk already passed
     /// ([`entry_store::sparse::LiveResume`]); empty after a restart.
     pub(crate) live_resume: BTreeMap<Digest32, entry_store::sparse::LiveResume>,
@@ -1498,6 +1525,7 @@ impl Drop for ChannelState {
         if let Some(resource) = &self.history_read {
             resource.revoke();
         }
+        self.room_snapshot.revoke();
         self.sek.lock_now();
     }
 }
@@ -1512,7 +1540,7 @@ impl std::fmt::Debug for ChannelState {
             .field("authors", &self.authors.len())
             .field("governance_ready", &self.governance_ready)
             .field("receiver_chains", &self.receivers.len())
-            .field("poisoned", &self.poisoned)
+            .field("poisoned", &self.poisoned.get())
             .finish_non_exhaustive()
     }
 }
@@ -2318,6 +2346,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -2353,7 +2382,7 @@ impl ChannelState {
             room_pause: vox_agentcomms::drive::PauseState::default(),
             pause_resume_after: 0,
             skipped: std::collections::VecDeque::new(),
-            poisoned: false,
+            poisoned: room_snapshot::Poisoned::default(),
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
@@ -2367,6 +2396,7 @@ impl ChannelState {
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
@@ -2961,6 +2991,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: match restart.projection.as_deref() {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
@@ -2997,7 +3028,7 @@ impl ChannelState {
             room_pause,
             pause_resume_after,
             skipped: std::collections::VecDeque::new(),
-            poisoned: false,
+            poisoned: room_snapshot::Poisoned::default(),
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
@@ -3011,6 +3042,7 @@ impl ChannelState {
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         };
         room.entries
@@ -3466,6 +3498,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -3500,7 +3533,7 @@ impl ChannelState {
             room_pause: vox_agentcomms::drive::PauseState::default(),
             pause_resume_after: 0,
             skipped: std::collections::VecDeque::new(),
-            poisoned: false,
+            poisoned: room_snapshot::Poisoned::default(),
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
@@ -3514,6 +3547,7 @@ impl ChannelState {
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         })
     }
@@ -3752,7 +3786,7 @@ impl ChannelState {
             )
         };
         if let Err(e) = save {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -3834,7 +3868,7 @@ impl ChannelState {
             SEG_AUTHORS,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4044,7 +4078,7 @@ impl ChannelState {
             SEG_SERVICES,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4309,7 +4343,7 @@ impl ChannelState {
         now_millis: u64,
     ) -> Result<Digest32> {
         self.ensure_local_append_available(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled {
@@ -4337,7 +4371,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = persisted {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4393,7 +4427,7 @@ impl ChannelState {
             SEG_KNOWN_MEMBERS,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4435,7 +4469,7 @@ impl ChannelState {
     pub fn skdm_for_consent(&self, profile: &Profile) -> Result<Skdm> {
         self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.current_governance(profile.store())?;
@@ -4657,7 +4691,7 @@ impl ChannelState {
         recover_own: bool,
     ) -> Result<u64> {
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let store = profile.store();
@@ -4783,7 +4817,7 @@ impl ChannelState {
                 batch.commit()
             })();
             if let Err(e) = persisted {
-                self.poisoned = true;
+                self.mark_poisoned();
                 self.save_error = Some(e.to_string());
                 return Err(e);
             }
@@ -4813,7 +4847,7 @@ impl ChannelState {
     pub fn rekey_skdm(&self, profile: &Profile) -> Result<Skdm> {
         self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.current_governance(profile.store())?;
@@ -4938,7 +4972,7 @@ impl ChannelState {
     /// The consent facts shared with the completed semantic governance projection. Ordinary
     /// questions clone only its Arc; native index turns reconstruct it after restart.
     fn consent_facts(&self) -> Result<std::sync::Arc<governance::ConsentFacts>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.governance_ready {
@@ -4998,7 +5032,7 @@ impl ChannelState {
         store: &Store,
         trusted: &BTreeSet<Digest32>,
     ) -> Result<BTreeSet<Digest32>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled {
@@ -5044,7 +5078,7 @@ impl ChannelState {
     /// generation it already holds is ignored by
     /// [`ChannelState::accept_skdm`], so the safe direction is to send.
     pub fn owed_rekeys(&self, store: &Store, after: Option<Digest32>) -> Result<GovernanceTargets> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled {
@@ -5087,7 +5121,7 @@ impl ChannelState {
 
     /// Check a single delivery target without collecting the room's consent page.
     pub fn owed_rekey(&self, store: &Store, target: &Digest32) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled || *target == self.me() || self.has_left(target) {
@@ -5160,7 +5194,7 @@ impl ChannelState {
                     SEG_TRUST_MARKS,
                     &prepared.sealed,
                 ) {
-                    self.poisoned = true;
+                    self.mark_poisoned();
                     self.save_error = Some(e.to_string());
                     return Err(e);
                 }
@@ -5260,7 +5294,7 @@ impl ChannelState {
         {
             return;
         }
-        self.poisoned = true;
+        self.mark_poisoned();
         // The original cause survives every later refusal (`save_failure`); never wrap it in
         // itself.
         if self.save_error.is_none() {
@@ -5394,7 +5428,7 @@ impl ChannelState {
     ) -> Result<Skdm> {
         self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.current_governance(profile.store())?;
@@ -5435,7 +5469,7 @@ impl ChannelState {
     pub fn rekey_skdm_for(&self, profile: &Profile, target: &Digest32) -> Result<Skdm> {
         self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.current_governance(profile.store())?;
@@ -5542,7 +5576,7 @@ impl ChannelState {
         floor: u64,
     ) -> Result<Vec<Skdm>> {
         self.require_legacy_current(profile.store())?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.current_governance(profile.store())?;
@@ -5632,13 +5666,15 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = saved {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.entries.committed();
         self.forks_kept = kept;
-        Ok(())
+        // As `finish_history_begin`: a newly kept fork proof withdraws read authority and the
+        // "not received yet" decisions taken under the governance before it.
+        self.retire_governance()
     }
 
     /// The members this room holds back for equivocating (V210-63): each `(author, seq)` where
@@ -5665,7 +5701,7 @@ impl ChannelState {
             SEG_HISTORY,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -5685,7 +5721,7 @@ impl ChannelState {
             SEG_DELIVERED,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -5959,7 +5995,7 @@ impl ChannelState {
     /// each selector adds no freshness while the room is held. Drop this snapshot on return;
     /// every later publication still reads current committed roots and authority separately.
     pub(crate) fn display_publication(&self, store: &Store) -> Result<DisplayPublication> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let rendered = self
@@ -5978,7 +6014,8 @@ impl ChannelState {
                 retention: (self.effective_retention(), self.effective_step_retention()),
                 expires_at: rendered.next_owed_expiry()?,
                 owed_count,
-                owed: owed_count != 0,
+                // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
+                owed: owed_count != 0 && self.owed_rows_shown(),
             },
             read_summary_stamp: ReadSummaryStamp {
                 reads: rendered.read_roots()?,
@@ -6027,7 +6064,7 @@ impl ChannelState {
     /// keep their bodies and never hold it back.
     pub fn checkpoint_if_due(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
         let now_ms = now.get();
-        if self.poisoned
+        if self.poisoned.get()
             || !self.governance_display_current(now_ms)
             || (self.room_retention() == 0 && self.room_step_retention() == 0)
         {
@@ -6085,7 +6122,7 @@ impl ChannelState {
             Err(error) if governance::refreshing(&error) => return Ok(0),
             Err(error) => return Err(error),
         }
-        if self.poisoned
+        if self.poisoned.get()
             || (self.effective_retention() == 0 && self.effective_step_retention() == 0)
         {
             return Ok(0);
@@ -6114,7 +6151,7 @@ impl ChannelState {
             Ok(dropped)
         })();
         if let Err(ref error) = result {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error.to_string());
         }
         result
@@ -6135,7 +6172,7 @@ impl ChannelState {
         after_departure: bool,
     ) -> Result<()> {
         self.ensure_local_append_available_for(profile.store(), after_departure)?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled {
@@ -6157,7 +6194,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = persisted {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -6314,7 +6351,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(error) = persisted {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error.to_string());
             return Err(error);
         }
@@ -6503,7 +6540,7 @@ impl ChannelState {
         settle_sparse: bool,
         recover_own: bool,
     ) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled && !settle_sparse {
@@ -6585,7 +6622,7 @@ impl ChannelState {
             if matches!(e, Error::OwnHistoryBehind) {
                 return Err(e);
             }
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -6654,7 +6691,7 @@ impl ChannelState {
     ) -> Result<SyncOutcome> {
         let now_ms = now.get();
         let retry = self.received_retries.retry(store);
-        if self.poisoned {
+        if self.poisoned.get() {
             // The first persist/absorption failure remains the room's diagnosis. A later retry
             // failure cannot relabel it, and the exact owner remains in `received_retries`.
             return Err(self.save_failure());
@@ -6676,7 +6713,7 @@ impl ChannelState {
             &self.admission,
         );
         if let Err(crate::log::sync::ApplyError::Local(error)) = session {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error.to_string());
             self.keep_forks(store)?;
             return Err(error);
@@ -6916,7 +6953,7 @@ impl ChannelState {
             Ok(out)
         })();
         if let Err(ref error) = result {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error.to_string());
         }
         result
@@ -6964,7 +7001,7 @@ impl ChannelState {
             match received.map_or_else(|| store.batch(), |flow| store.received_batch(flow)) {
                 Ok(b) => b,
                 Err(e) => {
-                    self.poisoned = true;
+                    self.mark_poisoned();
                     self.save_error = Some(e.to_string());
                     return Err(e);
                 }
@@ -7152,7 +7189,7 @@ impl ChannelState {
             })(),
         };
         if let Err(e) = committed {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -7216,7 +7253,7 @@ impl ChannelState {
                     ch.epoch,
                     ch.channel_id,
                     Arc::clone(&ch.received_retries),
-                    ch.poisoned.then(|| ch.save_failure().to_string()),
+                    ch.poisoned.get().then(|| ch.save_failure().to_string()),
                     ch.sek.key_bytes().is_ok(),
                 );
             }
@@ -7323,7 +7360,7 @@ impl ChannelState {
         }
         self.require_legacy_current(store)?;
         let now_ms = now.get();
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let author = skdm.body.author_id;
@@ -7601,7 +7638,7 @@ impl ChannelState {
     /// this node excepted. Empty until this node holds its own feed (V210-164).
     #[must_use]
     pub fn drive_members(&self) -> BTreeSet<Digest32> {
-        if self.poisoned || !self.settled {
+        if self.poisoned.get() || !self.settled {
             return BTreeSet::new();
         }
         let me = self.me();
@@ -7708,7 +7745,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = saved {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -7772,7 +7809,7 @@ impl ChannelState {
         chain: u64,
         floor: u64,
     ) -> Result<Option<Skdm>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.require_legacy_current(store)?;
@@ -8096,7 +8133,7 @@ impl ChannelState {
             Err(e) => {
                 // The chain advanced in memory but the advance was not persisted: a
                 // reopen would re-derive a consumed key. Poison instead.
-                self.poisoned = true;
+                self.mark_poisoned();
                 self.save_error = Some(e.to_string());
                 Err(e)
             }
@@ -8531,7 +8568,7 @@ impl ChannelState {
     /// tail watermark and invalidate any notice scan that depended on the old prefix.
     fn settle_display_order(&mut self, store: &Store) -> Result<()> {
         let result = (|| -> Result<()> {
-            if self.poisoned {
+            if self.poisoned.get() {
                 return Err(self.save_failure());
             }
             let generation = self.dag.reorder_generation();
@@ -8557,7 +8594,7 @@ impl ChannelState {
     /// ([`Dag::happened_before`]). `false` means concurrent or not yet known to be
     /// ordered. The seam claims are to be built on (PRD-001 R17).
     pub fn happened_before(&self, store: &Store, a: &Digest32, b: &Digest32) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.dag.happened_before(
@@ -8571,7 +8608,7 @@ impl ChannelState {
     /// in the room's one order (PRD-001 R13). The timeline is this sequence restricted
     /// to the rows this node can render.
     pub fn causal_order(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.dag
@@ -8581,7 +8618,7 @@ impl ChannelState {
     /// [`ChannelState::causal_order`] with each entry's clock. Transitional view consumer;
     /// bounded query callers use [`Self::order_view`] instead of collecting history.
     pub fn order_keys(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.dag
@@ -8590,7 +8627,7 @@ impl ChannelState {
 
     /// Pin published DAG roots for a bounded query. Drop the view before a client/network wait.
     pub fn order_view(&self, store: &Store) -> Result<OrderView<'_>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.entries.order_view(store, &self.sek, &self.channel_id)
@@ -8612,7 +8649,7 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<Accepted> {
         let now_ms = now.get();
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if entry.skeleton.channel_id != self.channel_id {
@@ -8687,7 +8724,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = persisted {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -8898,7 +8935,7 @@ impl ChannelState {
     /// "on N of M members' nodes"). Only a node's own word counts: an entry sent to it is not
     /// held until it says so.
     pub fn held_own(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let me = self.me();
@@ -8933,7 +8970,7 @@ impl ChannelState {
     /// anyone is known to have read, oldest first: what a client shows under each message it sent
     /// (ADR-028 R-6).
     pub fn read_by_own(&self, store: &Store) -> Result<Vec<(Digest32, Vec<Digest32>)>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let rendered = self
@@ -9012,7 +9049,7 @@ impl ChannelState {
             })
         })();
         if let Err(ref error) = result {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error.to_string());
         }
         result
@@ -9200,14 +9237,11 @@ impl ChannelState {
     /// only the later signed departure closes that return.
     #[must_use]
     pub fn has_left(&self, author: &Digest32) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if *author != self.me()
-            && crate::node::computer::fx28_mutant("sync-departed-peer")
-            && std::env::var_os("VOX_TEST_DEPARTED_AS_MEMBER_FILE")
-                .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
-            return false;
-        }
+        !room_snapshot::departed_as_member(author, &self.me()) && self.departed(author)
+    }
+
+    /// [`Self::has_left`] without its test knob.
+    fn departed(&self, author: &Digest32) -> bool {
         let Some(seq) = self.left_at(author) else {
             return false;
         };
@@ -9554,7 +9588,7 @@ impl ChannelState {
     /// Whether a failed persist has poisoned this channel (reopen to continue).
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.get()
     }
 
     /// Whether this channel's SEK is `mlock`ed (ADR-010 best-effort; surfaced to
@@ -9577,6 +9611,7 @@ impl ChannelState {
         if let Some(resource) = &self.history_read {
             resource.revoke();
         }
+        self.room_snapshot.revoke();
         self.sek.lock_now();
         self.continuity_key.lock_now();
         self.history_publication_changed.notify_waiters();
@@ -9671,7 +9706,7 @@ impl ChannelSessionRoom<'_> {
         if ch.post_pending() {
             return Err(crate::wire::WireError::TransportFailed);
         }
-        if ch.poisoned {
+        if ch.poisoned.get() {
             return Err(crate::wire::WireError::TransportFailed);
         }
         if ch.epoch != self.epoch {

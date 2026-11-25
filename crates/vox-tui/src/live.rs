@@ -450,6 +450,21 @@ const DECISIONS_SHOWN: usize = 500;
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
 
+/// `VOX_TEST_OWED_ROW=marked` (proofs only, a `test-knobs` build): the TUI submits the messages
+/// it shows as not received yet with the rest of what it showed, as it did before they were left
+/// out of read marks. Silent: the TUI's stderr is its terminal.
+#[cfg(feature = "test-knobs")]
+fn read_marks_owed() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("VOX_TEST_OWED_ROW").is_ok_and(|mode| mode == "marked")
+    });
+    *ON
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn read_marks_owed() -> bool {
+    false
+}
+
 /// A [`DaemonCore::shown`] the node did not take.
 struct MarkRefused {
     channel_id: Digest32,
@@ -3845,10 +3860,20 @@ impl CoreHandle for DaemonCore {
             self.thread_roots = roots;
             self.threads_stale = true;
         }
-        // Each message is told to the node once; the node keeps what it has recorded.
+        // Each message is told to the node once; the node keeps what it has recorded. A message
+        // not received yet was not read: the node refuses a batch naming one, so it is left out
+        // (as the agent hook leaves it out), and is told once its text has taken its place.
+        let owed: BTreeSet<Digest32> = self
+            .timeline
+            .as_ref()
+            .into_iter()
+            .flat_map(|t| t.rows.iter())
+            .filter(|r| r.owed && !read_marks_owed())
+            .map(|r| r.entry_hash)
+            .collect();
         let new: Vec<Digest32> = entries
             .iter()
-            .filter(|h| !self.marked.contains(*h))
+            .filter(|h| !self.marked.contains(*h) && !owed.contains(*h))
             .copied()
             .collect();
         if new.is_empty() {

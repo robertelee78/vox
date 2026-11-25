@@ -1649,27 +1649,18 @@ impl super::super::ChannelState {
         {
             return Ok(vec![Eligible; entries.len()]);
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
-        // No validated removal has ever been applied here: nothing to read per body.
-        if super::removal_generation(store, &self.channel_id)? == 0 {
-            return Ok(vec![Eligible; entries.len()]);
-        }
-        let Some(view) = View::recipient(
+        recipient_eligibility_at(
             store,
             &self.sek,
             &self.channel_id,
             self.genesis.creator_pubkey().fingerprint(),
-        )?
-        else {
-            return Ok(vec![Eligible; entries.len()]);
-        };
-        let cut = view.recipient_cut(recipient, self.now_hint)?;
-        entries
-            .iter()
-            .map(|entry| view.body_eligibility_after(&cut, recipient, entry))
-            .collect()
+            self.now_hint,
+            recipient,
+            entries,
+        )
     }
 
     pub(crate) fn recipient_body_eligibility(
@@ -1727,6 +1718,57 @@ impl super::super::ChannelState {
         let cut = view.recipient_cut(recipient, self.now_hint)?;
         view.body_eligibility_after(&cut, recipient, entry)
     }
+}
+
+/// [`super::super::ChannelState::recipient_bodies_eligibility`] for one body under a room's key,
+/// identity and clock, as a served read holds them in the room's published snapshot.
+#[allow(clippy::too_many_arguments)] // the room's key, identity and clock, as read by serving
+pub(in crate::node::channel) fn recipient_body_eligibility_at(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    creator: Digest32,
+    now: u64,
+    recipient: &Digest32,
+    entry: &Entry,
+) -> Result<super::channel::ContentEligibility> {
+    if !body_restricted(entry, recipient) {
+        return Ok(super::channel::ContentEligibility::Eligible);
+    }
+    Ok(recipient_eligibility_at(
+        store,
+        sek,
+        room,
+        creator,
+        now,
+        recipient,
+        std::slice::from_ref(entry),
+    )?[0])
+}
+
+#[allow(clippy::too_many_arguments)] // the room's key, identity and clock, as read by serving
+fn recipient_eligibility_at(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    creator: Digest32,
+    now: u64,
+    recipient: &Digest32,
+    entries: &[Entry],
+) -> Result<Vec<super::channel::ContentEligibility>> {
+    use super::channel::ContentEligibility::Eligible;
+    // No validated removal has ever been applied here: nothing to read per body.
+    if super::removal_generation(store, room)? == 0 {
+        return Ok(vec![Eligible; entries.len()]);
+    }
+    let Some(view) = View::recipient(store, sek, room, creator)? else {
+        return Ok(vec![Eligible; entries.len()]);
+    };
+    let cut = view.recipient_cut(recipient, now)?;
+    entries
+        .iter()
+        .map(|entry| view.body_eligibility_after(&cut, recipient, entry))
+        .collect()
 }
 
 impl View<'_> {

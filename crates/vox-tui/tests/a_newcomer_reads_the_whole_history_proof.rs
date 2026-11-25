@@ -11397,6 +11397,40 @@ fn a_newcomer_reads_the_holder_while_a_body_waits_on_the_stopped_author() {
     rg1::a_stopped_flow_leaves_the_body_slot(rg1::SlotDoor::Moved);
 }
 
+/// Ledger 91: a newcomer admitted while the author was stopped, whose inviter then stops, is
+/// known to the author on the first exchange once the author is back: the author lists it as a
+/// member, and the author never refuses it as a stranger (before, it refused it "authenticator
+/// invalid" for good). Reading the author's post end to end belongs to the pull-loop change.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped author, a stopped inviter; optional"]
+fn a_returned_author_knows_the_newcomer_admitted_while_it_was_away() {
+    rg1::a_returned_author_knows_the_newcomer();
+}
+
+/// A member whose own room save is held still answers another member's requests for headers,
+/// proofs and bodies at once: the reader, back after the author posted, shows the author's posts
+/// while the author's save stays held, the only holder of their headers and proofs being the
+/// author.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons and a held save; optional"]
+fn a_member_whose_own_save_is_held_still_answers() {
+    rg1::a_held_member_answers();
+}
+
+/// A member whose room cannot save (poisoned, as a failed write poisons it) answers nobody that
+/// room's history, and answers again once the room has recovered: the reader, back after the
+/// author posted, does not show the author's post while the author turns its requests away, and
+/// shows it once the author's room can save again. RED PRODUCT when the reader shows the post
+/// while the author's room is poisoned. Mutant: `VOX_MUTANT_POISON_KEEPS_SNAPSHOT`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons and a poisoned room; optional"]
+fn a_member_whose_room_cannot_save_answers_nobody_until_it_recovers() {
+    rg1::a_poisoned_member_answers_nobody();
+}
+
 /// A flow whose body ask the holder answered Busy, and whose holder then stopped, gives back its
 /// body slot: once the author is back, the newcomer reads from it the post the holder answered
 /// Busy for.
@@ -12939,6 +12973,464 @@ mod rg1 {
                 );
             }
         }
+    }
+
+    /// See [`super::a_member_whose_own_save_is_held_still_answers`]. Alice writes, Carol serves
+    /// Bob only heads (`VOX_TEST_HEADS_ONLY_FILE`), so Bob's headers, inclusion proofs and
+    /// bodies come from Alice alone; Alice's save of Carol's post is held
+    /// (`VOX_TEST_HOLD_ROOM_WRITE`) from before Bob starts until after the verdict.
+    pub(super) fn a_held_member_answers() {
+        const BOUND: Duration = Duration::from_secs(20);
+        let root = root();
+        let exe = binary();
+        crate::test_knobs::require_in(&exe, &["history receiver", "VOX_TEST_HEADS_ONLY_FILE"]);
+        if std::env::var_os("VOX_MUTANT_SERVE_WAITS_ON_ROOM").is_some() {
+            crate::test_knobs::require_in(&exe, &["VOX_MUTANT_SERVE_WAITS_ON_ROOM answered busy"]);
+        }
+        let alice = room::worker_as(root.path(), "held-alice", &exe);
+        let carol = room::worker_as(root.path(), "held-carol", &exe);
+        let bob = room::worker_as(root.path(), "held-bob", &exe);
+        let hold = alice.data.with_extension("hold");
+        let heads_only = carol.data.with_extension("heads-only");
+        std::fs::write(&heads_only, bob.b32()).expect("APPARATUS: heads-only staging file");
+        let _alice_daemon = start_with(
+            &alice,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_HOLD_ROOM_WRITE", hold.clone())],
+        );
+        let _carol_daemon = start_with(
+            &carol,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_HEADS_ONLY_FILE", heads_only.clone())],
+        );
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peers) in [
+            (&alice, [&bob, &carol]),
+            (&bob, [&alice, &carol]),
+            (&carol, [&alice, &bob]),
+        ] {
+            for peer in peers {
+                w.vox_env(
+                    None,
+                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                    &["trust", "add", &peer.b32(), "--name", &peer.name],
+                    None,
+                )
+                .expect_ok("trust before the room");
+            }
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("alice room link");
+        for w in [&bob, &carol] {
+            w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("join alice's room");
+            returning_reader_ready(w, &id);
+        }
+        post(&alice, &id, "HELD-A-00", true);
+        await_shown(&bob, &id, "HELD-A-00");
+        await_shown(&carol, &id, "HELD-A-00");
+        bob_daemon.stop();
+        eprintln!("[held] bob stopped");
+        for n in 1..=5 {
+            post(&alice, &id, &format!("HELD-A-{n:02}"), true);
+        }
+        let wanted = "HELD-A-05";
+        let room = vox_core::node::link::b32_decode(&id, "room").expect("APPARATUS: room id");
+        std::fs::write(&hold, room).expect("APPARATUS: arm alice's receiver hold");
+        post(&carol, &id, "HELD-C-01", true);
+        let staging = Instant::now();
+        while !hold.with_extension("engaged").exists() {
+            assert!(
+                staging.elapsed() < Duration::from_secs(120),
+                "APPARATUS: alice's save of carol's post never engaged the hold"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "[held] alice's save is held: {}",
+            std::fs::read_to_string(hold.with_extension("engaged")).unwrap_or_default()
+        );
+        let back = Instant::now();
+        let _bob_daemon = start(&bob, "127.0.0.1:0", None);
+        let shown = loop {
+            if read(&bob, &id, Some(wanted)).0.contains(wanted) {
+                break Some(back.elapsed());
+            }
+            if back.elapsed() > BOUND {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let still_held = hold.exists() && hold.with_extension("engaged").exists();
+        let _ = std::fs::remove_file(&hold);
+        eprintln!(
+            "[held] bob showed {wanted:?} {shown:?} after starting; alice's save held throughout: \
+             {still_held}; bob's status: {}",
+            status(&bob, &id)
+        );
+        assert!(
+            still_held,
+            "APPARATUS: alice's held save was released before the verdict"
+        );
+        assert!(
+            shown.is_some(),
+            "RED PRODUCT: bob, back after alice posted, did not show {wanted:?} within {BOUND:?} \
+             while alice's own save was held; carol serves bob only heads, so only alice could \
+             answer him"
+        );
+    }
+
+    /// See [`super::a_member_whose_room_cannot_save_answers_nobody_until_it_recovers`]. As in
+    /// [`a_held_member_answers`], Carol serves Bob only heads, so Bob's headers, proofs and
+    /// bodies come from Alice alone. Alice's room is poisoned (`VOX_TEST_POISON_ROOM_FILE`: as a
+    /// failed write poisons it, and its storage recovery fails while the file names it) before
+    /// Bob starts again; the file is removed once Alice has turned two of Bob's requests away.
+    pub(super) fn a_poisoned_member_answers_nobody() {
+        const MUTANT: &str = "VOX_MUTANT_POISON_KEEPS_SNAPSHOT";
+        const STAGING: Duration = Duration::from_secs(120);
+        const RECOVERED: Duration = Duration::from_secs(180);
+        let root = root();
+        let exe = binary();
+        crate::test_knobs::require_in(
+            &exe,
+            &[
+                "VOX_TEST_HEADS_ONLY_FILE",
+                "VOX_TEST_POISON_ROOM_FILE",
+                "to the actor: no snapshot",
+            ],
+        );
+        if std::env::var_os(MUTANT).is_some() {
+            crate::test_knobs::require_in(&exe, &["VOX_MUTANT_POISON_KEEPS_SNAPSHOT engaged"]);
+        }
+        let alice = room::worker_as(root.path(), "sick-alice", &exe);
+        let carol = room::worker_as(root.path(), "sick-carol", &exe);
+        let bob = room::worker_as(root.path(), "sick-bob", &exe);
+        let poison = alice.data.with_extension("poison");
+        let heads_only = carol.data.with_extension("heads-only");
+        std::fs::write(&heads_only, bob.b32()).expect("APPARATUS: heads-only staging file");
+        let _alice_daemon = start_with(
+            &alice,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_POISON_ROOM_FILE", poison.clone())],
+        );
+        let _carol_daemon = start_with(
+            &carol,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_HEADS_ONLY_FILE", heads_only.clone())],
+        );
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peers) in [
+            (&alice, [&bob, &carol]),
+            (&bob, [&alice, &carol]),
+            (&carol, [&alice, &bob]),
+        ] {
+            for peer in peers {
+                w.vox_env(
+                    None,
+                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                    &["trust", "add", &peer.b32(), "--name", &peer.name],
+                    None,
+                )
+                .expect_ok("trust before the room");
+            }
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("alice room link");
+        for w in [&bob, &carol] {
+            w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("join alice's room");
+            returning_reader_ready(w, &id);
+        }
+        post(&alice, &id, "SICK-A-00", true);
+        await_shown(&bob, &id, "SICK-A-00");
+        await_shown(&carol, &id, "SICK-A-00");
+        bob_daemon.stop();
+        eprintln!("[sick] bob stopped");
+        for n in 1..=5 {
+            post(&alice, &id, &format!("SICK-A-{n:02}"), true);
+        }
+        await_shown(&carol, &id, "SICK-A-05");
+        let wanted = "SICK-A-05";
+        let alice_err = alice.data.with_extension("err");
+        let log = || std::fs::read_to_string(&alice_err).unwrap_or_default();
+        let unhealthy = || alice.vox(None, &["status", "--json"]).json()["unhealthy"].clone();
+        std::fs::write(&poison, &id).expect("APPARATUS: name alice's room in the poison file");
+        let engaged = format!("VOX_TEST_POISON_ROOM_FILE engaged: room {id} cannot save");
+        let staging = Instant::now();
+        while !log().contains(&engaged) {
+            assert!(
+                staging.elapsed() < STAGING,
+                "APPARATUS: NO RESULT: alice's room was never poisoned; see {}",
+                alice_err.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[sick] alice's room cannot save: {}", unhealthy());
+        let turned_away = format!(
+            "history request peer={} to the actor: no snapshot",
+            bob.b32()
+        );
+        let back = Instant::now();
+        let _bob_daemon = start(&bob, "127.0.0.1:0", None);
+        loop {
+            if read(&bob, &id, Some(wanted)).0.contains(wanted) {
+                panic!(
+                    "RED PRODUCT: bob showed {wanted:?} {:?} after starting while alice's room \
+                     could not save; carol serves bob only heads, so alice answered him from a \
+                     poisoned room (alice unhealthy: {}; {MUTANT} engaged {} times)",
+                    back.elapsed(),
+                    unhealthy(),
+                    log()
+                        .matches("VOX_MUTANT_POISON_KEEPS_SNAPSHOT engaged")
+                        .count()
+                );
+            }
+            if log().matches(turned_away.as_str()).count() >= 2 {
+                break;
+            }
+            assert!(
+                back.elapsed() < STAGING,
+                "APPARATUS: NO RESULT: in {STAGING:?} bob neither showed {wanted:?} nor asked \
+                 alice twice while her room could not save; bob's status: {}",
+                status(&bob, &id)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            !read(&bob, &id, Some(wanted)).0.contains(wanted),
+            "RED PRODUCT: bob showed {wanted:?} after alice turned two of his requests away \
+             while her room could not save"
+        );
+        eprintln!(
+            "[sick] alice turned bob away twice {:?} after he started, her room still unable to \
+             save ({}); bob does not show {wanted:?}",
+            back.elapsed(),
+            unhealthy()
+        );
+        std::fs::remove_file(&poison).expect("APPARATUS: let alice's room save again");
+        let healed = Instant::now();
+        let shown = loop {
+            if read(&bob, &id, Some(wanted)).0.contains(wanted) {
+                break Some(healed.elapsed());
+            }
+            if healed.elapsed() > RECOVERED {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        eprintln!(
+            "[sick] bob showed {wanted:?} {shown:?} after alice's room could save again; alice \
+             unhealthy: {}; bob's status: {}",
+            unhealthy(),
+            status(&bob, &id)
+        );
+        assert!(
+            shown.is_some(),
+            "RED PRODUCT: once alice's room could save again, bob did not show {wanted:?} within \
+             {RECOVERED:?}"
+        );
+        eprintln!(
+            "GREEN: while alice's room could not save she answered bob nothing, and once it \
+             recovered bob showed {wanted:?}"
+        );
+    }
+
+    /// Ledger 91: a newcomer admitted while the author was stopped, whose inviter then stops, is
+    /// known to the author as soon as it is back. See the test's doc.
+    pub(super) fn a_returned_author_knows_the_newcomer() {
+        const BOUND: Duration = Duration::from_secs(10);
+        const WATCH: Duration = Duration::from_secs(90);
+        let root = root();
+        let exe = binary();
+        crate::test_knobs::require_in(
+            &exe,
+            &[
+                "VOX_TEST_REFUSE_ENTRIES_FILE answered ",
+                "history reroute origin=",
+            ],
+        );
+        if std::env::var_os("VOX_MUTANT_BOARD_OFFER_CONDITIONAL").is_some() {
+            crate::test_knobs::require_in(&exe, &["VOX_MUTANT_BOARD_OFFER_CONDITIONAL engaged"]);
+        }
+        let author = room::worker_as(root.path(), "news-author", &exe);
+        let holder = room::worker_as(root.path(), "news-holder", &exe);
+        let reader = room::worker_as(root.path(), "news-reader", &exe);
+        // The author starts again at the same address the others hold for it.
+        let author_at = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("APPARATUS: a free address for the author");
+            socket
+                .local_addr()
+                .expect("APPARATUS: the author's address")
+                .to_string()
+        };
+        let author_daemon = start(&author, &author_at, None);
+        let refuse = holder.data.with_extension("refuse-entries");
+        let holder_daemon = start_with(
+            &holder,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_REFUSE_ENTRIES_FILE", refuse.clone())],
+        );
+        let trust = |w: &Worker, peer: &Worker| {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("trust before the room");
+        };
+        trust(&author, &holder);
+        trust(&holder, &author);
+        trust(&author, &reader);
+        let id = create(&author);
+        let feed = || {
+            status(&author, &id)["own_feed_through"]
+                .as_u64()
+                .expect("APPARATUS: the author's status has no own_feed_through")
+        };
+        let before_posts = feed();
+        for n in 1..=30 {
+            post(&author, &id, &format!("NW-A-{n:02}"), true);
+        }
+        // The holder answers the newcomer's asks for the bodies of the last twenty, so the
+        // newcomer moves those asks to the stopped author's port (as in the slot act).
+        std::fs::write(
+            &refuse,
+            format!("{} {} {}", reader.b32(), before_posts + 11, feed()),
+        )
+        .expect("APPARATUS: refuse-entries staging file");
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        holder
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("holder joins the author's room");
+        returning_reader_ready(&holder, &id);
+        await_shown(&holder, &id, "NW-A-30");
+        author_daemon.stop();
+        eprintln!("[news] author stopped");
+        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        trust(&holder, &reader);
+        trust(&reader, &holder);
+        trust(&reader, &author);
+        let link = holder.vox(None, &["room", "link", &id]);
+        link.expect_ok("holder room link");
+        reader
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("newcomer joins through the holder");
+        let moved = format!(
+            "history reroute origin={} target={}",
+            holder.b32(),
+            author.b32()
+        );
+        let err = reader.data.with_extension("err");
+        let staging = Instant::now();
+        while !std::fs::read_to_string(&err)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains(&moved) && line.ends_with(" ask=entry"))
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: the newcomer never moved a body ask to the stopped author's port; \
+                 see {}",
+                err.display()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("[news] the newcomer moved a body ask to the stopped author's port");
+        post(&holder, &id, "NW-H-while-the-author-is-stopped", true);
+        await_shown(&reader, &id, "NW-H-while-the-author-is-stopped");
+        holder_daemon.stop();
+        eprintln!("[news] holder stopped");
+        let before = failed_rounds(&reader, &[&author]);
+        let back = Instant::now();
+        let _author_daemon = start(&author, &author_at, None);
+        eprintln!(
+            "[news] author started again at {author_at}, {:.2} s",
+            back.elapsed().as_secs_f64()
+        );
+        let wanted = "NW-A-back";
+        post(&author, &id, wanted, true);
+        eprintln!(
+            "[news] author posted {wanted:?} {:.2} s after it started",
+            back.elapsed().as_secs_f64()
+        );
+        let newcomer = reader.b32();
+        let mut seen = before[0].clone();
+        let mut refused = None;
+        let known = loop {
+            let now = failed_rounds(&reader, &[&author]).remove(0);
+            if now != seen {
+                eprintln!(
+                    "[news] {:.2} s after the author started, the newcomer's row toward it: \
+                     failed {} last_failure {} backoff {}",
+                    back.elapsed().as_secs_f64(),
+                    now.0,
+                    now.1,
+                    now.2
+                );
+                if refused.is_none()
+                    && now.0 > before[0].0
+                    && now.1.as_str() == Some("the peer refused: authenticator invalid")
+                {
+                    refused = Some(back.elapsed());
+                }
+                seen = now;
+            }
+            let listed = status(&author, &id)["members"]
+                .as_array()
+                .is_some_and(|members| members.iter().any(|m| m["id"] == newcomer.as_str()));
+            if listed {
+                break Some(back.elapsed());
+            }
+            if back.elapsed() > WATCH {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        // Printed only: whether the newcomer showed the post (the pull-loop change's act).
+        eprintln!(
+            "[news] the author listed the newcomer {known:?} after starting; refused it as a \
+             stranger {refused:?}; the newcomer shows {wanted:?} now: {}",
+            read(&reader, &id, Some(wanted)).0.contains(wanted)
+        );
+        let Some(known) = known else {
+            panic!(
+                "RED PRODUCT: the returned author never listed the newcomer as a member within \
+                 {WATCH:?} (refused it as a stranger {refused:?} after starting; the newcomer's \
+                 row toward it: {seen:?})"
+            );
+        };
+        assert!(
+            known <= BOUND && refused.is_none(),
+            "RED PRODUCT: the returned author listed the newcomer {known:?} after starting \
+             (bound {BOUND:?}) and refused it as a stranger {refused:?} (the newcomer's row \
+             toward it: {seen:?})"
+        );
     }
 
     /// Until `reader` shows `wanted`; RED PRODUCT when five status answers in a row show its flow

@@ -275,7 +275,7 @@ impl ChannelState {
     ) -> Result<Prepared> {
         // Delivery reset is debt metadata, not permission or a ratchet write. Its original
         // callers attempt both ledger saves even after a preceding storage failure.
-        if self.poisoned && !matches!(&work, Work::ResetDelivery { .. }) {
+        if self.poisoned.get() && !matches!(&work, Work::ResetDelivery { .. }) {
             return Err(self.save_failure());
         }
         let removal_generation = if matches!(

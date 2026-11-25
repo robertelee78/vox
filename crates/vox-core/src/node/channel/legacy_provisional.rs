@@ -17,7 +17,7 @@ impl ChannelState {
     }
 
     pub(crate) fn require_legacy_current(&self, store: &Store) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.legacy_cache_only(store)? {
@@ -41,7 +41,7 @@ impl ChannelState {
 
     /// Record only the exact authenticated current v1 header, never its body or peer HAVE.
     pub(crate) fn note_legacy_required(&self, store: &Store, tip: &Entry) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let sk = &tip.skeleton;
@@ -98,7 +98,7 @@ impl ChannelState {
         &self,
         store: &Store,
     ) -> Result<Option<LegacyProvisionalState>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         Ok(self

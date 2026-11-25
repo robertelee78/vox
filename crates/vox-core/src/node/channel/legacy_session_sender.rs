@@ -61,7 +61,7 @@ impl ChannelState {
         owner: Arc<()>,
         now: crate::time::Ms,
     ) -> Result<Option<PendingAnnouncement>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self

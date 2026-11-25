@@ -2,7 +2,7 @@
 //! envelope before these methods; every pinned store read is dropped before network I/O.
 
 use super::*;
-use crate::log::history::{ControlContext, LogScope, SignedHead};
+use crate::log::history::LogScope;
 use crate::node::store::Batch;
 
 pub(super) struct KeyProviderPruneWait {
@@ -232,10 +232,10 @@ impl HistoryAdmissionRoom for ChannelState {
 }
 
 pub(crate) struct PendingHistoryAdmission {
-    room: Digest32,
-    instance: [u8; 16],
-    epoch: u64,
-    me: Digest32,
+    pub(super) room: Digest32,
+    pub(super) instance: [u8; 16],
+    pub(super) epoch: u64,
+    pub(super) me: Digest32,
     sek: crate::atrest::sek::WeakSek,
     authors: BTreeMap<Digest32, CompositePublicKey>,
     members: BTreeSet<Digest32>,
@@ -251,6 +251,13 @@ pub(crate) struct HistoryAdmission<'a> {
     pending: &'a PendingHistoryAdmission,
     sek: &'a Sek,
     entries: entry_store::EntryIndex,
+}
+
+impl HistoryAdmission<'_> {
+    /// The room's key, for a committed read under it.
+    pub(super) fn sek(&self) -> &Sek {
+        self.sek
+    }
 }
 
 impl PendingHistoryAdmission {
@@ -517,7 +524,7 @@ impl ChannelState {
         store: &Store,
         authorization: Option<(Digest32, Digest32)>,
     ) -> Result<PendingHistoryAdmission> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.post_pending() {
@@ -525,6 +532,22 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
+        self.admission_facts(store, authorization)
+    }
+
+    /// The same facts for serving a peer: read-only, so a pending save does not stand in its way.
+    pub(super) fn served_history_admission(
+        &self,
+        store: &Store,
+    ) -> Result<PendingHistoryAdmission> {
+        self.admission_facts(store, None)
+    }
+
+    fn admission_facts(
+        &self,
+        store: &Store,
+        authorization: Option<(Digest32, Digest32)>,
+    ) -> Result<PendingHistoryAdmission> {
         Ok(PendingHistoryAdmission {
             room: self.channel_id,
             instance: self.history_instance(store)?,
@@ -738,7 +761,7 @@ impl ChannelState {
     }
 
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         Ok(self
@@ -872,19 +895,24 @@ impl ChannelState {
     }
 
     pub(super) fn require_history_source_boundary(&self, entry: &Entry) -> Result<()> {
-        if entry.skeleton.channel_id != self.channel_id
-            || !self.admission.is_admitted(
-                &self.channel_id,
-                entry.skeleton.epoch,
-                &entry.skeleton.author_id,
-            )
-            || self.dag.is_frozen(&entry.skeleton.author_id)
-        {
+        if !self.history_source_admissible(entry) {
             return Err(Error::MalformedGovernance(
                 "history source room, epoch or author boundary changed",
             ));
         }
         Ok(())
+    }
+
+    /// Whether this node would still admit a body of `entry` as a history source: its room, its
+    /// epoch's admission of its author, and its author not frozen by a fork proof.
+    pub(super) fn history_source_admissible(&self, entry: &Entry) -> bool {
+        entry.skeleton.channel_id == self.channel_id
+            && self.admission.is_admitted(
+                &self.channel_id,
+                entry.skeleton.epoch,
+                &entry.skeleton.author_id,
+            )
+            && !self.dag.is_frozen(&entry.skeleton.author_id)
     }
 
     pub(crate) fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
@@ -912,7 +940,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
@@ -930,6 +958,7 @@ impl ChannelState {
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
+        self.publish_room_snapshot(store);
         Ok(result)
     }
 
@@ -947,55 +976,8 @@ impl ChannelState {
         Ok(result)
     }
 
-    pub(crate) fn history_head_by_id(
-        &self,
-        store: &Store,
-        head: &Digest32,
-    ) -> Result<Option<SignedHead>> {
-        let read = self.history_read(store)?;
-        let Some(value) = read.history_head(head)? else {
-            return Ok(None);
-        };
-        // MP-9 (rule 6): besides committed heads, the one kept unresolved head of an author is
-        // served by its id, with what this node proved under it; the asker's own gates decide.
-        if read.history_head_committed(head, value.binding)?
-            || read.history_unresolved_head(&value.binding.author)? == Some(*head)
-        {
-            Ok(Some(value))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// One bounded page of commitments. No scan or signed-head vector survives this read.
-    pub(crate) fn history_head_hints(
-        &self,
-        store: &Store,
-        after: Option<Digest32>,
-    ) -> Result<HistoryHeadPage> {
-        let read = self.history_read(store)?;
-        let mut next = after;
-        let mut heads = Vec::new();
-        for _ in 0..64 {
-            let Some((author, state)) = read.history_author_after(next)? else {
-                return Ok(HistoryHeadPage { heads, next: None });
-            };
-            next = Some(author);
-            if let Some(id) = state.committed {
-                let head = read
-                    .history_head(&id)?
-                    .ok_or(Error::MalformedAtRest("committed history head missing"))?;
-                heads.push(HistoryHeadHint {
-                    author,
-                    leaves: head.root.leaves,
-                    head: id,
-                });
-            }
-        }
-        Ok(HistoryHeadPage { heads, next })
-    }
     pub(crate) fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
@@ -1005,152 +987,6 @@ impl ChannelState {
             ));
         }
         Ok(read)
-    }
-
-    /// The latest consistency-accepted commitment. It is not a control-ready or contiguous
-    /// position, and serving it does not change either state.
-    pub(crate) fn history_head(
-        &self,
-        store: &Store,
-        author: &Digest32,
-    ) -> Result<Option<SignedHead>> {
-        let read = self.history_read(store)?;
-        let Some(id) = read
-            .sparse_author(author, LogScope::Public)?
-            .and_then(|state| state.committed)
-        else {
-            return Ok(None);
-        };
-        read.history_head(&id)
-    }
-
-    /// A durable context, or one a serving reconstruction generated for an asked prefix and
-    /// still holds only in the serving cache (ADR-053 P). Both are content-addressed.
-    pub(crate) fn history_context(
-        &self,
-        store: &Store,
-        hash: &Digest32,
-    ) -> Result<Option<ControlContext>> {
-        Ok(match self.history_read(store)?.history_context(hash)? {
-            Some(context) => Some(context),
-            None => entry_store::sparse::serving_context(&self.channel_id, hash),
-        })
-    }
-
-    pub(crate) fn history_header(
-        &self,
-        store: &Store,
-        author: &Digest32,
-        seq: u64,
-    ) -> Result<Option<HistoryHeader>> {
-        self.history_read(store)?
-            .history_position_header(author, seq)?
-            .map(|entry| {
-                Ok(HistoryHeader {
-                    wire: entry.header_wire(),
-                })
-            })
-            .transpose()
-    }
-
-    /// Return only a retained signed commitment exactly at this node's completed role cut.
-    /// A newer accepted commitment is metadata, not a receipt for its unfinished source.
-    pub(crate) fn history_role_head(
-        &self,
-        store: &Store,
-        author: &Digest32,
-    ) -> Result<Option<SignedHead>> {
-        let read = self.history_read(store)?;
-        let Some(state) = read.sparse_author(author, LogScope::Public)? else {
-            return Ok(None);
-        };
-        let (through, hash) = read.history_held_through(author).unwrap_or((0, [0; 32]));
-        let source = if through == 0 {
-            None
-        } else {
-            read.history_validated_header(author, through)?
-                .map(|(head, _)| head)
-        };
-        for id in [state.committed, state.control_ready, source]
-            .into_iter()
-            .flatten()
-        {
-            let head = read
-                .history_head(&id)?
-                .ok_or(Error::MalformedAtRest("role receipt head missing"))?;
-            if head.id() != id
-                || head.binding.room != self.channel_id
-                || head.binding.author != *author
-                || head.binding.scope != LogScope::Public
-            {
-                return Err(Error::MalformedAtRest("role receipt head binding"));
-            }
-            if head.root.leaves != through || !read.history_head_committed(&id, head.binding)? {
-                continue;
-            }
-            if through != 0 {
-                let Some(included) = read.history_inclusion_receipt(&id, author, through)? else {
-                    continue;
-                };
-                if included.head_id() != id
-                    || included.binding() != head.binding
-                    || included.root() != head.root
-                    || included.header().entry().skeleton.seq != through
-                {
-                    return Err(Error::MalformedAtRest("role receipt inclusion binding"));
-                }
-                if included.header().entry().entry_hash() != hash {
-                    continue;
-                }
-            }
-            return Ok(Some(head));
-        }
-        Ok(None)
-    }
-
-    /// Metadata-only fallback: an exact sealed inclusion receipt can retain a signed header
-    /// before its source/effect has reached the canonical position index. This never supplies
-    /// Entry/Page bodies or publishes a canonical position. The receipt is the resolved source
-    /// head's: its prefix through the asked size is the asked head's (ADR-053 P).
-    pub(crate) fn history_proof_header(
-        &self,
-        store: &Store,
-        target: &super::ResolvedTarget,
-        seq: u64,
-    ) -> Result<Option<HistoryHeader>> {
-        let read = self.history_read(store)?;
-        let binding = target.target.binding;
-        // An admitted position is under the accepted chain only. Under another signed head
-        // (MP-9: an unresolved second history, served as itself) only an entry proven under
-        // that head is served. A prefix resolved to a committed source is under that chain.
-        if read.history_head_accepted(&target.source, binding)? {
-            if let Some(entry) = read.history_position_header(&binding.author, seq)? {
-                return Ok(Some(HistoryHeader {
-                    wire: entry.header_wire(),
-                }));
-            }
-        }
-        let Some(included) =
-            read.history_inclusion_receipt(&target.source, &binding.author, seq)?
-        else {
-            return Ok(None);
-        };
-        let source = read
-            .history_head(&target.source)?
-            .ok_or(Error::MalformedAtRest("proof header source head missing"))?;
-        let entry = included.header().entry();
-        if included.head_id() != target.source
-            || included.binding() != binding
-            || included.root() != source.root
-            || entry.skeleton.channel_id != self.channel_id
-            || entry.skeleton.author_id != binding.author
-            || entry.skeleton.seq != seq
-        {
-            return Err(Error::MalformedAtRest("proof header receipt binding"));
-        }
-        Ok(Some(HistoryHeader {
-            wire: entry.header_wire(),
-        }))
     }
 
     /// A locally queued receipt probe obeys the same durable exact refusal as wire inventory.
@@ -1200,32 +1036,6 @@ impl ChannelState {
             }
         }
         Ok(targets)
-    }
-
-    /// Decode and authenticate one body once under the caller's large-record envelope.
-    /// The response driver borrows its chunks for this quantum and drops the body before
-    /// yielding; it must not call whole-record AEAD once for every 64-KiB frame.
-    pub(crate) fn history_payload(&self, store: &Store, hash: &Digest32) -> Result<HistoryPayload> {
-        let read = self.history_read(store)?;
-        let Some(entry) = read.history_entry(hash)? else {
-            return Ok(HistoryPayload::Missing);
-        };
-        if entry.skeleton.v2.is_none() {
-            return Err(Error::MalformedAtRest("legacy entry in activated history"));
-        }
-        let payload_len = entry.skeleton.payload_len;
-        let Some(payload) = entry.payload else {
-            return Ok(HistoryPayload::BodyNotHeld { payload_len });
-        };
-        if payload.len() as u64 != payload_len || sha256(&payload) != entry.skeleton.payload_hash {
-            return Err(Error::MalformedAtRest(
-                "stored history payload differs from header",
-            ));
-        }
-        Ok(HistoryPayload::Held {
-            payload_len,
-            bytes: payload,
-        })
     }
 }
 
@@ -1452,64 +1262,6 @@ impl ChannelState {
             .publication_busy())
     }
 
-    /// Enumerate one locally held sealed package using the durable acquisition cursor.
-    /// An ineligible catalog entry advances the cursor without advertising it.
-    pub(crate) fn history_key_available_page(
-        &self,
-        store: &Store,
-        after: Option<u64>,
-    ) -> Result<Option<(u64, Option<crate::node::history_stream::KeyBodyAvailable>)>> {
-        let read = self.history_read(store)?;
-        let Some((cursor, log)) = read.key_package_after(after)? else {
-            return Ok(None);
-        };
-        let sealed = store
-            .snapshot()?
-            .get_segment_bounded(
-                &self.channel_id,
-                SegmentKind::LogDb,
-                log,
-                crate::node::keypackage::MAX_KEY_PACKAGE
-                    + crate::log::history::MAX_HEADER_BYTES
-                    + 9,
-            )?
-            .ok_or(Error::MalformedAtRest("key-package catalog body missing"))?;
-        let wire = open_segment(&self.sek, SegmentKind::LogDb, log, &sealed)?;
-        let entry = Entry::from_wire(&wire)?;
-        entry.verify_payload_binding()?;
-        let Some(v2) = entry.skeleton.v2.as_ref() else {
-            return Ok(Some((cursor, None)));
-        };
-        if v2.kind != crate::log::history::SignedEntryKind::KeyPackage {
-            return Err(Error::MalformedAtRest("key-package catalog entry differs"));
-        }
-        if entry.payload.is_none() {
-            return Ok(Some((cursor, None)));
-        }
-        let recipient = v2
-            .recipient
-            .ok_or(Error::MalformedAtRest("key-package recipient missing"))?;
-        let Some((head, header)) =
-            read.history_validated_header(&entry.skeleton.author_id, entry.skeleton.seq)?
-        else {
-            return Ok(Some((cursor, None)));
-        };
-        if header.entry_hash() != entry.entry_hash() {
-            return Err(Error::MalformedAtRest("key-package source header differs"));
-        }
-        Ok(Some((
-            cursor,
-            Some(crate::node::history_stream::KeyBodyAvailable {
-                cursor,
-                author: entry.skeleton.author_id,
-                head,
-                seq: entry.skeleton.seq,
-                hash: entry.entry_hash(),
-                recipient,
-            }),
-        )))
-    }
-
     /// A newly committed sealed-package debt may be filled by any eligible room peer.
     pub(crate) fn note_key_body_debt(&self) {
         for peer in self
@@ -1674,7 +1426,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if entry.skeleton.channel_id != self.channel_id
@@ -1763,6 +1515,12 @@ impl ChannelState {
             self.dag.install_verified_fork(proof);
             self.forks_kept = completed.kept;
             self.entries.committed();
+            // The proof froze its author and `note_fork_in` started a governance replay: what was
+            // decided under the governance before it no longer stands. Read authority and every
+            // "not received yet" decision go with the fork's installation, before the read
+            // resource is published again, as for any governance change (`OwedDecided` starts a
+            // new turn once governance is current again).
+            self.retire_governance()?;
         }
         if completed.poison {
             if let Err(error) = &completed.result {
@@ -1770,79 +1528,6 @@ impl ChannelState {
             }
         }
         completed.result
-    }
-
-    /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending:
-    /// what its inventory lists so a peer that never met the second history can ask for it.
-    pub(crate) fn history_fork_authors(&self) -> Vec<Digest32> {
-        self.dag
-            .fork_proofs()
-            .into_iter()
-            .filter(|proof| proof.existing.is_signed() && proof.conflicting.is_signed())
-            .map(|proof| proof.author_id)
-            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
-            .collect()
-    }
-
-    /// MP-9 (rule 6): per author the kept signed head whose continuity with the accepted chain
-    /// is still unresolved, ascending by author: what the inventory lists so a peer holding the
-    /// other history can fetch it by id and compare. An author frozen by a fork proof, or a head
-    /// accepted since, is resolved and not listed. At most one per author.
-    pub(crate) fn history_unresolved_hints(&self, store: &Store) -> Result<Vec<HistoryHeadHint>> {
-        let read = self.history_read(store)?;
-        let mut hints = Vec::new();
-        let mut after = None;
-        for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
-            let Some((author, _)) = read.history_author_after(after)? else {
-                break;
-            };
-            after = Some(author);
-            if self.dag.is_frozen(&author) {
-                continue;
-            }
-            let Some(id) = read.history_unresolved_head(&author)? else {
-                continue;
-            };
-            let Some(head) = read.history_head(&id)? else {
-                continue;
-            };
-            if read.history_head_accepted(&id, head.binding)? {
-                continue;
-            }
-            hints.push(HistoryHeadHint {
-                author,
-                leaves: head.root.leaves,
-                head: id,
-            });
-        }
-        Ok(hints)
-    }
-
-    /// MP-9: the two signed headers of the proof this node verified and kept for `author`.
-    /// No body and no key material travel.
-    pub(crate) fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
-        let proof = self.dag.fork_proof(author)?;
-        (proof.existing.is_signed() && proof.conflicting.is_signed()).then(|| {
-            (
-                proof.existing.header_wire(),
-                proof.conflicting.header_wire(),
-            )
-        })
-    }
-
-    /// MP-9: of the authors a peer lists, the first one this node has not frozen and whose key
-    /// it holds. One per inventory: a listing never makes this node ask for more.
-    pub(crate) fn history_fork_wanted(&self, authors: &[Digest32]) -> Option<Digest32> {
-        authors
-            .iter()
-            .copied()
-            .find(|author| !self.dag.is_frozen(author) && self.authors.contains_key(author))
-    }
-
-    /// An author frozen by a fork proof: its later history is refused, so nothing of it is
-    /// fetched.
-    pub(crate) fn history_author_frozen(&self, author: &Digest32) -> bool {
-        self.dag.is_frozen(author)
     }
 
     /// MP-9: apply two signed entries of one author at one position, found by comparing two
@@ -1948,7 +1633,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.require_history_source_boundary(entry)?;

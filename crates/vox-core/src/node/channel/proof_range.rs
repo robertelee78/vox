@@ -117,46 +117,24 @@ impl ProofRangeRestore {
         })
     }
 }
-pub(crate) struct PendingProofRange {
-    admission: super::sparse_history::PendingHistoryAdmission,
-    authority: Option<(u64, u64, u64, bool)>,
-}
-
-impl PendingProofRange {
-    pub(crate) fn advance(
-        self,
-        store: &Store,
-        cursor: &mut ProofRangeRestore,
-    ) -> Result<ProofRangeStep> {
-        self.admission
-            .with(|room| ProofRangeRestore::restore(room, store, self.authority, cursor))
-    }
-}
-
-impl ChannelState {
-    pub(crate) fn prepare_proof_range(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        cursor: &ProofRangeRestore,
-        authorization: Option<(Digest32, Digest32)>,
-    ) -> Result<PendingProofRange> {
-        let authority = self
+/// One step of a proof repair for `peer`, read through the room's published snapshot: it
+/// writes nothing, so it waits on nothing of the room's own.
+pub(crate) fn serve_proof_range(
+    snapshot: &super::RoomSnapshot,
+    store: &Store,
+    peer: Digest32,
+    cursor: &mut ProofRangeRestore,
+) -> Result<ProofRangeStep> {
+    let author = cursor.binding.author;
+    snapshot.with(|view| {
+        let authority = view
             .history_inventory_incarnation(&peer)
-            .zip(self.history_author_inventory_incarnation(&cursor.binding.author))
-            .map(|(peer, author)| {
-                (
-                    self.epoch(),
-                    peer,
-                    author,
-                    self.dag.is_frozen(&cursor.binding.author),
-                )
+            .zip(view.history_author_inventory_incarnation(&author))
+            .map(|(peer, author_life)| {
+                (view.epoch(), peer, author_life, snapshot.is_frozen(&author))
             });
-        Ok(PendingProofRange {
-            admission: self.prepare_history_admission(store, authorization)?,
-            authority,
-        })
-    }
+        ProofRangeRestore::restore(view.admission(), store, authority, cursor)
+    })
 }
 
 impl ProofRangeRestore {

@@ -413,7 +413,7 @@ impl ChannelState {
 
     /// Current governance revision, requiring authority to be ready at the room's latest time.
     pub fn governance_revision(&self, now: crate::time::Ms) -> Result<u64> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.governance_display_current(now.get()) {
@@ -556,7 +556,7 @@ impl ChannelState {
     }
 
     pub(in crate::node::channel) fn current_governance(&self, store: &Store) -> Result<View<'_>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         View::current(
@@ -608,7 +608,7 @@ impl ChannelState {
         store: &Store,
         now: u64,
     ) -> Result<View<'_>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         View::open(
@@ -627,7 +627,7 @@ impl ChannelState {
         store: &Store,
         now: crate::time::Ms,
     ) -> Result<GovernanceProgress> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.now_hint = self.now_hint.max(now.get());
@@ -657,6 +657,9 @@ impl ChannelState {
                     || (!was_ready && consent_ready);
                 self.governance_display = display;
                 self.governance_ready = consent_ready;
+                if changed {
+                    self.owed_decided.governance_changed();
+                }
             }
             Ok(GovernanceProgress {
                 // Irreversible work needs the current checked disk fold, not merely the retained
@@ -711,7 +714,7 @@ impl ChannelState {
         _store: &Store,
         now: crate::time::Ms,
     ) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.governance_display_current(now.get()) {
@@ -738,7 +741,7 @@ impl ChannelState {
         who: &Digest32,
         now: u64,
     ) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         // Genesis authority is immutable; creation can append its initial facts

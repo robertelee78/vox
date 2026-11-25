@@ -91,7 +91,7 @@ impl ChannelState {
         work: ProjectionWork,
         now: crate::time::Ms,
     ) -> Result<PendingProjection> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         // The legacy cache-only check is a committed read. No no-op derived batch
@@ -226,6 +226,9 @@ impl ChannelState {
                     self.governance_display.revision != display.revision || !self.governance_ready;
                 self.governance_display = display;
                 self.governance_ready = true;
+                if progress.changed {
+                    self.owed_decided.governance_changed();
+                }
             }
             Ok(ProjectionProgress::Governance(progress))
         });
@@ -246,7 +249,7 @@ impl ChannelState {
         &self,
         now: crate::time::Ms,
     ) -> Result<PendingProjection> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         Ok(PendingProjection {

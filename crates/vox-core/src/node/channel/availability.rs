@@ -88,6 +88,10 @@ impl State {
             peers: BTreeMap::new(),
         })
     }
+    /// Every admitted author's serving scalar, for the room's published snapshot.
+    pub(super) fn peers(&self) -> BTreeMap<Digest32, Arc<Peer>> {
+        self.peers.clone()
+    }
     fn peer(&mut self, author: Digest32) -> Result<Arc<Peer>> {
         if !self.peers.contains_key(&author) && self.peers.len() >= super::AUTHORS_HARD_LIMIT {
             return Err(Error::SizeLimitExceeded("room availability authors"));
