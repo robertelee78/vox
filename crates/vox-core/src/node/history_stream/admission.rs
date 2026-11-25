@@ -67,14 +67,23 @@ pub(super) fn stage(
     }
     let mut work = WorkBudget::default();
     match (query, object) {
-        (Query::Head(author), Object::Head(bytes)) => {
+        (Query::Head(_) | Query::HeadById(_), Object::Head(bytes)) => {
             let head = SignedHead::from_wire(bytes)?;
+            // MP-9 (rule 6): a head asked for by its exact id is staged as an observation like
+            // any other: it is verified, retained, and promoted only through the same gates.
+            let requested = match query {
+                Query::Head(author) => head.binding.author == *author,
+                Query::HeadById(id) => head.id() == *id,
+                _ => false,
+            };
             if head.binding.room != room.channel_id()
                 || head.binding.scope != LogScope::Public
-                || head.binding.author != *author
+                || !requested
             {
                 return Err(invalid("requested head binding differs"));
             }
+            let author_id = head.binding.author;
+            let author = &author_id;
             let key = room
                 .history_author_key(author)
                 .ok_or(invalid("unknown history author"))?;
@@ -105,6 +114,18 @@ pub(super) fn stage(
                 _ => false,
             };
             let held = retained && input.history_head_accepted(&id, head.binding)?;
+            // MP-9: a head of the accepted head's size with another root is opened and compared
+            // like one of another size (promote_head), not only refused as a conflict.
+            let equal_rival = *author != room.me()
+                && !fork_mutant_is("equal-rival-refused")
+                && match state.and_then(|state| state.committed) {
+                    Some(accepted) if accepted != id => {
+                        input.history_head(&accepted)?.is_some_and(|accepted| {
+                            accepted.root.leaves == head.root.leaves && accepted.root != head.root
+                        })
+                    }
+                    _ => false,
+                };
             drop(input);
             let brought = !(retained && observed_already);
             if brought {
@@ -122,7 +143,7 @@ pub(super) fn stage(
                     // proof, wire exchange, cancellation or conflict exit never completes.
                     own_observed.store(true, std::sync::atomic::Ordering::Release);
                 }
-                if conflict {
+                if conflict && !equal_rival {
                     return Err(invalid("conflicting authenticated heads retained"));
                 }
             }
@@ -231,10 +252,18 @@ pub(super) fn stage(
                     if proof.position != *from || from != to || proof.size != signed.root.leaves {
                         return Err(invalid("inclusion response interval differs"));
                     }
-                    let header = input
-                        .history_position_header(&signed.binding.author, *from)?
-                        .or(input.history_pending_header(head, *from)?)
-                        .ok_or(invalid("inclusion header is absent"))?;
+                    // MP-9: an accepted position's header is under every accepted head only.
+                    // Under another signed head the header its holder sent for that exact head
+                    // is the one proven; the accepted entry would fail as if the proof were bad.
+                    let accepted_head = input.history_head_accepted(head, signed.binding)?;
+                    let position = input.history_position_header(&signed.binding.author, *from)?;
+                    let pending = input.history_pending_header(head, *from)?;
+                    let header = if accepted_head {
+                        position.or(pending)
+                    } else {
+                        pending.or(position)
+                    }
+                    .ok_or(invalid("inclusion header is absent"))?;
                     let HistoryStep::Complete(header) =
                         VerifiedHeader::verify(&header, signed.binding, &key, &mut work)?
                     else {
@@ -362,6 +391,9 @@ pub(super) enum Advanced {
     Need(Query),
     Complete,
     Busy,
+    /// MP-9: two signed entries of one author at one position, one under the accepted chain
+    /// and one under another signed head. The caller records it as a fork.
+    Fork(Box<(Entry, Entry)>),
 }
 
 /// One verifier turn runs the bounded proof to its end. Primitive cooperative slices replenish
@@ -539,6 +571,9 @@ pub(super) fn advance(
             promote_head(room, store, committed, binding.head)
         }
         ResultStep::Prefix(prefix) => {
+            let input = room.history_read(store)?;
+            let unlinked = unlinked_prefix(&input, &prefix)?;
+            drop(input);
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 keep_witness(
@@ -548,7 +583,13 @@ pub(super) fn advance(
                         prefix.root().leaves,
                     )?,
                 )?;
-                index.keep_history_prefix_receipt(&prefix)?;
+                if unlinked {
+                    // MP-9: the head's prefix differs from the accepted chain. Kept under its
+                    // own head so the comparison resumes; never as an accepted range.
+                    index.keep_history_unlinked_prefix_receipt(&prefix)?;
+                } else {
+                    index.keep_history_prefix_receipt(&prefix)?;
+                }
                 index.finish_history_verifier_cursor(*binding)
             })?;
             cache_ranges()?;
@@ -632,6 +673,11 @@ fn combine_parent(
     let input = room.history_read(store)?;
     let included = input.history_inclusion_receipt(&head, &author, seq)?;
     let prefix = input.history_prefix_receipt(&head, &author, seq)?;
+    // MP-9: an unlinked prefix makes no parent receipt; it is not the accepted chain.
+    let prefix = match prefix {
+        Some(prefix) if unlinked_prefix(&input, &prefix)? => None,
+        other => other,
+    };
     drop(input);
     if let (Some(included), Some(prefix)) = (included, prefix) {
         let parent = governance::VerifiedParentPrefix::new(included, prefix)?;
@@ -668,43 +714,40 @@ pub(super) fn promote_head(
         }
         None => (None, Descriptor::empty(signed.binding)),
     };
-    if signed.root.leaves < baseline.leaves {
-        let baseline_id = baseline_id.ok_or(invalid("nonempty baseline has no head"))?;
-        let Some(prefix) = input.history_prefix_receipt(
-            &baseline_id,
-            &signed.binding.author,
-            signed.root.leaves,
-        )?
-        else {
-            return Ok(Advanced::Need(Query::Proof {
-                head: baseline_id,
-                kind: ProofKind::Consistency,
-                from: signed.root.leaves,
-                to: baseline.leaves,
-            }));
-        };
-        if prefix.prefix() != signed.root || prefix.root() != baseline {
-            return Err(invalid(
-                "stale head differs from accepted consistency chain",
-            ));
+    if let Some((outcome, unresolved)) = unequal(&input, id, &signed, baseline_id, baseline)? {
+        if let (true, Advanced::Need(query)) = (unresolved, &outcome) {
+            // MP-9 (rule 6): the comparison waits for evidence a later peer may hold. The head
+            // is owned as this author's unresolved observation: listed, served by its id and
+            // compared again after a restart; never accepted by being kept.
+            let author = signed.binding.author;
+            let kept = input.history_unresolved_head(&author)? == Some(id);
+            drop(input);
+            let keep = !kept && !fork_mutant_is("second-head-unkept");
+            if keep {
+                room.history_write_tracked(store, committed, |index| {
+                    index.keep_history_unresolved_head(&author, &id)
+                })?;
+            }
+            #[cfg(feature = "test-knobs")]
+            eprintln!(
+                "history comparison unresolved author={} head={} kept={} awaits={}",
+                crate::node::link::b32_encode(&author),
+                crate::node::link::b32_encode(&id),
+                kept || keep,
+                match query {
+                    Query::Header { head, .. } if Some(*head) == baseline_id => "accepted-side",
+                    Query::Header { .. } => "other-side",
+                    _ => "proof",
+                }
+            );
+            #[cfg(not(feature = "test-knobs"))]
+            let _ = query;
         }
-        return Ok(Advanced::Complete);
+        return Ok(outcome);
     }
-    let Some(prefix) =
-        input.history_prefix_receipt(&id, &signed.binding.author, baseline.leaves)?
-    else {
-        return Ok(Advanced::Need(Query::Proof {
-            head: id,
-            kind: ProofKind::Consistency,
-            from: baseline.leaves,
-            to: signed.root.leaves,
-        }));
-    };
-    if prefix.prefix() != baseline {
-        return Err(invalid(
-            "consistency differs from current accepted baseline",
-        ));
-    }
+    let prefix = input
+        .history_prefix_receipt(&id, &signed.binding.author, baseline.leaves)?
+        .ok_or(invalid("promotion consistency receipt vanished"))?;
     if signed.root.leaves != 0
         && input
             .history_inclusion_receipt(&id, &signed.binding.author, signed.root.leaves)?
@@ -797,6 +840,9 @@ pub(super) fn start_entry(
         drop(input);
         return match promote_head(room, store, committed, head)? {
             Advanced::Need(query) => Ok(EntryStart::Need(query)),
+            // The verifier path that opened the competing entry records the fork; an entry
+            // under a head proven to be another history is never started.
+            Advanced::Fork(_) => Err(invalid("entry head is a competing signed history")),
             _ => Ok(EntryStart::Busy),
         };
     }
@@ -1224,6 +1270,309 @@ enum WitnessMutant {
     EveryTrace,
     /// Control coverage is saved without its verified trace (cache-only, before ADR-053 MP-7).
     ControlUnkept,
+}
+
+/// MP-9 (rules 6 and 7): where a signed head of another size than the accepted one stands
+/// (an equal size with another root included). `None`: it extends the accepted chain and
+/// today's promotion goes on. `Some((outcome, unresolved))`: the outcome, and whether it
+/// belongs to an unresolved comparison (a `Need` there is evidence a later peer may hold).
+/// Read-only.
+fn unequal(
+    input: &entry_store::Read<'_>,
+    id: Digest32,
+    signed: &SignedHead,
+    baseline_id: Option<Digest32>,
+    baseline: Descriptor,
+) -> Result<Option<(Advanced, bool)>> {
+    let author = signed.binding.author;
+    if signed.root.leaves < baseline.leaves {
+        let baseline_id = baseline_id.ok_or(invalid("nonempty baseline has no head"))?;
+        let at = signed.root.leaves;
+        // Rule 7: when both sides are already opened at m = |smaller head| they are compared
+        // before any proof is asked of a peer that may hold only one of them; a different
+        // signed entry there is a fork. Matching entries are not continuity.
+        let mut opened = true;
+        if at != 0 && !fork_mutant() {
+            match compare_overlap(input, id, baseline_id, author, at)? {
+                Overlap::Same => {
+                    if input
+                        .history_range(signed.binding, 1, at)?
+                        .is_some_and(|held| held != signed.root)
+                    {
+                        let outcome = prefix_walk(input, id, baseline_id, author, at)?;
+                        return Ok(Some((outcome, true)));
+                    }
+                }
+                Overlap::Fork(fork) => return Ok(Some((Advanced::Fork(fork), true))),
+                // Not opened yet: today's consistency check decides first, at today's cost.
+                Overlap::Need(_) => opened = false,
+            }
+        }
+        let Some(prefix) = input.history_prefix_receipt(&baseline_id, &author, at)? else {
+            let need = Advanced::Need(Query::Proof {
+                head: baseline_id,
+                kind: ProofKind::Consistency,
+                from: at,
+                to: baseline.leaves,
+            });
+            return Ok(Some((need, !opened)));
+        };
+        if prefix.root() == baseline && prefix.prefix() != signed.root && !fork_mutant() {
+            // The smaller head is not the accepted chain's prefix: both sides are opened at m,
+            // then the prefixes below it.
+            let outcome = match compare_overlap(input, id, baseline_id, author, at)? {
+                Overlap::Same => prefix_walk(input, id, baseline_id, author, at)?,
+                Overlap::Fork(fork) => Advanced::Fork(fork),
+                Overlap::Need(query) => Advanced::Need(query),
+            };
+            return Ok(Some((outcome, true)));
+        }
+        if prefix.prefix() != signed.root || prefix.root() != baseline {
+            return Err(invalid(
+                "stale head differs from accepted consistency chain",
+            ));
+        }
+        return Ok(Some((Advanced::Complete, false)));
+    }
+    if let (Some(baseline_id), true) = (
+        baseline_id,
+        signed.root.leaves == baseline.leaves && signed.root != baseline,
+    ) {
+        // Two signed heads of one size and different roots (this head is not accepted): both
+        // are opened at that size, then the prefixes below it. A size-zero rival is refused.
+        let at = baseline.leaves;
+        if at == 0 {
+            return Err(invalid("conflicting authenticated heads retained"));
+        }
+        let outcome = match compare_overlap(input, id, baseline_id, author, at)? {
+            Overlap::Same => prefix_walk(input, id, baseline_id, author, at)?,
+            Overlap::Fork(fork) => Advanced::Fork(fork),
+            Overlap::Need(query) => Advanced::Need(query),
+        };
+        return Ok(Some((outcome, true)));
+    }
+    let Some(prefix) = input.history_prefix_receipt(&id, &author, baseline.leaves)? else {
+        let need = Advanced::Need(Query::Proof {
+            head: id,
+            kind: ProofKind::Consistency,
+            from: baseline.leaves,
+            to: signed.root.leaves,
+        });
+        return Ok(Some((need, false)));
+    };
+    if prefix.prefix() != baseline {
+        // Rule 7: the head does not extend the accepted one. Both sides are opened at the
+        // accepted size, a position that fits both heads; a different signed entry there is a
+        // fork, a matching one sends the comparison into the prefixes.
+        if let (Some(baseline_id), false) = (baseline_id, fork_mutant()) {
+            let at = baseline.leaves;
+            let outcome = match compare_overlap(input, id, baseline_id, author, at)? {
+                Overlap::Same => prefix_walk(input, id, baseline_id, author, at)?,
+                Overlap::Fork(fork) => Advanced::Fork(fork),
+                Overlap::Need(query) => Advanced::Need(query),
+            };
+            return Ok(Some((outcome, true)));
+        }
+        return Err(invalid(
+            "consistency differs from current accepted baseline",
+        ));
+    }
+    Ok(None)
+}
+
+/// MP-9 (rule 6): resume the comparison of `author`'s kept unresolved head, after a restart or
+/// with a peer met later: the request it needs next, or the fork it already proves. Read-only;
+/// what a peer brings is admitted by the ordinary verifiers and `promote_head`.
+pub(super) fn unresolved_step(
+    input: &entry_store::Read<'_>,
+    author: &Digest32,
+) -> Result<Option<Advanced>> {
+    let Some(id) = input.history_unresolved_head(author)? else {
+        return Ok(None);
+    };
+    comparison_step(input, author, id)
+}
+
+/// MP-9 (rule 6): the next step of comparing `author`'s held, not accepted head `id` (a head a
+/// peer listed as unresolved and this node fetched by its id, or its own kept one) with the
+/// accepted one: a request, or the fork the held openings already prove. Read-only.
+pub(super) fn comparison_step(
+    input: &entry_store::Read<'_>,
+    author: &Digest32,
+    id: Digest32,
+) -> Result<Option<Advanced>> {
+    let Some(signed) = input.history_head(&id)? else {
+        return Ok(None);
+    };
+    if signed.binding.author != *author || input.history_head_accepted(&id, signed.binding)? {
+        return Ok(None);
+    }
+    let Some(baseline_id) = input
+        .sparse_author(author, signed.binding.scope)?
+        .and_then(|state| state.committed)
+    else {
+        return Ok(None);
+    };
+    let baseline = input
+        .history_head(&baseline_id)?
+        .ok_or(invalid("accepted baseline missing"))?
+        .root;
+    // A resumed comparison asks a peer that kept this head what it proved under it: the
+    // opening at the smaller size first, whichever head is larger. Matching there, today's
+    // consistency check decides (`unequal`). A smaller kept head is not asked a consistency
+    // proof under this node's own accepted head first: the peer that listed it may hold that
+    // head only as an unresolved one and answer unavailable at every meeting, so the two sides
+    // would never be compared. The ordinary promotion of a head keeps today's order and cost.
+    let at = signed.root.leaves.min(baseline.leaves);
+    if signed.root.leaves != baseline.leaves && at != 0 && !fork_mutant() {
+        match compare_overlap(input, id, baseline_id, *author, at)? {
+            Overlap::Fork(fork) => return Ok(Some(Advanced::Fork(fork))),
+            Overlap::Need(query) => return Ok(Some(Advanced::Need(query))),
+            Overlap::Same => {}
+        }
+    }
+    // A refused comparison (Err) has nothing left to ask: it stays unresolved, never a fork.
+    Ok(
+        match unequal(input, id, &signed, Some(baseline_id), baseline) {
+            Ok(Some((outcome @ (Advanced::Need(_) | Advanced::Fork(_)), _))) => Some(outcome),
+            Ok(_) | Err(_) => None,
+        },
+    )
+}
+
+/// MP-9: one position compared under two signed heads of one author.
+enum Overlap {
+    /// The same entry, or one that cannot prove a fork (an expired skeleton without its
+    /// signature): continuity is still checked as before.
+    Same,
+    /// Two different signed entries at one position.
+    Fork(Box<(Entry, Entry)>),
+    /// A side not opened yet. A peer that withholds it leaves the comparison pending.
+    Need(Query),
+}
+
+/// Positions below a matching overlap that one comparison opens, nearest first. Past them the
+/// head is refused as today and nothing is called a fork.
+const MAX_PREFIX_WALK: u64 = 64;
+
+/// MP-9 (rule 7): the entry at `at` under another signed head `head` and under the accepted
+/// chain, each authenticated under its own root: the other by inclusion under `head`, the
+/// accepted one as an admitted position or by inclusion under the accepted head.
+fn compare_overlap(
+    input: &entry_store::Read<'_>,
+    head: Digest32,
+    accepted: Digest32,
+    author: Digest32,
+    at: u64,
+) -> Result<Overlap> {
+    let Some(other) = input.history_inclusion_receipt(&head, &author, at)? else {
+        return Ok(Overlap::Need(Query::Header { head, seq: at }));
+    };
+    let held = if no_accepted_opening(&author) {
+        None
+    } else {
+        match input.history_position_header(&author, at)? {
+            Some(entry) => Some(entry),
+            None => input
+                .history_inclusion_receipt(&accepted, &author, at)?
+                .map(|included| included.header().entry().clone()),
+        }
+    };
+    let Some(held) = held else {
+        return Ok(Overlap::Need(Query::Header {
+            head: accepted,
+            seq: at,
+        }));
+    };
+    let other = other.header().entry().clone();
+    if held.entry_hash() == other.entry_hash() || !held.is_signed() || !other.is_signed() {
+        return Ok(Overlap::Same);
+    }
+    Ok(Overlap::Fork(Box::new((held, other))))
+}
+
+/// MP-9 (rule 7): the two heads hold the same entry at `at` but different prefixes. Matching
+/// one header is not a common prefix: the positions below are opened under both heads, nearest
+/// first, until two different signed entries are found or a side is withheld (pending).
+fn prefix_walk(
+    input: &entry_store::Read<'_>,
+    head: Digest32,
+    accepted: Digest32,
+    author: Digest32,
+    at: u64,
+) -> Result<Advanced> {
+    if fork_mutant_is("terminal-header-only") {
+        // The mutant: a matching terminal header ends the comparison, refused as before.
+        return Err(invalid(
+            "consistency differs from current accepted baseline",
+        ));
+    }
+    for seq in (at.saturating_sub(MAX_PREFIX_WALK).max(1)..at).rev() {
+        match compare_overlap(input, head, accepted, author, seq)? {
+            Overlap::Same => {}
+            Overlap::Fork(fork) => return Ok(Advanced::Fork(fork)),
+            Overlap::Need(query) => return Ok(Advanced::Need(query)),
+        }
+    }
+    Err(invalid(
+        "consistency differs from current accepted baseline",
+    ))
+}
+
+/// MP-9: a verified prefix that differs from the accepted chain's range of the same size. It is
+/// another history's prefix, kept under its own head only: the canonical range index holds the
+/// accepted chain (a conflicting write there fails, and would end the comparison).
+fn unlinked_prefix(
+    input: &entry_store::Read<'_>,
+    prefix: &crate::log::history::ConsistentPrefix,
+) -> Result<bool> {
+    Ok(prefix.prefix().leaves != 0
+        && input
+            .history_range(prefix.binding(), 1, prefix.prefix().leaves)?
+            .is_some_and(|held| held != prefix.prefix()))
+}
+
+/// `VOX_MUTANT_FORK` (MP-9): `equal-size-only`, heads of different sizes are never compared;
+/// `second-head-unkept`, an unresolved second head is neither kept nor listed;
+/// `fork-unpropagated`, a recorded fork is never listed to peers; `equal-rival-refused`, a head
+/// of the accepted size with another root is refused at staging as before;
+/// `terminal-header-only`, a matching entry at the overlap ends the comparison (no prefix walk).
+/// Said once when first read.
+#[cfg(feature = "test-knobs")]
+pub(super) fn fork_mutant_is(which: &str) -> bool {
+    static VALUE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        let value = std::env::var("VOX_MUTANT_FORK").ok();
+        if let Some(value) = &value {
+            eprintln!("vox: VOX_MUTANT_FORK={value} engaged");
+        }
+        value
+    });
+    VALUE.as_deref() == Some(which)
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(super) const fn fork_mutant_is(_: &str) -> bool {
+    false
+}
+
+fn fork_mutant() -> bool {
+    fork_mutant_is("equal-size-only")
+}
+
+/// `VOX_TEST_NO_ACCEPTED_OPENING_FILE` (MP-9 staging): this daemon is a holder that kept an
+/// author's accepted head but no opening of it: for the author named in the file, it never opens
+/// the accepted side itself, and it serves no header, proof or entry under that accepted head
+/// (server.rs). Heads, other heads' openings and fork proofs are unaffected.
+#[cfg(feature = "test-knobs")]
+pub(super) fn no_accepted_opening(author: &Digest32) -> bool {
+    std::env::var_os("VOX_TEST_NO_ACCEPTED_OPENING_FILE")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| text.trim() == crate::node::link::b32_encode(author))
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn no_accepted_opening(_: &Digest32) -> bool {
+    false
 }
 
 /// `VOX_MUTANT_WITNESS=unkept|every-trace|control-unkept`: says so once when the daemon first

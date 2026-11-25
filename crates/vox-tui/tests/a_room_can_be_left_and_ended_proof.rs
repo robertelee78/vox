@@ -2692,6 +2692,145 @@ fn a_removal_that_names_no_tip_of_its_target_keeps_only_what_its_context_reached
     eprintln!("[proof] MP6 (b): a removal naming no tip of carol keeps her post below her last control its context reached and none of the three after it");
 }
 
+/// One identifier printed in full by one command and shortened by another.
+fn mp9_same_id(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
+}
+
+/// Poll `author`'s own status until `peer` says it holds all of `author`'s own feed in `room`.
+fn mp9_peer_holds_own_feed(author: &Worker, peer: &Worker, room: &str) {
+    let peer_id = peer.b32();
+    let (held, status) = poll(author, &["status", "--json"], WITHIN, |o| {
+        o.ok && o.json()["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["id"].as_str().is_some_and(|rid| mp9_same_id(rid, room)))
+            .any(|r| {
+                let own = r["own_feed_through"].as_u64().unwrap_or(u64::MAX);
+                r["members"].as_array().into_iter().flatten().any(|m| {
+                    m["id"]
+                        .as_str()
+                        .is_some_and(|mid| mp9_same_id(mid, &peer_id))
+                        && m["held_through"].as_u64().is_some_and(|held| held >= own)
+                })
+            })
+    });
+    assert!(
+        held,
+        "PRODUCT (staging): {} never said it holds {}'s whole feed: {status:?}",
+        peer.name, author.name
+    );
+}
+
+/// `w`'s own feed length in `room`, as its status says.
+fn mp9_own_feed_through(w: &Worker, room: &str) -> u64 {
+    let status = setup(w, &["status", "--json"]);
+    status.json()["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["id"].as_str().is_some_and(|rid| mp9_same_id(rid, room)))
+        .and_then(|r| r["own_feed_through"].as_u64())
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {}'s status names no own feed in the room: {status:?}",
+                w.name
+            )
+        })
+}
+
+/// ADR-053 MP-9 with a member that forks itself into two branches of one length: **a reader
+/// holding one branch records the fork when it meets a member holding the other.** alice
+/// (creator), carol (the forking member), dave. carol's last entry before the fork is a post
+/// every member read, so each branch is posts alone. dave stops; carol posts branch A and alice
+/// shows it; alice stops. A copy of carol's profile from before branch A then posts branch B, as
+/// long as branch A, with only dave running: dave accepts and shows branch B. carol stops and
+/// alice comes back: dave and alice each hold one branch of one length.
+///
+/// Asserted on dave: `vox status --json` lists carol's equivocation (`MP9 fork-recorded`).
+/// Mutant `VOX_MUTANT_FORK=equal-rival-refused` (a head of the accepted size with another root
+/// refused at staging, as before MP-9) turns it red there.
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_branches() {
+    watchdog::arm();
+    // A mutant a run names is in the `vox` under test; the daemons inherit it.
+    if std::env::var_os("VOX_MUTANT_FORK").is_some() {
+        test_knobs::require(&["VOX_MUTANT_FORK"]);
+    }
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "carol", "dave"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let [alice, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    for reader in [&*carol, &*dave] {
+        mp6_post_until_read(alice, reader, id, "MP9-READY");
+    }
+    setup(carol, &["room", "post", id, "MP9-BASE"]);
+    mp6_all_shown(
+        &[alice, dave],
+        id,
+        &["MP9-BASE"],
+        "carol's last post before her fork",
+    );
+    mp6_quiet(&[alice, carol, dave]);
+    dave.stop_daemon_cleanly();
+    carol.stop_daemon_cleanly();
+    let base_data = tmp.path().join("carol-base-data");
+    let base_cfg = tmp.path().join("carol-base-cfg");
+    copy_profile_tree(&carol.data, &base_data);
+    copy_profile_tree(&carol.cfg, &base_cfg);
+    carol.restart_daemon(&tmp.path().join("carol-a.err"));
+    let branch_a = ["MP9-BRANCH-A-1", "MP9-BRANCH-A-2"];
+    for tag in branch_a {
+        setup(carol, &["room", "post", id, tag]);
+    }
+    mp6_all_shown(&[alice], id, &branch_a, "carol's branch A");
+    let a_through = mp9_own_feed_through(carol, id);
+    alice.stop_daemon_cleanly();
+    carol.stop_daemon_cleanly();
+    std::fs::remove_dir_all(&carol.data).expect("APPARATUS: remove carol's branch-A data");
+    std::fs::remove_dir_all(&carol.cfg).expect("APPARATUS: remove carol's branch-A config");
+    copy_profile_tree(&base_data, &carol.data);
+    copy_profile_tree(&base_cfg, &carol.cfg);
+    dave.restart_daemon(&tmp.path().join("dave-b.err"));
+    carol.restart_daemon(&tmp.path().join("carol-b.err"));
+    let branch_b = ["MP9-BRANCH-B-1", "MP9-BRANCH-B-2"];
+    for tag in branch_b {
+        setup(carol, &["room", "post", id, tag]);
+    }
+    let b_through = mp9_own_feed_through(carol, id);
+    assert_eq!(
+        a_through, b_through,
+        "APPARATUS: carol's two branches are not of one length"
+    );
+    mp6_all_shown(&[dave], id, &branch_b, "carol's branch B");
+    mp9_peer_holds_own_feed(carol, dave, id);
+    carol.stop_daemon_cleanly();
+    alice.restart_daemon(&tmp.path().join("alice-back.err"));
+    let carol_id = carol.b32();
+    let (recorded, status) = poll(dave, &["status", "--json"], Duration::from_secs(90), |o| {
+        o.ok && o.json()["equivocations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| {
+                e["author"]
+                    .as_str()
+                    .is_some_and(|author| mp9_same_id(author, &carol_id))
+            })
+    });
+    assert!(
+        recorded,
+        "PRODUCT [MP9 fork-recorded]: dave, holding carol's branch B, met alice holding her branch A of one length and never recorded her fork: {status:?}"
+    );
+    eprintln!("[proof] MP9: dave recorded carol's fork: {status:?}");
+}
+
 /// Count, newest page, thread summary and thread page of `w` for `cid` and `root`: what the acts
 /// below compare before and after rows leave or come back.
 struct Shown {

@@ -1748,6 +1748,9 @@ enum NetEvent {
         /// object the peer asked for. A completed round that moved nothing is `empty` in
         /// `vox status --json` (ADR-038 FX-29).
         moved: bool,
+        /// MP-9: the peer's inventory listed a fork or an unresolved head this node would ask it
+        /// for; this node's own round with it is raised, as a new head hint wakes one.
+        ask_back: bool,
     },
     /// A session's worker persisted entries (ADR-025 D1a): the room's generation moved, so its
     /// ports are evaluated — reported on its own, because a retired worker's result is ignored
@@ -2482,9 +2485,16 @@ async fn answer_off_actor(
     let answered = task.await;
     let current = serving.end(channel_id, token);
     drop(running);
-    if let Ok((result, inventory_added, moved)) = answered {
+    if let Ok((result, inventory_added, moved, ask_back)) = answered {
         note_served(&serving.book, channel_id, peer, current, &result, moved);
-        serving.answered(channel_id, peer, current && inventory_added);
+        serving.answered(
+            channel_id,
+            peer,
+            crate::node::history_stream::Answered {
+                inventory_added: current && inventory_added,
+                ask_back: current && ask_back,
+            },
+        );
     }
     None
 }
@@ -8418,9 +8428,18 @@ impl Node {
                 // admitted: the marks wait in `Serving`, the answering tasks do not.
                 () = serving.answered_wake.notified(), if !save_pending => {
                     let started = std::time::Instant::now();
-                    for ((channel_id, peer), inventory_added) in serving.take_answered() {
+                    for ((channel_id, peer), answered) in serving.take_answered() {
                         self.ensure_port(&channel_id, &peer).await;
-                        if inventory_added {
+                        if answered.inventory_added {
+                            self.sched_rooms.insert(channel_id);
+                        }
+                        // MP-9: only this node's own inventory exchange asks a listed fork
+                        // proof or an unresolved head by its id, so the listing raises one
+                        // round with this peer.
+                        if answered.ask_back {
+                            if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                                port.raise();
+                            }
                             self.sched_rooms.insert(channel_id);
                         }
                     }
@@ -14022,6 +14041,7 @@ impl Node {
                 result,
                 inventory_added,
                 moved,
+                ask_back,
             } => {
                 let current = self
                     .ports
@@ -14046,6 +14066,14 @@ impl Node {
                 if current.is_some() && inventory_added {
                     // Pending inbox hints already make the port eligible. Do not create an
                     // extra inventory request when a scoped parked hint is later discarded.
+                    self.sched_rooms.insert(channel_id);
+                }
+                // MP-9: only this node's own inventory exchange asks a listed fork proof or an
+                // unresolved head by its id, so the listing raises one round with this peer.
+                if current.is_some() && ask_back {
+                    if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                        port.raise();
+                    }
                     self.sched_rooms.insert(channel_id);
                 }
                 let still_departed = if departure_receipt || limited_recovery {
@@ -19525,7 +19553,7 @@ impl Node {
         let tx = self.net_tx.clone();
         let inbox = Arc::clone(&self.history_hints);
         let task = tokio::spawn(async move {
-            let (result, inventory_added, moved) = crate::node::history_stream::serve(
+            let (result, inventory_added, moved, ask_back) = crate::node::history_stream::serve(
                 shared,
                 store,
                 peer,
@@ -19549,6 +19577,7 @@ impl Node {
                     result,
                     inventory_added,
                     moved,
+                    ask_back,
                 })
                 .await;
         });

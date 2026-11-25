@@ -324,6 +324,9 @@ pub(crate) struct Flow {
     /// A newly constructed inventory took precedence over an already eligible local probe.
     /// Its real completion owns exactly one subsequent port request.
     pub(crate) local_own_after_inventory: bool,
+    /// MP-9: the one comparison request this flow's inventory asked of the peer. Unavailable,
+    /// it records nothing and fails nothing: the next inventory may ask again.
+    inventory_ask: Option<Query>,
     discovery_reply: Option<(
         super::HeadHint,
         u64,
@@ -613,6 +616,7 @@ impl Flow {
             local_own_verification,
             local_own_discovery,
             local_own_after_inventory: false,
+            inventory_ask: None,
             availability_captured: None,
             availability_connection: 0,
             availability_ack: None,
@@ -826,6 +830,7 @@ impl Flow {
             local_own_verification: false,
             local_own_discovery: false,
             local_own_after_inventory: false,
+            inventory_ask: None,
             availability_captured: None,
             availability_connection: 0,
             availability_ack: None,
@@ -1652,6 +1657,8 @@ impl Flow {
                 Query::Context(_) => "context",
                 Query::Inventory => "inventory",
                 Query::KeyAvailability { .. } => "key-availability",
+                Query::Fork(_) => "fork",
+                Query::HeadById(_) => "head-by-id",
             },
             Some(_) => "local",
             None => "none",
@@ -3381,6 +3388,23 @@ impl Flow {
                     if offered.full {
                         return Err(Error::Unreachable("history role hint capacity busy"));
                     }
+                    // MP-9: the one listed fork this node has not frozen is asked of this peer.
+                    if let Some(author) = inventory.fork {
+                        self.push(Task {
+                            request: task.request,
+                            purpose: Purpose::Control,
+                            operation: Operation::Wire(Query::Fork(author)),
+                        })?;
+                    }
+                    // MP-9 (rule 6): one unresolved comparison request of this peer.
+                    if let Some(query) = inventory.ask.clone() {
+                        self.inventory_ask = Some(query.clone());
+                        self.push(Task {
+                            request: task.request,
+                            purpose: Purpose::Control,
+                            operation: Operation::Wire(query),
+                        })?;
+                    }
                 }
                 let brought_now = result.brought || result.body_progress;
                 self.brought |= brought_now;
@@ -3676,6 +3700,19 @@ impl Flow {
                         "selected current body is unavailable or cancelled",
                     ));
                 }
+                #[cfg(feature = "test-knobs")]
+                if result.status == Status::EvidenceUnavailable {
+                    eprintln!("history evidence unavailable query={query:?}");
+                }
+                if result.status == Status::EvidenceUnavailable
+                    && (matches!(query, Query::Fork(_) | Query::HeadById(_))
+                        || self.inventory_ask.as_ref() == Some(&query))
+                {
+                    // A listed proof, or the comparison step an inventory asked, that is not
+                    // served records nothing and fails nothing: the next inventory may ask
+                    // again (MP-9).
+                    return Ok(());
+                }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
                     if self.local_own_discovery {
                         self.discovery_unavailable =
@@ -3752,7 +3789,9 @@ impl Flow {
                             }
                             Query::Inventory
                             | Query::KeyAvailability { .. }
-                            | Query::Context(_) => None,
+                            | Query::Context(_)
+                            | Query::Fork(_)
+                            | Query::HeadById(_) => None,
                         };
                         // Park this source's exact unavailable dependency, and try the
                         // author through the existing reroute when it is another peer.

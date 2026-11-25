@@ -2332,7 +2332,7 @@ impl Write<'_, '_> {
                     .ok_or(invalid("promotion predecessor missing"))?;
                 indexed_entry(&source, self.sek, self.channel, SegmentKind::LogDb, at)?.entry_hash()
             };
-            if entry.skeleton.prev_hash != previous
+            if (entry.skeleton.prev_hash != previous && !crate::log::feed::chain_unchecked())
                 || (p.cursor == p.through && at.log != p.witness)
             {
                 return Err(invalid("promotion predecessor or witness differs"));

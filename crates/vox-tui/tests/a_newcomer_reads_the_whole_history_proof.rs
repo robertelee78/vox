@@ -11747,8 +11747,20 @@ fn a_newcomer_shows_nothing_a_corrupting_holder_serves_under_its_head() {
 /// ADR-053 P guard (moving-head ruling §5): the same staging, but the holder is on another fork
 /// of the author (a copy of the author's profile from before the newcomer's head wrote other
 /// posts there) and answers under the newcomer's head with its own branch's prefix. The
-/// newcomer shows and applies nothing from it, stays pending, calls nothing a fork from those
-/// proofs, and still reads the same holder in another room. Mutant: `VOX_MUTANT_ASKER_ROOT=1`.
+/// newcomer applies nothing from it (its anchor stays), stays pending, calls no fork from those
+/// proofs, and still reads the same holder in another room. The author really signed two
+/// histories, so with ADR-053 MP-9 the newcomer records that fork, but only through the holder's
+/// listed proof (`Query::Fork`), never from its answers. Two things stand between the forked
+/// holder's answers and the screen here: the fork proof freezes the author, and the newcomer's
+/// root check refuses
+/// the holder's proofs under its head. Mutant: `VOX_MUTANT_FORK=fork-unpropagated` (passed to
+/// the holder alone: it records the fork but never lists it): RED on the positive assertion, the
+/// fork is never recorded through the proof. No mutant reaches the show claim in this scene (the
+/// proof freezes the author first; `VOX_MUTANT_ASKER_ROOT=1` never engages here), so here it is
+/// printed as an observation ("observed: nothing of the forked holder's branch was shown"), not
+/// asserted: the show claim is proven by
+/// `a_newcomer_shows_nothing_a_corrupting_holder_serves_under_its_head`, RED under
+/// `VOX_MUTANT_ASKER_ROOT=1`.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "three real daemons, a copied author on another fork, a stopped author; optional"]
@@ -14051,6 +14063,13 @@ mod rg1 {
         if provider != Provider::Honest {
             knobs.extend(["VOX_TEST_BAD_PREFIX_FILE", "bad prefix served mode="]);
         }
+        if provider == Provider::Forked {
+            // MP-9: the newcomer's stderr says when it asked for a fork a peer listed.
+            knobs.push("fork_asked=");
+        }
+        if std::env::var_os("VOX_MUTANT_FORK").is_some() {
+            knobs.push("VOX_MUTANT_FORK");
+        }
         for (asked, read) in [
             ("VOX_MUTANT_ASKER_ROOT", "VOX_TEST_ASKER_ROOT_MUTANT"),
             ("VOX_MUTANT_PREFIX_GATE", "VOX_MUTANT_PREFIX_GATE"),
@@ -14096,11 +14115,15 @@ mod rg1 {
         }
         let author_knobs = [("VOX_TEST_HEADS_ONLY_FILE", author_only.clone())];
         let bad_prefix = holder.data.with_extension("bad-prefix");
-        let holder_knobs = [
+        let mut holder_knobs = vec![
             ("VOX_TEST_HEADS_ONLY_FILE", holder_only.clone()),
             ("VOX_TEST_UNAVAILABLE_HEAD_FILE", refuse_head.clone()),
             ("VOX_TEST_BAD_PREFIX_FILE", bad_prefix.clone()),
         ];
+        // MP-9's holder-side mutant (`fork-unpropagated`): the holder alone reads it.
+        if let Some(mutant) = std::env::var_os("VOX_MUTANT_FORK") {
+            holder_knobs.push(("VOX_MUTANT_FORK", std::path::PathBuf::from(mutant)));
+        }
         let reader_knobs: Vec<(&str, std::path::PathBuf)> =
             std::env::var_os("VOX_MUTANT_ASKER_ROOT")
                 .map(|on| ("VOX_TEST_ASKER_ROOT_MUTANT", std::path::PathBuf::from(on)))
@@ -14519,10 +14542,12 @@ mod rg1 {
     /// post in the author's room cites the author's grants, so all of them wait on the same
     /// prefix of the author; the unrelated sender is the same holder in a second room it makes
     /// now, whose key it delivers to N. RED if N shows anything in the author's room, calls the
-    /// author's history a fork, or commits another head of the author. GREEN when, in three
-    /// status answers in a row, N still needs the stopped author while the holder has answered
-    /// it bad proofs under n and keeps answering (or N's holder rounds keep completing), and N
-    /// reads the holder's post in the second room.
+    /// author's history a fork other than through a listed fork proof (`Provider::Forked`: the
+    /// author really signed two histories, ADR-053 MP-9), or commits another head of the author.
+    /// GREEN when, in three status answers in a row, N still needs the stopped author while the
+    /// holder has answered it bad proofs under n and keeps answering (or N's holder rounds keep
+    /// completing), N reads the holder's post in the second room, and (`Provider::Forked`) N has
+    /// recorded the author's fork through that proof.
     fn bad_holder_verdict(
         provider: Provider,
         author: &Worker,
@@ -14621,16 +14646,30 @@ mod rg1 {
         };
         let started = Instant::now();
         let mut samples: Vec<(usize, u64)> = Vec::new();
+        // In the Forked scene no mutant reaches the show claim (the fork proof freezes the author
+        // first): it is observed and printed, not asserted; the corrupting-holder act proves it.
+        let mut forked_shown: Option<BTreeSet<String>> = None;
         loop {
             let shown = texts(id);
             let served = bad();
             let total: usize = served.values().sum();
-            assert!(
-                shown.is_empty(),
-                "RED PRODUCT: the newcomer shows {shown:?} in the author's room, which only the \
-                 {provider:?} holder could have served under the author's head of size {n}; the \
-                 holder's bad answers under {n}: {served:?}"
-            );
+            if provider == Provider::Forked {
+                if !shown.is_empty() && forked_shown.is_none() {
+                    eprintln!(
+                        "[prefix] observed: the newcomer shows {shown:?} in the author's room, \
+                         which only the Forked holder could have served under the author's head \
+                         of size {n}; the holder's bad answers under {n}: {served:?}"
+                    );
+                    forked_shown = Some(shown);
+                }
+            } else {
+                assert!(
+                    shown.is_empty(),
+                    "RED PRODUCT: the newcomer shows {shown:?} in the author's room, which only \
+                     the {provider:?} holder could have served under the author's head of size \
+                     {n}; the holder's bad answers under {n}: {served:?}"
+                );
+            }
             let report = reader.vox(None, &["status", "--json"]);
             report.expect_ok("newcomer status");
             let report = report.json();
@@ -14641,10 +14680,56 @@ mod rg1 {
                 .filter(|fork| fork["room"].as_str() == Some(id))
                 .cloned()
                 .collect();
+            // ADR-053 MP-9: forks travel. The Forked staging makes the author really sign two
+            // histories (its profile copied before it wrote n, writing other posts there), so
+            // once the holder holds both branches' entries at one position and lists the
+            // author, the newcomer may call it, but only through MP-9's proof (`Query::Fork`:
+            // the two signed headers, each verified with the author's key); a fork called from
+            // the holder's answers under n alone stays RED. `vox status` carries no entry
+            // hashes, so the act tells the proof path apart by: the newcomer asked for a fork a
+            // peer listed (`fork_asked=true` on its own stderr), the holder's own status lists
+            // the same fork (it holds the two signed entries it serves), the position is at or
+            // below n, and the newcomer's room freezes the author.
+            let (asked, held, frozen) = if provider == Provider::Forked && !forks.is_empty() {
+                let asked = std::fs::read_to_string(reader.data.with_extension("err"))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| {
+                        line.contains("history inventory listed forks=")
+                            && line.contains("fork_asked=true")
+                    });
+                let holder_report = holder.vox(None, &["status", "--json"]);
+                holder_report.expect_ok("holder status");
+                let held: Vec<Value> = holder_report.json()["equivocations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let frozen = report["rooms"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
+                    .and_then(|row| row["frozen"].as_array())
+                    .is_some_and(|frozen| {
+                        frozen
+                            .iter()
+                            .any(|member| member.as_str() == Some(&author.b32()))
+                    });
+                (asked, held, frozen)
+            } else {
+                (false, Vec::new(), false)
+            };
+            let proven = asked
+                && frozen
+                && forks.iter().all(|fork| {
+                    fork["author"].as_str() == Some(&author.b32())
+                        && fork["position"].as_u64().is_some_and(|at| at <= n)
+                        && held.contains(fork)
+                });
             assert!(
-                forks.is_empty(),
+                forks.is_empty() || proven,
                 "RED PRODUCT: the newcomer calls a fork from the {provider:?} holder's answers: \
-                 {forks:?}; the holder's bad answers under {n}: {served:?}"
+                 {forks:?}, not through a listed fork's proof (asked a listed fork: {asked}; \
+                 the holder's own forks: {held:?}; the author frozen in the newcomer's room: \
+                 {frozen}); the holder's bad answers under {n}: {served:?}"
             );
             let anchors = committed(reader, &["err"]);
             assert!(
@@ -14691,6 +14776,13 @@ mod rg1 {
                 && samples[0].0 > 0
                 && (samples[2].0 > samples[0].0 || samples[2].1 > samples[0].1)
             {
+                assert!(
+                    provider != Provider::Forked || proven,
+                    "RED PRODUCT: the newcomer, settled (three status answers in a row), never \
+                     recorded the author's fork through the holder's listed proof: its forks \
+                     {forks:?}; asked a listed fork: {asked}; the holder's own forks: {held:?}; \
+                     the holder's bad answers under {n}: {served:?}"
+                );
                 eprintln!(
                     "[prefix] the {provider:?} holder's bad answers under the author's head of \
                      size {n}: {served:?}; newcomer samples (bad answers, completed holder \
@@ -14698,12 +14790,37 @@ mod rg1 {
                      {author_port}; second room shows {unrelated:?}",
                     member(&room, &holder.b32()).cloned().unwrap_or(Value::Null)
                 );
-                eprintln!(
-                    "GREEN: the newcomer anchored on the author's head of size {n} shows nothing \
-                     the {provider:?} holder served under it, calls nothing a fork, keeps its \
-                     anchor and still needs the stopped author, and reads the same holder's post \
-                     in another room"
-                );
+                let forks_said = if provider == Provider::Forked {
+                    format!(
+                        "records the author's fork {forks:?} only through the holder's listed \
+                         proof (two signed entries of the author)"
+                    )
+                } else {
+                    "calls nothing a fork".to_owned()
+                };
+                if provider == Provider::Forked {
+                    match &forked_shown {
+                        None => eprintln!(
+                            "[prefix] observed: nothing of the forked holder's branch was shown"
+                        ),
+                        Some(shown) => eprintln!(
+                            "[prefix] observed: the newcomer showed {shown:?} from the forked \
+                             holder's branch"
+                        ),
+                    }
+                    eprintln!(
+                        "GREEN: the newcomer anchored on the author's head of size {n} \
+                         {forks_said}, keeps its anchor and still needs the stopped author, and \
+                         reads the same holder's post in another room"
+                    );
+                } else {
+                    eprintln!(
+                        "GREEN: the newcomer anchored on the author's head of size {n} shows \
+                         nothing the {provider:?} holder served under it, {forks_said}, keeps its \
+                         anchor and still needs the stopped author, and reads the same holder's \
+                         post in another room"
+                    );
+                }
                 return;
             }
             assert!(

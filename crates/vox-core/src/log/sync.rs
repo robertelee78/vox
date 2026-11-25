@@ -1688,7 +1688,12 @@ where
 ///   by a signed `Termination` of its own feed, and it keeps posting after it; its history server
 ///   never serves a `Termination` header (Entry, Header and control-range answers), so a reader
 ///   learns of later positions while the termination stays hidden;
-/// - `terminated-serves`: it keeps a feed it terminated open, as above, and serves everything.
+/// - `terminated-serves`: it keeps a feed it terminated open, as above, and serves everything;
+/// - `split-chain` (ADR-053 MP-9 arm d): every own room entry it signs is written to
+///   `VOX_MUTANT_ENTRY_DIR/<seq>`, and where that directory holds `adopt-<seq>` (the entry another
+///   copy of this identity signed at that position) it appends that entry in place of its own,
+///   without checking that an entry names the one before it. Its signed root then holds the other
+///   copy's entry at a position above a different entry: a signed tree that is not a chain.
 ///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
@@ -1713,6 +1718,7 @@ pub mod mutant {
         RefuseSessions,
         TerminateAndWithhold,
         TerminatedServes,
+        SplitChain,
     }
 
     fn mode() -> Mode {
@@ -1731,6 +1737,7 @@ pub mod mutant {
                 "refuse-sessions" => Mode::RefuseSessions,
                 "terminate-and-withhold" => Mode::TerminateAndWithhold,
                 "terminated-serves" => Mode::TerminatedServes,
+                "split-chain" => Mode::SplitChain,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1774,6 +1781,44 @@ pub mod mutant {
     #[must_use]
     pub fn withholds(entry: &Entry) -> bool {
         mode() == Mode::TerminateAndWithhold && entry.skeleton.end_of_feed
+    }
+
+    /// `split-chain`: whether this build appends its own entries without checking that each names
+    /// the one before it (`prev_hash`, `lipmaa_backlink`).
+    #[must_use]
+    pub fn splits_chain() -> bool {
+        mode() == Mode::SplitChain
+    }
+
+    /// `split-chain`: the own room entry to append in place of `entry`, just signed: the other
+    /// copy's entry at its position when `VOX_MUTANT_ENTRY_DIR/adopt-<seq>` holds one of this
+    /// author and room; else `entry`, written to `VOX_MUTANT_ENTRY_DIR/<seq>` for the other copy.
+    #[must_use]
+    pub fn own_entry(entry: Entry) -> Entry {
+        if mode() != Mode::SplitChain || entry.skeleton.v2.is_none() {
+            return entry;
+        }
+        let Some(dir) = std::env::var_os("VOX_MUTANT_ENTRY_DIR").map(std::path::PathBuf::from)
+        else {
+            return entry;
+        };
+        let seq = entry.skeleton.seq;
+        if let Some(adopted) = std::fs::read(dir.join(format!("adopt-{seq}")))
+            .ok()
+            .and_then(|bytes| Entry::from_wire(&bytes).ok())
+            .filter(|adopted| {
+                adopted.skeleton.author_id == entry.skeleton.author_id
+                    && adopted.skeleton.channel_id == entry.skeleton.channel_id
+                    && adopted.skeleton.seq == seq
+            })
+        {
+            eprintln!("{MARKER}: appends the other copy's entry at {seq}");
+            return adopted;
+        }
+        if let Err(error) = std::fs::write(dir.join(seq.to_string()), entry.to_wire()) {
+            eprintln!("{MARKER}: cannot write its entry at {seq}: {error}");
+        }
+        entry
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1834,7 +1879,8 @@ pub mod mutant {
             | Mode::WithdrawUnentitled
             | Mode::AdminUnentitled
             | Mode::RefuseSessions
-            | Mode::TerminatedServes => asked,
+            | Mode::TerminatedServes
+            | Mode::SplitChain => asked,
             Mode::TerminateAndWithhold => asked
                 .into_iter()
                 .filter(|w| Entry::from_wire(w).map_or(true, |e| !withholds(&e)))

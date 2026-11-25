@@ -1530,6 +1530,46 @@ impl ChannelState {
         completed.result
     }
 
+    /// MP-9: apply two signed entries of one author at one position, found by comparing two
+    /// signed heads or received from a peer, exactly as a fork found at a held position is
+    /// applied: the author is frozen, the proof kept in SEG_FORKS and its boundary noted.
+    /// Returns false when the author was already frozen.
+    pub(crate) fn record_history_fork(
+        &mut self,
+        store: &Store,
+        existing: Entry,
+        conflicting: Entry,
+    ) -> Result<bool> {
+        let author = existing.skeleton.author_id;
+        let seq = existing.skeleton.seq;
+        if seq == 0
+            || existing.skeleton.channel_id != self.channel_id
+            || conflicting.skeleton.channel_id != self.channel_id
+        {
+            return Err(Error::MalformedBundle("fork proof binding"));
+        }
+        if self.dag.is_frozen(&author) {
+            return Ok(false);
+        }
+        let key = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedBundle("fork proof author is unknown"))?;
+        let proof = crate::log::dag::VerifiedFork::verify(
+            crate::log::dag::ForkProof {
+                author_id: author,
+                seq,
+                existing,
+                conflicting,
+            },
+            key,
+        )
+        .map_err(|_| Error::MalformedBundle("fork proof verification failed"))?;
+        self.dag.install_verified_fork(proof);
+        self.keep_forks(store)?;
+        Ok(true)
+    }
+
     /// Capture only the exact publication's sealed-index access, never its room guard.
     pub(crate) fn prepare_history_publication(
         &self,

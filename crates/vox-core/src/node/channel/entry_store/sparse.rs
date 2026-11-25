@@ -328,13 +328,16 @@ pub(crate) enum ObjectKind {
     ProofRange = 9,
     // A context actually supplied by a proof of this returning author's public head.
     RecoveryContext = 10,
+    // MP-9 (rule 6): per author, the id of the one signed head whose continuity with the
+    // accepted chain is unresolved. A local owner of a retained Head object, never authority.
+    Unresolved = 11,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
             Self::ProofRange => STATE_BYTES,
-            Self::RecoveryContext => 32,
+            Self::RecoveryContext | Self::Unresolved => 32,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
@@ -352,6 +355,11 @@ fn recovery_context_key(author: &Digest32, context: &Digest32) -> Digest32 {
     let mut input = b"vox/own-recovery-context/v1".to_vec();
     input.extend_from_slice(author);
     input.extend_from_slice(context);
+    sha256(&input)
+}
+fn unresolved_key(author: &Digest32) -> Digest32 {
+    let mut input = b"vox/local-unresolved-head/v1".to_vec();
+    input.extend_from_slice(author);
     sha256(&input)
 }
 
@@ -1638,6 +1646,17 @@ impl Read<'_> {
         })
         .transpose()
     }
+    /// MP-9 (rule 6): the signed head of `author` whose continuity is unresolved, if one is kept.
+    pub(crate) fn history_unresolved_head(&self, author: &Digest32) -> Result<Option<Digest32>> {
+        self.history_object(ObjectKind::Unresolved, &unresolved_key(author))?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("unresolved head owner"))
+            })
+            .transpose()
+    }
 
     pub(crate) fn history_context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
         self.history_object(ObjectKind::Context, hash)?
@@ -2569,6 +2588,24 @@ impl Write<'_, '_> {
             recovery_context_key(author, context),
             head,
         )
+    }
+    /// MP-9 (rule 6): own the one signed head of `author` whose continuity with the accepted
+    /// chain is unresolved, so it is listed, served by id and compared again after a restart.
+    /// One per author: a newer unresolved observation replaces it. Fork proofs are kept apart
+    /// (SEG_FORKS) and never replaced by this.
+    pub(crate) fn keep_history_unresolved_head(
+        &mut self,
+        author: &Digest32,
+        head: &Digest32,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = object_key(ObjectKind::Unresolved, &unresolved_key(author));
+        let root = self.directory.active.sparse.objects;
+        let prior = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
+        let id = self.save_sparse_record(prior, head, ObjectKind::Unresolved.limit())?;
+        self.directory.active.sparse.objects =
+            self.change_value(root, key, Some(Value::Number(id)))?;
+        Ok(())
     }
 
     /// Return one updated object root without choosing which publication owns it.
@@ -4250,6 +4287,22 @@ impl Write<'_, '_> {
         if receipt.prefix().leaves != 0 {
             self.keep_history_range(receipt.binding(), 1, receipt.prefix())?;
         }
+        self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
+    }
+    /// MP-9: a verified prefix of a signed head that is not the accepted chain's. Kept under its
+    /// own head only, so the comparison of the two histories resumes; never a canonical range.
+    pub(crate) fn keep_history_unlinked_prefix_receipt(
+        &mut self,
+        receipt: &ConsistentPrefix,
+    ) -> Result<()> {
+        if receipt.binding().room != *self.channel {
+            return Err(invalid("prefix receipt room"));
+        }
+        let key = receipt_key(
+            &receipt.head_id(),
+            &receipt.binding().author,
+            receipt.prefix().leaves,
+        );
         self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
     }
 }

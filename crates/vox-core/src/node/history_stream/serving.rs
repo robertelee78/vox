@@ -35,6 +35,17 @@ struct Entry {
     live: BTreeMap<u64, Live>,
 }
 
+/// What the answers to one member since the actor's last take ask of the actor
+/// (see [`Serving::answered`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Answered {
+    /// An answer accepted a new inventory hint: the room is woken.
+    pub(crate) inventory_added: bool,
+    /// MP-9: the member's inventory listed a fork or an unresolved head this node would ask it
+    /// for (`client::listing_wanted`): this node's own round with it is raised.
+    pub(crate) ask_back: bool,
+}
+
 /// Node-wide: the open rooms and the answers running for them.
 pub(crate) struct Serving {
     rooms: StdMutex<BTreeMap<Digest32, Entry>>,
@@ -42,9 +53,9 @@ pub(crate) struct Serving {
     pub(crate) budget: Arc<Budget>,
     pub(crate) book: SharedSyncBook,
     pub(crate) inbox: Arc<HintInbox>,
-    /// The members answered since the actor last took them, by room and member; `true` when an
-    /// answer accepted a new inventory hint. See [`Self::answered`].
-    answered: StdMutex<BTreeMap<(Digest32, Digest32), bool>>,
+    /// The members answered since the actor last took them, by room and member, with what their
+    /// answers ask of the actor. See [`Self::answered`].
+    answered: StdMutex<BTreeMap<(Digest32, Digest32), Answered>>,
     /// Woken when a member is marked answered; the actor takes the marks when it next runs.
     pub(crate) answered_wake: tokio::sync::Notify,
 }
@@ -68,20 +79,20 @@ impl Serving {
 
     /// A finished answer marks its member and wakes the actor, never waiting for it. What the
     /// actor does with answers (make sure of the member's port, wake the room for a new
-    /// inventory hint) is the same for one as for many, so the marks coalesce: one per room and
-    /// member however many answers finish while the actor is busy, and no task is left waiting.
-    pub(crate) fn answered(&self, id: Digest32, peer: Digest32, inventory_added: bool) {
-        *self
-            .answered
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry((id, peer))
-            .or_default() |= inventory_added;
+    /// inventory hint, raise its own round with a member whose listing it would ask about) is the
+    /// same for one as for many, so the marks coalesce: one per room and member however many
+    /// answers finish while the actor is busy, and no task is left waiting.
+    pub(crate) fn answered(&self, id: Digest32, peer: Digest32, answered: Answered) {
+        let mut marks = self.answered.lock().unwrap_or_else(|e| e.into_inner());
+        let mark = marks.entry((id, peer)).or_default();
+        mark.inventory_added |= answered.inventory_added;
+        mark.ask_back |= answered.ask_back;
+        drop(marks);
         self.answered_wake.notify_one();
     }
 
     /// The members answered since the last take (see [`Self::answered`]).
-    pub(crate) fn take_answered(&self) -> BTreeMap<(Digest32, Digest32), bool> {
+    pub(crate) fn take_answered(&self) -> BTreeMap<(Digest32, Digest32), Answered> {
         std::mem::take(&mut *self.answered.lock().unwrap_or_else(|e| e.into_inner()))
     }
 

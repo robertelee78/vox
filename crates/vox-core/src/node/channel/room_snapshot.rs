@@ -4,7 +4,8 @@
 //! own pending save.
 //!
 //! It holds the room's key, its epoch, who its authors and members are, who left and who may
-//! recover its own history, frozen authors, inventory incarnations and role state. It holds no
+//! recover its own history, frozen authors and the two signed headers of each fork proof that
+//! froze one (MP-9), inventory incarnations and role state. It holds no
 //! history: every read opens its own store read transaction under the key, so it sees redb's
 //! committed roots, and every read checks the peer's applied removal and the recipient cut in the
 //! store itself, as the room-locked reads did.
@@ -19,6 +20,9 @@ pub(crate) struct RoomSnapshot {
     authors: BTreeSet<Digest32>,
     left: BTreeSet<Digest32>,
     frozen: BTreeSet<Digest32>,
+    /// MP-9: per frozen author whose kept proof is still signed, its two signed entry headers:
+    /// what the inventory lists and `Query::Fork` serves.
+    forks: BTreeMap<Digest32, (Vec<u8>, Vec<u8>)>,
     back: BTreeMap<Digest32, u64>,
     left_at: BTreeMap<Digest32, u64>,
     held: BTreeMap<Digest32, u64>,
@@ -209,6 +213,21 @@ impl ChannelState {
                 .filter(|author| self.dag.is_frozen(author))
                 .copied()
                 .collect(),
+            forks: self
+                .dag
+                .fork_proofs()
+                .into_iter()
+                .filter(|proof| signed_fork(proof))
+                .map(|proof| {
+                    (
+                        proof.author_id,
+                        (
+                            proof.existing.header_wire(),
+                            proof.conflicting.header_wire(),
+                        ),
+                    )
+                })
+                .collect(),
             held: self.held.clone(),
             recovery: left
                 .iter()
@@ -223,6 +242,12 @@ impl ChannelState {
             left,
         })
     }
+}
+
+/// A fork proof whose two entries still carry their signatures: the only kind that is listed or
+/// served (MP-9). A peer verifies what it receives; an unsigned pair would prove nothing to it.
+fn signed_fork(proof: &ForkProof) -> bool {
+    proof.existing.is_signed() && proof.conflicting.is_signed()
 }
 
 /// What a served request reads, whether through the room (a client's own flow) or through the
@@ -263,12 +288,66 @@ pub(crate) trait ServedRoom {
         author: Digest32,
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<()>;
+    /// An author frozen by a fork proof (MP-9a): its later history is refused, so nothing of it
+    /// is fetched, and its unresolved head is not listed.
+    fn history_author_frozen(&self, author: &Digest32) -> bool;
+    /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending:
+    /// what its inventory lists so a peer that never met the second history can ask for it.
+    fn history_fork_authors(&self) -> Vec<Digest32>;
+    /// MP-9: the two signed headers of the proof this node verified and kept for `author`.
+    /// No body and no key material travel.
+    fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)>;
+    /// MP-9: of the authors a peer lists, the first one this node has not frozen and whose key
+    /// it holds. One per inventory: a listing never makes this node ask for more.
+    fn history_fork_wanted(&self, authors: &[Digest32]) -> Option<Digest32> {
+        authors
+            .iter()
+            .copied()
+            .find(|author| !self.history_author_frozen(author) && self.is_author(author))
+    }
+    /// MP-9 (rule 6): per author the kept signed head whose continuity with the accepted chain
+    /// is still unresolved, ascending by author: what the inventory lists so a peer holding the
+    /// other history can fetch it by id and compare. An author frozen by a fork proof, or a head
+    /// accepted since, is resolved and not listed. At most one per author.
+    fn history_unresolved_hints(&self, store: &Store) -> Result<Vec<HistoryHeadHint>> {
+        let read = self.history_read(store)?;
+        let mut hints = Vec::new();
+        let mut after = None;
+        for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
+            let Some((author, _)) = read.history_author_after(after)? else {
+                break;
+            };
+            after = Some(author);
+            if self.history_author_frozen(&author) {
+                continue;
+            }
+            let Some(id) = read.history_unresolved_head(&author)? else {
+                continue;
+            };
+            let Some(head) = read.history_head(&id)? else {
+                continue;
+            };
+            if read.history_head_accepted(&id, head.binding)? {
+                continue;
+            }
+            hints.push(HistoryHeadHint {
+                author,
+                leaves: head.root.leaves,
+                head: id,
+            });
+        }
+        Ok(hints)
+    }
     fn history_head_by_id(&self, store: &Store, head: &Digest32) -> Result<Option<SignedHead>> {
         let read = self.history_read(store)?;
         let Some(value) = read.history_head(head)? else {
             return Ok(None);
         };
-        if read.history_head_committed(head, value.binding)? {
+        // MP-9 (rule 6): besides committed heads, the one kept unresolved head of an author is
+        // served by its id, with what this node proved under it; the asker's own gates decide.
+        if read.history_head_committed(head, value.binding)?
+            || read.history_unresolved_head(&value.binding.author)? == Some(*head)
+        {
             Ok(Some(value))
         } else {
             Ok(None)
@@ -403,10 +482,15 @@ pub(crate) trait ServedRoom {
     ) -> Result<Option<HistoryHeader>> {
         let read = self.history_read(store)?;
         let binding = target.target.binding;
-        if let Some(entry) = read.history_position_header(&binding.author, seq)? {
-            return Ok(Some(HistoryHeader {
-                wire: entry.header_wire(),
-            }));
+        // An admitted position is under the accepted chain only. Under another signed head
+        // (MP-9: an unresolved second history, served as itself) only an entry proven under
+        // that head is served. A prefix resolved to a committed source is under that chain.
+        if read.history_head_accepted(&target.source, binding)? {
+            if let Some(entry) = read.history_position_header(&binding.author, seq)? {
+                return Ok(Some(HistoryHeader {
+                    wire: entry.header_wire(),
+                }));
+            }
         }
         let Some(included) =
             read.history_inclusion_receipt(&target.source, &binding.author, seq)?
@@ -597,6 +681,27 @@ impl ServedRoom for ChannelState {
     ) -> Result<()> {
         ChannelState::forget_history_decline(self, store, peer, author, committed)
     }
+    fn history_author_frozen(&self, author: &Digest32) -> bool {
+        self.dag.is_frozen(author)
+    }
+    fn history_fork_authors(&self) -> Vec<Digest32> {
+        self.dag
+            .fork_proofs()
+            .into_iter()
+            .filter(|proof| signed_fork(proof))
+            .map(|proof| proof.author_id)
+            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
+            .collect()
+    }
+    fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
+        let proof = self.dag.fork_proof(author)?;
+        signed_fork(proof).then(|| {
+            (
+                proof.existing.header_wire(),
+                proof.conflicting.header_wire(),
+            )
+        })
+    }
 }
 
 impl ServedRoom for RoomView<'_> {
@@ -692,5 +797,19 @@ impl ServedRoom for RoomView<'_> {
         })?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+    fn history_author_frozen(&self, author: &Digest32) -> bool {
+        self.snapshot.is_frozen(author)
+    }
+    fn history_fork_authors(&self) -> Vec<Digest32> {
+        self.snapshot
+            .forks
+            .keys()
+            .copied()
+            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
+            .collect()
+    }
+    fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.snapshot.forks.get(author).cloned()
     }
 }

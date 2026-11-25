@@ -78,6 +78,7 @@ pub(super) async fn answer(
     inbox_generation: u64,
     connection_serial: u64,
     inventory_added: &mut bool,
+    ask_back: &mut bool,
     served_object: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
@@ -175,11 +176,38 @@ pub(super) async fn answer(
             role,
             key_catalog,
             availability,
+            forks,
+            unresolved,
         } = incoming.frame()?
         else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
         let work_job = incoming.job();
+        // MP-9: a fork or (rule 6) an unresolved head the requester lists that this node would
+        // ask it for is a reason for this node to run its own inventory exchange with it; the
+        // listing itself is never evidence (`client::listing_wanted`).
+        if !forks.is_empty() || !unresolved.is_empty() {
+            if let Lookup::Found(wanted) = source
+                .serve_read(&work_job, 0, move |room, store| {
+                    Ok(Some(super::client::listing_wanted(
+                        room,
+                        store,
+                        &forks,
+                        &unresolved,
+                    )?))
+                })
+                .await?
+            {
+                #[cfg(feature = "test-knobs")]
+                if wanted.value {
+                    eprintln!(
+                        "history listing wanted peer={}",
+                        crate::node::link::b32_encode(&source.peer)
+                    );
+                }
+                *ask_back |= wanted.value;
+            }
+        }
         source
             .offer_key_catalog(&work_job, key_catalog, connection_serial)
             .await?;
@@ -260,6 +288,32 @@ pub(super) async fn answer(
                         _ => false,
                     }
             });
+    // A holder that kept an author's accepted head but no opening of it (MP-9 staging,
+    // `admission::no_accepted_opening`): nothing under that accepted head, nor under a prefix of
+    // it (ADR-053 P), is served; only what it proved under the kept unresolved head is.
+    #[cfg(feature = "test-knobs")]
+    let staged_unavailable = staged_unavailable
+        || match (query.clone(), target) {
+            (
+                Query::Header { head, .. }
+                | Query::Proof { head, .. }
+                | Query::Entry { head, .. }
+                | Query::Page { head, .. },
+                Some(target),
+            ) if super::admission::no_accepted_opening(&target.binding.author) => matches!(
+                source
+                    .serve_read(io.job(), 0, move |room, store| {
+                        Ok(Some(
+                            room.history_read(store)?
+                                .history_unresolved_head(&target.binding.author)?
+                                != Some(head),
+                        ))
+                    })
+                    .await?,
+                Lookup::Found(found) if found.value
+            ),
+            _ => false,
+        };
     #[cfg(not(feature = "test-knobs"))]
     let staged_unavailable = false;
     // `VOX_TEST_REFUSE_ENTRIES_FILE` = `<peer> <from> <to> [busy]`: that peer's body asks
@@ -389,7 +443,7 @@ async fn respond(
     };
     match *query {
         Query::Inventory => {
-            let Lookup::Found(inventory) = source.inventory(&job).await? else {
+            let Lookup::Found(mut inventory) = source.inventory(&job).await? else {
                 return Ok((Status::Busy, None));
             };
             let status = match send(
@@ -401,6 +455,8 @@ async fn respond(
                     role: inventory.value.1.as_ref().map(|notice| notice.head),
                     key_catalog: inventory.value.2,
                     availability: io.availability_connection.map(|_| inventory.value.4),
+                    forks: std::mem::take(&mut inventory.value.5 .0),
+                    unresolved: std::mem::take(&mut inventory.value.5 .1),
                 },
                 0,
             )
@@ -490,6 +546,76 @@ async fn respond(
                 Frame::Meta {
                     request,
                     object: Object::Head(&wire),
+                },
+                0,
+                served_object,
+            )
+            .await?
+            {
+                Sent::Yes => Status::Complete,
+                Sent::Busy | Sent::Full => Status::Busy,
+            };
+            Ok((status, None))
+        }
+        Query::HeadById(id) => {
+            // MP-9 (rule 6): a committed head or the author's kept unresolved head, by its exact
+            // id; only its signed bytes travel, to the peer that asked. Nothing else is served.
+            let found = source
+                .serve_read(&job, 128 * 1024, move |room, store| {
+                    Ok(room
+                        .history_head_by_id(store, &id)?
+                        .filter(|head| head.binding.scope == crate::log::history::LogScope::Public))
+                })
+                .await?;
+            let held = match found {
+                Lookup::Found(held) => held,
+                Lookup::Busy => return Ok((Status::Busy, None)),
+                Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
+            };
+            let wire = held.value.to_wire();
+            let status = match send_object(
+                source,
+                io,
+                credit,
+                Frame::Meta {
+                    request,
+                    object: Object::Head(&wire),
+                },
+                0,
+                served_object,
+            )
+            .await?
+            {
+                Sent::Yes => Status::Complete,
+                Sent::Busy | Sent::Full => Status::Busy,
+            };
+            Ok((status, None))
+        }
+        Query::Fork(author) => {
+            // Only the proof this node verified and kept (MP-9): two signed headers, no body.
+            let found = source
+                .serve_read(
+                    &job,
+                    2 * crate::log::history::MAX_HEADER_BYTES,
+                    move |room, _| Ok(room.history_fork_proof(&author)),
+                )
+                .await?;
+            let held = match found {
+                Lookup::Found(held) => held,
+                Lookup::Busy => return Ok((Status::Busy, None)),
+                Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
+            };
+            let (existing, conflicting) = &held.value;
+            let status = match send_object(
+                source,
+                io,
+                credit,
+                Frame::Meta {
+                    request,
+                    object: Object::Fork {
+                        existing,
+                        conflicting,
+                    },
                 },
                 0,
                 served_object,
