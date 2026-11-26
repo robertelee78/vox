@@ -2712,14 +2712,22 @@ pub(crate) enum ApplicationReceipt {
     Reconcile,
 }
 
+/// Whose authority an in-flight Computer write changes, between staging its replacement and
+/// publishing it: every node's, or only these nodes'.
+enum AuthorityChange {
+    Every,
+    Nodes(BTreeSet<Digest32>),
+}
+
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
     account: Account,
     storage_failed: std::sync::atomic::AtomicBool,
     /// Fail closed across the gap between staging a policy replacement and publishing its new
-    /// in-memory snapshot. Status reads do not consult this flag and therefore never wedge on I/O.
-    authority_blocked: std::sync::atomic::AtomicBool,
+    /// in-memory snapshot, for exactly the authority that replacement changes. Status reads do
+    /// not consult this and therefore never wedge on I/O.
+    authority_in_flight: Mutex<Option<AuthorityChange>>,
     own_key_writers:
         Mutex<Vec<std::sync::Weak<crate::node::channel::own_writer_gate::RevocableSend>>>,
     own_key_settled: tokio::sync::watch::Sender<()>,
@@ -3011,10 +3019,7 @@ impl Computer {
     pub(crate) fn policy_target_after_writer(&self) -> Result<ComputerPolicyTarget> {
         blocking_transaction(|| {
             let _change = self.changes_writer(None)?;
-            if self
-                .authority_blocked
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.own_key_authority_blocked() {
                 return Err(Error::Profile(
                     "the computer policy writer did not finish publishing its durable result",
                 ));
@@ -3064,9 +3069,7 @@ impl Computer {
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
     pub(crate) fn policy_current(&self, applied: u64, expired: bool, node: Digest32) -> bool {
         let s = lock(&self.state);
-        !self
-            .authority_blocked
-            .load(std::sync::atomic::Ordering::Acquire)
+        !self.authority_blocked_for(&node)
             && ((s.genesis.is_none() && s.intervals.is_empty())
                 || (self.storage_ready().is_ok()
                     && s.policy_revision == applied
@@ -3120,11 +3123,7 @@ impl Computer {
         writer: &Arc<crate::node::channel::own_writer_gate::RevocableSend>,
     ) -> bool {
         let mut writers = lock(&self.own_key_writers);
-        if self
-            .authority_blocked
-            .load(std::sync::atomic::Ordering::Acquire)
-            || self.storage_ready().is_err()
-        {
+        if self.own_key_authority_blocked() || self.storage_ready().is_err() {
             return false;
         }
         writers.retain(|writer| writer.strong_count() != 0);
@@ -3132,11 +3131,10 @@ impl Computer {
         true
     }
 
-    fn block_own_key_authority(&self) {
+    fn block_own_key_authority(&self, change: AuthorityChange) {
         let owners = {
             let mut writers = lock(&self.own_key_writers);
-            self.authority_blocked
-                .store(true, std::sync::atomic::Ordering::Release);
+            *lock(&self.authority_in_flight) = Some(change);
             writers.retain(|writer| writer.strong_count() != 0);
             writers
                 .iter()
@@ -3150,14 +3148,23 @@ impl Computer {
 
     fn unblock_own_key_authority(&self) {
         let _writers = lock(&self.own_key_writers);
-        self.authority_blocked
-            .store(false, std::sync::atomic::Ordering::Release);
+        *lock(&self.authority_in_flight) = None;
         self.own_key_settled.send_replace(());
     }
 
+    /// Whether any Computer write is between staging its replacement and publishing it.
     pub(crate) fn own_key_authority_blocked(&self) -> bool {
-        self.authority_blocked
-            .load(std::sync::atomic::Ordering::Acquire)
+        lock(&self.authority_in_flight).is_some()
+    }
+
+    /// Whether the in-flight Computer write, if any, changes `node`'s authority. A write that
+    /// changes only other nodes' application leaves this node's current policy readable.
+    fn authority_blocked_for(&self, node: &Digest32) -> bool {
+        match &*lock(&self.authority_in_flight) {
+            None => false,
+            Some(AuthorityChange::Every) => true,
+            Some(AuthorityChange::Nodes(nodes)) => nodes.contains(node),
+        }
     }
 
     pub(crate) fn own_key_settled(&self) -> tokio::sync::watch::Receiver<()> {
@@ -3180,7 +3187,7 @@ impl Computer {
     fn storage_failure(&self) {
         self.storage_failed
             .store(true, std::sync::atomic::Ordering::Release);
-        self.block_own_key_authority();
+        self.block_own_key_authority(AuthorityChange::Every);
         self.own_key_settled.send_replace(());
         self.invalidate_reachers();
     }
@@ -3959,9 +3966,7 @@ impl Computer {
         let _lease = self.publications.try_read()?;
         let state = lock(&self.state);
         let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
-        let settled = !self
-            .authority_blocked
-            .load(std::sync::atomic::Ordering::Acquire)
+        let settled = !self.authority_blocked_for(node)
             && (unmanaged || self.storage_ready().is_ok())
             && Self::revision_expired(&state) == expired
             && Self::application_settled_in(&state, node, revision)
@@ -4330,7 +4335,7 @@ impl Computer {
                 path,
                 account: account.clone(),
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
-                authority_blocked: std::sync::atomic::AtomicBool::new(false),
+                authority_in_flight: Mutex::new(None),
                 own_key_writers: Mutex::new(Vec::new()),
                 own_key_settled: tokio::sync::watch::channel(()).0,
                 signer,
@@ -4410,7 +4415,7 @@ impl Computer {
             path,
             account: account.clone(),
             storage_failed: std::sync::atomic::AtomicBool::new(false),
-            authority_blocked: std::sync::atomic::AtomicBool::new(false),
+            authority_in_flight: Mutex::new(None),
             own_key_writers: Mutex::new(Vec::new()),
             own_key_settled: tokio::sync::watch::channel(()).0,
             signer: Arc::new(root),
@@ -4578,7 +4583,8 @@ impl Computer {
             }
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
-            let publication_changed = self.publication_authority_changed(&held, &next);
+            let authority_change = self.publication_authority_change(&held, &next);
+            let publication_changed = authority_change.is_some();
             #[cfg(feature = "test-knobs")]
             let skip_publication = self
                 .mark_held_join_writer_for_proof(publication_changed && transition.is_none())
@@ -4606,8 +4612,8 @@ impl Computer {
                     }
                 }
             }
-            if publication_changed {
-                self.block_own_key_authority();
+            if let Some(change) = authority_change {
+                self.block_own_key_authority(change);
             }
             #[cfg(feature = "test-knobs")]
             let mutant_state_guard =
@@ -4859,7 +4865,8 @@ impl Computer {
         if held.body() != next.body() {
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
-            let publication_changed = self.publication_authority_changed(&held, &next);
+            let authority_change = self.publication_authority_change(&held, &next);
+            let publication_changed = authority_change.is_some();
             #[cfg(feature = "test-knobs")]
             let skip_publication = self
                 .mark_held_join_writer_for_proof(publication_changed && !publication_owned)
@@ -4875,8 +4882,8 @@ impl Computer {
             } else {
                 None
             };
-            if publication_changed {
-                self.block_own_key_authority();
+            if let Some(change) = authority_change {
+                self.block_own_key_authority(change);
             }
             if let Err(error) = self.save_before(&next, None) {
                 self.storage_failure();
@@ -4907,9 +4914,11 @@ impl Computer {
 
     /// Only changes to physical publication eligibility drain current publications. Pairing
     /// preview, aliases, reach, delivery watermarks and observation history stay independent.
-    /// Application preparation/receipts and binding derivation matter even at one policy revision.
-    fn publication_authority_changed(&self, held: &State, next: &State) -> bool {
-        held.policy_revision != next.policy_revision
+    /// Application preparation/receipts and binding derivation matter even at one policy revision,
+    /// but only to their own node: the revision, its expiry, the group and this computer's grant
+    /// are every node's authority; an `applied`, `prepared` or `derived` entry is its node's.
+    fn publication_authority_change(&self, held: &State, next: &State) -> Option<AuthorityChange> {
+        if held.policy_revision != next.policy_revision
             || Self::revision_expired(held) != Self::revision_expired(next)
             || held.genesis.is_some() != next.genesis.is_some()
             || held.intervals.is_empty() != next.intervals.is_empty()
@@ -4917,9 +4926,23 @@ impl Computer {
                 let local = self.signer.fingerprint();
                 held.grant(&local) != next.grant(&local)
             })
-            || held.applied != next.applied
-            || held.prepared != next.prepared
-            || held.derived != next.derived
+        {
+            return Some(AuthorityChange::Every);
+        }
+        fn changed<'a, V: PartialEq>(
+            held: &'a BTreeMap<Digest32, V>,
+            next: &'a BTreeMap<Digest32, V>,
+        ) -> impl Iterator<Item = Digest32> + 'a {
+            held.keys()
+                .chain(next.keys())
+                .filter(|node| held.get(*node) != next.get(*node))
+                .copied()
+        }
+        let nodes: BTreeSet<Digest32> = changed(&held.applied, &next.applied)
+            .chain(changed(&held.prepared, &next.prepared))
+            .chain(changed(&held.derived, &next.derived))
+            .collect();
+        (!nodes.is_empty()).then_some(AuthorityChange::Nodes(nodes))
     }
 
     /// Publish into an existing room gate only while its node's durable keyring matches
@@ -4939,9 +4962,7 @@ impl Computer {
         }
         crate::node::tunnel::publish_reachers(
             gate,
-            if !self
-                .authority_blocked
-                .load(std::sync::atomic::Ordering::Acquire)
+            if !self.authority_blocked_for(&node)
                 && ((state.genesis.is_none() && state.intervals.is_empty())
                     || (self.storage_ready().is_ok()
                         && applied == state.policy_revision
