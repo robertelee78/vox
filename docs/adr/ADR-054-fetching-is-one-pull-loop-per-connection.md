@@ -24,11 +24,13 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   which also amends ADR-053 MP-12's promise that a holder is not asked again on that connection)
   and on what a peer is told of private records (`design/adopt/ruling-private-tip.md`); the design
   rules that the reviews of the built tree enforce; and the rules for a store written by v0.4.30.
-  The new rules are PL-14 to PL-38, in the section "Amendment 3". Each amended place is marked; the
+  The new rules are PL-14 to PL-40, in the section "Amendment 3". Each amended place is marked; the
   text it amends stays as it was, beside the mark. An amendment 2 was drafted
   (`design/adr-054/amendment-2/`) and is not on main; what it carried is carried here. The loop and
   the adoption are built in a scratch tree, frozen at scratch commit `0bfd8592c`, measured there
-  and accepted by each area's reviewer; none of it is merged.)*
+  and accepted by each area's reviewer; a full sweep of the release proofs on that build then
+  found two faults, fixed and accepted as PL-39 and PL-40 (scratch `8f28b38b8`, measured again
+  there); none of it is merged.)*
 - **Date**: 2026-11-24
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, fetching, serving, admission, KISS, release
@@ -1405,6 +1407,35 @@ app is a waste".
     first or prevent every busy refusal" (`keys-17.md:7`, :13). A peer can occupy the existing
     network allowance of 64 queued events: bounded contention, not unbounded accumulation
     (`keys-17.md:9`).
+- **PL-39. A member this node has lost its connection to is reached again.**
+  1. A room's loops run only over connections that exist. A member port with no connection
+     reaches its peer (ADR-025 D2), one dial per peer at a time, a fixed 8 s apart. There is no
+     doubling and no port backoff: PL-12's "the reach backoff" is this fixed spacing.
+  2. The address comes from this node's board first, then a connected board, then the peer book.
+     A kept anchor is left to its own redial. Only a port of the room instance held now, at the
+     room's current epoch, for a peer that is a member there and whose removal is not applied,
+     may dial; a port kept for a departure receipt or a recovery does not.
+  3. A reach that fails only ends the attempt: it runs no key work, counts as no sync failure and
+     says nothing; a failure from an earlier network changes nothing. Reaching grants nothing:
+     a loop starts only for a peer with standing, and keys go only where key delivery decides.
+  - *Source*: `simple-sync/pull/regress/FixRetrust.md`; `simple-sync/review/serve-22.md`,
+    `serve-23.md` (both REJECT), accepted `serve-24.md`.
+  - *Why*: adoption step 7 deleted the reach with the scheduler. After a relay froze, each side's
+    one dial (made for key work) failed, its key went into the log, nothing was owed, and nobody
+    dialled the other again: for 90 s only local-network dials, and a post made after the relay
+    was back never arrived. Found by the full sweep on the frozen build (the re-trust proof).
+  - *Built*: accepted at scratch `003effe82` (`serve-24.md`), from source; no review ran anything.
+    The re-trust proof is green on it four times in four; that either side is back within 8 s is
+    read from the code, not measured.
+- **PL-40. Rows a governance fold takes away or brings back tell clients on every path that runs
+  the fold.** Since the one-step admission (ledger 111) the admission's own write runs the fold;
+  it now raises the same notice as the projection step, once per real change, and re-reads the
+  room's newest row.
+  - *Source*: `simple-sync/pull/regress/FixNews.md`; accepted `simple-sync/review/delete-18.md`.
+  - *Why*: after a removed member's posts left a room, nothing told a client to re-read the
+    room's preview and unread count. Found by the full sweep on the frozen build.
+  - *Built*: accepted at scratch `b2f456aba` (`delete-18.md`), from source; its proof is green on
+    it once.
 
 ### (c) What is deleted
 
