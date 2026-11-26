@@ -226,6 +226,13 @@ impl ChannelState {
         );
         let pin = if has_append {
             None
+        } else if matches!(
+            native,
+            Native::StartupCleanup(entry_store::Preparation::CleanupPending)
+        ) {
+            // Open left a publication a restart interrupted for this cleanup to finish, and the
+            // room stays unpublished until it has: its unfinished phase is not another owner's.
+            Some(self.reserve_publication_cleanup(store, Arc::clone(&owner))?)
         } else {
             Some(self.reserve_pending_write(store, Arc::clone(&owner))?)
         };

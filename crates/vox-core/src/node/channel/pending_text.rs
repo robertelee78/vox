@@ -247,6 +247,23 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
+        self.reserve_publication_cleanup(store, owner)
+    }
+
+    /// The same ownership for the startup cleanup of a publication a restart interrupted
+    /// (`entry_store::Preparation::CleanupPending`): that unfinished publication is what the
+    /// cleanup finishes, and no request owns it after a restart, so only another save of this
+    /// room refuses it. Every other write keeps waiting for the publication to finish.
+    pub(crate) fn reserve_publication_cleanup(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+    ) -> Result<history::PendingHistoryRead> {
+        if self.post_pending() {
+            return Err(Error::Profile(
+                "room publication is busy; retry this operation",
+            ));
+        }
         let pin = self.pin_history_read(Arc::clone(store))?;
         self.pending_text = Some(owner);
         Ok(pin)
