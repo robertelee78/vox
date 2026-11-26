@@ -54,7 +54,7 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            stage: Stage::Receiver,
+            stage: Stage::Startup,
             pending: false,
             result: None,
             request: None,
@@ -612,17 +612,19 @@ impl Node {
             .is_some_and(|held| !held.authority.current())
         {
             prepared.save = State::default();
-            prepared.wait_on("current computer trust", now.get());
+            prepared.wait_on(COMPUTER_TRUST_WAIT, now.get());
             return Ok(false);
         }
         if let Some(result) = prepared.save.result.take() {
             let saved = match result {
                 Ok(saved) => saved,
-                Err(
-                    Error::ComputerPolicySuperseded
-                    | Error::Profile("room publication is busy; retry this operation"),
-                ) => {
-                    prepared.wait_on("current computer trust", now.get());
+                Err(Error::ComputerPolicySuperseded) => {
+                    prepared.wait_on(COMPUTER_TRUST_WAIT, now.get());
+                    prepared.save.lifetime = None;
+                    return Ok(false);
+                }
+                Err(Error::Profile("room publication is busy; retry this operation")) => {
+                    prepared.wait_on("a save already under way to finish", now.get());
                     prepared.save.lifetime = None;
                     return Ok(false);
                 }
@@ -654,19 +656,18 @@ impl Node {
                 return Ok(false);
             }
             match (prepared.save.stage, saved) {
-                (Stage::Receiver, Saved::Consent(consent_save::Effect::Cleanup { more, .. })) => {
-                    prepared.progressed |= more;
-                    prepared.save.stage = Stage::Startup;
-                }
                 (
                     Stage::Startup,
                     Saved::Governance(governance_save::Saved::StartupCleanup { blocks_current }),
                 ) => {
                     if blocks_current {
-                        prepared.wait_on("cleaning up its earlier saved form", now.get());
-                        prepared.legacy_cleanup_due = Some(std::time::Instant::now() + TICK);
+                        prepared.progressed("cleaning up its earlier saved form", now.get());
                         return Ok(false);
                     }
+                    prepared.save.stage = Stage::Receiver;
+                }
+                (Stage::Receiver, Saved::Consent(consent_save::Effect::Cleanup { more, .. })) => {
+                    prepared.progressed |= more;
                     prepared.save.stage = Stage::Governance;
                 }
                 (
@@ -938,7 +939,7 @@ impl Node {
         }
         if prepared.save.stage == Stage::Startup && !channel.legacy_startup_cleanup_blocks_current()
         {
-            prepared.save.stage = Stage::Governance;
+            prepared.save.stage = Stage::Receiver;
         }
         if prepared.save.stage == Stage::Packages
             && (channel.is_member_removed(&store, &channel.me())?
@@ -1104,6 +1105,13 @@ fn refold(prepared: &mut RoomPreparation, now: u64) {
     prepared.save.request = Some(Work::Projection(ProjectionWork::Governance));
     prepared.wait_on(stage_wait(Stage::Governance), now);
 }
+
+/// A preparing room's save found this node's computer policy changing or not yet applied here
+/// (`Computer::policy_current`). A computer in no group waits only for its own policy save; in a
+/// group it waits for this node to apply the newest signed policy, and `vox computer status`
+/// says what is pending and what to do.
+const COMPUTER_TRUST_WAIT: &str =
+    "this computer's trust policy to apply on this node (see `vox computer status`)";
 
 fn stage_wait(stage: Stage) -> &'static str {
     match stage {
