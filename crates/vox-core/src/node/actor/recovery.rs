@@ -125,6 +125,7 @@ impl Node {
                         me,
                         now_ms,
                         paused_legacy_owner,
+                        &mut |_| {},
                     )
                 })
                 .await;
@@ -150,7 +151,7 @@ impl Node {
     pub(super) async fn finish_store_recovery(
         &mut self,
         id: Digest32,
-        original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        original: std::sync::Weak<crate::node::channel::RoomLock>,
         opened: crate::error::Result<ChannelState>,
     ) {
         if !self
@@ -175,7 +176,7 @@ impl Node {
                         waiting: None,
                         waiting_noted: false,
                         progressed: false,
-                        channel: Arc::new(tokio::sync::Mutex::new(channel)),
+                        channel: Arc::new(crate::node::channel::RoomLock::new(channel)),
                         reply: None,
                         reopening: false,
                         recovery: Some(original),

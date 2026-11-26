@@ -490,16 +490,21 @@ impl ChannelState {
             scan.reset();
             return Ok((scan, None));
         }
+        // Another epoch or retention policy can change any verdict: everything again. A commit
+        // in the room, an own post or a wake can change only the position each key stopped at
+        // (a body arrived, an effect finished, a body expired): every key again, each from its
+        // place (`Retirement::checked`), never from position 1.
+        if scan.epoch != self.epoch || scan.retention != retention {
+            scan.reset();
+            scan.epoch = self.epoch;
+            scan.retention = retention;
+        }
         if scan.head != head
-            || scan.epoch != self.epoch
-            || scan.retention != retention
             || scan.entry_generation != generation
             || scan.wake_at.is_some_and(|at| now >= at)
         {
-            scan.reset();
+            scan.new_pass();
             scan.head = head;
-            scan.epoch = self.epoch;
-            scan.retention = retention;
             scan.entry_generation = generation;
         }
         if scan.complete || head == 0 {
@@ -518,7 +523,11 @@ impl ChannelState {
                     scan.complete = true;
                     return Ok((scan, None));
                 };
-                (key, id, 1)
+                (
+                    key,
+                    id,
+                    scan.checked.get(&key).map_or(1, |through| through + 1),
+                )
             }
         };
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
@@ -549,11 +558,13 @@ impl ChannelState {
         }
         for _ in 0..64 {
             if next > head {
+                scan.checked.remove(&key);
                 scan.after = Some(key);
                 scan.current = None;
                 return Ok((scan, Some((key, id))));
             }
             let Some((_source, header)) = entries.history_validated_header(&me, next)? else {
+                scan.checked.insert(key, next - 1);
                 scan.after = Some(key);
                 scan.current = None;
                 return Ok((scan, None));
@@ -593,6 +604,7 @@ impl ChannelState {
                         }
                     }
                 }
+                scan.checked.insert(key, next - 2);
                 scan.after = Some(key);
                 scan.current = None;
                 return Ok((scan, None));
@@ -604,11 +616,13 @@ impl ChannelState {
                 ));
             }
             if message.header.channel_id == self.channel_id && message.header.chain_id == chain {
+                scan.checked.insert(key, next - 2);
                 scan.after = Some(key);
                 scan.current = None;
                 return Ok((scan, None));
             }
         }
+        scan.checked.insert(key, next - 1);
         scan.current = Some((key, id, next));
         Ok((scan, None))
     }

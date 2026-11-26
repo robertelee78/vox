@@ -1,6 +1,4 @@
-//! The quinn-backed QUIC substrate (ADR-011 §"Substrate = QUIC") and the real
-//! [`crate::log::sync::Transport`] implementation that M5 anti-entropy sync runs
-//! over.
+//! The quinn-backed QUIC substrate (ADR-011 §"Substrate = QUIC").
 //!
 //! ## One connection, many streams
 //! A [`VoxConnection`] is one QUIC connection to one peer. Each logical flow opens
@@ -25,15 +23,6 @@
 //! produced so a downgrade is auditable end-to-end. A handshake that cannot
 //! negotiate the hybrid group simply fails — there is no classical fallback.
 //!
-//! ## Sync over QUIC (the M5 `Transport` impl)
-//! [`QuicStreamTransport`] implements the synchronous M5
-//! [`Transport`](crate::log::sync::Transport) trait over
-//! a reliable QUIC bi-stream by bridging to a tokio runtime
-//! ([`tokio::runtime::Handle::block_on`]). Each M5 frame (an opaque byte vector) is
-//! length-delimited on the stream with a 4-byte big-endian length prefix, so the
-//! byte stream is re-framed into the exact messages M5 sent. A hard close maps the
-//! [`WireError`] to a QUIC application close code. Two loopback peers reconcile
-//! divergent logs over this transport in the tests.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,12 +42,6 @@ use crate::transport::router::{
 };
 use crate::transport::session::SessionEstablishment;
 use crate::wire::WireError;
-
-/// The maximum length of a single length-delimited M5 frame on a reliable stream.
-/// Generous enough for any [`crate::log::sync`] frame (it bounds an `ENTRY` carrying
-/// a max-size entry), and a hard cap so a hostile peer cannot announce a huge frame
-/// length to force an allocation (anti-abuse, mirroring the M5 codec's own caps).
-pub const MAX_STREAM_FRAME: usize = crate::log::sync::MAX_ENTRY_WIRE + 4096;
 
 /// The QUIC application close code carried when a sync stream hard-fails. quinn
 /// requires a `VarInt`; the M5 [`WireError`] byte is widened into it so the peer
@@ -1598,7 +1581,7 @@ fn finish_connection(
     let peer_id = proven.peer;
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
-    let (group, own_recovery, availability) = confirm_handshake(&connection)?;
+    let (group, own_recovery) = confirm_handshake(&connection)?;
     let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
@@ -1619,7 +1602,6 @@ fn finish_connection(
         peer_process,
         session,
         own_recovery,
-        availability,
         via_circuit,
         circuit_origin: None,
         router: DatagramRouter::start(connection.clone(), overflow),
@@ -1648,7 +1630,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
 /// defence in depth beneath the provider, which offers no other group
 /// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
-fn confirm_handshake(connection: &Connection) -> Result<(u16, bool, bool)> {
+fn confirm_handshake(connection: &Connection) -> Result<(u16, bool)> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1657,13 +1639,14 @@ fn confirm_handshake(connection: &Connection) -> Result<(u16, bool, bool)> {
     };
     match &hd.protocol {
         Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), false, false))
+            Ok((u16::from(hd.negotiated_key_exchange_group), false))
         }
         Some(p) if p.as_slice() == crate::transport::provider::VOX_OWN_RECOVERY_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), true, false))
+            Ok((u16::from(hd.negotiated_key_exchange_group), true))
         }
+        // The retired availability ALPN remains accepted and is never reused.
         Some(p) if p.as_slice() == crate::transport::provider::VOX_AVAILABILITY_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), true, true))
+            Ok((u16::from(hd.negotiated_key_exchange_group), true))
         }
         _ => Err(Error::ProtocolMismatch),
     }
@@ -1687,7 +1670,6 @@ pub struct VoxConnection {
     peer_process: Digest32,
     session: SessionEstablishment,
     own_recovery: bool,
-    availability: bool,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
     /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
@@ -2287,10 +2269,6 @@ impl VoxConnection {
     pub fn session(&self) -> &SessionEstablishment {
         &self.session
     }
-    /// Whether this exact authenticated TLS connection negotiated availability notifications.
-    pub(crate) fn supports_availability(&self) -> bool {
-        self.availability
-    }
     /// Whether the peer answered a request of this node's for `room` on this connection.
     pub(crate) fn introduced(&self, room: &Digest32) -> bool {
         lock(&self.introduced).contains(room)
@@ -2470,8 +2448,3 @@ impl VoxConnection {
         &self.connection
     }
 }
-
-// The M5 `Transport` over a reliable QUIC bi-stream lives in its own module to
-// keep this file focused on the endpoint/connection lifecycle; it is re-exported
-// here so `crate::transport::quic::QuicStreamTransport` remains a stable path.
-pub use crate::transport::stream_transport::QuicStreamTransport;

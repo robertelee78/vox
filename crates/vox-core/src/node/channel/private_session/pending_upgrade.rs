@@ -44,6 +44,7 @@ enum Work {
         at: u64,
     },
     Serve(serve::Serving),
+    Discover(serve::Discovery),
     Admit(serve::MediaAdmission),
     PullCursor {
         peer: Digest32,
@@ -120,9 +121,10 @@ pub(crate) struct PendingUpgrade {
     progress: private_index::Restart,
     legacy: Option<LegacyCursor>,
     legacy_pending: bool,
-    observed: BTreeMap<Digest32, (Digest32, u64)>,
-    observed_removed: Vec<(Digest32, (Digest32, u64))>,
     controls_after: Option<Digest32>,
+    /// This step's control catch-up (`Work::Controls`) made an author's Session controls current
+    /// that were not: permission news (`Saved::controls_ready`).
+    controls_ready: bool,
     next_log_id: u64,
     now: u64,
     retention: (u64, u64),
@@ -136,6 +138,9 @@ pub(crate) struct PendingUpgrade {
     invalid: Vec<(Digest32, String)>,
     receive_persisting: bool,
     maintenance: bool,
+    /// A read-only step (a teller's looking discovery quantum): permission preparation is only
+    /// looked at, never stepped, and nothing is written; it holds no publication ownership.
+    read_only: bool,
     cursor: Option<PullCursorCheckpoint>,
     incarnation: Option<Digest32>,
     wait: Option<UpgradeWait>,
@@ -164,6 +169,11 @@ pub(crate) struct Saved {
     pub(crate) cursor_committed: bool,
     pub(crate) page: Option<Page>,
     pub(crate) admitted: Option<bool>,
+    /// One discovery quantum's outcome (`serve::Discovered`).
+    pub(crate) discovered: Option<serve::Discovered>,
+    /// An author's Session controls became current in this step (`Work::Controls` completed
+    /// its control frontier): its installer raises permission news, once.
+    pub(crate) controls_ready: bool,
 }
 
 pub(crate) struct CompletedUpgrade {
@@ -314,6 +324,7 @@ impl ChannelState {
             Work::Receive { .. }
                 | Work::Check { .. }
                 | Work::Serve(_)
+                | Work::Discover(_)
                 | Work::Admit(_)
                 | Work::Legacy
                 | Work::Replay
@@ -389,6 +400,7 @@ impl ChannelState {
                         replay: Ok(false) | Err(_)
                     }
                     | Work::Serve(_)
+                    | Work::Discover(_)
                     | Work::Admit(_)
                     | Work::PullCursor { .. }
             ) {
@@ -405,9 +417,8 @@ impl ChannelState {
             progress,
             legacy,
             legacy_pending: !self.private_sessions.legacy_pending.is_empty(),
-            observed: self.private_sessions.observed_generations.clone(),
-            observed_removed: Vec::new(),
             controls_after: self.private_sessions.controls_after,
+            controls_ready: false,
             maintenance: matches!(
                 &work,
                 Work::Restore
@@ -417,6 +428,7 @@ impl ChannelState {
                     | Work::Replay
                     | Work::ScheduleReplay { .. }
             ),
+            read_only: matches!(&work, Work::Discover(discovery) if discovery.looks()),
             expiry_allowed: match &work {
                 Work::ScheduleReplay { replay: Ok(true) } => true,
                 Work::Receive { .. } | Work::Replay => {
@@ -497,11 +509,6 @@ impl ChannelState {
             after: work.after,
             migrating: work.migrating,
         });
-        for (hash, observation) in pending.observed_removed {
-            if self.private_sessions.observed_generations.get(&hash) == Some(&observation) {
-                self.private_sessions.observed_generations.remove(&hash);
-            }
-        }
         self.private_sessions.controls_after = pending.controls_after;
         if pending.entries_changed {
             self.entries.committed();
@@ -510,12 +517,9 @@ impl ChannelState {
         self.drive.news.extend(pending.news);
         self.gen
             .fetch_add(pending.records, std::sync::atomic::Ordering::Relaxed);
-        if let Some((peer, cursor, demands, automatic, notice)) = pending.cursor {
+        if let Some((peer, cursor, demands, _, notice)) = pending.cursor {
             self.private_sessions.cursors.insert(peer, cursor);
             self.private_sessions.demands = demands;
-            if automatic {
-                self.private_sessions.auto_continue.insert(peer);
-            }
             if let Some(notice) = notice {
                 self.set_aside.push(notice);
             }
@@ -523,6 +527,7 @@ impl ChannelState {
         if let Some(incarnation) = pending.incarnation {
             self.private_sessions.incarnation = Some(incarnation);
         }
+        self.publish_private_tip();
         for (hash, error) in pending.invalid {
             if !self.private_sessions.invalid_noted {
                 self.set_aside.push(format!(
@@ -589,6 +594,7 @@ impl PendingUpgrade {
                 let mut checked_unknown = false;
                 let mut page = None;
                 let mut admitted = None;
+                let mut discovered = None;
                 let (advance, received) = match work {
                     Work::Restore => (self.restore(store, sek)?, None),
                     Work::Controls => (self.controls(store, sek)?, None),
@@ -725,6 +731,10 @@ impl PendingUpgrade {
                         page = Some(self.serve(store, sek, serving)?);
                         (SessionAdvance::Waiting, None)
                     }
+                    Work::Discover(discovery) => {
+                        discovered = Some(self.discover(store, sek, discovery)?);
+                        (SessionAdvance::Waiting, None)
+                    }
                     Work::Admit(admission) => {
                         admitted = Some(self.admit(store, sek, &admission)?);
                         (SessionAdvance::Waiting, None)
@@ -770,6 +780,8 @@ impl PendingUpgrade {
                     cursor_committed,
                     page,
                     admitted,
+                    discovered,
+                    controls_ready: self.controls_ready,
                     session_rendered: self.news.len(),
                 })
             })
@@ -805,8 +817,17 @@ impl PendingUpgrade {
         )?)
     }
     fn at(&self, store: &Store, sek: &Sek, id: u64) -> Result<Option<Stored>> {
-        store
-            .snapshot()?
+        self.at_in(&store.snapshot()?, sek, id)
+    }
+    /// The record at arrival position `id` in this exact snapshot: the one its locator was
+    /// selected from, so an expiry between the two reads cannot split them.
+    fn at_in(
+        &self,
+        snapshot: &crate::node::store::Snapshot,
+        sek: &Sek,
+        id: u64,
+    ) -> Result<Option<Stored>> {
+        snapshot
             .get_segment_bounded(
                 &self.room,
                 SegmentKind::PrivateSession,
@@ -920,9 +941,14 @@ impl PendingUpgrade {
         Ok(SessionAdvance::Advanced)
     }
 
+    /// The bounded control catch-up. An author whose control frontier it completes, and whose
+    /// Session controls were not current before it (`control_ready`, read once before its first
+    /// row here and once at its head), became current in this step: `controls_ready`.
     fn controls(&mut self, store: &Store, sek: &Sek) -> Result<SessionAdvance> {
         let mut bytes = 0usize;
         let mut advanced = false;
+        // The author this step is catching up, and whether its controls were current before.
+        let mut was: Option<(Digest32, bool)> = None;
         for _ in 0..WORK_ROWS {
             let author = match self.controls_after {
                 Some(after) => self
@@ -951,6 +977,11 @@ impl PendingUpgrade {
                 .checked_add(1)
                 .ok_or(Error::MalformedAtRest("Session control frontier exhausted"))?;
             let read = self.index.read(store, sek, &self.room)?;
+            if was.is_none_or(|(at, _)| at != author) {
+                let ready =
+                    control_ready(&read, sek, &self.room, &author, head, self.controls_pending)?;
+                was = Some((author, ready));
+            }
             let entry = read
                 .get(&author, seq)?
                 .ok_or(Error::MalformedAtRest("Session control entry missing"))?;
@@ -983,6 +1014,18 @@ impl PendingUpgrade {
             advanced = true;
             if seq == head {
                 self.controls_after = Some(author);
+                if was == Some((author, false))
+                    && control_ready(
+                        &self.index.read(store, sek, &self.room)?,
+                        sek,
+                        &self.room,
+                        &author,
+                        head,
+                        self.controls_pending,
+                    )?
+                {
+                    self.controls_ready = true;
+                }
             }
         }
         Ok(SessionAdvance::Advanced)
@@ -1053,35 +1096,6 @@ impl PendingUpgrade {
         for _ in 0..WORK_ROWS {
             let Some((id, entry)) = self.legacy_after(store, sek, &work)? else {
                 if !work.migrating {
-                    let read = self.index.read(store, sek, &self.room)?;
-                    let mut done = Vec::new();
-                    let mut batch = store.batch()?;
-                    for (hash, (author, generation)) in &self.observed {
-                        if read.log_id(hash)?.is_some() {
-                            batch.ruled();
-                            private_index::observe_control(
-                                &mut batch,
-                                sek,
-                                &self.room,
-                                author,
-                                private_index::Control {
-                                    generation: Some(*generation),
-                                    ..Default::default()
-                                },
-                            )?;
-                            done.push(*hash);
-                        }
-                    }
-                    drop(read);
-                    if !done.is_empty() {
-                        check(&batch)?;
-                        batch.commit()?;
-                    }
-                    for hash in done {
-                        if let Some(observation) = self.observed.remove(&hash) {
-                            self.observed_removed.push((hash, observation));
-                        }
-                    }
                     work.migrating = true;
                     work.after = None;
                     self.legacy = Some(work);
@@ -1183,17 +1197,7 @@ impl PendingUpgrade {
         if floor.through < self.heads.get(author).copied().unwrap_or(0) {
             return Err(Error::StreamRefused(floor_index::REFRESHING));
         }
-        let newest = floor
-            .announced
-            .into_iter()
-            .chain(fact.generation)
-            .chain(
-                self.observed
-                    .values()
-                    .filter(|(a, _)| a == author)
-                    .map(|(_, generation)| *generation),
-            )
-            .max();
+        let newest = floor.announced.into_iter().chain(fact.generation).max();
         let Some(generation) = newest else {
             return Ok(false);
         };
@@ -1307,7 +1311,9 @@ impl PendingUpgrade {
             return Err(Error::StreamRefused(floor_index::REFRESHING));
         }
         drop(read);
-        let Some((old, iteration, _)) = floor_index::authorized_floor_step(
+        // Not decidable yet: `PREPARING` when only more bounded local steps remain, `REFRESHING`
+        // when a fact is missing (`floor_index::Step::decided`).
+        let Some((old, iteration, _)) = floor_index::authorized_floor_progress(
             store,
             sek,
             &self.room,
@@ -1316,8 +1322,9 @@ impl PendingUpgrade {
             &(header.author_id, *recipient, header.epoch, header.chain_id),
             membership,
             restored,
+            !self.read_only,
         )?
-        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?
+        .decided()?
         else {
             return Ok(false);
         };
@@ -1325,15 +1332,27 @@ impl PendingUpgrade {
             return Ok(false);
         }
         // Derived continuity may itself acquire the writer: exclusively a native-worker leaf.
-        let range = floor_index::continuity_step(
-            store,
-            sek,
-            &self.room,
-            &header.author_id,
-            recipient,
-            membership,
-        )?
-        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?;
+        // A read-only step only looks (`continuity_prepared`).
+        let range = if self.read_only {
+            floor_index::continuity_prepared(
+                store,
+                sek,
+                &self.room,
+                &header.author_id,
+                recipient,
+                membership,
+            )?
+        } else {
+            floor_index::continuity_progress(
+                store,
+                sek,
+                &self.room,
+                &header.author_id,
+                recipient,
+                membership,
+            )?
+        }
+        .decided()?;
         Ok(range.is_some_and(|(lower, upper)| {
             lower <= (header.epoch, header.chain_id) && (header.epoch, header.chain_id) <= upper
         }))
@@ -2038,7 +2057,9 @@ impl ChannelState {
                     }
                 }
             }
-            PrivateQuery::LiveTail => return Err(Error::Profile("private refetch query changed")),
+            PrivateQuery::LiveTail { .. } => {
+                return Err(Error::Profile("private refetch query changed"))
+            }
         }
         demand.finish_scan();
         if demand
@@ -2087,7 +2108,6 @@ impl ChannelState {
             .automatic
             .remove(&peer)
             .ok_or(Error::StreamRefused("private refetch selection missing"))?;
-        self.private_sessions.pulling.remove(&peer);
         let PrivateQuery::ArchiveRecords { positions, .. } = &selected.query else {
             return Err(error);
         };
@@ -2265,25 +2285,7 @@ pub(crate) use page::{LivePageResult, PageFlow, PagePreparation, PageResult};
 mod expiry;
 mod serve;
 pub(in crate::node::channel) use expiry::sweep_private;
-pub(crate) use serve::MediaAdmission;
-
-impl ChannelState {
-    pub(in crate::node::channel) fn snapshot_private_generations(
-        &self,
-    ) -> Vec<(Digest32, Digest32, u64)> {
-        self.private_sessions
-            .observed_generations
-            .iter()
-            .map(|(hash, (author, generation))| (*hash, *author, *generation))
-            .collect()
-    }
-
-    pub(in crate::node::channel) fn install_private_generations(&mut self, committed: &[Digest32]) {
-        for hash in committed {
-            self.private_sessions.observed_generations.remove(hash);
-        }
-    }
-}
+pub(crate) use serve::{Discovered, MediaAdmission, QUANTUM_BYTES};
 
 impl ChannelState {
     /// Exact place_committed/backfill cadence: one bounded migration turn, not the
@@ -2339,12 +2341,10 @@ pub(super) fn control_ready(
         return Ok(false);
     }
     let target = if read.sparse_enabled() {
-        let state = read.sparse_author(author, crate::log::history::LogScope::Public)?;
-        if state.as_ref().is_some_and(|state| {
-            state.committed.is_some() && state.control_ready == state.committed
-        }) {
+        if read.history_control_ready(author, crate::log::history::LogScope::Public)? {
             return Ok(true);
         }
+        let state = read.sparse_author(author, crate::log::history::LogScope::Public)?;
         match state.and_then(|state| state.committed) {
             Some(head) => {
                 read.history_head(&head)?

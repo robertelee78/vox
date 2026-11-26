@@ -1,9 +1,8 @@
 //! Private component work uses the common retained save slot and its exact publication owner.
 use super::*;
 use crate::node::channel::{pending_control, pending_retention, pending_upgrade};
-use crate::node::channel::{CompletedAnnouncement, PendingAnnouncement};
 use crate::node::history_demand::{Bounds, PrivatePlan};
-use crate::node::sessionstream::{Ask, Page};
+use crate::node::sessionstream::Page;
 use crate::node::store::Store;
 
 type Native = pending_upgrade::Saved;
@@ -17,14 +16,6 @@ pub(super) enum Work {
     Import,
     Expiry,
     ScheduleReplay,
-    AnnounceLegacy,
-    Serve {
-        ask: Ask,
-        peer: Digest32,
-        holders: BTreeSet<Digest32>,
-        charge: crate::node::history_budget::BufferCharge,
-        guard: history_demand::CurrentPrivateGuard,
-    },
     Admit {
         admission: pending_upgrade::MediaAdmission,
         guard: history_demand::CurrentPrivateGuard,
@@ -63,11 +54,6 @@ pub(super) enum Saved {
         pruned: usize,
     },
     ExpiryUnavailable,
-    Announcement {
-        count: usize,
-        complete: bool,
-    },
-    Page(Page),
     Flow(Box<pending_upgrade::PageFlow>),
     PageFinished(pending_upgrade::PageResult),
     Admitted(bool),
@@ -76,7 +62,6 @@ pub(super) enum Saved {
 pub(super) enum NativeKind {
     Upgrade,
     Migration,
-    Serve,
     Admission,
     AutoFailure,
     Flow(Box<pending_upgrade::PageFlow>),
@@ -163,7 +148,6 @@ pub(super) enum Prepared {
     },
     Import(pending_control::PendingImport),
     Expiry(Box<pending_retention::PendingRetention>),
-    Announcement(Box<PendingAnnouncement>),
     Ready {
         saved: Saved,
         boundary: Option<Boundary>,
@@ -176,7 +160,6 @@ pub(super) enum Completed {
     },
     Import(pending_control::CompletedImport),
     Expiry(pending_retention::CompletedRetention),
-    Announcement(Box<CompletedAnnouncement>),
     Ready(Result<Saved>),
 }
 
@@ -237,31 +220,6 @@ impl Work {
                 pending: channel.prepare_pending_private_replay(store, owner, now)?,
                 kind: NativeKind::Upgrade,
                 boundary: None,
-            }),
-            Self::AnnounceLegacy => {
-                match channel.prepare_pending_legacy_announcement(store, owner, now)? {
-                    Some(pending) => Some(Prepared::Announcement(Box::new(pending))),
-                    None => ready(Saved::Announcement {
-                        count: 0,
-                        complete: true,
-                    }),
-                }
-            }
-            Self::Serve {
-                ask,
-                peer,
-                holders,
-                charge,
-                guard,
-            } => Some(Prepared::Native {
-                pending: channel
-                    .prepare_pending_private_page(store, owner, ask, peer, &holders, charge)?,
-                kind: NativeKind::Serve,
-                boundary: Some(Boundary::Current {
-                    guard,
-                    before: true,
-                    after: true,
-                }),
             }),
             Self::Admit { admission, guard } => Some(Prepared::Native {
                 pending: channel.prepare_pending_private_admission(store, owner, admission)?,
@@ -370,11 +328,7 @@ impl Work {
 }
 
 impl Prepared {
-    pub(super) fn run(
-        self,
-        store: &Store,
-        signer: &dyn crate::identity::composite::RootSigner,
-    ) -> Completed {
+    pub(super) fn run(self, store: &Store) -> Completed {
         match self {
             Self::Native {
                 pending,
@@ -400,9 +354,6 @@ impl Prepared {
             }
             Self::Import(pending) => Completed::Import(pending.run(store)),
             Self::Expiry(pending) => Completed::Expiry(pending.save(store)),
-            Self::Announcement(pending) => {
-                Completed::Announcement(Box::new(pending.run(store, signer)))
-            }
             Self::Ready { saved, boundary } => Completed::Ready(match boundary {
                 Some(boundary) => boundary
                     .check(store, false)
@@ -420,7 +371,6 @@ impl Completed {
             Self::Native { completed, .. } => completed.can_install(channel, owner),
             Self::Import(completed) => completed.can_install(channel, owner),
             Self::Expiry(completed) => completed.can_install(channel, owner),
-            Self::Announcement(completed) => completed.can_install(channel, owner),
             Self::Ready(_) => true,
         }
     }
@@ -431,7 +381,6 @@ impl Completed {
             Self::Native { completed, .. } => completed.take_history_pin(),
             Self::Import(completed) => completed.take_history_pin(),
             Self::Expiry(completed) => completed.take_history_pin(),
-            Self::Announcement(completed) => completed.take_history_pin(),
             Self::Ready(_) => None,
         }
     }
@@ -450,9 +399,6 @@ impl Completed {
                         pruned: installed.pruned,
                     })
             }
-            Self::Announcement(completed) => channel
-                .finish_pending_legacy_announcement(store, *completed)
-                .map(|(count, complete)| Saved::Announcement { count, complete }),
             Self::Ready(result) => result,
         }
     }
@@ -463,22 +409,14 @@ impl Completed {
             Self::Expiry(completed) => completed.result.map(|installed| Saved::Expired {
                 pruned: installed.pruned,
             }),
-            Self::Announcement(completed) => completed
-                .into_result()
-                .map(|(count, complete)| Saved::Announcement { count, complete }),
             Self::Ready(result) => result,
         }
     }
 }
-fn native_saved(mut saved: Native, kind: NativeKind) -> Result<Saved> {
+fn native_saved(saved: Native, kind: NativeKind) -> Result<Saved> {
     match kind {
         NativeKind::Upgrade => Ok(Saved::Upgrade(Box::new(saved))),
         NativeKind::Migration => Ok(Saved::Migration),
-        NativeKind::Serve => saved
-            .page
-            .take()
-            .map(Saved::Page)
-            .ok_or(Error::Profile("native private page receipt missing")),
         NativeKind::Admission => saved
             .admitted
             .map(Saved::Admitted)
@@ -499,4 +437,4 @@ fn native_saved(mut saved: Native, kind: NativeKind) -> Result<Saved> {
 }
 
 mod continuation;
-pub(super) use continuation::{ArchiveReceipt, Continuation, ParkedPrivateDrive};
+pub(super) use continuation::{Continuation, ParkedPrivateDrive};

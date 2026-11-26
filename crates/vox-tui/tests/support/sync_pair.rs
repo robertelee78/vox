@@ -558,37 +558,6 @@ pub fn announced(p: &Proc, mode: &str) -> bool {
         .any(|l| l.contains(MUTANT_MARKER) && l.contains(&format!("\"{mode}\"")))
 }
 
-/// A counter summed over a member's `(room, peer)` rows, optionally for one peer only.
-pub fn counter(status: &serde_json::Value, key: &str, peer: Option<&str>) -> u64 {
-    status["sync"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter(|r| {
-                    peer.is_none_or(|p| {
-                        r["peer"]
-                            .as_str()
-                            .is_some_and(|x| p.starts_with(x) || x.starts_with(p))
-                    })
-                })
-                .map(|r| r[key].as_u64().unwrap_or(0))
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// The rows' last failures, for a failure message.
-pub fn failures(status: &serde_json::Value) -> Vec<String> {
-    status["sync"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r["last_failure"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Reads a room over a member's own control socket, as `vox room read` does.
 pub struct Reader {
     rt: tokio::runtime::Runtime,

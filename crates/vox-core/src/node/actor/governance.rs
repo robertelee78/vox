@@ -2,47 +2,6 @@
 
 use super::*;
 
-/// **Test-only**: the named marker contains one raw room id. Accepted remote governance input
-/// renames it with `.ready` appended; unrelated room work and deadline wakes cannot arm it.
-/// A bounded sweep selecting that ready room renames it with `.engaged` appended and parks beyond
-/// the room. The FX-22 journey then requires the real authority deadline to supply another sweep.
-#[cfg(feature = "test-knobs")]
-pub const TEST_HOLD_SWEEP_AFTER_ENV: &str = "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE";
-
-#[cfg(feature = "test-knobs")]
-pub(super) fn ready_sweep_after(room: &Digest32) {
-    let Some(path) = std::env::var_os(TEST_HOLD_SWEEP_AFTER_ENV).filter(|path| !path.is_empty())
-    else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    if std::fs::read(&path).is_ok_and(|held| held.as_slice() == room) {
-        let mut ready = path.as_os_str().to_owned();
-        ready.push(".ready");
-        let _ = std::fs::rename(path, ready);
-    }
-}
-
-#[cfg(feature = "test-knobs")]
-fn hold_sweep_after(room: &Digest32) -> bool {
-    let Some(path) = std::env::var_os(TEST_HOLD_SWEEP_AFTER_ENV).filter(|path| !path.is_empty())
-    else {
-        return false;
-    };
-    let path = std::path::PathBuf::from(path);
-    let mut ready = path.as_os_str().to_owned();
-    ready.push(".ready");
-    let Ok(held) = std::fs::read(&ready) else {
-        return false;
-    };
-    if held.as_slice() != room {
-        return false;
-    }
-    let mut engaged = path.as_os_str().to_owned();
-    engaged.push(".engaged");
-    std::fs::rename(ready, engaged).is_ok()
-}
-
 #[derive(Default)]
 pub(super) struct Maintenance {
     pub pending: bool,
@@ -63,7 +22,7 @@ pub(super) struct Maintenance {
     pub(super) removal: Option<Removal>,
     /// Ordinary turns rejected by a superseding policy, fenced to their original attachment.
     pub(super) policy_interrupted:
-        BTreeMap<Digest32, (std::sync::Weak<tokio::sync::Mutex<ChannelState>>, u64)>,
+        BTreeMap<Digest32, (std::sync::Weak<crate::node::channel::RoomLock>, u64)>,
 }
 
 impl Maintenance {
@@ -156,7 +115,7 @@ impl Maintenance {
 pub(super) struct Removal {
     pub(super) room: Digest32,
     pub(super) member: Digest32,
-    pub(super) instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    pub(super) instance: std::sync::Weak<crate::node::channel::RoomLock>,
     pub(super) after: Option<Digest32>,
     pub(super) count: usize,
     pub(super) done: bool,
@@ -332,13 +291,6 @@ impl Node {
             return;
         };
         self.governance_work.after = Some(room);
-        #[cfg(feature = "test-knobs")]
-        if hold_sweep_after(&room) {
-            // The marker is apparatus. Leave the selected room behind the cursor and park; its
-            // actual stored authority deadline is the only event that can resume this sweep.
-            self.governance_work.pending = false;
-            return;
-        }
         // Retain this exact skipped turn on the matching native owner. Its completion, not a
         // physical writer wait, releases the wake for another bounded sweep.
         if let Some(pending) = self.pending_posts.get_mut(&room) {

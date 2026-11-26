@@ -492,6 +492,7 @@ impl ChannelState {
         }
         self.drive.news.extend(news);
         self.private_sessions.next = self.private_sessions.next.max(next);
+        self.publish_private_tip();
         self.private_sessions.floor_sweep = floor_sweep;
         if refresh_changed {
             self.private_sessions.refresh = refresh;

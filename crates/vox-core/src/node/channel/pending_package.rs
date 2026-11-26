@@ -82,10 +82,6 @@ pub(crate) enum Work {
         skdm: Box<Skdm>,
     },
     Acknowledge(Attempt),
-    Reoffer {
-        target: Digest32,
-        history: bool,
-    },
     ResetDelivery {
         target: Digest32,
         history: bool,
@@ -144,7 +140,6 @@ pub(crate) enum Saved {
     },
     Installed(Attempt),
     Attempted(Attempt),
-    Reoffered,
     /// A real native reset attempt; legacy session adoption ignores its storage error only
     /// after both original ledger attempts have finished. Other consumers keep the debt owed.
     DeliveryReset {
@@ -200,6 +195,7 @@ enum Native {
     Install {
         receipt: Attempt,
         selected: Result<Option<Receiver>>,
+        debt: Option<Ledger>,
     },
     Acknowledge {
         receipt: Attempt,
@@ -210,7 +206,6 @@ enum Native {
         floor: Option<u64>,
         delivered: bool,
         write_history: bool,
-        reoffer: bool,
     },
 }
 
@@ -230,14 +225,77 @@ enum Delta {
         slot: (Digest32, u64),
         chain: Box<ReceiverChain>,
         drive: bool,
-        retained: bool,
         changed: bool,
+        debt: Option<Ledger>,
     },
-    Reoffer {
-        target: Digest32,
-        history: Option<u64>,
-        delivered: bool,
-    },
+    Ledger(Ledger),
+}
+
+/// One member's rows of this node's key ledgers: `history` is the retired generation it is owed
+/// from (`SEG_HISTORY`), `delivered` that its "has the live generation" row (`SEG_DELIVERED`) is
+/// removed, so the periodic rekeys owe it the live one.
+struct Ledger {
+    target: Digest32,
+    history: Option<u64>,
+    delivered: bool,
+}
+
+impl Ledger {
+    fn queue(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        sek: &Sek,
+        room: &Digest32,
+    ) -> Result<()> {
+        if let Some(floor) = self.history {
+            queue_ledger_row(batch, sek, room, SEG_HISTORY, self.target, Some(floor))?;
+        }
+        if self.delivered {
+            queue_ledger_row(batch, sek, room, SEG_DELIVERED, self.target, None)?;
+        }
+        Ok(())
+    }
+
+    fn apply(self, channel: &mut ChannelState) {
+        if self.delivered {
+            channel.delivered.remove(&self.target);
+        }
+        if let Some(floor) = self.history {
+            channel.history.insert(self.target, floor);
+        }
+    }
+}
+
+/// Set (`Some`) or remove (`None`) `target`'s row of one key ledger segment, in `batch`.
+fn queue_ledger_row(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    segment: u64,
+    target: Digest32,
+    value: Option<u64>,
+) -> Result<()> {
+    let mut values = match batch.get_segment(room, SegmentKind::KeyMaterial, segment)? {
+        Some(sealed) => parse_delivered(&open_segment(
+            sek,
+            SegmentKind::KeyMaterial,
+            segment,
+            &sealed,
+        )?)?,
+        None => BTreeMap::new(),
+    };
+    if let Some(value) = value {
+        values.insert(target, value);
+    } else {
+        values.remove(&target);
+    }
+    let sealed = seal_segment(
+        sek,
+        SegmentKind::KeyMaterial,
+        segment,
+        &delivered_bytes(&values),
+    )?;
+    batch.put_segment(room, SegmentKind::KeyMaterial, segment, &sealed)
 }
 
 pub(crate) struct Prepared {
@@ -285,7 +343,6 @@ impl ChannelState {
                 | Work::Accept { .. }
                 | Work::SealOutbound { .. }
                 | Work::FrameOutbound { .. }
-                | Work::Reoffer { .. }
         ) {
             let generation = self.removal_generation(store)?;
             let me = self.me();
@@ -294,7 +351,6 @@ impl ChannelState {
             }
             let target = match &work {
                 Work::SealOutbound { target, .. } => Some(*target),
-                Work::Reoffer { target, .. } => Some(*target),
                 Work::FrameOutbound { bundle, .. } => {
                     Some(CompositePublicKey::from_bytes(&bundle.root_pub)?.fingerprint())
                 }
@@ -456,31 +512,6 @@ impl ChannelState {
                 let queue = receipt.locator.map(|_| self.key_packages.clone());
                 Native::Acknowledge { receipt, queue }
             }
-            Work::Reoffer { target, history } => {
-                let consented = !history || self.has_consented(store, &target)?;
-                let floor = if history && consented {
-                    self.entitled_from(&target)
-                        .map(|(from, _)| from)
-                        .filter(|from| *from < self.sender.chain_id())
-                } else {
-                    None
-                };
-                let write_history = floor
-                    .is_some_and(|floor| self.history.get(&target).is_none_or(|old| *old >= floor));
-                let owed = floor.map(|floor| {
-                    self.history
-                        .get(&target)
-                        .copied()
-                        .map_or(floor, |old| old.min(floor))
-                });
-                Native::LedgerReset {
-                    target,
-                    floor: owed,
-                    delivered: consented && self.delivered.contains_key(&target),
-                    write_history,
-                    reoffer: true,
-                }
-            }
             Work::ResetDelivery { target, history } => {
                 let floor = if history {
                     self.entitled_from(&target)
@@ -496,7 +527,6 @@ impl ChannelState {
                     floor,
                     delivered: self.delivered.contains_key(&target),
                     write_history,
-                    reoffer: false,
                 }
             }
         };
@@ -618,6 +648,16 @@ impl ChannelState {
             Err(error) if governance::refreshing(&error) => return Err(error),
             other => other,
         };
+        // A key handed over directly (not read from the log) and new to this node says its
+        // author may take this node's keys now (V210-118). That debt is written in the batch
+        // that installs the key, before the key is acknowledged, so the periodic rekeys owe it
+        // from then on, whatever becomes of the stream or of any attempt to deliver at once.
+        let debt = match (&selected, author) {
+            (Ok(Some(_)), Some(target)) if fresh && locator.is_none() => {
+                self.owed_again(store, target)?
+            }
+            _ => None,
+        };
         Ok(Native::Install {
             receipt: Attempt {
                 locator,
@@ -632,29 +672,48 @@ impl ChannelState {
                 floor_resolved: false,
             },
             selected,
+            debt,
         })
     }
 
-    pub(crate) fn finish_pending_package(
-        &mut self,
-        store: &Store,
-        mut completed: Completed,
-    ) -> Result<Saved> {
+    /// What `target` is owed again once it may take this node's keys (V210-118), if it is
+    /// consented to here: every generation it is entitled to, the live one (its "delivered"
+    /// row goes) and each retired one from where its entitlement began, as history. It may
+    /// have refused them while its owner did not trust this identity, or dropped them when its
+    /// owner stopped trusting it. Sending a generation it already holds is harmless: it keeps
+    /// the one it has.
+    fn owed_again(&self, store: &Store, target: Digest32) -> Result<Option<Ledger>> {
+        if !self.has_consented(store, &target)? {
+            return Ok(None);
+        }
+        let history = self
+            .entitled_from(&target)
+            .map(|(from, _)| from)
+            .filter(|from| *from < self.sender.chain_id())
+            .filter(|from| self.history.get(&target).is_none_or(|old| *old >= *from));
+        let delivered = self.delivered.contains_key(&target);
+        Ok((history.is_some() || delivered).then_some(Ledger {
+            target,
+            history,
+            delivered,
+        }))
+    }
+
+    pub(crate) fn finish_pending_package(&mut self, mut completed: Completed) -> Result<Saved> {
         if !completed.can_install(self, &completed.pending.owner) {
             return completed.result;
         }
         if completed.committed {
             self.entries.committed();
         }
-        let mut available = None;
         match completed.delta {
             Delta::Queue(queue) => self.key_packages = queue,
             Delta::Receiver {
                 slot,
                 chain,
                 drive,
-                retained,
                 changed,
+                debt,
             } => {
                 if changed {
                     if drive {
@@ -668,30 +727,14 @@ impl ChannelState {
                         }
                     }
                 }
-                if retained {
-                    available = Some(slot.0);
+                if let Some(debt) = debt {
+                    debt.apply(self);
                 }
             }
-            Delta::Reoffer {
-                target,
-                history,
-                delivered,
-            } => {
-                if delivered {
-                    self.delivered.remove(&target);
-                }
-                if let Some(floor) = history {
-                    self.history.insert(target, floor);
-                }
-            }
+            Delta::Ledger(ledger) => ledger.apply(self),
             Delta::None => {}
         }
         self.release_pending_text(&completed.pending.owner, false);
-        if let Some(author) = available {
-            if let Err(error) = self.note_available(store, author) {
-                completed.result = Err(error);
-            }
-        }
         if completed.poison {
             if let Err(error) = &completed.result {
                 self.poison(error);
@@ -951,6 +994,7 @@ impl Prepared {
                     Native::Install {
                         mut receipt,
                         selected,
+                        debt,
                     } => {
                         let selected = match selected {
                             Ok(selected) => selected,
@@ -1076,22 +1120,19 @@ impl Prepared {
                                     )))
                             };
                             if receipt.drive && !restored_drive {
-                                receipt.floor_resolved = covered;
-                                receipt.accepted = Some(AcceptedSkdm {
-                                    rendered: 0,
-                                    changed: false,
-                                });
-                                return Ok(Saved::Installed(receipt));
+                                // A Drive key already held: the receiver stays as it is.
+                                (existing, false, covered)
+                            } else {
+                                let changed = match existing.retain_history_release(&incoming) {
+                                    Ok(changed) => changed,
+                                    Err(error) => {
+                                        receipt.floor_wait = receipt.floor_baseline;
+                                        receipt.refusal = Some(error);
+                                        return Ok(Saved::Installed(receipt));
+                                    }
+                                };
+                                (existing, changed, covered || changed)
                             }
-                            let changed = match existing.retain_history_release(&incoming) {
-                                Ok(changed) => changed,
-                                Err(error) => {
-                                    receipt.floor_wait = receipt.floor_baseline;
-                                    receipt.refusal = Some(error);
-                                    return Ok(Saved::Installed(receipt));
-                                }
-                            };
-                            (existing, changed, covered || changed)
                         } else {
                             let limit = if receipt.drive {
                                 crate::node::drive::MAX_DRIVE_CHAINS
@@ -1146,14 +1187,6 @@ impl Prepared {
                                     receipt.refusal = Some(Error::StreamRefused(
                                         receiver_releases::CLEANUP_PENDING,
                                     ));
-                                    return Ok(Saved::Installed(receipt));
-                                }
-                                receiver_releases::Remember::Unchanged if !changed => {
-                                    receipt.floor_resolved = covered;
-                                    receipt.accepted = Some(AcceptedSkdm {
-                                        rendered: 0,
-                                        changed: false,
-                                    });
                                     return Ok(Saved::Installed(receipt));
                                 }
                                 receiver_releases::Remember::Retained => true,
@@ -1249,18 +1282,24 @@ impl Prepared {
                             writer.queue_backfill(slot.0, Some(1))?;
                             writer.seal()?;
                         }
-                        batch.commit()?;
-                        committed = true;
-                        receipt.floor_resolved = covered;
-                        if changed || retained {
+                        // **The one exit for an accepted key**: no other return of this arm
+                        // accepts. What the install queued and the debt its acceptance computed
+                        // (`owed_again`) commit together, or the key is not accepted.
+                        if changed || retained || debt.is_some() {
+                            if let Some(debt) = &debt {
+                                debt.queue(&mut batch, sek, &pending.room)?;
+                            }
+                            batch.commit()?;
+                            committed = true;
                             delta = Delta::Receiver {
                                 slot,
                                 chain: Box::new(candidate),
                                 drive: receipt.drive,
-                                retained,
                                 changed,
+                                debt,
                             };
                         }
+                        receipt.floor_resolved = covered;
                         receipt.accepted = Some(AcceptedSkdm {
                             rendered: 0,
                             changed,
@@ -1272,20 +1311,14 @@ impl Prepared {
                         floor,
                         delivered,
                         write_history,
-                        reoffer,
                     } => {
                         poison = true;
-                        let history = (SEG_HISTORY, floor, write_history);
                         let live = (SEG_DELIVERED, None, delivered);
-                        let ordered = if reoffer {
-                            [history, live]
-                        } else {
-                            [live, history]
-                        };
+                        let history = (SEG_HISTORY, floor, write_history);
                         let mut last_error = None;
                         let mut saved_history = None;
                         let mut saved_delivered = false;
-                        for (segment, value, write) in ordered {
+                        for (segment, value, write) in [live, history] {
                             if !write {
                                 continue;
                             }
@@ -1299,35 +1332,13 @@ impl Prepared {
                                         generation,
                                     )?;
                                 }
-                                let mut values = match batch.get_segment(
-                                    &pending.room,
-                                    SegmentKind::KeyMaterial,
-                                    segment,
-                                )? {
-                                    Some(sealed) => parse_delivered(&open_segment(
-                                        sek,
-                                        SegmentKind::KeyMaterial,
-                                        segment,
-                                        &sealed,
-                                    )?)?,
-                                    None => BTreeMap::new(),
-                                };
-                                if let Some(value) = value {
-                                    values.insert(target, value);
-                                } else {
-                                    values.remove(&target);
-                                }
-                                let sealed = seal_segment(
+                                queue_ledger_row(
+                                    &mut batch,
                                     sek,
-                                    SegmentKind::KeyMaterial,
-                                    segment,
-                                    &delivered_bytes(&values),
-                                )?;
-                                batch.put_segment(
                                     &pending.room,
-                                    SegmentKind::KeyMaterial,
                                     segment,
-                                    &sealed,
+                                    target,
+                                    value,
                                 )?;
                                 batch.commit()
                             })();
@@ -1338,23 +1349,18 @@ impl Prepared {
                                     } else {
                                         saved_delivered = true;
                                     }
-                                    delta = Delta::Reoffer {
+                                    delta = Delta::Ledger(Ledger {
                                         target,
                                         history: saved_history,
                                         delivered: saved_delivered,
-                                    };
+                                    });
                                 }
-                                Err(error) if reoffer => return Err(error),
                                 Err(error) => {
                                     last_error = Some(error);
                                 }
                             }
                         }
-                        if reoffer {
-                            Ok(Saved::Reoffered)
-                        } else {
-                            Ok(Saved::DeliveryReset { error: last_error })
-                        }
+                        Ok(Saved::DeliveryReset { error: last_error })
                     }
                 }
             })

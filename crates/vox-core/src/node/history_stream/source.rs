@@ -6,7 +6,6 @@ use std::sync::{
     Arc,
 };
 
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::error::{Error, Result};
@@ -16,7 +15,6 @@ use crate::log::history::{
     consistency_ranges, inclusion_ranges, split, ConsistencyProof, ControlRangeProof, ControlToken,
     Descriptor, HeadTarget, InclusionProof, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
-use crate::node::channel::pending_text::PENDING_WRITE_WAIT;
 use crate::node::channel::{
     ChannelState, ResolvedTarget, RoomSnapshot, RoomSnapshotCell, ServedRoom,
 };
@@ -25,28 +23,6 @@ use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
 
 use super::{Proof, ProofKind, RequestId};
-
-pub(super) enum DeclineResult {
-    Stored {
-        remembered: bool,
-        captured: Digest32,
-        current: Digest32,
-    },
-    AuthorizationChanged {
-        captured: Digest32,
-        current: Digest32,
-    },
-}
-
-#[cfg(feature = "test-knobs")]
-fn request_text(request: &RequestId) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(request.len() * 2);
-    for byte in request {
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
 
 // Directory plaintext is capped at 1 MiB before copy/decrypt. This also covers its sealed
 // bytes and bounded decoded author/presence maps. It is temporary, not part of Held's output.
@@ -59,30 +35,9 @@ pub(super) struct Held<T> {
     _charge: BufferCharge,
 }
 
-/// Exact local announcement owner. Its token is never carried as peer authority.
-pub(super) struct RoleAnnouncement {
-    pub(super) owner: Arc<crate::node::channel::role_owed::RoleOwed>,
-    pub(super) peer: Digest32,
-    pub(super) token: Arc<()>,
-    pub(super) head: super::HeadHint,
-}
-
-pub(super) struct CatalogAnnouncement {
-    pub(super) owner: Arc<crate::node::channel::role_owed::RoleOwed>,
-    pub(super) peer: Digest32,
-    pub(super) token: Arc<()>,
-}
-
 impl<T> Held<T> {
     pub(super) fn job(&self) -> Job {
         self._charge.job()
-    }
-
-    pub(super) fn map<U>(self, map: impl FnOnce(T) -> U) -> Held<U> {
-        Held {
-            value: map(self.value),
-            _charge: self._charge,
-        }
     }
 }
 
@@ -113,7 +68,7 @@ enum ReadBoundary {
 
 #[derive(Clone)]
 pub(super) struct Source {
-    pub(super) room: Arc<Mutex<ChannelState>>,
+    pub(super) room: Arc<crate::node::channel::RoomLock>,
     pub(super) store: Arc<Store>,
     pub(super) epoch: u64,
     pub(super) peer: Digest32,
@@ -127,6 +82,10 @@ pub(super) struct Source {
     own_head_receipt: bool,
     // Set only on a server clone whose exact query is separately restricted to the peer's feed.
     own_recovery: bool,
+    /// A Range bundle's server: it waits for the local admission it needs (bytes, the room's
+    /// own saving, a publication) and then answers; it never answers Busy and has no deadline.
+    /// One request is in flight per connection, so the wait costs only that connection.
+    patient: bool,
     work_committed: Arc<AtomicBool>,
     retirement_request: Option<RequestId>,
     /// An answer to a peer reads the room's published snapshot, never the room itself.
@@ -134,118 +93,9 @@ pub(super) struct Source {
 }
 
 impl Source {
-    #[cfg(feature = "test-knobs")]
-    async fn hold_decline_for_proof(&self, author: Digest32, head: Digest32, request: RequestId) {
-        const VARIABLE: &str = "VOX_TEST_HOLD_HISTORY_DECLINE_FILE";
-        let Some(path) = std::env::var_os(VARIABLE) else {
-            return;
-        };
-        if !std::path::Path::new(&path).exists() {
-            return;
-        }
-        let entered =
-            std::path::PathBuf::from(format!("{}.entered", std::path::Path::new(&path).display()));
-        let Some((_, captured)) = self.authorization else {
-            return;
-        };
-        let identity = format!(
-            "peer={} author={} head={} request={} captured={}\n",
-            crate::node::link::b32_encode(&self.peer),
-            crate::node::link::b32_encode(&author),
-            crate::node::link::b32_encode(&head),
-            request_text(&request),
-            crate::node::link::b32_encode(&captured),
-        );
-        if std::fs::write(&entered, identity).is_err() {
-            return;
-        }
-        while std::path::Path::new(&path).exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let _ = std::fs::remove_file(entered);
-    }
-
-    #[cfg(not(feature = "test-knobs"))]
-    async fn hold_decline_for_proof(
-        &self,
-        _author: Digest32,
-        _head: Digest32,
-        _request: RequestId,
-    ) {
-    }
-
-    /// Durably remember that this exact source refused this author's advertised head before the
-    /// live flow treats the refusal as complete. A restart reconstructs the inbox from it.
-    pub(super) async fn remember_decline(
-        &self,
-        job: &Job,
-        author: Digest32,
-        head: Digest32,
-        request: RequestId,
-        metadata: bool,
-    ) -> Result<DeclineResult> {
-        // The marker is apparatus only: it proves that a real shipped flow carrying its captured
-        // authorization has reached the durability edge before a proof changes trust.
-        self.hold_decline_for_proof(author, head, request).await;
-        let peer = self.peer;
-        let authorization = self.authorization.ok_or(Error::Unreachable(
-            "history refusal has no captured authorization",
-        ))?;
-        let committed = Arc::clone(&self.work_committed);
-        match self
-            .write_owned(
-                job,
-                (0, 0, false),
-                move |room, store| {
-                    room.prepare_history_decline(
-                        store,
-                        peer,
-                        author,
-                        head,
-                        (authorization.0, authorization.1, metadata),
-                    )
-                },
-                move |pending, store| pending.commit(store, &committed),
-                |room, _, result| {
-                    if matches!(
-                        &result,
-                        crate::node::channel::HistoryDeclineResult::Stored {
-                            remembered: true,
-                            ..
-                        }
-                    ) {
-                        room.history_index_committed();
-                    }
-                    Ok(result)
-                },
-            )
-            .await?
-        {
-            Lookup::Found(saved) => match saved.value {
-                crate::node::channel::HistoryDeclineResult::Stored {
-                    remembered,
-                    current,
-                } => Ok(DeclineResult::Stored {
-                    remembered,
-                    captured: authorization.1,
-                    current,
-                }),
-                crate::node::channel::HistoryDeclineResult::AuthorizationChanged { current } => {
-                    Ok(DeclineResult::AuthorizationChanged {
-                        captured: authorization.1,
-                        current,
-                    })
-                }
-            },
-            Lookup::Busy | Lookup::Missing => {
-                Err(Error::Unreachable("history refusal was not persisted"))
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        room: Arc<Mutex<ChannelState>>,
+        room: Arc<crate::node::channel::RoomLock>,
         store: Arc<Store>,
         epoch: u64,
         peer: Digest32,
@@ -265,6 +115,7 @@ impl Source {
             authorization,
             own_head_receipt: false,
             own_recovery: false,
+            patient: false,
             work_committed,
             retirement_request,
             snapshot: None,
@@ -280,20 +131,59 @@ impl Source {
         self
     }
 
+    /// What this source may serve a peer of `standing` (`channel::room_snapshot::standing`, the
+    /// one rule the loop's teller uses too): a member anything; a returning author its own
+    /// receipt and, on an own-recovery source, its own public tree; a departed author its own
+    /// departure receipt only.
+    fn serves(&self, standing: Option<crate::node::channel::Standing>) -> bool {
+        use crate::node::channel::Standing;
+        match standing {
+            Some(Standing::Member) => true,
+            Some(Standing::Returning) => self.own_head_receipt || self.own_recovery,
+            Some(Standing::Departed) => self.own_head_receipt,
+            None => false,
+        }
+    }
+
+    /// The access a local step requires, read from the room itself: the room instance's epoch
+    /// and, for a source working for a peer, that peer's standing ([`Self::serves`]) with no
+    /// applied removal. The room's one local admission (`runtime::Flow::admit`, its peer this
+    /// node) works for no peer: this node's own removal, and the readmission that ends it, are
+    /// entries it admits, so its own standing never stops it.
+    fn room_access(&self, room: &ChannelState) -> Result<()> {
+        if room.epoch() != self.epoch {
+            return Err(Error::Unreachable("history room access changed"));
+        }
+        if self
+            .authorization
+            .is_some_and(|(node, _)| node == self.peer)
+        {
+            return Ok(());
+        }
+        let allowed = self.serves(room.standing(&self.store, &self.peer)?);
+        #[cfg(feature = "test-knobs")]
+        let mutant =
+            crate::node::computer::fx28_mutant("sync-departed-peer") && room.has_left(&self.peer);
+        #[cfg(not(feature = "test-knobs"))]
+        let mutant = false;
+        if (!mutant && !allowed) || room.peer_removal_applied(&self.store, &self.peer)? {
+            return Err(Error::Unreachable("history room access changed"));
+        }
+        Ok(())
+    }
+
     /// The access a served read requires, decided on the room's published snapshot; the
     /// peer's applied removal is read in the store, as the room-locked check read it.
     fn snapshot_access(&self, snapshot: &RoomSnapshot) -> Result<()> {
         let peer = &self.peer;
-        let departed_receipt =
-            self.own_head_receipt && snapshot.is_author(peer) && snapshot.has_left(peer);
-        let recovery = self.own_recovery && snapshot.recovery_standing(peer);
+        let allowed = self.serves(snapshot.standing(peer));
         #[cfg(feature = "test-knobs")]
         let mutant =
             crate::node::computer::fx28_mutant("sync-departed-peer") && snapshot.has_left(peer);
         #[cfg(not(feature = "test-knobs"))]
         let mutant = false;
         if snapshot.epoch() != self.epoch
-            || (!mutant && !snapshot.is_member(peer) && !departed_receipt && !recovery)
+            || (!mutant && !allowed)
             || snapshot.peer_removal_applied(&self.store, peer)?
         {
             return Err(Error::Unreachable("history room access changed"));
@@ -323,7 +213,7 @@ impl Source {
     async fn room_wait_mutant(&self) -> Result<bool> {
         #[cfg(feature = "test-knobs")]
         if std::env::var_os("VOX_MUTANT_SERVE_WAITS_ON_ROOM").is_some() {
-            let cap = Instant::now() + PENDING_WRITE_WAIT;
+            let cap = Instant::now() + std::time::Duration::from_millis(250);
             loop {
                 let room = self.room.lock().await;
                 if !room.post_pending() {
@@ -379,7 +269,7 @@ impl Source {
             .ok_or(Error::Unreachable("history room access changed"))?;
         let source = self.clone();
         // The blocking reader owns both charges; a dropped waiter cannot free them early.
-        tokio::task::spawn_blocking(move || {
+        let read = tokio::task::spawn_blocking(move || {
             let PreparedRead { charge, scratch } = admission;
             source.current()?;
             source.snapshot_access(&snapshot)?;
@@ -393,8 +283,8 @@ impl Source {
                 None => Lookup::Missing,
             })
         })
-        .await
-        .map_err(|_| Error::Unreachable("history disk reader stopped"))?
+        .await;
+        read.map_err(|_| Error::Unreachable("history disk reader stopped"))?
     }
     /// Record user-visible history work at the commit edge, independently of whether the
     /// surrounding exchange is later cancelled, superseded, retired or rejected.
@@ -411,6 +301,11 @@ impl Source {
             .ok_or(Error::Profile("history Begin has no Flow retirement owner"))
     }
 
+    /// The node and generation this source's writes were authorized under, if a peer's.
+    pub(super) fn authorization(&self) -> Option<(Digest32, Digest32)> {
+        self.authorization
+    }
+
     pub(super) fn for_own_head_receipt(&self) -> Self {
         let mut source = self.clone();
         source.own_head_receipt = true;
@@ -420,6 +315,14 @@ impl Source {
         let mut source = self.clone();
         source.own_recovery = true;
         source
+    }
+    pub(super) fn patient(&self) -> Self {
+        let mut source = self.clone();
+        source.patient = true;
+        source
+    }
+    pub(super) fn is_patient(&self) -> bool {
+        self.patient
     }
     /// Persist only contexts already exposed by a proof/header of this requester's own
     /// authenticated head. The native owner commits before the proof leaves this node.
@@ -439,7 +342,7 @@ impl Source {
                 job,
                 (128 * 1024, 128 * 1024, false),
                 move |room, store| room.prepare_recovery_contexts(store, author, head, contexts),
-                |pending, store| pending.commit(store),
+                |pending, store, _| pending.commit(store),
                 |room, _, ()| {
                     room.history_index_committed();
                     Ok(())
@@ -460,7 +363,10 @@ impl Source {
         if self.fence.is_retired() {
             return Err(Error::Unreachable("history request cancelled"));
         }
-        if matches!(boundary, ReadBoundary::Observing) && Instant::now() >= self.deadline {
+        if matches!(boundary, ReadBoundary::Observing)
+            && !self.patient
+            && Instant::now() >= self.deadline
+        {
             return Err(Error::Unreachable("history request deadline elapsed"));
         }
         Ok(())
@@ -571,26 +477,6 @@ impl Source {
         .await
     }
 
-    /// Pre-admit the exact authority-read envelope before a body append can commit. This
-    /// does no read and confers no authority; read_committed still checks the live room/grant.
-    pub(super) async fn prepare_committed_read(&self, job: &Job) -> Result<Option<PreparedRead>> {
-        self.current()?;
-        self.reserve_read(job, 0, DIRECTORY_ENVELOPE).await
-    }
-
-    pub(super) async fn read_committed<T, F>(
-        &self,
-        admission: PreparedRead,
-        read: F,
-    ) -> Result<Lookup<T>>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
-    {
-        self.read_reserved(admission, ReadBoundary::Committed, read)
-            .await
-    }
-
     async fn reserve_read(
         &self,
         job: &Job,
@@ -600,14 +486,59 @@ impl Source {
         let work_envelope = envelope
             .checked_add(temporary)
             .ok_or(Error::SizeLimitExceeded("history read envelope"))?;
-        let Some(work_job) = job.record_job(work_envelope).await else {
-            return Ok(None);
+        loop {
+            let Some(work_job) = job.record_job(work_envelope).await else {
+                return Ok(None);
+            };
+            let mut scratch = match work_job.reserve_or_pressure(work_envelope) {
+                Ok(scratch) => scratch,
+                Err(Error::HistoryCapacity(pressure)) if self.patient => {
+                    self.released(*pressure).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let charge = scratch
+                .split_off(envelope)
+                .ok_or(Error::Profile("history read reservation changed"))?;
+            return Ok(Some(PreparedRead { charge, scratch }));
+        }
+    }
+
+    /// A patient server's wait for byte credit: the release edge, or this request's end.
+    pub(super) async fn released(
+        &self,
+        pressure: crate::node::history_budget::BytePressure,
+    ) -> Result<()> {
+        let result = tokio::select! {
+            biased;
+            () = self.fence.retired() => Err(Error::Unreachable("history request cancelled")),
+            () = pressure.released() => Ok(()),
         };
-        let mut scratch = work_job.reserve_or_pressure(work_envelope)?;
-        let charge = scratch
-            .split_off(envelope)
-            .ok_or(Error::Profile("history read reservation changed"))?;
-        Ok(Some(PreparedRead { charge, scratch }))
+        result
+    }
+
+    /// Subscribe to the room's next published snapshot before a read whose answer may clear
+    /// only when the room commits again (a recipient cut still refreshing, a publication in
+    /// the middle of its transactions): every such commit publishes a new snapshot.
+    pub(super) fn next_publication(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.snapshot.as_ref().map(|cell| cell.next_publication())
+    }
+
+    /// A patient server's wait for the room's next published snapshot, or this request's end.
+    pub(super) async fn published(
+        &self,
+        next: Option<tokio::sync::watch::Receiver<()>>,
+    ) -> Result<()> {
+        let mut next = next.ok_or(Error::Unreachable("history room access changed"))?;
+        let result = tokio::select! {
+            biased;
+            () = self.fence.retired() => Err(Error::Unreachable("history request cancelled")),
+            changed = next.changed() => {
+                changed.map_err(|_| Error::Unreachable("history room access changed"))
+            }
+        };
+        result
     }
 
     async fn read_charged<T, F>(
@@ -663,22 +594,7 @@ impl Source {
         // async waiter detaches it; credit cannot be reused while the disk read still runs.
         let task = tokio::task::spawn_blocking(move || {
             source.current_at(boundary)?;
-            let departed_receipt = source.own_head_receipt
-                && room.is_author(&source.peer)
-                && room.has_left(&source.peer);
-            let recovery =
-                source.own_recovery && room.recovery_standing(&source.store, &source.peer)?;
-            #[cfg(feature = "test-knobs")]
-            let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
-                && room.has_left(&source.peer);
-            #[cfg(not(feature = "test-knobs"))]
-            let mutant = false;
-            if room.epoch() != source.epoch
-                || (!mutant && !room.is_member(&source.peer) && !departed_receipt && !recovery)
-                || room.peer_removal_applied(&source.store, &source.peer)?
-            {
-                return Err(Error::Unreachable("history room access changed"));
-            }
+            source.room_access(&room)?;
             let value = read(&mut room, &source.store)?;
             // Do not turn a completed callback into cancellation after it may have committed.
             // The actor validates the returned Flow against its current port/fence and accounts
@@ -719,14 +635,14 @@ impl Source {
         T: Send + 'static,
         O: Send + 'static,
         Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
-        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Run: FnOnce(P, &Store, &OwnedRoom<'_>) -> Result<T> + Send + 'static,
         Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
     {
         self.current()?;
         let Some(admission) = self.reserve_read(job, allocation.0, allocation.1).await? else {
             return Ok(Lookup::Busy);
         };
-        self.write_owned_reserved(admission, allocation.2, None, None, prepare, run, install)
+        self.write_owned_reserved(admission, allocation.2, None, prepare, run, install)
             .await
     }
 
@@ -744,65 +660,15 @@ impl Source {
         T: Send + 'static,
         O: Send + 'static,
         Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
-        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Run: FnOnce(P, &Store, &OwnedRoom<'_>) -> Result<T> + Send + 'static,
         Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
     {
         self.current()?;
         let Some(admission) = self.reserve_read(job, allocation.0, allocation.1).await? else {
             return Ok(Lookup::Busy);
         };
-        self.write_owned_reserved(admission, false, None, Some(request), prepare, run, install)
+        self.write_owned_reserved(admission, false, Some(request), prepare, run, install)
             .await
-    }
-
-    /// Complete an already committed write's native follow-up using its original charge.
-    /// A retired transport cannot cancel physical postcommit work. The original room instance,
-    /// epoch and caller's in-batch grant still fence every effect; no new transport authority
-    /// or budget admission is acquired.
-    pub(super) async fn continue_owned<V, P, T, Prepare, Run, Install>(
-        &self,
-        held: Held<V>,
-        instance: [u8; 16],
-        prepare: Prepare,
-        run: Run,
-        install: Install,
-    ) -> Result<Held<V>>
-    where
-        V: Send + 'static,
-        P: Send + 'static,
-        T: Send + 'static,
-        Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
-        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
-        Install: FnOnce(&mut ChannelState, &Store, T) -> Result<()> + Send + 'static,
-    {
-        let Held {
-            value,
-            _charge: mut charge,
-        } = held;
-        let scratch = charge
-            .split_off(0)
-            .ok_or(Error::Profile("history continuation reservation changed"))?;
-        let admission = PreparedRead { charge, scratch };
-        match self
-            .write_owned_reserved(
-                admission,
-                false,
-                Some(instance),
-                None,
-                prepare,
-                run,
-                move |room, store, completed| {
-                    install(room, store, completed)?;
-                    Ok(value)
-                },
-            )
-            .await?
-        {
-            Lookup::Found(held) => Ok(held),
-            Lookup::Busy | Lookup::Missing => {
-                Err(Error::Profile("history continuation lost its reservation"))
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -810,7 +676,6 @@ impl Source {
         &self,
         admission: PreparedRead,
         publication: bool,
-        continuation: Option<[u8; 16]>,
         begin: Option<RequestId>,
         prepare: Prepare,
         run: Run,
@@ -821,259 +686,286 @@ impl Source {
         T: Send + 'static,
         O: Send + 'static,
         Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
-        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Run: FnOnce(P, &Store, &OwnedRoom<'_>) -> Result<T> + Send + 'static,
         Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
     {
         let publication_flow = begin
             .map(|request| self.retirement_request().map(|root| (request, root)))
             .transpose()?;
-        let mut waited: Option<Instant> = None;
-        let mut room = loop {
-            let room = if continuation.is_some() {
-                self.room.clone().lock_owned().await
-            } else {
-                tokio::select! {
+        // Ruling correction 5. Everything this one local publication needs (its charge and
+        // scratch, `admission`) is held already. What a member's own post needs, the room's one
+        // pending write, is reserved only by the native worker that runs this step, under the
+        // room lock it re-checks in, and is released when that step ends; it is never held
+        // across a wait. An own post that holds the pending write, or waits for it
+        // (`authored_save_waits`), goes first; this step waits on the room's release, with no
+        // deadline.
+        enum Step<A, O> {
+            Wait(A),
+            Done(Result<Lookup<O>>),
+        }
+        let owner = Arc::new(());
+        let mut parts = Some((admission, prepare, run, install));
+        loop {
+            loop {
+                let room = tokio::select! {
                     biased;
                     () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
                     room = self.room.clone().lock_owned() => room,
-                }
-            };
-            if let Some(instance) = continuation {
-                if room.epoch() != self.epoch || room.history_instance(&self.store)? != instance {
-                    return Err(Error::Unreachable("history continuation room changed"));
-                }
-            } else {
-                self.current()?;
-                let departed_receipt = self.own_head_receipt
-                    && room.is_author(&self.peer)
-                    && room.has_left(&self.peer);
-                let recovery =
-                    self.own_recovery && room.recovery_standing(&self.store, &self.peer)?;
-                #[cfg(feature = "test-knobs")]
-                let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
-                    && room.has_left(&self.peer);
-                #[cfg(not(feature = "test-knobs"))]
-                let mutant = false;
-                if room.epoch() != self.epoch
-                    || (!mutant && !room.is_member(&self.peer) && !departed_receipt && !recovery)
-                    || room.peer_removal_applied(&self.store, &self.peer)?
-                {
-                    return Err(Error::Unreachable("history room access changed"));
-                }
-            }
-            // A served write stands aside for the node's own authored save: the one the
-            // room's pending write is held by, and one waiting for it (`authored_save_waits`,
-            // registered by the post worker before it waits on the same edge). Every release
-            // of the pending write wakes this edge. Wait it out: answered Busy instead, a peer
-            // fetching from a node that posts back to back paid a round, a 200 ms Busy backoff
-            // and, with the next post already announced, the restart of its flow for nearly
-            // every body it asked for (measured: a reader held 2 of 1,272 rows after a 60 s
-            // burst at 20 posts/s). A short cap over the whole wait bounds it behind a holder
-            // that stalls; past it the answer is the Busy it was. The flow's own deadline
-            // cannot serve: the reader's turn elapses first and it would see no answer.
-            if room.post_pending() || (continuation.is_none() && room.authored_save_waits()) {
-                let wake = room.history_publication_wake();
-                drop(room);
-                if continuation.is_some() {
-                    wake.await;
-                } else {
-                    let cap = *waited.get_or_insert_with(|| Instant::now() + PENDING_WRITE_WAIT);
+                };
+                self.check_write_access(&room)?;
+                if room.post_pending() || room.authored_save_waits() {
+                    let wake = room.history_publication_wake();
+                    drop(room);
                     tokio::select! {
                         biased;
                         () = self.fence.retired() => {
                             return Err(Error::Unreachable("history request cancelled"));
                         }
-                        () = tokio::time::sleep_until(cap) => return Ok(Lookup::Busy),
                         () = wake => {}
                     }
+                    continue;
                 }
-                continue;
-            }
-            if !publication && room.history_publication_busy(&self.store)? {
-                if continuation.is_none() {
-                    // This operation has not inspected evidence: another native publication
-                    // owns the room. Proof serving must not turn that wait into a durable
-                    // EvidenceUnavailable refusal for an otherwise retained signed head.
-                    return Ok(Lookup::Busy);
-                }
-                let wake = room.history_publication_wake();
-                drop(room);
-                wake.await;
-                continue;
-            }
-            break room;
-        };
-        let room_instance = room.history_instance(&self.store)?;
-        let input_instance = room.generation();
-        let input_channel = room.channel_id();
-        let pending = prepare(&mut room, &self.store)?;
-        let owner = Arc::new(());
-        let mut pin =
-            room.reserve_pending_history_write(&self.store, Arc::clone(&owner), publication)?;
-        if let Some((request, root)) = publication_flow {
-            if let Err(error) = room.register_history_publication_flow(&self.store, request, root) {
-                room.release_pending_text(&owner, false);
-                return Err(error);
-            }
-        }
-        drop(room);
-        let source = self.clone();
-        let recovery_room = Arc::clone(&self.room);
-        let recovery_store = Arc::clone(&self.store);
-        let recovery_owner = Arc::clone(&owner);
-        let task = tokio::task::spawn_blocking(move || {
-            let PreparedRead { charge, scratch } = admission;
-            #[cfg(feature = "test-knobs")]
-            if let Some(path) = std::env::var_os("VOX_TEST_HOLD_ROOM_WRITE")
-                .map(std::path::PathBuf::from)
-                .filter(|path| {
-                    !publication
-                        && std::fs::read(path).is_ok_and(|bytes| bytes.as_slice() == input_channel)
-                })
-            {
-                let detail = format!(
-                    "history receiver {}; publication={publication}",
-                    std::any::type_name::<P>()
-                );
-                let _ = std::fs::write(path.with_extension("engaged"), &detail);
-                eprintln!("vox: holding {detail}");
-                while path.exists() {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                eprintln!("vox: released {detail}");
-            }
-            // Every physical callback and its room guard unwind before failure releases the
-            // exact reservation. Dropping the async waiter never cancels this native owner.
-            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let input_source = source.clone();
-                let input_owner = Arc::clone(&owner);
-                let input_epoch = source.epoch;
-                let input_authorization = source.authorization;
-                let metadata_source = source.clone();
-                let metadata_owner = Arc::clone(&owner);
-                let metadata_instance = Arc::clone(&input_instance);
-                let input = crate::node::channel::semantic_projection::SelectedReceiverInput::new(
-                    move |slot| {
-                        let room = input_source.room.blocking_lock();
-                        room.classification_receiver_bytes(
-                            slot,
-                            &input_owner,
-                            input_epoch,
-                            &input_instance,
-                        )
-                    },
-                    move |slot, iteration| {
-                        let room = metadata_source.room.blocking_lock();
-                        room.classification_receiver_metadata(
-                            slot,
-                            iteration,
-                            &metadata_owner,
-                            input_epoch,
-                            &metadata_instance,
-                        )
-                    },
-                    move |batch| {
-                        if let Some((node, generation)) = input_authorization {
-                            if super::authorization_generation_in(
-                                batch,
-                                node,
-                                input_channel,
-                                room_instance,
-                                input_epoch,
-                            )? != generation
-                            {
-                                return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
-                            }
+                if !publication && room.history_publication_busy(&self.store)? {
+                    if !self.patient {
+                        // This operation has not inspected evidence: another native publication
+                        // owns the room. Proof serving must not turn that wait into a durable
+                        // EvidenceUnavailable refusal for an otherwise retained signed head. A
+                        // patient (loop) answer waits for the publication's end instead, as for
+                        // an own post above: answered, never refused Busy.
+                        return Ok(Lookup::Busy);
+                    }
+                    let wake = room.history_publication_wake();
+                    drop(room);
+                    tokio::select! {
+                        biased;
+                        () = self.fence.retired() => {
+                            return Err(Error::Unreachable("history request cancelled"));
                         }
-                        Ok(())
-                    },
-                );
-                let saved = input.scope(|| run(pending, &source.store));
-                let mut room = source.room.blocking_lock();
-                let owns = room.owns_pending_history_write(&owner);
-                if owns {
-                    room.history_index_committed();
+                        () = wake => {}
+                    }
+                    continue;
                 }
-                let result = saved.and_then(|value| {
-                    if !owns {
-                        return Err(Error::Unreachable("history publication owner changed"));
-                    }
-                    if room.epoch() != source.epoch
-                        || room.history_instance(&source.store)? != room_instance
+                break;
+            }
+            let inputs = parts
+                .take()
+                .ok_or(Error::Profile("history write lost its inputs"))?;
+            let source = self.clone();
+            let recovery_room = Arc::clone(&self.room);
+            let recovery_store = Arc::clone(&self.store);
+            let recovery_owner = Arc::clone(&owner);
+            let owner = Arc::clone(&owner);
+            let task = tokio::task::spawn_blocking(move || {
+                let mut room = source.room.blocking_lock();
+                if let Err(error) = source.check_write_access(&room) {
+                    return Step::Done(Err(error));
+                }
+                let busy = match room.history_publication_busy(&source.store) {
+                    Ok(busy) => !publication && busy,
+                    Err(error) => return Step::Done(Err(error)),
+                };
+                if room.post_pending() || room.authored_save_waits() || busy {
+                    return Step::Wait(inputs);
+                }
+                let (admission, prepare, run, install) = inputs;
+                let room_instance = match room.history_instance(&source.store) {
+                    Ok(instance) => instance,
+                    Err(error) => return Step::Done(Err(error)),
+                };
+                let input_instance = room.generation();
+                let input_channel = room.channel_id();
+                let pending = match prepare(&mut room, &source.store) {
+                    Ok(pending) => pending,
+                    Err(error) => return Step::Done(Err(error)),
+                };
+                let mut pin = match room.reserve_pending_history_write(
+                    &source.store,
+                    Arc::clone(&owner),
+                    publication,
+                ) {
+                    Ok(pin) => pin,
+                    Err(error) => return Step::Done(Err(error)),
+                };
+                if let Some((request, root)) = publication_flow {
+                    if let Err(error) =
+                        room.register_history_publication_flow(&source.store, request, root)
                     {
-                        return Err(Error::Unreachable("history publication room changed"));
+                        room.release_pending_text(&owner, false);
+                        return Step::Done(Err(error));
                     }
-                    install(&mut room, &source.store, value)
-                });
-                room.release_pending_text(&owner, false);
-                let publication = if owns {
-                    let published = room
-                        .publish_history_read(Arc::clone(&source.store))
-                        .map(|_| ());
-                    if published.is_err() {
-                        pin.retain_saved_read();
+                }
+                drop(room);
+                let PreparedRead { charge, scratch } = admission;
+                #[cfg(feature = "test-knobs")]
+                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_ROOM_WRITE")
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| {
+                        !publication
+                            && std::fs::read(path)
+                                .is_ok_and(|bytes| bytes.as_slice() == input_channel)
+                    })
+                {
+                    let detail = format!(
+                        "history receiver {}; publication={publication}",
+                        std::any::type_name::<P>()
+                    );
+                    let _ = std::fs::write(path.with_extension("engaged"), &detail);
+                    eprintln!("vox: holding {detail}");
+                    while path.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    published.and_then(|()| room.history_write_released(&source.store))
-                } else {
-                    Ok(())
-                };
-                let settled = if let Some((request, root)) = publication_flow {
-                    room.settle_history_publication_flow(&source.store, request, root)
-                } else {
-                    Ok(())
-                };
-                result.and_then(|value| publication.and(settled).map(|()| value))
-            }));
-            let result = match completed {
-                Ok(result) => result,
-                Err(_) => {
-                    let error = Error::Profile("history save worker stopped");
+                    eprintln!("vox: released {detail}");
+                }
+                // Every physical callback and its room guard unwind before failure releases the
+                // exact reservation. Dropping the async waiter never cancels this native owner.
+                let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let input_source = source.clone();
+                    let input_owner = Arc::clone(&owner);
+                    let input_epoch = source.epoch;
+                    let input_authorization = source.authorization;
+                    let metadata_source = source.clone();
+                    let metadata_owner = Arc::clone(&owner);
+                    let metadata_instance = Arc::clone(&input_instance);
+                    let input =
+                        crate::node::channel::semantic_projection::SelectedReceiverInput::new(
+                            move |slot| {
+                                let room = input_source.room.blocking_lock();
+                                room.classification_receiver_bytes(
+                                    slot,
+                                    &input_owner,
+                                    input_epoch,
+                                    &input_instance,
+                                )
+                            },
+                            move |slot, iteration| {
+                                let room = metadata_source.room.blocking_lock();
+                                room.classification_receiver_metadata(
+                                    slot,
+                                    iteration,
+                                    &metadata_owner,
+                                    input_epoch,
+                                    &metadata_instance,
+                                )
+                            },
+                            move |batch| {
+                                if let Some((node, generation)) = input_authorization {
+                                    if super::authorization_generation_in(
+                                        batch,
+                                        node,
+                                        input_channel,
+                                        room_instance,
+                                        input_epoch,
+                                    )? != generation
+                                    {
+                                        return Err(Error::StreamRefused(
+                                            super::AUTHORIZATION_CHANGED,
+                                        ));
+                                    }
+                                }
+                                Ok(())
+                            },
+                        );
+                    let owned = OwnedRoom {
+                        source: &source,
+                        owner: &owner,
+                        instance: room_instance,
+                    };
+                    let saved = input.scope(|| run(pending, &source.store, &owned));
                     let mut room = source.room.blocking_lock();
-                    if room.owns_pending_history_write(&owner) {
+                    let owns = room.owns_pending_history_write(&owner);
+                    if owns {
                         room.history_index_committed();
-                        room.fail_pending_history_write(&owner, &error);
                     }
+                    let result = saved.and_then(|value| {
+                        if !owns {
+                            return Err(Error::Unreachable("history publication owner changed"));
+                        }
+                        if room.epoch() != source.epoch
+                            || room.history_instance(&source.store)? != room_instance
+                        {
+                            return Err(Error::Unreachable("history publication room changed"));
+                        }
+                        install(&mut room, &source.store, value)
+                    });
                     room.release_pending_text(&owner, false);
+                    let publication = if owns {
+                        let published = room
+                            .publish_history_read(Arc::clone(&source.store))
+                            .map(|_| ());
+                        if published.is_err() {
+                            pin.retain_saved_read();
+                        }
+                        published
+                    } else {
+                        Ok(())
+                    };
                     let settled = if let Some((request, root)) = publication_flow {
                         room.settle_history_publication_flow(&source.store, request, root)
                     } else {
                         Ok(())
                     };
-                    settled.and(Err(error))
+                    result.and_then(|value| publication.and(settled).map(|()| value))
+                }));
+                let result = match completed {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let error = Error::Profile("history save worker stopped");
+                        let mut room = source.room.blocking_lock();
+                        if room.owns_pending_history_write(&owner) {
+                            room.history_index_committed();
+                            room.fail_pending_history_write(&owner, &error);
+                        }
+                        room.release_pending_text(&owner, false);
+                        let settled = if let Some((request, root)) = publication_flow {
+                            room.settle_history_publication_flow(&source.store, request, root)
+                        } else {
+                            Ok(())
+                        };
+                        settled.and(Err(error))
+                    }
+                };
+                drop(pin);
+                drop(scratch);
+                Step::Done(result.map(|value| {
+                    Lookup::Found(Held {
+                        value,
+                        _charge: charge,
+                    })
+                }))
+            });
+            match task.await {
+                Ok(Step::Wait(inputs)) => parts = Some(inputs),
+                Ok(Step::Done(result)) => return result,
+                Err(_) => {
+                    // A native task that stopped outside its unwind guard may own the room's
+                    // reservation. A joined cleanup, never an aborted waiter, settles it.
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let error = Error::Unreachable("history save completion stopped");
+                        let mut room = recovery_room.blocking_lock();
+                        if room.owns_pending_history_write(&recovery_owner) {
+                            room.history_index_committed();
+                            room.fail_pending_history_write(&recovery_owner, &error);
+                        }
+                        room.release_pending_text(&recovery_owner, false);
+                        if let Some((request, root)) = publication_flow {
+                            room.settle_history_publication_flow(&recovery_store, request, root)?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|_| Error::Unreachable("history save cleanup stopped"))??;
+                    return Err(Error::Unreachable("history save completion stopped"));
                 }
-            };
-            drop(pin);
-            drop(scratch);
-            result.map(|value| {
-                Lookup::Found(Held {
-                    value,
-                    _charge: charge,
-                })
-            })
-        });
-        match task.await {
-            Ok(result) => result,
-            Err(_) => {
-                // A native task canceled before starting owns no commit, but its room pin was
-                // reserved already. A joined failure, never an aborted waiter, settles it.
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let error = Error::Unreachable("history save completion stopped");
-                    let mut room = recovery_room.blocking_lock();
-                    if room.owns_pending_history_write(&recovery_owner) {
-                        room.history_index_committed();
-                        room.fail_pending_history_write(&recovery_owner, &error);
-                    }
-                    room.release_pending_text(&recovery_owner, false);
-                    if let Some((request, root)) = publication_flow {
-                        room.settle_history_publication_flow(&recovery_store, request, root)?;
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(|_| Error::Unreachable("history save cleanup stopped"))??;
-                Err(Error::Unreachable("history save completion stopped"))
             }
         }
+    }
+
+    /// The serving peer may still write here: the room's epoch, its membership (or the
+    /// departed receipt or recovery standing it was admitted by) and no applied removal.
+    fn check_write_access(&self, room: &ChannelState) -> Result<()> {
+        self.current()?;
+        self.room_access(room)?;
+        Ok(())
     }
 
     pub(super) async fn write_admission<T, F>(
@@ -1085,25 +977,6 @@ impl Source {
     where
         T: Send + 'static,
         F: FnOnce(&crate::node::channel::HistoryAdmission<'_>, &Store) -> Result<T>
-            + Send
-            + 'static,
-    {
-        self.write_admission_available(job, allocation, move |room, store| {
-            operation(room, store).map(|value| (value, false))
-        })
-        .await
-    }
-
-    /// Publish a serving edge only after the exact admission transaction installs.
-    pub(super) async fn write_admission_available<T, F>(
-        &self,
-        job: &Job,
-        allocation: (usize, usize),
-        operation: F,
-    ) -> Result<Lookup<T>>
-    where
-        T: Send + 'static,
-        F: FnOnce(&crate::node::channel::HistoryAdmission<'_>, &Store) -> Result<(T, bool)>
             + Send
             + 'static,
     {
@@ -1126,13 +999,8 @@ impl Source {
                 }
                 room.prepare_history_admission(store, authorization)
             },
-            move |pending, store| pending.with(|room| operation(room, store)),
-            |room, _, (value, available)| {
-                if available {
-                    room.note_history_available();
-                }
-                Ok(value)
-            },
+            move |pending, store, _| pending.with(|room| operation(room, store)),
+            |_, _, value| Ok(value),
         )
         .await
     }
@@ -1143,6 +1011,23 @@ impl Source {
                 .await?,
             Lookup::Found(_)
         ))
+    }
+
+    /// The per-frame authorization of [`Self::authorize`], for a frame of an answer already
+    /// assembled and about to be written: the room's snapshot cell it was served from still
+    /// publishes (it is revoked when the room is poisoned, locked or closed), and the peer still
+    /// has, in that snapshot, the access this answer was served under, its applied removal read
+    /// in the store as before. No job: one removal read, while no shared admission is held.
+    pub(super) async fn still_authorized(&self) -> Result<()> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .and_then(|cell| cell.current())
+            .ok_or(Error::Unreachable("history room access changed"))?;
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || source.snapshot_access(&snapshot))
+            .await
+            .map_err(|_| Error::Unreachable("history disk reader stopped"))?
     }
 
     /// Resolve the head a request names to one committed source head of the same room, scope and
@@ -1287,6 +1172,9 @@ impl Source {
             else {
                 return Ok(Lookup::Busy);
             };
+            // Subscribed before the read: a step that meets a publication in progress waits
+            // for the room's next published snapshot (the publication's end commits).
+            let published = cell.next_publication();
             let snapshot = cell
                 .current()
                 .ok_or(Error::Unreachable("history room access changed"))?;
@@ -1315,6 +1203,11 @@ impl Source {
                     }));
                 }
                 crate::node::channel::ProofRangeStep::Missing => return Ok(Lookup::Missing),
+                crate::node::channel::ProofRangeStep::Busy if self.patient => {
+                    drop(charge);
+                    self.published(Some(published)).await?;
+                    continue;
+                }
                 crate::node::channel::ProofRangeStep::Busy => return Ok(Lookup::Busy),
                 crate::node::channel::ProofRangeStep::Progress => {}
             }
@@ -1338,13 +1231,18 @@ impl Source {
     ) -> Result<Lookup<Proof>> {
         let head = &target.target;
         self.current()?;
-        let charge = match job.reserve_or_pressure(1024 * 1024) {
-            Ok(charge) => charge,
-            // Serving retains wire Busy; a client retains the exact byte-release wait.
-            Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
-                return Ok(Lookup::Busy);
+        let charge = loop {
+            match job.reserve_or_pressure(1024 * 1024) {
+                Ok(charge) => break charge,
+                Err(Error::HistoryCapacity(pressure)) if self.patient => {
+                    self.released(*pressure).await?;
+                }
+                // Serving retains wire Busy; a client retains the exact byte-release wait.
+                Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                    return Ok(Lookup::Busy);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         if to > head.root.leaves {
             return Err(Error::MalformedBundle("proof exceeds requested head"));
@@ -1447,13 +1345,10 @@ impl Source {
         if lo == 0 || lo > hi || hi > head.root.leaves {
             return Err(Error::MalformedBundle("control interval differs from head"));
         }
-        let redundant = redundant_control();
         let tokens = 'interval: loop {
             let mut pending = vec![(1u64, head.root.leaves)];
             let mut tokens = Vec::new();
             let mut headers = 0;
-            // The end of the last node without controls served expanded (test-knobs only).
-            let mut expanded = 0;
             while let Some((start, leaves)) = pending.pop() {
                 self.current()?;
                 if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
@@ -1470,11 +1365,7 @@ impl Source {
                 let end = start
                     .checked_add(leaves - 1)
                     .ok_or(Error::MalformedAtRest("history range overflow"))?;
-                let wasteful = redundant.is_some()
-                    && descriptor.controls == 0
-                    && leaves > 1
-                    && start > expanded;
-                if end < lo || start > hi || (descriptor.controls == 0 && !wasteful) {
+                if end < lo || start > hi || descriptor.controls == 0 {
                     tokens.push(ControlToken::Collapse(descriptor));
                 } else if leaves == 1 {
                     if headers == MAX_CONTROL_HEADERS {
@@ -1496,10 +1387,6 @@ impl Source {
                         .await?;
                     match found {
                         Lookup::Found(found) => {
-                            #[cfg(feature = "mutant-sender")]
-                            if crate::log::sync::mutant::withholds(&found.value) {
-                                return Ok(Lookup::Missing);
-                            }
                             tokens.push(ControlToken::Leaf(Box::new(found.value)));
                             headers += 1;
                         }
@@ -1507,34 +1394,12 @@ impl Source {
                         Lookup::Missing => return Ok(Lookup::Missing),
                     }
                 } else {
-                    if wasteful {
-                        expanded = end;
-                    }
                     let left = split(leaves)?;
                     tokens.push(ControlToken::Branch);
                     pending.push((start + left, leaves - left));
                     pending.push((start, left));
                 }
                 tokio::task::yield_now().await;
-            }
-            #[cfg(feature = "test-knobs")]
-            if let Some(path) = redundant.as_ref().filter(|_| expanded > 0) {
-                use std::fmt::Write as _;
-                use std::io::Write as _;
-                let mut line = String::with_capacity(96);
-                for byte in target.id {
-                    let _ = write!(line, "{byte:02x}");
-                }
-                let _ = writeln!(line, " {lo} {hi}");
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path.with_extension("served"))
-                    .and_then(|mut file| file.write_all(line.as_bytes()))
-                    .map_err(|error| Error::Storage {
-                        op: "redundant control marker",
-                        detail: error.to_string(),
-                    })?;
             }
             break tokens;
         };
@@ -1569,23 +1434,6 @@ impl Source {
             _charge: charge,
         }))
     }
-}
-
-/// `VOX_TEST_REDUNDANT_CONTROL_FILE=<path>`: while `<path>` exists this node serves control
-/// proofs as a hostile relay may: each node without controls inside the asked interval, which
-/// the walk above collapses, is expanded once into its two collapsed halves. The proof still
-/// verifies, though no serving walk visits those halves. Each such proof is noted, as
-/// `<head hex> <lo> <hi>`, in `<path>.served`.
-#[cfg(feature = "test-knobs")]
-fn redundant_control() -> Option<std::path::PathBuf> {
-    std::env::var_os("VOX_TEST_REDUNDANT_CONTROL_FILE")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.exists())
-}
-
-#[cfg(not(feature = "test-knobs"))]
-const fn redundant_control() -> Option<std::path::PathBuf> {
-    None
 }
 
 /// `VOX_MUTANT_PREFIX_GATE=header|proof|entry|inclusion|consistency|control`: that serving
@@ -1633,566 +1481,67 @@ impl Source {
         .await
         .map_err(|_| Error::Unreachable("history flush worker stopped"))?
     }
+}
 
-    /// One bounded, charged scalar inventory. Every page rechecks current room access;
-    /// the compact index is read without touching content bodies or walking the archive.
-    pub(super) async fn inventory(
-        &self,
-        job: &Job,
-    ) -> Result<
-        Lookup<(
-            Vec<super::HeadHint>,
-            Option<RoleAnnouncement>,
-            Option<([u8; 16], u64)>,
-            Option<CatalogAnnouncement>,
-            super::super::channel::availability::Token,
-            (Vec<Digest32>, Vec<super::HeadHint>),
-        )>,
-    > {
-        let charge = job.reserve_or_pressure(
-            (crate::log::history::MAX_CONTEXT_AUTHORS + 2) * std::mem::size_of::<super::HeadHint>()
-                + crate::log::history::MAX_CONTEXT_AUTHORS
-                    * (std::mem::size_of::<Digest32>() + std::mem::size_of::<super::HeadHint>()),
-        )?;
-        let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
-        let mut after = None;
-        for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
-            self.current()?;
-            let page = self
-                .serve_read(job, 64 * 1024, move |room, store| {
-                    room.history_head_hints(store, after)
-                        .map(|page| Some((room.channel_id(), page)))
-                })
-                .await?;
-            let Lookup::Found(page) = page else {
-                return Ok(Lookup::Busy);
-            };
-            let (room_id, page) = page.value;
-            if hints.len() + page.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
-                return Err(Error::SizeLimitExceeded("inventory author bound"));
-            }
-            hints.extend(page.heads.iter().map(|hint| super::HeadHint {
-                author: hint.author,
-                size: hint.leaves,
-                head: hint.head,
-            }));
-            match page.next {
-                Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
-                None => {
-                    let peer = self.peer;
-                    let role = match self
-                        .serve_read(job, 128 * 1024, move |room, store| {
-                            let owner = room.role_owed();
-                            let role =
-                                room.history_role_head(store, &peer)?
-                                    .map(|head| super::HeadHint {
-                                        author: peer,
-                                        size: head.root.leaves,
-                                        head: head.id(),
-                                    });
-                            let notice = if let Some(head) = role {
-                                owner.observe(peer, head);
-                                owner.snapshot(peer).map(|(token, head)| RoleAnnouncement {
-                                    owner,
-                                    peer,
-                                    token,
-                                    head,
-                                })
-                            } else {
-                                owner.unavailable(peer);
-                                None
-                            };
-                            Ok(Some(notice))
-                        })
-                        .await?
-                    {
-                        Lookup::Found(role) => role.value,
-                        Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
-                    };
-                    let (key_catalog, catalog_announcement) = match self
-                        .serve_read(job, 128 * 1024, move |room, store| {
-                            let instance = room.history_instance(store)?;
-                            let tip = room.history_read(store)?.key_package_tip()?;
-                            let owner = room.role_owed();
-                            let notice = owner
-                                .key_catalog_announcement(peer)
-                                .map(|token| CatalogAnnouncement { owner, peer, token });
-                            Ok(Some(((instance, tip), notice)))
-                        })
-                        .await?
-                    {
-                        Lookup::Found(hint) => (Some(hint.value.0), hint.value.1),
-                        Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
-                    };
-                    let mut authors: Vec<_> = hints.iter().map(|hint| hint.author).collect();
-                    if role.is_some() && !authors.contains(&peer) {
-                        authors.push(peer);
-                    }
-                    self.flush_authors_before_ack(room_id, authors).await?;
-                    let Lookup::Found(availability) = self
-                        .serve_read(job, 0, move |room, store| {
-                            // MP-9: the forks this node recorded and (rule 6) its unresolved
-                            // second heads, each a reason for the peer to ask, never evidence.
-                            let mut forks = room.history_fork_authors();
-                            if super::admission::fork_mutant_is("fork-unpropagated") {
-                                forks.clear();
-                            }
-                            let unresolved =
-                                if super::admission::fork_mutant_is("second-head-unkept") {
-                                    Vec::new()
-                                } else {
-                                    room.history_unresolved_hints(store)?
-                                        .into_iter()
-                                        .map(|hint| super::HeadHint {
-                                            author: hint.author,
-                                            size: hint.leaves,
-                                            head: hint.head,
-                                        })
-                                        .collect()
-                                };
-                            Ok(Some((
-                                room.availability_peer(peer)?.local(),
-                                (forks, unresolved),
-                            )))
-                        })
-                        .await?
-                    else {
-                        return Ok(Lookup::Busy);
-                    };
-                    let (availability, forks) = availability.value;
-                    return Ok(Lookup::Found(Held {
-                        value: (
-                            hints,
-                            role,
-                            key_catalog,
-                            catalog_announcement,
-                            availability,
-                            forks,
-                        ),
-                        _charge: charge,
-                    }));
-                }
-                _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
-            }
+/// The room again between two native transactions of one owned write, which still holds the
+/// room's pending write: the mutex is taken for one bounded in-memory step and dropped before
+/// the next native commit, as the write's own prepare and install are. Nothing is published
+/// until the write's one install ends.
+pub(super) struct OwnedRoom<'a> {
+    source: &'a Source,
+    owner: &'a Arc<()>,
+    instance: [u8; 16],
+}
+
+impl OwnedRoom<'_> {
+    /// The room, after a commit of this write: still this write's own, still the room it began
+    /// in. An install of what committed needs no more. While it is held, the native write's
+    /// receiver input is withheld (`SelectedReceiverInput::withhold`): a step under this lock
+    /// runs as the write's own prepare and install do, outside that input, so nothing it calls
+    /// can lock the room a second time on this thread.
+    pub(super) fn lock(&self) -> Result<RoomHeld<'_>> {
+        let withheld = crate::node::channel::semantic_projection::SelectedReceiverInput::withhold();
+        let room = self.source.room.blocking_lock();
+        if !room.owns_pending_history_write(self.owner) {
+            return Err(Error::Unreachable("history publication owner changed"));
         }
-        Err(Error::SizeLimitExceeded("inventory index slice bound"))
-    }
-
-    pub(super) async fn observe_availability(
-        &self,
-        job: &Job,
-        connection: u64,
-        token: super::super::channel::availability::Token,
-    ) -> Result<()> {
-        let peer = self.peer;
-        match self
-            .serve_read(job, 0, move |room, _| {
-                room.availability_peer(peer)?.observe(connection, token);
-                Ok(Some(()))
-            })
-            .await?
+        if room.epoch() != self.source.epoch
+            || room.history_instance(&self.source.store)? != self.instance
         {
-            Lookup::Found(_) => Ok(()),
-            _ => Err(Error::Unreachable("availability room read busy")),
+            return Err(Error::Unreachable("history publication room changed"));
         }
+        room.history_index_committed();
+        Ok(RoomHeld {
+            room,
+            _withheld: withheld,
+        })
     }
 
-    /// A peer's role advertisement wakes an authenticated query; it is not a receipt.
-    pub(super) async fn offer_role(
-        &self,
-        job: &Job,
-        inbox: &super::HintInbox,
-        generation: u64,
-        room_id: Digest32,
-        connection: u64,
-        role: Option<super::HeadHint>,
-    ) -> Result<super::hints::Offer> {
-        let Some(role) = role else {
-            return Ok(super::hints::Offer::default());
-        };
-        let author = role.author;
-        let peer = self.peer;
-        let epoch = self.epoch;
-        let current = self
-            .serve_read(job, 128, move |room, store| {
-                if room.channel_id() != room_id || room.me() != author {
-                    return Err(Error::MalformedBundle("history role hint binding"));
-                }
-                let Some(incarnations) = room
-                    .history_inventory_incarnation(&peer)
-                    .zip(room.history_author_inventory_incarnation(&author))
-                else {
-                    return Ok(None);
-                };
-                let instance = room.history_instance(store)?;
-                let authorization =
-                    super::authorization_generation(store, author, room_id, instance, epoch)?;
-                let scope = crate::node::ports::SupportDiscovery {
-                    connection,
-                    instance,
-                    epoch,
-                    authorization,
-                };
-                Ok(Some((
-                    room.held_through(&peer).is_none_or(|held| held < role.size),
-                    scope,
-                    incarnations,
-                )))
-            })
-            .await?;
-        let (needed, scope, incarnations) = match current {
-            Lookup::Found(held) => held.value,
-            Lookup::Busy | Lookup::Missing => {
-                return Err(Error::Unreachable("history role hint authority busy"));
-            }
-        };
-        if !needed {
-            return Ok(super::hints::Offer::default());
-        }
-        inbox.offer_role(generation, room_id, self.peer, scope, incarnations, role)
+    /// The room before a further write of this owned write: the same access every owned write
+    /// checks before it prepares (`check_write_access`).
+    pub(super) fn lock_for_write(&self) -> Result<RoomHeld<'_>> {
+        let room = self.lock()?;
+        self.source.check_write_access(&room)?;
+        Ok(room)
     }
+}
 
-    /// A catalog watermark is an unauthoritative scheduling hint for this exact peer.
-    pub(super) async fn offer_key_catalog(
-        &self,
-        job: &Job,
-        hint: Option<([u8; 16], u64)>,
-        connection_serial: u64,
-    ) -> Result<()> {
-        let Some((instance, tip)) = hint else {
-            return Ok(());
-        };
-        if instance == [0; 16] {
-            return Err(Error::MalformedBundle("key catalog instance is zero"));
-        }
-        let peer = self.peer;
-        match self
-            .serve_read(job, 128, move |room, _store| {
-                room.role_owed()
-                    .observe_key_catalog(peer, instance, tip, connection_serial);
-                Ok(Some(()))
-            })
-            .await?
-        {
-            Lookup::Found(_) => Ok(()),
-            Lookup::Busy | Lookup::Missing => {
-                Err(Error::Unreachable("key catalog hint authority busy"))
-            }
-        }
+/// The room held by [`OwnedRoom`]; the lock is released before the receiver input comes back.
+pub(super) struct RoomHeld<'a> {
+    room: tokio::sync::MutexGuard<'a, ChannelState>,
+    _withheld: crate::node::channel::semantic_projection::Withheld,
+}
+
+impl std::ops::Deref for RoomHeld<'_> {
+    type Target = ChannelState;
+
+    fn deref(&self) -> &ChannelState {
+        &self.room
     }
+}
 
-    /// Complete only the exact notice after the peer processed the inventory and while the
-    /// originating room and trust incarnation are still current.
-    pub(super) async fn acknowledge_role(&self, job: &Job, notice: RoleAnnouncement) -> Result<()> {
-        let authorization = self.authorization;
-        let epoch = self.epoch;
-        match self
-            .read(job, 128, move |room, store| {
-                if !Arc::ptr_eq(&room.role_owed(), &notice.owner) {
-                    return Ok(Some(()));
-                }
-                if let Some((node, expected)) = authorization {
-                    let room_id = room.channel_id();
-                    let current = super::authorization_generation(
-                        store,
-                        node,
-                        room_id,
-                        room.history_instance(store)?,
-                        epoch,
-                    )?;
-                    if current != expected {
-                        return Ok(Some(()));
-                    }
-                }
-                notice.owner.ack(notice.peer, &notice.token);
-                Ok(Some(()))
-            })
-            .await?
-        {
-            Lookup::Found(_) => Ok(()),
-            Lookup::Busy | Lookup::Missing => Err(Error::Unreachable(
-                "history role announcement confirmation busy",
-            )),
-        }
-    }
-
-    /// Retire only the catalog change whose matching inventory reached the peer.
-    pub(super) async fn acknowledge_key_catalog(
-        &self,
-        job: &Job,
-        notice: CatalogAnnouncement,
-        connection_serial: u64,
-    ) -> Result<()> {
-        let authorization = self.authorization;
-        let epoch = self.epoch;
-        match self
-            .read(job, 128, move |room, store| {
-                if !Arc::ptr_eq(&room.role_owed(), &notice.owner) {
-                    return Ok(Some(()));
-                }
-                if let Some((node, expected)) = authorization {
-                    let current = super::authorization_generation(
-                        store,
-                        node,
-                        room.channel_id(),
-                        room.history_instance(store)?,
-                        epoch,
-                    )?;
-                    if current != expected {
-                        return Ok(Some(()));
-                    }
-                }
-                notice.owner.ack_key_catalog_announcement(
-                    notice.peer,
-                    &notice.token,
-                    connection_serial,
-                );
-                Ok(Some(()))
-            })
-            .await?
-        {
-            Lookup::Found(_) => Ok(()),
-            Lookup::Busy | Lookup::Missing => Err(Error::Unreachable(
-                "key catalog announcement confirmation busy",
-            )),
-        }
-    }
-
-    pub(super) async fn transient_scope(
-        &self,
-        job: &Job,
-        room_id: Digest32,
-        author: Digest32,
-        connection: u64,
-    ) -> Result<Option<super::hints::TransientScope>> {
-        let peer = self.peer;
-        let epoch = self.epoch;
-        let captured = self.authorization.map(|(_, generation)| generation);
-        match self
-            .read(job, 128, move |room, store| {
-                if room.channel_id() != room_id {
-                    return Err(Error::MalformedBundle("history refusal room binding"));
-                }
-                Ok(Some(super::hints::TransientScope {
-                    connection,
-                    // A late response belongs to its original grant, never a later regrant.
-                    authorization: match captured {
-                        Some(generation) => generation,
-                        None => super::authorization_generation(
-                            store,
-                            room.me(),
-                            room_id,
-                            room.history_instance(store)?,
-                            epoch,
-                        )?,
-                    },
-                    incarnations: room
-                        .history_inventory_incarnation(&peer)
-                        .zip(room.history_author_inventory_incarnation(&author)),
-                }))
-            })
-            .await?
-        {
-            Lookup::Found(scope) => Ok(Some(scope.value)),
-            Lookup::Busy => Ok(None),
-            Lookup::Missing => Err(Error::Unreachable("history room access changed")),
-        }
-    }
-
-    /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
-    /// A completed terminal control is not receipt of the content before it. Keep hints
-    /// eligible until their selected newest window is visited and has no missing positions.
-    /// A peer's BodyNotHeld is not a global absence verdict: a later hint may retry those
-    /// positions from another peer without rewinding the main cursor or draining older history.
-    /// The caller holds the original HAVE's decode charge and preserves this inbox generation.
-    pub(super) async fn offer_inventory(
-        &self,
-        job: &Job,
-        inbox: &super::HintInbox,
-        generation: u64,
-        room_id: Digest32,
-        connection: u64,
-        hints: &[super::HeadHint],
-    ) -> Result<super::hints::Offer> {
-        if hints.len() > 64 {
-            return Err(Error::SizeLimitExceeded("inventory filter slice"));
-        }
-        // Input copy and returned vector coexist inside this small prepaid envelope.
-        let Some(input_charge) = job.reserve(64 * std::mem::size_of::<super::HeadHint>()) else {
-            return Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            });
-        };
-        let peer = self.peer;
-        let slice = hints.to_vec();
-        let committed = Arc::clone(&self.work_committed);
-        let output_envelope = 64
-            * (std::mem::size_of::<super::HeadHint>()
-                + std::mem::size_of::<(Digest32, Digest32)>()
-                + std::mem::size_of::<super::hints::TransientScope>()
-                + std::mem::size_of::<super::HeadHint>()
-                + std::mem::size_of::<Digest32>())
-            + std::mem::size_of::<usize>();
-        let filtered = self
-            .serve_read(job, output_envelope, move |room, store| {
-                let _input_charge = input_charge;
-                if room.channel_id() != room_id {
-                    return Err(Error::MalformedBundle("inventory room binding"));
-                }
-                let current_authorization = super::authorization_generation(
-                    store,
-                    room.me(),
-                    room_id,
-                    room.history_instance(store)?,
-                    room.epoch(),
-                )?;
-                let read = room.history_read(store)?;
-                let mut missing = Vec::with_capacity(slice.len());
-                let mut changed = Vec::new();
-                for hint in slice {
-                    let scope = super::hints::TransientScope {
-                        connection,
-                        authorization: current_authorization,
-                        incarnations: room
-                            .history_inventory_incarnation(&peer)
-                            .zip(room.history_author_inventory_incarnation(&hint.author)),
-                    };
-                    if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
-                        read.history_declined_head(&peer, &hint.author)?
-                    {
-                        let current = room
-                            .history_inventory_incarnation(&peer)
-                            .zip(room.history_author_inventory_incarnation(&hint.author));
-                        if declined == hint.head
-                            && authorization == current_authorization
-                            && current == Some((peer_incarnation, author_incarnation))
-                        {
-                            // The durable relationship is the source of truth. Do not mirror it
-                            // in an uncharged process-global vector: an unchanged inventory is
-                            // simply ineligible, including after reconnect and restart.
-                            continue;
-                        } else {
-                            changed.push(hint.author);
-                        }
-                    }
-                    if hint.author == room.me() {
-                        // Inventory is only an unauthoritative scalar hint. Even when its
-                        // signed head is already accepted locally, it does not prove the peer
-                        // completed every effect it owes through that position. Keep the hint
-                        // until Query::Head asks the peer for the authenticated role-complete
-                        // receipt. A previously recorded later receipt makes an older echo
-                        // redundant; no scalar echo itself may advance held_through.
-                        if room.held_through(&peer).is_none_or(|held| held < hint.size) {
-                            missing.push((hint, scope));
-                        }
-                        continue;
-                    }
-                    // A frozen author's later history is refused; its heads are not fetched
-                    // again, so a recorded fork is not re-proven every round (MP-9).
-                    if room.history_author_frozen(&hint.author) {
-                        continue;
-                    }
-                    let state =
-                        read.sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
-                    // An inventory scalar is redundant only when its exact signed head is
-                    // already in this author's accepted consistency chain, its selected
-                    // current live window is complete and its exact control receipt is
-                    // durable. Size alone never suppresses an unknown or same-size conflicting
-                    // head. The live window may omit ordinary archive bodies; the separate
-                    // bounded control closure proves those omitted positions contain no
-                    // unapplied control and is what makes this state restart-complete.
-                    let held = match (state, read.history_head(&hint.head)?) {
-                        (Some(state), Some(advertised))
-                            if advertised.binding.author == hint.author
-                                && advertised.binding.scope
-                                    == crate::log::history::LogScope::Public
-                                && advertised.root.leaves == hint.size
-                                && read
-                                    .history_head_accepted(&hint.head, advertised.binding)? =>
-                        {
-                            match (state.committed, state.live) {
-                                (Some(current_id), Some(window))
-                                    if state.control_ready == Some(current_id)
-                                        && window.head == current_id
-                                        && window.complete() =>
-                                {
-                                    read.history_head(&current_id)?.is_some_and(|current| {
-                                        current.binding == advertised.binding
-                                            && window.through == current.root.leaves
-                                    })
-                                }
-                                _ => false,
-                            }
-                        }
-                        _ => false,
-                    };
-                    // One indexed successor lookup, not a scan of older missing bodies.
-                    // Normal retention cleanup removes expired missing positions.
-                    let retry_missing = if held && hint.size != 0 {
-                        let floor = hint
-                            .size
-                            .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
-                            .max(1);
-                        let (positions, _) =
-                            read.missing_page(Some((hint.author, floor - 1)), 1)?;
-                        positions.first().is_some_and(|(author, seq)| {
-                            *author == hint.author && *seq <= hint.size
-                        })
-                    } else {
-                        false
-                    };
-                    if !held
-                        || retry_missing
-                        || (hint.author == room.me()
-                            && room.history_departure_matches(store, hint)?)
-                    {
-                        // Keep this hint as a bounded signed-head receipt probe. It is not
-                        // itself acknowledgement and grants no source or authority.
-                        missing.push((hint, scope));
-                    }
-                }
-                drop(read);
-                changed.sort_unstable();
-                changed.dedup();
-                let rearmed = changed.len();
-                for author in changed {
-                    room.forget_history_decline(store, peer, author, &committed)?;
-                }
-                Ok(Some((missing, rearmed)))
-            })
-            .await?;
-        match filtered {
-            Lookup::Found(filtered) => {
-                self.current()?;
-                let (mut missing, mut rearmed) = filtered.value;
-                let mut failure = None;
-                missing.retain(|(hint, scope)| {
-                    match inbox.transient_blocked(generation, room_id, self.peer, *hint, *scope) {
-                        Ok((blocked, changed)) => {
-                            rearmed += usize::from(changed);
-                            !blocked
-                        }
-                        Err(error) => {
-                            failure = Some(error);
-                            false
-                        }
-                    }
-                });
-                if let Some(error) = failure {
-                    return Err(error);
-                }
-                let missing: Vec<_> = missing.into_iter().map(|(hint, _)| hint).collect();
-                let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
-                offer.rearmed = rearmed;
-                Ok(offer)
-            }
-            Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            }),
-        }
+impl std::ops::DerefMut for RoomHeld<'_> {
+    fn deref_mut(&mut self) -> &mut ChannelState {
+        &mut self.room
     }
 }

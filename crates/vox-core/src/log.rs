@@ -21,9 +21,6 @@
 //! - [`dag`] — the cross-author causal Merkle-DAG: causal (not total) ordering,
 //!   topological iteration, convergence (two replicas that receive the same
 //!   entries converge), and the acceptance predicate + fork/equivocation handling.
-//! - [`sync`] — anti-entropy over an abstract byte-stream transport: the frontier
-//!   mode (default) and the Negentropy range-reconciliation mode, mode-negotiated
-//!   by the `HELLO` bitmap, honoring the M0 wire error codes on hard-fail.
 //! - [`negentropy`] — a faithful Negentropy v1 range-based set-reconciliation
 //!   codec + engine (Doug Hoyte / NIP-77), keyed by the full 32-byte SHA-256 entry
 //!   hash (no truncation).
@@ -38,9 +35,7 @@
 //! replicates everything and exposes the "attempt decrypt → render on success"
 //! seam ([`dag::Dag::render`]); the actual decryption is M4/M6.
 //!
-//! ## Scope boundaries (documented, not stubbed)
-//! - **Real QUIC transport** is M9 (ADR-011): M5 is the protocol *logic* over an
-//!   abstract [`sync::Transport`]; an in-memory duplex drives the tests.
+//! ## Scope boundaries
 //! - **Payload TTL policy / at-rest** is M8 (ADR-010): M5 provides *authenticated
 //!   pruning* ([`entry::Entry::prune_payload`]) — the mechanism, not the policy.
 //! - **Admitted-set population / consent read-gate** is M3/M6 (ADR-005/007): M5
@@ -52,6 +47,7 @@ pub mod dag;
 pub mod entry;
 pub mod feed;
 pub mod history;
+#[cfg(feature = "mutant-sender")]
+pub mod mutant;
 pub mod negentropy;
 pub mod selfchannel;
-pub mod sync;

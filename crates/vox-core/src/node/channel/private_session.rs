@@ -1,8 +1,6 @@
 //! Session payloads live outside the public room log. New sealed rows retain the
 //! wire once and its one-record opener; old rendered-body rows remain readable.
 
-use std::time::{Duration, Instant};
-
 use super::session_projection::{floor_index, private_index};
 use super::*;
 
@@ -26,12 +24,28 @@ const PULL_MARKS_PER_DONOR: usize = 32;
 const PULL_CHECKPOINT_BYTES: usize = AUTHORS_HARD_LIMIT * (2048 + PULL_MARKS_PER_DONOR * 256) + 256;
 const PROJECTION_UNAVAILABLE: Digest32 = [0; 32];
 
-pub(crate) enum PrivatePullIntent {
-    Due(u64),
-    Paced(Instant),
-    Ineligible,
-}
 type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
+
+/// What a connection's loop asks a peer of this room's private Sessions now
+/// (`ChannelState::select_private_ask`).
+pub(crate) enum PrivateAsk {
+    Ask(Ask),
+    /// Nothing is owed of this peer now, or this node may not ask it.
+    Nothing,
+    /// The room cannot decide now; it decides at a later publication.
+    Undecided,
+}
+
+/// This node's private Session tip, `(donor incarnation, newest arrival)`: told to nobody. It
+/// wakes the connections' tellers, whose bounded discovery walk decides with the serve's own
+/// per-record rule what each peer may be told (`history_stream::private::Telling`). Changed
+/// only by the native installs that move it.
+pub(super) struct PrivateTip(tokio::sync::watch::Sender<Cursor>);
+impl Default for PrivateTip {
+    fn default() -> Self {
+        Self(tokio::sync::watch::Sender::new(Cursor::default()))
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PullEvidence {
@@ -625,8 +639,6 @@ pub(super) struct PrivateSessions {
     refresh: Option<RefreshWork>,
     invalid_noted: bool,
     pub(super) upgrading: bool,
-    // Verified input from one bounded receive batch, cleared only after its effects commit.
-    observed_generations: BTreeMap<Digest32, (Digest32, u64)>,
     controls_import: bool,
     controls_import_after: Option<(usize, u64, Digest32)>,
     controls_after: Option<Digest32>,
@@ -635,11 +647,8 @@ pub(super) struct PrivateSessions {
     cursors: BTreeMap<Digest32, Cursor>,
     demands: BTreeMap<Digest32, PullDemand>,
     automatic: BTreeMap<Digest32, AutoSelection>,
-    auto_continue: BTreeSet<Digest32>,
-    auto_yield: BTreeSet<Digest32>,
     observed_tips: BTreeMap<Digest32, Cursor>,
-    pulling: BTreeSet<Digest32>,
-    attempted: BTreeMap<Digest32, Instant>,
+    tip: PrivateTip,
     revision: u64,
     // Admission and open retain a capability recheck. Sparse controls deliver the existing
     // authenticated statement to later members; this obligation cannot force a duplicate.
@@ -879,114 +888,7 @@ impl ChannelState {
         {
             return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
-        Ok(fact
-            .generation
-            .into_iter()
-            .chain(
-                self.private_sessions
-                    .observed_generations
-                    .values()
-                    .filter(|(a, _)| a == author)
-                    .map(|(_, generation)| *generation)
-                    .max(),
-            )
-            .max())
-    }
-
-    /// Called only for an authenticated input in the current bounded receive batch, before
-    /// withholding can remove its payload. No uncommitted observation survives a restart.
-    pub(super) fn observe_legacy_drive_generation(&mut self, entry: &Entry) -> Result<()> {
-        let Some(message) = entry
-            .payload
-            .as_deref()
-            .and_then(|p| GroupMessage::from_wire(p).ok())
-        else {
-            return Ok(());
-        };
-        let h = message.header;
-        if h.channel_id != drive_channel(&self.channel_id)
-            || h.author_id != entry.skeleton.author_id
-            || h.epoch != entry.skeleton.epoch
-        {
-            return Ok(());
-        }
-        let hash = entry.entry_hash();
-        if !self
-            .private_sessions
-            .observed_generations
-            .contains_key(&hash)
-            && self.private_sessions.observed_generations.len() >= crate::log::sync::MAX_STAGED
-        {
-            return Err(Error::SizeLimitExceeded(
-                "Session received control observations",
-            ));
-        }
-        self.private_sessions
-            .observed_generations
-            .insert(hash, (h.author_id, h.chain_id));
-        Ok(())
-    }
-
-    /// Queue compact evidence with the received entries' own effects. Do not clear on failure.
-    pub(super) fn queue_private_generations(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-    ) -> Result<bool> {
-        let mut queued = false;
-        for (hash, (author, generation)) in &self.private_sessions.observed_generations {
-            if self
-                .entries
-                .in_batch(batch, &self.sek, &self.channel_id)?
-                .log_id(hash)?
-                .is_some()
-            {
-                // Drive generations are keys: flush only a transaction that actually queues one
-                // (ADR-038 FX-30). Marking an empty migration Ruled caused a needless full sync.
-                batch.ruled();
-                private_index::observe_control(
-                    batch,
-                    &self.sek,
-                    &self.channel_id,
-                    author,
-                    private_index::Control {
-                        generation: Some(*generation),
-                        ..Default::default()
-                    },
-                )?;
-                queued = true;
-            }
-        }
-        Ok(queued)
-    }
-
-    pub(super) fn private_controls_committed(&mut self, store: &Store) -> Result<()> {
-        let result = (|| {
-            let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-            let mut after = None;
-            loop {
-                let next = match after {
-                    Some(hash) => self
-                        .private_sessions
-                        .observed_generations
-                        .range((std::ops::Bound::Excluded(hash), std::ops::Bound::Unbounded))
-                        .next(),
-                    None => self.private_sessions.observed_generations.first_key_value(),
-                }
-                .map(|(hash, _)| *hash);
-                let Some(hash) = next else {
-                    break;
-                };
-                if read.log_id(&hash)?.is_some() {
-                    self.private_sessions.observed_generations.remove(&hash);
-                }
-                after = Some(hash);
-            }
-            Ok(())
-        })();
-        if let Err(error) = &result {
-            self.private_save_failed(error);
-        }
-        result
+        Ok(fact.generation)
     }
 
     /// Whether the legacy indexes have scanned every public position. Encrypted legacy drive
@@ -1179,6 +1081,7 @@ impl ChannelState {
         self.private_sessions.restoring = !state.complete;
         self.private_sessions.restore_after = state.after;
         self.private_sessions.next = state.next;
+        self.publish_private_tip();
         self.private_sessions.pending_active = state.pending;
         self.private_sessions.pending_after = state.pending_after;
         self.private_sessions.pending_through = state.pending_through;
@@ -1192,29 +1095,6 @@ impl ChannelState {
 
     pub(crate) fn private_support_discovery_pending(&self) -> bool {
         self.private_sessions.support_rediscovery
-    }
-    pub(crate) fn private_support_discovery_hint(
-        &self,
-        store: &Store,
-        peer: &Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64)>> {
-        if !self.private_sessions.support_rediscovery || self.own_behind || !self.is_member(peer) {
-            return Ok(None);
-        }
-        let read = self.history_read(store)?;
-        let Some(id) = read
-            .sparse_author(&self.me(), crate::log::history::LogScope::Public)?
-            .and_then(|state| state.committed)
-        else {
-            return Ok(None);
-        };
-        let head = read
-            .history_head(&id)?
-            .ok_or(Error::MalformedAtRest("own discovery head missing"))?;
-        // This is a fresh connection-scoped metadata probe, distinct from the old
-        // Control receipt and exact-target proof operations. Port owns its unavailable
-        // disposition; neither durable refusal domain is erased or reinterpreted here.
-        Ok(Some((self.me(), id, head.root.leaves)))
     }
     /// Caller carries an actual useful Head response on the exact current recipient port,
     /// after refreshing the higher-head write fence. This is not a universal rollback verdict.
@@ -1599,6 +1479,7 @@ impl ChannelState {
                     .map_err(|_| Error::MalformedAtRest("private stream incarnation"))?,
             ),
         };
+        self.publish_private_tip();
         let binding: Digest32 = d
             .bytes()?
             .try_into()
@@ -1634,18 +1515,6 @@ impl ChannelState {
             BTreeMap::new()
         };
         d.finish()?;
-        self.private_sessions
-            .auto_continue
-            .extend(demands.iter().filter_map(|(peer, demand)| {
-                (demand.active_stamp.is_some()
-                    || !demand.pending.is_empty()
-                    || !demand.marks.is_empty()
-                    || demand.range.is_some()
-                    || demand.projection.is_some()
-                    || demand.unidentified
-                    || demand.rediscover)
-                    .then_some(*peer)
-            }));
         self.private_sessions.demands = demands;
         if binding == self.private_pull_binding() {
             self.private_sessions.cursors = cursors;
@@ -1684,6 +1553,52 @@ impl ChannelState {
 pub(crate) mod pending_session;
 
 impl ChannelState {
+    /// This node's private Session tip, never told (`PrivateTip`): what wakes the connections'
+    /// tell to decide again what each peer may be told (`history_stream::pull` tell).
+    pub(crate) fn private_tip(&self) -> tokio::sync::watch::Receiver<Cursor> {
+        self.private_sessions.tip.0.subscribe()
+    }
+
+    pub(super) fn publish_private_tip(&self) {
+        let now = Cursor {
+            incarnation: self.private_sessions.incarnation.unwrap_or_default(),
+            after: self.private_sessions.next.saturating_sub(1),
+        };
+        self.private_sessions.tip.0.send_if_modified(|was| {
+            let changed = *was != now;
+            *was = now;
+            changed
+        });
+    }
+
+    /// The peers the private serve would answer now (`prepare_pending_private_page`'s room and
+    /// peer preconditions). A roster, not read authorization: a Have tells each of them only a
+    /// position a native discovery quantum found it may be served (`history_stream::private::
+    /// Telling`), so a member that may read nothing here learns nothing about the feed. Empty
+    /// while this node cannot serve any. `None` while the room cannot decide whom it would
+    /// serve: its governance refreshing (`require_governance_ready`) or its Session upgrade
+    /// work running (`needs_session_upgrade`). That is a wait, not a refusal: nobody is told
+    /// anything meanwhile (the serve's own preconditions refuse too), and the room's next
+    /// publication after it ends decides again.
+    pub(crate) fn private_have_peers(&self, store: &Store) -> Option<BTreeSet<Digest32>> {
+        if self.poisoned.get() {
+            return Some(BTreeSet::new());
+        }
+        if self.needs_session_upgrade()
+            || self
+                .require_governance_ready(store, crate::time::Ms(self.now_hint))
+                .is_err()
+        {
+            return None;
+        }
+        Some(
+            self.drive_members()
+                .into_iter()
+                .filter(|peer| self.private_peer_current(store, peer).unwrap_or(false))
+                .collect(),
+        )
+    }
+
     fn private_peer_current(&self, store: &Store, peer: &Digest32) -> Result<bool> {
         // A room this node left carries no Session traffic either way (ADR-023 RL-8.1a).
         Ok(!self.has_left(&self.me())
@@ -1692,76 +1607,54 @@ impl ChannelState {
             && !self.is_member_removed(store, &self.me())?)
     }
 
-    pub(crate) fn private_pull_revision_matches(&self, peer: Digest32, revision: u64) -> bool {
-        self.private_sessions.revision == revision && self.drive_members().contains(&peer)
-    }
-
-    /// Select without physical resources; the paced deadline is the original attempt's
-    /// exact one-second boundary, not a renewed discovery interval.
-    pub(crate) fn private_pull_intent(
-        &self,
-        peer: Digest32,
-        projection_causal: bool,
-    ) -> PrivatePullIntent {
-        if self.poisoned.get()
-            || self.drive.receivers.is_empty()
-            || self.private_sessions.pulling.contains(&peer)
-            || !self.drive_members().contains(&peer)
-        {
-            return PrivatePullIntent::Ineligible;
-        }
-        if !projection_causal && !self.private_sessions.auto_continue.contains(&peer) {
-            if let Some(at) = self.private_sessions.attempted.get(&peer) {
-                let deadline = *at + Duration::from_secs(1);
-                if Instant::now() < deadline {
-                    return PrivatePullIntent::Paced(deadline);
-                }
-            }
-        }
-        PrivatePullIntent::Due(self.private_sessions.revision)
-    }
-
-    pub(crate) fn start_private_pull(
+    /// What a connection's loop asks its peer of this room's private Sessions now (ruling
+    /// correction 2), from this node's durable private debt and the peer's private tip as its
+    /// Have told it (`tip`, an observation of the donor, never a permission, a read floor or
+    /// proof that earlier records are retained): the old automatic debt (`select_private_refetch`:
+    /// pending locators, marks whose evidence or opening changed, unscanned ranges and the
+    /// overflow projection), or the live tail when the tip is beyond this node's cursor for the
+    /// peer. `prefer_live`: the live tail first when both are owed. `Nothing`: nothing is owed of
+    /// this peer now, or this node may not ask it (not Drive-eligible, the peer announces no
+    /// private support, no receiver to read with). `Undecided`: the room cannot decide now (its
+    /// governance or Session floors refreshing, the peer's Session controls refreshing); the
+    /// room decides at a later publication. Every page still passes the native receive checks
+    /// (`PageFlow`).
+    pub(crate) fn select_private_ask(
         &mut self,
         store: &Store,
         peer: Digest32,
-        revision: u64,
-        projection_causal: bool,
-    ) -> Result<Option<Ask>> {
-        if revision != self.private_sessions.revision
-            || !self.private_policy_ready(store, self.now_hint)?
-        {
-            return Ok(None);
+        tip: Option<&Cursor>,
+        prefer_live: bool,
+    ) -> Result<PrivateAsk> {
+        if self.poisoned.get() || self.drive.receivers.is_empty() {
+            return Ok(PrivateAsk::Nothing);
         }
-        if self.poisoned.get()
-            || self.drive.receivers.is_empty()
-            || !self.supports_private(store, &peer)?
-            || !self.private_peer_current(store, &peer)?
-            || (self.private_sessions.pulling.contains(&peer)
-                && self
-                    .private_sessions
-                    .attempted
-                    .get(&peer)
-                    .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
-            || (!projection_causal
-                && !self.private_sessions.auto_continue.contains(&peer)
-                && self
-                    .private_sessions
-                    .attempted
-                    .get(&peer)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1)))
-        {
-            return Ok(None);
+        if !self.private_policy_ready(store, self.now_hint)? {
+            return Ok(PrivateAsk::Undecided);
         }
-        self.private_sessions.pulling.insert(peer);
-        self.private_sessions.attempted.insert(peer, Instant::now());
-        let eligible = projection_causal || self.private_sessions.auto_continue.contains(&peer);
-        let yield_live = self.private_sessions.auto_yield.remove(&peer);
-        if eligible && !yield_live {
-            let boundary_ready = self.private_sessions.observed_tips.contains_key(&peer)
-                || self.private_sessions.cursors.contains_key(&peer);
+        if !self.private_peer_current(store, &peer)? {
+            return Ok(PrivateAsk::Nothing);
+        }
+        match self.supports_private(store, &peer) {
+            Ok(true) => {}
+            Ok(false) => return Ok(PrivateAsk::Nothing),
+            Err(Error::StreamRefused(why)) if why == CONTROL_REFRESHING => {
+                return Ok(PrivateAsk::Undecided);
+            }
+            Err(error) => return Err(error),
+        }
+        let revision = self.private_sessions.revision;
+        let cursor = self
+            .private_sessions
+            .cursors
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default();
+        let live = tip.is_some_and(|tip| {
+            tip.after > 0 && (tip.incarnation != cursor.incarnation || tip.after > cursor.after)
+        });
+        if !(live && prefer_live) {
             if let Some(selection) = self.select_private_refetch(store, peer)? {
-                self.private_sessions.auto_continue.remove(&peer);
                 let ask = Ask {
                     revision,
                     room: self.channel_id,
@@ -1770,35 +1663,22 @@ impl ChannelState {
                     cursor: selection.cursor.clone(),
                 };
                 self.private_sessions.automatic.insert(peer, selection);
-                self.private_sessions.auto_yield.insert(peer);
-                return Ok(Some(ask));
-            }
-            if boundary_ready {
-                self.private_sessions.auto_continue.remove(&peer);
+                return Ok(PrivateAsk::Ask(ask));
             }
         }
-        Ok(Some(Ask {
-            revision,
-            room: self.channel_id,
-            epoch: self.epoch,
-            query: PrivateQuery::LiveTail,
-            cursor: self
-                .private_sessions
-                .cursors
-                .get(&peer)
-                .cloned()
-                .unwrap_or_default(),
-        }))
-    }
-
-    /// Cancel only the selected policy revision. A stale task must not clear a newer pull.
-    pub(crate) fn cancel_private_pull(&mut self, peer: Digest32, revision: u64) {
-        if self.private_sessions.revision == revision {
-            self.private_sessions.pulling.remove(&peer);
-            self.private_sessions.automatic.remove(&peer);
-            self.private_sessions.auto_continue.remove(&peer);
-            self.private_sessions.auto_yield.remove(&peer);
-        }
+        // The live tail asks exactly the anchor the peer told (`through`), never a search.
+        Ok(match tip.filter(|_| live) {
+            Some(through) => PrivateAsk::Ask(Ask {
+                revision,
+                room: self.channel_id,
+                epoch: self.epoch,
+                query: PrivateQuery::LiveTail {
+                    through: through.clone(),
+                },
+                cursor,
+            }),
+            None => PrivateAsk::Nothing,
+        })
     }
 
     /// Stable generation scope for explicit private history. Ratchet iteration advances do
@@ -1882,10 +1762,6 @@ impl ChannelState {
         self.private_sessions.revision = self.private_sessions.revision.wrapping_add(1);
         self.private_sessions.cursors.clear();
         self.private_sessions.observed_tips.clear();
-        self.private_sessions.pulling.clear();
         self.private_sessions.automatic.clear();
-        self.private_sessions.auto_continue.clear();
-        self.private_sessions.auto_yield.clear();
-        self.private_sessions.attempted.clear();
     }
 }

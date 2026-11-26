@@ -121,9 +121,11 @@ fn failed(reason: impl Into<String>) -> VoxError {
 /// `_what` names the call for a reader of the code; a person reads only the fault's sentence.
 fn outcome(_what: &str, out: Outcome) -> Result<(), VoxError> {
     match out {
-        Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_) => {
-            Ok(())
-        }
+        Outcome::Done
+        | Outcome::Bound(_)
+        | Outcome::OwnRetention { .. }
+        | Outcome::Appended(_)
+        | Outcome::JoinedRecovering => Ok(()),
         // The one sentence vox-core writes for the fault (ADR-028 E-7), never its variant's name
         // and never prefixed with the call's.
         Outcome::Failed(f) => Err(failed(f.explain())),

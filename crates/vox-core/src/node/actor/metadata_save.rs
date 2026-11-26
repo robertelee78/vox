@@ -3952,7 +3952,9 @@ enum JoinPending {
 struct JoinReadyPending {
     reply: oneshot::Sender<Outcome>,
     outcome: Outcome,
-    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    instance: std::sync::Weak<crate::node::channel::RoomLock>,
+    /// The join's own patience (`BOARD_PATIENCE`): past it the join answers that the node is a
+    /// member again even while its own history is still being recovered, and the CLI says so.
     deadline: tokio::time::Instant,
 }
 struct JoinAdoptionPending {
@@ -3961,6 +3963,9 @@ struct JoinAdoptionPending {
     mine: bool,
     lifetime: Arc<maintenance_save::Lifetime>,
     after: JoinAdoption,
+    /// A wake for the room's busy publication is armed: set when one is, cleared when it fires,
+    /// so a waiting adoption holds at most one.
+    publication_wait: Arc<std::sync::atomic::AtomicBool>,
 }
 impl JoinAdoptionPending {
     async fn retire(self, room: Digest32) {
@@ -4171,6 +4176,7 @@ impl Node {
                     mine,
                     lifetime,
                     after,
+                    publication_wait: Arc::default(),
                 }),
             );
         if !self.pending_posts.contains_key(&room) {
@@ -4219,16 +4225,30 @@ impl Node {
                         let _ = pending.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                         continue;
                     }
-                    #[cfg(feature = "test-knobs")]
-                    let answer_early =
-                        crate::node::computer::fx28_mutant("rejoin-answers-before-own-history");
-                    #[cfg(not(feature = "test-knobs"))]
-                    let answer_early = false;
-                    if answer_early
-                        || !channel.own_history_behind()
-                        || tokio::time::Instant::now() >= pending.deadline
-                    {
+                    // The join answers when this node may post here: the same condition `room
+                    // post` checks (`ChannelState::require_own_history_current`). Own-history
+                    // recovery runs through the connections' loops and its completion clears it
+                    // (`actor/recovery_save.rs`). If that recovery cannot complete (this node's
+                    // own signed history conflicts with what a member holds, `Recovery::Fork`),
+                    // the join says so. Otherwise, once the join's own patience has passed, it
+                    // answers that the node is a member again (it is, and it reads) and that its
+                    // own history is still being recovered (`Outcome::JoinedRecovering`).
+                    let may_post = channel.require_own_history_current().is_ok();
+                    let frozen = !may_post
+                        && self.log_store().is_some_and(|store| {
+                            matches!(channel.own_recovery_key(&store), Ok(None))
+                        });
+                    if may_post {
                         let _ = pending.reply.send(pending.outcome);
+                    } else if frozen {
+                        let _ = pending
+                            .reply
+                            .send(Outcome::Failed(Fault::RejoinedOwnHistoryFrozen));
+                    } else if tokio::time::Instant::now() >= pending.deadline {
+                        let _ = pending.reply.send(match pending.outcome {
+                            Outcome::Done => Outcome::JoinedRecovering,
+                            other => other,
+                        });
                     } else {
                         self.pending_metadata
                             .get_or_insert_with(Pending::default)
@@ -4238,7 +4258,34 @@ impl Node {
                     continue;
                 }
                 JoinPending::Adoption(pending) => {
-                    if self.pending_posts.contains_key(&room) {
+                    // **A busy publication is waited for, not taken for a failed join**: the
+                    // adoption's save would be refused "room publication is busy" (its
+                    // `reserve_pending_write`). The wake is subscribed under the room lock before
+                    // the check, and it brings this advance back when the publication changes.
+                    // A lock held elsewhere is not a reason to wait: the save is begun, and a
+                    // busy refusal brings the adoption back here.
+                    let publication = self.channels.get(&room).and_then(|instance| {
+                        let channel = instance.try_lock().ok()?;
+                        let wake = channel.history_publication_wake();
+                        channel
+                            .history_publication_busy(&pending.lifetime.store)
+                            .unwrap_or(false)
+                            .then_some(wake)
+                    });
+                    if self.pending_posts.contains_key(&room) || publication.is_some() {
+                        if let Some(wake) = publication.filter(|_| {
+                            !pending
+                                .publication_wait
+                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        }) {
+                            let waiting = Arc::clone(&pending.publication_wait);
+                            let advance = Arc::clone(&self.post_save_wake);
+                            tokio::spawn(async move {
+                                wake.await;
+                                waiting.store(false, std::sync::atomic::Ordering::Release);
+                                advance.notify_one();
+                            });
+                        }
                         self.pending_metadata
                             .get_or_insert_with(Pending::default)
                             .join_replies
@@ -4728,7 +4775,7 @@ impl RoomWithdrawalPurpose {
                 let fault = match result {
                     Ok(anchors) => {
                         eprintln!("{}: put a room withdraw for {} to {anchors} anchor(s) though this node may not end it",
-                            crate::log::sync::mutant::MARKER, crate::node::network::short_id(_room));
+                            crate::log::mutant::MARKER, crate::node::network::short_id(_room));
                         Fault::NotCreator
                     }
                     Err(fault) => fault,

@@ -5,20 +5,21 @@
 //! Payload slices borrow the charged input frame rather than making another queued copy.
 
 mod admission;
+mod bundle;
 mod client;
 mod credit;
 mod driver;
-mod hints;
+pub(crate) mod private;
+pub(crate) mod pull;
 pub(crate) mod runtime;
 mod server;
 mod serving;
 mod source;
 mod transport;
 
-pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
-pub(crate) use driver::exchange;
-pub(crate) use hints::{HintInbox, RefusalRetry};
-pub(crate) use serving::{Answered, OpenRoom, Serving};
+pub(crate) use admission::fork_mutant_is;
+pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver};
+pub(crate) use serving::{OpenRoom, Place, Serving};
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -38,17 +39,8 @@ pub const DONE_RESERVE: usize = 512;
 pub(crate) const AUTHORIZATION_CHANGED: &str = "history authorization changed before publication";
 // One frame tag plus the canonical CBOR encoding of any u8 mode bitmap.
 const MAX_HELLO_FRAME_BYTES: usize = 3;
-// Tag + outer triple + request ID + the largest canonical Query (KeyBody) + the one-element
-// target option and the canonical head body of a head-bound query (ADR-053 P). Query's bounded
-// u64 and digest fields and the fixed head body make this an exact structural maximum,
-// independent of peer input.
+// Conservative bound for the tag, request ID, query and canonical head target (ADR-053 P).
 const MAX_WANT_FRAME_BYTES: usize = 160 + 1 + HeadTarget::MAX_BYTES;
-// Tag and a conservatively maximal CBOR array header. Each locally materialized HAVE hint is an
-// array header, two 32-byte byte strings (each with a maximal CBOR length header), and one u64.
-// The decoder still reserves the full attacker-sized envelope before reading any variable frame;
-// this bound sizes only an encoder whose exact local hint count is already known.
-const HAVE_FRAME_FIXED_BYTES: usize = 1 + 9;
-const HAVE_HINT_MAX_BYTES: usize = 9 + 2 * (9 + 32) + 9;
 // Conservative tag/CBOR overhead for a locally sourced byte-string frame. The peer-facing
 // decoder still reserves the full attacker-sized frame and decode envelope before its prefix.
 const LOCAL_BYTES_FRAME_FIXED_BYTES: usize = 128;
@@ -112,134 +104,201 @@ fn generation_from_nonce(
     crate::hash::sha256(&bytes)
 }
 
-/// Run one admitted incoming request with a fixed lifetime. This never asks for another page.
+/// Run one incoming request with a fixed lifetime. This never asks for another page.
+/// The answer ends when its asker's stream ends (the asker left or stopped reading, or the
+/// connection closed), whether it is still waiting for its admission or already answering:
+/// nothing it holds outlives its asker. Its handshake and query, and a Have's one HOLDING, are
+/// read before any shared admission; the daemon-wide job of `node` is admitted only then, for
+/// the local work of assembling the answer (at most the request's wire credit), and given back
+/// with every shared charge before the answer is written: no shared admission is held while
+/// the asker is waited on. `place` says where the query counts (`Serving::place`) and whether
+/// it fits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
-    room: std::sync::Arc<tokio::sync::Mutex<super::channel::ChannelState>>,
+    room: std::sync::Arc<super::channel::RoomLock>,
     store: std::sync::Arc<super::store::Store>,
     peer: Digest32,
-    connection_serial: u64,
     preamble: Preamble,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    job: Job,
+    budget: std::sync::Arc<super::history_budget::Budget>,
+    node: Digest32,
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
-    inbox: std::sync::Arc<HintInbox>,
+    holdings: std::sync::Arc<pull::Holdings>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    availability_connection: Option<u64>,
     snapshot: std::sync::Arc<super::channel::RoomSnapshotCell>,
-) -> (Result<Status>, bool, bool, bool) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let source = source::Source::new(
-        room,
-        store,
-        preamble.epoch,
-        peer,
-        fence.clone(),
-        deadline,
-        None,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        None,
-    )
-    .serving(snapshot);
-    let mut io =
-        transport::Transport::new(send, recv, job, fence, deadline, availability_connection);
-    let generation = inbox.generation(preamble.room, peer);
-    let mut inventory_added = false;
-    // MP-9: the requester's inventory listed a fork or an unresolved head this node would ask it
-    // for (`client::listing_wanted`): the actor raises this node's own round with it.
-    let mut ask_back = false;
-    // Whether the round moved anything: an inventory exchange that added no hint on this side
-    // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
-    // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
+    conn: std::sync::Arc<crate::transport::quic::VoxConnection>,
+    place: Box<dyn FnOnce(Place) -> bool + Send>,
+) -> (Result<Status>, bool) {
+    // The one waiter on the asker's stream: it ends the answer if the asker leaves while it is
+    // read or written, and confirms a receipt's delivery after the finish (see below).
+    let mut asker_left = std::pin::pin!(send.stopped());
     let mut served_object = false;
-    // `VOX_TEST_REFUSE_HISTORY_FILE`: while the named file exists this node refuses every bounded
-    // history stream it is asked to serve, resetting it with `TransportFailed` and leaving the
-    // connection up: a peer's transport hiccup, for the proofs.
-    #[cfg(feature = "test-knobs")]
-    if std::env::var_os("VOX_TEST_REFUSE_HISTORY_FILE")
-        .is_some_and(|path| std::path::Path::new(&path).exists())
-    {
-        io.abort(crate::wire::WireError::TransportFailed);
-        return (
-            Err(Error::Unreachable(
-                "history refused by VOX_TEST_REFUSE_HISTORY_FILE",
-            )),
-            false,
-            false,
-            false,
-        );
-    }
-    let result = serve_request(
-        &source,
-        &mut io,
-        preamble,
-        &inbox,
-        generation,
-        connection_serial,
-        &mut inventory_added,
-        &mut ask_back,
-        &mut served_object,
-        &departure_receipt,
-    )
-    .await;
-    if let Err(error) = &result {
-        let code = match error {
-            Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
-            Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
-                crate::wire::WireError::ProtocolLimits
+    // An own-feed receipt this answer carries, until the asker acknowledged the whole answer.
+    let mut receipt_pending: Option<u64> = None;
+    let mut hand = transport::Private::new(send, recv, std::sync::Arc::clone(&fence));
+    let result = tokio::select! {
+        biased;
+        result = async {
+            let asked = match read_ask(&mut hand, preamble, peer, place).await {
+                Ok(Ok(asked)) => asked,
+                Ok(Err(status)) => return Ok(status),
+                Err(error) => {
+                    hand.abort(abort_code(&error));
+                    return Err(error);
+                }
+            };
+            // Parsed and request-bound before publication. If the peer's departure is applied
+            // while this response is in flight, lifecycle cleanup may retain only this exact
+            // query. The server and Source still restrict the response to the peer's own
+            // settled, included head.
+            if preamble.purpose == Purpose::Control
+                && matches!(&asked.query, Query::Head(author) if *author == peer)
+            {
+                departure_receipt.store(true, std::sync::atomic::Ordering::Release);
             }
-            _ => crate::wire::WireError::TransportFailed,
-        };
-        io.abort(code);
+            let lane = match preamble.purpose {
+                Purpose::Control => super::history_budget::Lane::Control,
+                Purpose::Live => super::history_budget::Lane::Live,
+                Purpose::History => super::history_budget::Lane::Archive,
+            };
+            let job = budget.admit_job(node, lane).await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let source = source::Source::new(
+                room,
+                store,
+                preamble.epoch,
+                peer,
+                fence.clone(),
+                deadline,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+            )
+            .serving(snapshot);
+            let mut io = transport::Transport::new(job);
+            let answered = server::answer(
+                &source,
+                &mut io,
+                preamble,
+                asked,
+                &holdings,
+                &conn,
+                &mut served_object,
+            )
+            .await;
+            // The job and every shared charge of the answer end here; what is written next is
+            // the connection's own bytes, and only this write (and a receipt's acknowledgement,
+            // below) waits on the asker.
+            let frames = io.into_frames();
+            let (status, served, receipt) = match answered {
+                Ok(answered) => answered,
+                Err(error) => {
+                    hand.abort(abort_code(&error));
+                    return Err(error);
+                }
+            };
+            receipt_pending = receipt;
+            for frame in &frames {
+                // Each frame is authorized again before it goes, as each was before it was
+                // written when answers streamed: a revoked snapshot (poisoned, locked or closed
+                // room) or a peer's lost access ends the answer here.
+                if let Err(error) = served.still_authorized().await {
+                    hand.abort(abort_code(&error));
+                    return Err(error);
+                }
+                hand.write(frame).await?;
+            }
+            hand.finish()?;
+            Ok(status)
+        } => result,
+        _ = &mut asker_left => Err(Error::Unreachable("history asker left")),
+    };
+    // `finish` only queued the stream's end. An answer that carries a receipt waits, on the same
+    // waiter, until the asker acknowledged every byte, the end included: only then does the
+    // receipt count as served, and the teller toward a departed author ends once a served
+    // receipt covers its departure (`pull::standing`). The asker stopping the stream, or the
+    // connection ending, is a failed delivery. Nothing shared is held here: the job, the
+    // answer's charges and its frames ended with the writes; the stream's unacknowledged bytes
+    // are the connection's own. Every other answer returns at once.
+    let result = match result {
+        Ok(status) if receipt_pending.is_some() => match asker_left.await {
+            Ok(None) => {
+                if let Some(size) = receipt_pending.take() {
+                    holdings.receipt_served(preamble.room, peer, &conn, size);
+                }
+                Ok(status)
+            }
+            Ok(Some(_)) | Err(_) => Err(Error::Unreachable("history receipt not acknowledged")),
+        },
+        result => result,
+    };
+    // A receipt that was owed and could not be delivered ends the connection, never silently:
+    // the asker asks each head once per connection and the teller stays until it is served, so
+    // a new connection starts both again.
+    if result.is_err() && receipt_pending.is_some() {
+        conn.close(crate::wire::WireError::TransportFailed);
     }
-    (
-        result,
-        inventory_added,
-        inventory_added || served_object,
-        ask_back,
-    )
+    (result, served_object)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_request(
-    source: &source::Source,
-    io: &mut transport::Transport,
+fn abort_code(error: &Error) -> crate::wire::WireError {
+    match error {
+        Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
+        Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
+            crate::wire::WireError::ProtocolLimits
+        }
+        _ => crate::wire::WireError::TransportFailed,
+    }
+}
+
+/// One incoming request as read before its admission (`read_ask`).
+struct Asked {
+    query: Query,
+    target: Option<HeadTarget>,
+    /// The request's wire credit, charged with its handshake.
+    credit: credit::Response,
+    /// A Have's one HOLDING.
+    holding: Option<transport::Incoming>,
+    /// The exchange of a connection's loop ([`Place::Loop`]): answered patiently.
+    patient: bool,
+}
+
+/// Read one request's handshake and query, and a Have's one HOLDING, as the connection's
+/// private input: fixed-bound frames and the HOLDING within the request's wire credit, with no
+/// job and no shared byte credit, so nothing shared waits on the asker. A Have takes its
+/// connection's one Have place before its HOLDING is read. `Err(status)`: answered already
+/// (cancelled, or refused where its query counts).
+async fn read_ask(
+    hand: &mut transport::Private,
     preamble: Preamble,
-    inbox: &HintInbox,
-    inbox_generation: u64,
-    connection_serial: u64,
-    inventory_added: &mut bool,
-    ask_back: &mut bool,
-    served_object: &mut bool,
-    departure_receipt: &std::sync::atomic::AtomicBool,
-) -> Result<Status> {
-    let first = match io.read_hello().await? {
+    peer: Digest32,
+    place: Box<dyn FnOnce(Place) -> bool + Send>,
+) -> Result<std::result::Result<Asked, Status>> {
+    let first = match hand.read(MAX_HELLO_FRAME_BYTES + 4, Some(&[0x01])).await? {
         transport::Read::Frame(frame) => frame,
-        transport::Read::End => return Err(invalid("history closed before HELLO")),
-        transport::Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
+        _ => return Err(invalid("history closed before HELLO")),
     };
     if !matches!(first.frame()?, Frame::Hello(mode) if mode == crate::wire::SYNC_MODE_BOUNDED_HISTORY)
     {
         return Err(invalid("history HELLO mode"));
     }
+    let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY).encode_private()?;
     let mut overhead = first.wire_len()
         + preamble.encode().len()
         + 4
         + crate::transport::streams::StreamKind::Sync.frame().len()
+        + 4
+        + hello.len()
         + 4;
     drop(first);
-    let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY);
-    let Some(encoded) = hello.encode(io.job())? else {
-        return Err(Error::Unreachable("history HELLO writer busy"));
-    };
-    overhead += encoded.as_slice().len() + 4;
-    io.write_encoded(&encoded).await?;
-    drop(encoded);
-    let next = match io.read_want_or_cancel().await? {
+    hand.write(&hello).await?;
+    let next = match hand
+        .read(MAX_WANT_FRAME_BYTES + 4, Some(&[0x03, 0x09]))
+        .await?
+    {
         transport::Read::Frame(frame) => frame,
-        transport::Read::End => return Err(invalid("history closed before WANT")),
-        transport::Read::Busy => return Err(Error::Unreachable("history WANT reader busy")),
+        _ => return Err(invalid("history closed before WANT")),
     };
     overhead += next.wire_len();
     let (query, target) = match next.frame()? {
@@ -254,38 +313,50 @@ async fn serve_request(
                 status: Status::Cancelled,
                 continuation: None,
             };
-            if !io.write(&done).await? {
-                return Err(Error::Unreachable("history cancelled response busy"));
-            }
-            io.finish()?;
-            return Ok(Status::Cancelled);
+            hand.write(&done.encode_private()?).await?;
+            hand.finish()?;
+            return Ok(Err(Status::Cancelled));
         }
         _ => return Err(invalid("history expected bound WANT")),
     };
     drop(next);
-    // Parsed and request-bound before publication. If the peer's departure is applied while
-    // this response is in flight, lifecycle cleanup may retain only this exact query. The server
-    // and Source still restrict the response to the peer's own settled, included head.
-    if preamble.purpose == Purpose::Control
-        && matches!(&query, Query::Head(author) if *author == source.peer)
-    {
-        departure_receipt.store(true, std::sync::atomic::Ordering::Release);
+    // Decided by the holder from the query: a loop's exchanges, its Have or its one ask (with
+    // the loop's exact receipt, `pull::receipt`), take their connection's one place each; any
+    // other query is an old flow's.
+    let placed = match &query {
+        Query::Have => Place::Loop { have: true },
+        Query::Range { .. } | Query::Fork(_) | Query::HeadById(_) => Place::Loop { have: false },
+        Query::Head(author) if preamble.purpose == Purpose::Control && *author == peer => {
+            Place::Loop { have: false }
+        }
+        _ => Place::OldFlow,
+    };
+    if !place(placed) {
+        hand.abort(crate::wire::WireError::SessionBusy);
+        return Ok(Err(Status::Busy));
     }
-    server::answer(
-        source,
-        io,
-        preamble,
+    let mut credit = credit::Response::new(preamble.request, query.clone())?;
+    credit.charge_handshake(overhead)?;
+    // A Have's one HOLDING follows its WANT at once (`pull::send_have`); it shares this
+    // request's wire credit.
+    let holding = if matches!(query, Query::Have) {
+        if preamble.purpose != Purpose::Control {
+            return Err(Error::MalformedBundle("have requires control purpose"));
+        }
+        match hand.read(credit.remaining_wire(), None).await? {
+            transport::Read::Frame(frame) => Some(frame),
+            _ => return Err(Error::MalformedBundle("have closed before HOLDING")),
+        }
+    } else {
+        None
+    };
+    Ok(Ok(Asked {
         query,
         target,
-        overhead,
-        inbox,
-        inbox_generation,
-        connection_serial,
-        inventory_added,
-        ask_back,
-        served_object,
-    )
-    .await
+        credit,
+        holding,
+        patient: placed != Place::OldFlow,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,11 +438,9 @@ impl ProofKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
-    /// One bounded inventory of scalar authenticated-head hints; no content request.
-    Inventory,
-    KeyAvailability {
-        after: Option<u64>,
-    },
+    /// The asker's Have: what it holds, sent after this WANT as one HOLDING frame. The answer
+    /// carries nothing but its Done; a Have is news, never a request for work.
+    Have,
     Head(Digest32),
     Context(Digest32),
     /// A proof dependency's signed header, without requesting its content body.
@@ -390,14 +459,6 @@ pub enum Query {
         seq: u64,
         offset: u64,
     },
-    /// Explicit sealed-package transfer for recipient delivery or opaque relay.
-    KeyBody {
-        head: Digest32,
-        author: Digest32,
-        hash: Digest32,
-        seq: u64,
-        offset: u64,
-    },
     Page {
         head: Digest32,
         lo: u64,
@@ -410,44 +471,59 @@ pub enum Query {
     /// MP-9 (rule 6): one signed head this peer retains, by its exact id: an unresolved second
     /// head it listed. Answered with the signed head bytes; never a committed-head claim.
     HeadById(Digest32),
+    /// One bundle of existing proof forms under the exact `head`: its signed head, a consistency
+    /// proof from the asker's own `anchor` size (0: none), and the `want`ed entries, control
+    /// coverage or body remainder, cut at one response quantum with an explicit continuation.
+    /// `skip`: how many of the bundle's first contexts (in the order the holder sends them, each
+    /// distinct one once) the asker already received in its last answer to this same request,
+    /// which stopped on contexts that did not fit; the holder sends the rest. A bundle's proof
+    /// and context material thus always advances by at least one context per answer, however
+    /// large the room's contexts are. Encoded as a seventh element only when not zero.
+    Range {
+        head: Digest32,
+        anchor: u64,
+        want: RangeWant,
+        skip: u64,
+    },
+}
+
+/// What one Range bundle carries under its head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RangeWant {
+    /// Header, inclusion proof and body (or none: not held) of each position `lo..=hi`.
+    Entries { lo: u64, hi: u64 },
+    /// Control interval proofs covering `lo..=hi`, empty ones for intervals with no control.
+    Controls { lo: u64, hi: u64 },
+    /// The remainder of position `seq`'s body from `offset`, after its header.
+    Body { seq: u64, offset: u64 },
+}
+
+impl RangeWant {
+    /// The interval this want names, for its continuation.
+    pub fn interval(self) -> (u64, u64) {
+        match self {
+            Self::Entries { lo, hi } | Self::Controls { lo, hi } => (lo, hi),
+            Self::Body { seq, .. } => (seq, seq),
+        }
+    }
 }
 
 impl Query {
     /// The asker's head a provider resolves to answer this query (ADR-053 P). Such a request
-    /// carries the head's canonical body as its target; every other query carries none. KeyBody
-    /// names the asker's head too, but its provider serves only its own exact validated source.
+    /// carries the head's canonical body as its target; every other query carries none.
     pub fn target_head(&self) -> Option<Digest32> {
         match self {
             Self::Header { head, .. }
             | Self::Proof { head, .. }
             | Self::Entry { head, .. }
-            | Self::Page { head, .. } => Some(*head),
+            | Self::Page { head, .. }
+            | Self::Range { head, .. } => Some(*head),
             _ => None,
-        }
-    }
-    /// Name another head in a head-bound query (test-knobs: the hostile asker of the P guards).
-    #[cfg(feature = "test-knobs")]
-    fn retarget(&mut self, target: Digest32) {
-        if let Self::Header { head, .. }
-        | Self::Proof { head, .. }
-        | Self::Entry { head, .. }
-        | Self::Page { head, .. } = self
-        {
-            *head = target;
         }
     }
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Inventory
-            | Self::Head(_)
-            | Self::Context(_)
-            | Self::Fork(_)
-            | Self::HeadById(_) => {}
-            Self::KeyAvailability { after } => {
-                if *after == Some(0) {
-                    return Err(invalid("key availability cursor"));
-                }
-            }
+            Self::Have | Self::Head(_) | Self::Context(_) | Self::Fork(_) | Self::HeadById(_) => {}
             Self::Header { seq, .. } => position(*seq)?,
             Self::Proof { kind, from, to, .. } => {
                 if *from > *to
@@ -458,7 +534,7 @@ impl Query {
                     return Err(invalid("history proof interval"));
                 }
             }
-            Self::Entry { seq, offset, .. } | Self::KeyBody { seq, offset, .. } => {
+            Self::Entry { seq, offset, .. } => {
                 position(*seq)?;
                 if *offset > MAX_PAYLOAD_BYTES as u64 {
                     return Err(invalid("history body offset"));
@@ -480,6 +556,28 @@ impl Query {
                     return Err(invalid("history page budget"));
                 }
             }
+            Self::Range { anchor, want, .. } => {
+                if *anchor > MAX_SEQ {
+                    return Err(invalid("history range anchor"));
+                }
+                match *want {
+                    RangeWant::Entries { lo, hi } => {
+                        interval(lo, hi)?;
+                        if hi - lo >= MAX_PAGE_ENTRIES as u64 {
+                            return Err(invalid("history range page"));
+                        }
+                    }
+                    RangeWant::Controls { lo, hi } => interval(lo, hi)?,
+                    // Offset 0: the first body request, which carries the position's header
+                    // and its inclusion under the named head; a later offset continues it.
+                    RangeWant::Body { seq, offset } => {
+                        position(seq)?;
+                        if offset > MAX_PAYLOAD_BYTES as u64 {
+                            return Err(invalid("history body offset"));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -487,11 +585,8 @@ impl Query {
     fn encode(&self, e: &mut Encoder) -> Result<()> {
         self.validate()?;
         match self {
-            Self::Inventory => {
-                e.array(1).uint(6);
-            }
-            Self::KeyAvailability { after } => {
-                e.array(2).uint(8).uint(after.unwrap_or(0));
+            Self::Have => {
+                e.array(1).uint(10);
             }
             Self::Head(author) => {
                 e.array(2).uint(0).bytes(author);
@@ -524,21 +619,6 @@ impl Query {
             Self::Entry { head, seq, offset } => {
                 e.array(4).uint(3).bytes(head).uint(*seq).uint(*offset);
             }
-            Self::KeyBody {
-                head,
-                author,
-                hash,
-                seq,
-                offset,
-            } => {
-                e.array(6)
-                    .uint(7)
-                    .bytes(head)
-                    .bytes(author)
-                    .bytes(hash)
-                    .uint(*seq)
-                    .uint(*offset);
-            }
             Self::Page {
                 head,
                 lo,
@@ -554,6 +634,28 @@ impl Query {
                     .uint(*entries as u64)
                     .uint(*wire_bytes as u64);
             }
+            Self::Range {
+                head,
+                anchor,
+                want,
+                skip,
+            } => {
+                let (kind, a, b) = match *want {
+                    RangeWant::Entries { lo, hi } => (0, lo, hi),
+                    RangeWant::Controls { lo, hi } => (1, lo, hi),
+                    RangeWant::Body { seq, offset } => (2, seq, offset),
+                };
+                e.array(if *skip == 0 { 6 } else { 7 })
+                    .uint(9)
+                    .bytes(head)
+                    .uint(*anchor)
+                    .uint(kind)
+                    .uint(a)
+                    .uint(b);
+                if *skip != 0 {
+                    e.uint(*skip);
+                }
+            }
         }
         Ok(())
     }
@@ -561,7 +663,8 @@ impl Query {
     fn decode(d: &mut Decoder<'_>) -> Result<Self> {
         let len = d.array()?;
         let query = match (d.uint()?, len) {
-            (6, 1) => Self::Inventory,
+            // Query tags 6, 7 and 8 are retired and must not be reused.
+            (10, 1) => Self::Have,
             (0, 2) => Self::Head(digest(d)?),
             (1, 2) => Self::Context(digest(d)?),
             (9, 2) => Self::Fork(digest(d)?),
@@ -576,21 +679,8 @@ impl Query {
                 from: d.uint()?,
                 to: d.uint()?,
             },
-            (8, 2) => {
-                let cursor = d.uint()?;
-                Self::KeyAvailability {
-                    after: (cursor != 0).then_some(cursor),
-                }
-            }
             (3, 4) => Self::Entry {
                 head: digest(d)?,
-                seq: d.uint()?,
-                offset: d.uint()?,
-            },
-            (7, 6) => Self::KeyBody {
-                head: digest(d)?,
-                author: digest(d)?,
-                hash: digest(d)?,
                 seq: d.uint()?,
                 offset: d.uint()?,
             },
@@ -601,6 +691,28 @@ impl Query {
                 entries: size(d.uint()?)?,
                 wire_bytes: size(d.uint()?)?,
             },
+            (9, len @ (6 | 7)) => {
+                let head = digest(d)?;
+                let anchor = d.uint()?;
+                let kind = d.uint()?;
+                let (a, b) = (d.uint()?, d.uint()?);
+                let want = match kind {
+                    0 => RangeWant::Entries { lo: a, hi: b },
+                    1 => RangeWant::Controls { lo: a, hi: b },
+                    2 => RangeWant::Body { seq: a, offset: b },
+                    _ => return Err(invalid("history range want")),
+                };
+                let skip = if len == 7 { d.uint()? } else { 0 };
+                if len == 7 && skip == 0 {
+                    return Err(invalid("history range skip"));
+                }
+                Self::Range {
+                    head,
+                    anchor,
+                    want,
+                    skip,
+                }
+            }
             _ => return Err(invalid("history query arity/kind")),
         };
         query.validate()?;
@@ -651,7 +763,7 @@ pub struct Continuation {
 impl Continuation {
     fn validate(&self) -> Result<()> {
         interval(self.lo, self.hi)?;
-        if self.query_kind > 4
+        if self.query_kind > 5
             || self.next_seq < self.lo
             || self.next_seq > self.hi
             || self.offset > MAX_PAYLOAD_BYTES as u64
@@ -711,6 +823,265 @@ impl Continuation {
     }
 }
 
+/// The most runs of either kind one author's Have carries: the newest, oldest first. The body
+/// runs of an author that has more are told as further pages of at most this many runs each.
+pub const MAX_HAVE_RUNS: usize = 256;
+/// The most Have pages of the asked author a Range answer's correction carries (`server.rs`
+/// range answer, `credit.rs`): the newest page, plus the older body pages overlapping the asked
+/// interval. Every older page but the oldest holds exactly `MAX_HAVE_RUNS` disjoint runs, so
+/// it spans at least `MAX_HAVE_RUNS` positions; an Entries interval (fewer than
+/// `MAX_PAGE_ENTRIES` = 128 positions) therefore overlaps at most two older pages and a Body
+/// position one, and a Controls correction carries only the newest page (older pages hold
+/// only body runs, which a Controls answer never corrects).
+pub const MAX_CORRECTION_PAGES: usize = 3;
+/// The most signed heads one author's Have carries: committed, observed and a conflict pair.
+pub const MAX_HAVE_HEADS: usize = 4;
+
+/// What a node can serve of one author, scoped to the peer it tells (design simple-sync §1,
+/// ADR-054 PL-2): the signed heads it holds, unequal observations included, its committed head
+/// first when it has one (`committed`); under that head, the runs of positions whose header and
+/// witnesses it serves; apart from them and able to shrink, the runs whose bodies it serves,
+/// sealed key packages included; and the runs inside which it answers a control interval (its
+/// verified control coverage, "no control here" included). A holder that answers without what
+/// it was asked for sends this again, corrected, in its answer. MP-9: whether it holds a
+/// verified fork proof of the author (`fork`, a reason to ask `Query::Fork`), and the author's
+/// one kept signed head whose continuity with its accepted chain is unresolved (`unresolved`,
+/// id and size: a reason to ask `Query::HeadById`, never a committed head). Neither is evidence.
+///
+/// `bodies_span` is the interval of positions whose bodies this Have tells completely: inside
+/// it a position outside `bodies` is not held; outside it this Have says nothing of bodies. The
+/// author's Have proper (its heads, proof and controls) spans through `MAX_SEQ`, its newest
+/// body runs; each older page of body runs is an `AuthorHave` with no heads, proof or controls
+/// and a span below it. The pages of one author tile `1..=MAX_SEQ`; each replaces, inside its
+/// span only, what was told before (a body no longer held shrinks it), and an omitted page is
+/// not absence. A Have encoded before pages existed spans everything. Encoded as the ninth
+/// element.
+///
+/// `role` is the holder's exact role-complete head of the author (`history_role_head`:
+/// committed, exactly at its contiguous held-through, with terminal inclusion and matching
+/// terminal hash), `(id, size)`: a reason for the author to ask the exact receipt
+/// (`Query::Head(self)` under Control), never a receipt itself. Encoded as a tenth element only
+/// when present, and only on the author's Have proper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorHave {
+    pub author: Digest32,
+    pub heads: Vec<Vec<u8>>,
+    pub committed: bool,
+    pub proof: Vec<(u64, u64)>,
+    pub bodies: Vec<(u64, u64)>,
+    pub controls: Vec<(u64, u64)>,
+    pub fork: bool,
+    pub unresolved: Option<(Digest32, u64)>,
+    pub bodies_span: (u64, u64),
+    pub role: Option<(Digest32, u64)>,
+}
+
+impl Default for AuthorHave {
+    fn default() -> Self {
+        Self {
+            author: [0; 32],
+            heads: Vec::new(),
+            committed: false,
+            proof: Vec::new(),
+            bodies: Vec::new(),
+            controls: Vec::new(),
+            fork: false,
+            unresolved: None,
+            bodies_span: (1, MAX_SEQ),
+            role: None,
+        }
+    }
+}
+
+impl AuthorHave {
+    /// The author's Have proper: its newest page, which carries its heads, proof and controls.
+    pub(crate) fn is_newest_page(&self) -> bool {
+        self.bodies_span.1 == MAX_SEQ
+    }
+
+    fn validate(&self) -> Result<()> {
+        let (span_lo, span_hi) = self.bodies_span;
+        if self.heads.len() > MAX_HAVE_HEADS
+            || (self.committed && self.heads.is_empty())
+            || self.proof.len() > MAX_HAVE_RUNS
+            || self.bodies.len() > MAX_HAVE_RUNS
+            || self.controls.len() > MAX_HAVE_RUNS
+            || self.heads.iter().any(|head| head.len() > MAX_HEADER_BYTES)
+            || span_lo == 0
+            || span_lo > span_hi
+            || span_hi > MAX_SEQ
+            || (!self.is_newest_page()
+                && (!self.heads.is_empty()
+                    || !self.proof.is_empty()
+                    || !self.controls.is_empty()
+                    || self.fork
+                    || self.unresolved.is_some()
+                    || self.role.is_some()))
+            || self
+                .bodies
+                .iter()
+                .any(|&(lo, hi)| lo < span_lo || hi > span_hi)
+        {
+            return Err(invalid("history have bounds"));
+        }
+        for runs in [&self.proof, &self.bodies, &self.controls] {
+            let mut last = 0;
+            for &(lo, hi) in runs {
+                interval(lo, hi)?;
+                if lo <= last {
+                    return Err(invalid("history have runs order"));
+                }
+                last = hi;
+            }
+        }
+        if self.unresolved.is_some_and(|(_, size)| size > MAX_SEQ) {
+            return Err(invalid("history have unresolved size"));
+        }
+        Ok(())
+    }
+
+    fn wire_bound(&self) -> usize {
+        // The page span (array and two sizes) and the optional role element (array, 32-byte
+        // id, size).
+        180 + self.heads.iter().map(|head| head.len() + 9).sum::<usize>()
+            + 20 * (self.proof.len() + self.bodies.len() + self.controls.len())
+    }
+
+    fn encode(&self, e: &mut Encoder) -> Result<()> {
+        self.validate()?;
+        e.array(if self.role.is_some() { 10 } else { 9 })
+            .bytes(&self.author)
+            .array(self.heads.len());
+        for head in &self.heads {
+            e.bytes(head);
+        }
+        e.uint(u64::from(self.committed));
+        for runs in [&self.proof, &self.bodies, &self.controls] {
+            e.array(runs.len());
+            for &(lo, hi) in runs {
+                e.array(2).uint(lo).uint(hi);
+            }
+        }
+        e.uint(u64::from(self.fork));
+        e.array(usize::from(self.unresolved.is_some()));
+        if let Some((head, size)) = self.unresolved {
+            e.array(2).bytes(&head).uint(size);
+        }
+        e.array(2).uint(self.bodies_span.0).uint(self.bodies_span.1);
+        if let Some((head, size)) = self.role {
+            e.array(2).bytes(&head).uint(size);
+        }
+        Ok(())
+    }
+
+    fn decode(d: &mut Decoder<'_>) -> Result<Self> {
+        let len = d.array()?;
+        if !(8..=10).contains(&len) {
+            return Err(invalid("history have arity"));
+        }
+        let author = digest(d)?;
+        let count = d.array()?;
+        if count > MAX_HAVE_HEADS {
+            return Err(invalid("history have heads"));
+        }
+        let mut heads = Vec::with_capacity(count);
+        for _ in 0..count {
+            heads.push(bounded_bytes(d, MAX_HEADER_BYTES)?.to_vec());
+        }
+        let committed = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("history have committed flag")),
+        };
+        let mut runs = [Vec::new(), Vec::new(), Vec::new()];
+        for list in &mut runs {
+            let count = d.array()?;
+            if count > MAX_HAVE_RUNS {
+                return Err(invalid("history have runs"));
+            }
+            for _ in 0..count {
+                arity(d, 2)?;
+                list.push((d.uint()?, d.uint()?));
+            }
+        }
+        let [proof, bodies, controls] = runs;
+        let fork = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("history have fork flag")),
+        };
+        let unresolved = match d.array()? {
+            0 => None,
+            1 => {
+                arity(d, 2)?;
+                Some((digest(d)?, d.uint()?))
+            }
+            _ => return Err(invalid("history have unresolved count")),
+        };
+        let bodies_span = if len >= 9 {
+            arity(d, 2)?;
+            (d.uint()?, d.uint()?)
+        } else {
+            (1, MAX_SEQ)
+        };
+        let have = Self {
+            author,
+            heads,
+            committed,
+            proof,
+            bodies,
+            controls,
+            fork,
+            unresolved,
+            bodies_span,
+            role: if len == 10 {
+                arity(d, 2)?;
+                Some((digest(d)?, d.uint()?))
+            } else {
+                None
+            },
+        };
+        have.validate()?;
+        Ok(have)
+    }
+
+    /// This Have without the positions `lo..=hi` in the runs of `kind`: a holder's correction
+    /// after it answered without them.
+    pub(crate) fn without(mut self, kind: HaveRuns, lo: u64, hi: u64) -> Self {
+        let runs = match kind {
+            HaveRuns::Proof => &mut self.proof,
+            HaveRuns::Bodies => &mut self.bodies,
+            HaveRuns::Controls => &mut self.controls,
+        };
+        let mut out = Vec::with_capacity(runs.len() + 1);
+        for &(a, b) in runs.iter() {
+            if b < lo || a > hi {
+                out.push((a, b));
+                continue;
+            }
+            if a < lo {
+                out.push((a, lo - 1));
+            }
+            if b > hi {
+                out.push((hi + 1, b));
+            }
+        }
+        *runs = out;
+        if kind == HaveRuns::Proof {
+            // A body is served only with its proofs.
+            self = self.without(HaveRuns::Bodies, lo, hi);
+        }
+        self
+    }
+}
+
+/// Which runs of an [`AuthorHave`] a correction narrows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HaveRuns {
+    Proof,
+    Bodies,
+    Controls,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadHint {
     pub author: Digest32,
@@ -718,30 +1089,34 @@ pub struct HeadHint {
     pub head: Digest32,
 }
 
-/// A provider's durable acquisition of one opaque key-package body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyBodyAvailable {
-    pub(crate) cursor: u64,
-    pub(crate) author: Digest32,
-    pub(crate) head: Digest32,
-    pub(crate) seq: u64,
-    pub(crate) hash: Digest32,
-    pub(crate) recipient: Digest32,
-}
-
-pub(crate) type KeyAvailabilityPage = Option<(u64, Option<KeyBodyAvailable>)>;
-pub(crate) type KeyAvailabilityResult = Option<([u8; 16], KeyAvailabilityPage)>;
-
-/// Durable recipient body work, scoped to its authenticated source.
+/// One live package body debt as the loop matched an explicit Body answer to it: the accepted
+/// entry it is keyed by (its fixed validated source head, author, position and entry hash; the
+/// recipient is the one that signed header names). The typed refill admits a body only for it,
+/// and only while the durable debt still exists in the refill's own transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyBodyNeed {
     pub(crate) head: Digest32,
+    pub(crate) author: Digest32,
     pub(crate) seq: u64,
     pub(crate) hash: Digest32,
-    pub(crate) recipient: Digest32,
-    pub(crate) target: HeadHint,
-    pub(crate) authorization: Digest32,
 }
+
+/// One retained original sender release this holder can hand back to its author (ADR-054
+/// adoption step 5, OwnRelease): which author, key epoch and chain, and the earliest iteration
+/// it can open from. Never the key. Told ONLY to that author, as the Have's own section
+/// (`Frame::Releases`, `pull::tell`); the author asks it with the sealed one-shot request
+/// (`actor/own_keys.rs`) only while its native readability check lacks that key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReleaseHave {
+    pub(crate) author: Digest32,
+    pub(crate) epoch: u64,
+    pub(crate) chain: u64,
+    pub(crate) earliest: u64,
+}
+
+/// Entries in one `Frame::Releases`; a longer section goes as several frames.
+pub(crate) const MAX_RELEASES_PER_FRAME: usize = 256;
+const RELEASE_WIRE_BOUND: usize = 72;
 
 pub enum Proof {
     Inclusion(InclusionProof),
@@ -767,26 +1142,6 @@ pub enum Object<'a> {
 
 pub enum Frame<'a> {
     Hello(u8),
-    Have {
-        hints: Vec<HeadHint>,
-        /// An authenticated peer's progress hint for the recipient's own feed. This is
-        /// a reason to query, never a receipt or an authorization decision.
-        role: Option<HeadHint>,
-        key_catalog: Option<([u8; 16], u64)>,
-        availability: Option<super::channel::availability::Token>,
-        /// MP-9: authors this node holds a verified fork proof for, ascending. A reason to ask
-        /// `Query::Fork`, never itself evidence.
-        forks: Vec<Digest32>,
-        /// MP-9 (rule 6): per author at most one retained signed head whose continuity with
-        /// this node's accepted chain is unresolved, ascending by author. A reason to ask
-        /// `Query::HeadById`; never a committed head.
-        unresolved: Vec<HeadHint>,
-    },
-    KeyAvailability {
-        request: RequestId,
-        instance: [u8; 16],
-        page: Option<(u64, Option<KeyBodyAvailable>)>,
-    },
     Want {
         request: RequestId,
         query: Query,
@@ -809,6 +1164,17 @@ pub enum Frame<'a> {
         continuation: Option<Continuation>,
     },
     Cancel(RequestId),
+    /// A Have (`AuthorHave` per author), or, inside a Range answer, the holder's corrected
+    /// Have of the asked author.
+    Holding(Vec<AuthorHave>),
+    /// The Have's own-release section (`ReleaseHave`), told only to that author; each entry
+    /// replaces the one of its (epoch, chain) told before. Tag 0x0D.
+    Releases(Vec<ReleaseHave>),
+    /// A Have that also carries the holder's private Session tip, `(donor incarnation,
+    /// through)`: told only to a peer currently eligible for the room's private Sessions
+    /// (Drive), never to any other peer, and never inside an answer. An observation, not a
+    /// permission, a read floor or proof that earlier records are retained. Frame tag 0x0E.
+    PrivateHolding(Vec<AuthorHave>, crate::node::sessionstream::Cursor),
     Ack {
         request: RequestId,
         entry: Digest32,
@@ -851,24 +1217,7 @@ impl<'a> Frame<'a> {
     fn encoding_envelope(&self) -> Result<(usize, usize)> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
-            Self::KeyAvailability { .. } => 256,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have {
-                hints,
-                forks,
-                unresolved,
-                ..
-            } => (HAVE_FRAME_FIXED_BYTES + 280 + HAVE_HINT_MAX_BYTES)
-                .checked_add(
-                    hints
-                        .len()
-                        .checked_add(forks.len())
-                        .and_then(|count| count.checked_add(unresolved.len()))
-                        .and_then(|count| count.checked_mul(HAVE_HINT_MAX_BYTES))
-                        .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
-                )
-                .filter(|bound| *bound <= MAX_FRAME_BYTES)
-                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
             Self::Meta {
                 object:
                     Object::Fork {
@@ -891,6 +1240,26 @@ impl<'a> Frame<'a> {
                 .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
             Self::Done { .. } => DONE_RESERVE,
             Self::Cancel(_) => CANCEL_FRAME_MAX_BYTES,
+            Self::Holding(authors) => authors
+                .iter()
+                .map(AuthorHave::wire_bound)
+                .sum::<usize>()
+                .checked_add(16)
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Releases(releases) => {
+                if releases.len() > MAX_RELEASES_PER_FRAME {
+                    return Err(invalid("history releases"));
+                }
+                16 + RELEASE_WIRE_BOUND * releases.len()
+            }
+            Self::PrivateHolding(authors, _) => authors
+                .iter()
+                .map(AuthorHave::wire_bound)
+                .sum::<usize>()
+                .checked_add(16 + 48)
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
             Self::Ack { .. } => ACK_FRAME_MAX_BYTES,
             Self::Meta {
                 object: Object::Proof(_),
@@ -906,82 +1275,26 @@ impl<'a> Frame<'a> {
     // One encoder and validation path for both optional server output and required client ACKs.
     // The owned reservation covers the same nested proof and final-frame copies in either case.
     fn encode_precharged(&self, maximum: usize, charge: BufferCharge) -> Result<Encoded> {
+        Ok(Encoded {
+            bytes: self.encode_bytes(maximum)?,
+            _charge: charge,
+        })
+    }
+
+    /// A loop's own small frames (its request, its Have) are the connection's private
+    /// assembly: encoded with no job and no shared byte admission (ADR-054 PL-6).
+    pub(super) fn encode_private(&self) -> Result<Vec<u8>> {
+        let (maximum, _) = self.encoding_envelope()?;
+        self.encode_bytes(maximum)
+    }
+
+    fn encode_bytes(&self, maximum: usize) -> Result<Vec<u8>> {
         let mut e = Encoder::new();
         let mut tail = None;
         let id = match self {
             Self::Hello(bitmap) => {
                 e.uint(u64::from(*bitmap));
                 0x01
-            }
-            Self::Have {
-                hints,
-                role,
-                key_catalog,
-                availability,
-                forks,
-                unresolved,
-            } => {
-                if hints.len() > MAX_CONTEXT_AUTHORS
-                    || forks.len() > MAX_CONTEXT_AUTHORS
-                    || unresolved.len() > MAX_CONTEXT_AUTHORS
-                {
-                    return Err(invalid("history have authors"));
-                }
-                e.array(6).array(hints.len());
-                let mut previous = None;
-                for hint in hints {
-                    if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
-                        return Err(invalid("history have order/size"));
-                    }
-                    previous = Some(hint.author);
-                    e.array(3)
-                        .bytes(&hint.author)
-                        .uint(hint.size)
-                        .bytes(&hint.head);
-                }
-                e.array(usize::from(role.is_some()));
-                if let Some(role) = role {
-                    if role.size > MAX_SEQ {
-                        return Err(invalid("history role hint size"));
-                    }
-                    e.array(3)
-                        .bytes(&role.author)
-                        .uint(role.size)
-                        .bytes(&role.head);
-                }
-                e.array(usize::from(key_catalog.is_some()));
-                if let Some((instance, tip)) = key_catalog {
-                    e.array(2).bytes(instance).uint(*tip);
-                }
-                e.array(usize::from(availability.is_some()));
-                if let Some(token) = availability {
-                    if token.open == 0 {
-                        return Err(invalid("availability lifetime"));
-                    }
-                    e.array(2).uint(token.open).uint(token.revision);
-                }
-                e.array(forks.len());
-                let mut previous = None;
-                for author in forks {
-                    if previous.is_some_and(|last| last >= *author) {
-                        return Err(invalid("history have fork order"));
-                    }
-                    previous = Some(*author);
-                    e.bytes(author);
-                }
-                e.array(unresolved.len());
-                let mut previous = None;
-                for hint in unresolved {
-                    if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
-                        return Err(invalid("history have unresolved order/size"));
-                    }
-                    previous = Some(hint.author);
-                    e.array(3)
-                        .bytes(&hint.author)
-                        .uint(hint.size)
-                        .bytes(&hint.head);
-                }
-                0x02
             }
             Self::Want {
                 request,
@@ -1084,31 +1397,40 @@ impl<'a> Frame<'a> {
                 }
                 0x08
             }
-            Self::KeyAvailability {
-                request,
-                instance,
-                page,
-            } => {
-                e.array(3)
-                    .bytes(request)
-                    .bytes(instance)
-                    .array(usize::from(page.is_some()));
-                if let Some((cursor, body)) = page {
-                    if *cursor == 0 || body.is_some_and(|body| body.cursor != *cursor) {
-                        return Err(invalid("key availability page cursor"));
-                    }
-                    e.array(2).uint(*cursor).array(usize::from(body.is_some()));
-                    if let Some(body) = body {
-                        position(body.seq)?;
-                        e.array(5)
-                            .bytes(&body.author)
-                            .bytes(&body.head)
-                            .uint(body.seq)
-                            .bytes(&body.hash)
-                            .bytes(&body.recipient);
-                    }
+            Self::Holding(authors) => {
+                if authors.len() > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
                 }
-                0x0B
+                e.array(authors.len());
+                for have in authors {
+                    have.encode(&mut e)?;
+                }
+                0x0C
+            }
+            Self::Releases(releases) => {
+                if releases.len() > MAX_RELEASES_PER_FRAME {
+                    return Err(invalid("history releases"));
+                }
+                e.array(releases.len());
+                for release in releases {
+                    e.array(4)
+                        .bytes(&release.author)
+                        .uint(release.epoch)
+                        .uint(release.chain)
+                        .uint(release.earliest);
+                }
+                0x0D
+            }
+            Self::PrivateHolding(authors, tip) => {
+                if authors.len() > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                e.array(3).array(authors.len());
+                for have in authors {
+                    have.encode(&mut e)?;
+                }
+                e.bytes(&tip.incarnation).uint(tip.after);
+                0x0E
             }
             Self::Cancel(request) => {
                 e.array(1).bytes(request);
@@ -1137,10 +1459,7 @@ impl<'a> Frame<'a> {
         if let Some(tail) = tail {
             bytes.extend_from_slice(&tail);
         }
-        Ok(Encoded {
-            bytes,
-            _charge: charge,
-        })
+        Ok(bytes)
     }
 
     pub fn decode(bytes: &'a [u8]) -> Result<Self> {
@@ -1151,108 +1470,7 @@ impl<'a> Frame<'a> {
             0x01 => {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
-            0x02 => {
-                arity(&mut d, 6)?;
-                let count = d.array()?;
-                if count > MAX_CONTEXT_AUTHORS {
-                    return Err(invalid("history have authors"));
-                }
-                let mut hints = Vec::with_capacity(count);
-                let mut previous = None;
-                for _ in 0..count {
-                    arity(&mut d, 3)?;
-                    let author = digest(&mut d)?;
-                    let size = d.uint()?;
-                    if size > MAX_SEQ || previous.is_some_and(|last| last >= author) {
-                        return Err(invalid("history have order/size"));
-                    }
-                    previous = Some(author);
-                    hints.push(HeadHint {
-                        author,
-                        size,
-                        head: digest(&mut d)?,
-                    });
-                }
-                let role = match d.array()? {
-                    0 => None,
-                    1 => {
-                        arity(&mut d, 3)?;
-                        let author = digest(&mut d)?;
-                        let size = d.uint()?;
-                        if size > MAX_SEQ {
-                            return Err(invalid("history role hint size"));
-                        }
-                        Some(HeadHint {
-                            author,
-                            size,
-                            head: digest(&mut d)?,
-                        })
-                    }
-                    _ => return Err(invalid("history role hint count")),
-                };
-                let key_catalog = match d.array()? {
-                    0 => None,
-                    1 => {
-                        arity(&mut d, 2)?;
-                        Some((request_id(&mut d)?, d.uint()?))
-                    }
-                    _ => return Err(invalid("key catalog hint count")),
-                };
-                let availability = match d.array()? {
-                    0 => None,
-                    1 => {
-                        arity(&mut d, 2)?;
-                        let open = d.uint()?;
-                        if open == 0 {
-                            return Err(invalid("availability lifetime"));
-                        }
-                        Some(super::channel::availability::Token {
-                            open,
-                            revision: d.uint()?,
-                        })
-                    }
-                    _ => return Err(invalid("availability count")),
-                };
-                let count = d.array()?;
-                if count > MAX_CONTEXT_AUTHORS {
-                    return Err(invalid("history have forks"));
-                }
-                let mut forks = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let author = digest(&mut d)?;
-                    if forks.last().is_some_and(|last| *last >= author) {
-                        return Err(invalid("history have fork order"));
-                    }
-                    forks.push(author);
-                }
-                let count = d.array()?;
-                if count > MAX_CONTEXT_AUTHORS {
-                    return Err(invalid("history have unresolved"));
-                }
-                let mut unresolved: Vec<HeadHint> = Vec::with_capacity(count);
-                for _ in 0..count {
-                    arity(&mut d, 3)?;
-                    let author = digest(&mut d)?;
-                    let size = d.uint()?;
-                    if size > MAX_SEQ || unresolved.last().is_some_and(|last| last.author >= author)
-                    {
-                        return Err(invalid("history have unresolved order/size"));
-                    }
-                    unresolved.push(HeadHint {
-                        author,
-                        size,
-                        head: digest(&mut d)?,
-                    });
-                }
-                Self::Have {
-                    hints,
-                    role,
-                    key_catalog,
-                    availability,
-                    forks,
-                    unresolved,
-                }
-            }
+            // Frame tag 0x02 (the old inventory Have) is retired and must not be reused.
             0x03 => {
                 arity(&mut d, 3)?;
                 let request = request_id(&mut d)?;
@@ -1357,6 +1575,56 @@ impl<'a> Frame<'a> {
                     continuation,
                 }
             }
+            0x0C => {
+                let count = d.array()?;
+                if count > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                let mut authors = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    authors.push(AuthorHave::decode(&mut d)?);
+                }
+                Self::Holding(authors)
+            }
+            0x0D => {
+                let count = d.array()?;
+                if count > MAX_RELEASES_PER_FRAME {
+                    return Err(invalid("history releases"));
+                }
+                let mut releases = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arity(&mut d, 4)?;
+                    releases.push(ReleaseHave {
+                        author: digest(&mut d)?,
+                        epoch: d.uint()?,
+                        chain: d.uint()?,
+                        earliest: d.uint()?,
+                    });
+                }
+                Self::Releases(releases)
+            }
+            0x0E => {
+                arity(&mut d, 3)?;
+                let count = d.array()?;
+                if count > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                let mut authors = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    authors.push(AuthorHave::decode(&mut d)?);
+                }
+                let incarnation = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("history private tip incarnation"))?;
+                Self::PrivateHolding(
+                    authors,
+                    crate::node::sessionstream::Cursor {
+                        incarnation,
+                        after: d.uint()?,
+                    },
+                )
+            }
             0x09 => {
                 arity(&mut d, 1)?;
                 Self::Cancel(request_id(&mut d)?)
@@ -1375,49 +1643,7 @@ impl<'a> Frame<'a> {
                     next_offset,
                 }
             }
-            0x0B => {
-                arity(&mut d, 3)?;
-                let request = request_id(&mut d)?;
-                let instance = request_id(&mut d)?;
-                let page = match d.array()? {
-                    0 => None,
-                    1 => {
-                        arity(&mut d, 2)?;
-                        let cursor = d.uint()?;
-                        if cursor == 0 {
-                            return Err(invalid("key availability page cursor"));
-                        }
-                        let body = match d.array()? {
-                            0 => None,
-                            1 => {
-                                arity(&mut d, 5)?;
-                                let author = digest(&mut d)?;
-                                let head = digest(&mut d)?;
-                                let seq = d.uint()?;
-                                position(seq)?;
-                                let hash = digest(&mut d)?;
-                                let recipient = digest(&mut d)?;
-                                Some(KeyBodyAvailable {
-                                    cursor,
-                                    author,
-                                    head,
-                                    seq,
-                                    hash,
-                                    recipient,
-                                })
-                            }
-                            _ => return Err(invalid("key availability item count")),
-                        };
-                        Some((cursor, body))
-                    }
-                    _ => return Err(invalid("key availability page count")),
-                };
-                Self::KeyAvailability {
-                    request,
-                    instance,
-                    page,
-                }
-            }
+            // Frame tag 0x0B is retired and must not be reused.
             _ => return Err(invalid("history frame kind")),
         };
         d.finish()?;

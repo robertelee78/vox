@@ -369,9 +369,9 @@ pub enum JoinReject {
     /// Refused after the work gate: wrong passphrase, identity mismatch, an
     /// unresolvable prekey, or a policy refusal. One value, so it is no oracle.
     Refused = 3,
-    /// Every one of the responder's join slots was held, so it did not start the exchange
-    /// (V210-92). Sent before the challenge, so before anything about the passphrase is known: it
-    /// says only that this member is busy, and nothing about the joiner.
+    /// The responder is busy and says nothing about the joiner (V210-92): every one of its join
+    /// slots was held, so it did not start the exchange (sent before the challenge); or, after the
+    /// passphrase was accepted, it was saving the room for longer than a join's offer waits.
     Busy = 4,
     /// The exchange succeeded — the passphrase was accepted — and the responder then could not
     /// admit the joiner (V210-128): locked or closing mid-join, its store refused the write, or a
@@ -406,7 +406,7 @@ impl JoinReject {
             Self::PowInvalid => "responder refused: proof-of-work invalid",
             Self::Malformed => "responder refused: malformed frame",
             Self::Refused => "responder refused",
-            Self::Busy => "responder refused: busy answering other joins",
+            Self::Busy => "responder refused: busy answering other joins or saving the room",
             Self::NotAdmitted => "responder refused: it could not admit this identity",
             Self::RoomEnded => "responder refused: the room has ended",
             Self::ResponderLeft => "responder refused: it has left the room",
@@ -1375,7 +1375,17 @@ where
             // publishes admission. In particular, a later seal failure/crash cannot leave a
             // witness newer than its durable withdrawal. A missing/mismatched acknowledgement
             // ends the exchange before the admission callback is invoked.
-            let (name, own_history) = proposal_inputs(outcome.peer.identity.clone()).await?;
+            let (name, own_history) = match proposal_inputs(outcome.peer.identity.clone()).await {
+                Ok(inputs) => inputs,
+                // A member still saving the room when its offer's patience ran out says it is
+                // busy, never an early close with no cause: the joiner tries another member.
+                Err(e @ Error::JoinResponderBusy) => {
+                    let _ = send_frame(&mut send, &JoinFrame::Rejected(JoinReject::Busy)).await;
+                    let _ = send.finish();
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
             let proposed =
                 AdmissionProposal::from_witness(&outcome.witness, cfg.root, name, own_history)?
                     .to_body();

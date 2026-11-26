@@ -229,36 +229,39 @@ fn successor_hash(mut hash: Digest32) -> Option<Digest32> {
 
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
 /// A read that takes several requests gives each row as it is when that request is answered:
-/// any row may change the instant after it is read, in one request or five. This token refuses
-/// such a read only when the order of rows it has already given changed (an entry moved by a
-/// late parent), which would show a row twice or skip it across pages anchored on an entry.
+/// any row may change the instant after it is read, in one request or five. A row's display
+/// key is fixed when its header is first published, so no admission reverses two rows already
+/// given: an arrival only inserts, and a removal only takes rows away. This token therefore
+/// refuses such a read only when the open room it reads was replaced (reopened or readmitted).
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    order: u64,
+    #[cfg(feature = "test-knobs")]
+    arrivals: u64,
 }
 
 impl Revision {
-    fn of(ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
-        #[allow(unused_mut)]
-        let mut order = rendered.order().revision();
-        #[cfg(feature = "test-knobs")]
-        {
-            if crate::node::mp11_mutant(
+    fn of(ch: &ReadFacts) -> Self {
+        Self {
+            incarnation: ch.gen.clone(),
+            #[cfg(feature = "test-knobs")]
+            arrivals: if crate::node::mp11_mutant(
                 "VOX_MUTANT_READ_REFUSES_ARRIVALS",
                 "a read spanning requests is refused when a message arrives",
             ) {
-                order = order.wrapping_add(ch.generation);
-            }
+                ch.generation
+            } else {
+                0
+            },
         }
-        Ok(Self {
-            incarnation: ch.gen.clone(),
-            order,
-        })
     }
-    fn current(&self, ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
-        let now = Self::of(ch, rendered)?;
-        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.order == now.order)
+    fn current(&self, ch: &ReadFacts) -> bool {
+        let now = Self::of(ch);
+        #[cfg(feature = "test-knobs")]
+        if self.arrivals != now.arrivals {
+            return false;
+        }
+        Arc::ptr_eq(&self.incarnation, &now.incarnation)
     }
 }
 
@@ -722,6 +725,18 @@ impl View<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// The continuation token of `vox room read --hashes` pages: the saved room and the kind
+    /// of key its cursors carry. It moves only when the saved room is replaced.
+    fn order_token(&self) -> u64 {
+        let token = crate::hash::sha256_concat(&[
+            b"vox-room-display-order-v2",
+            &self.rendered.history_instance(),
+        ]);
+        let mut current = [0; 8];
+        current.copy_from_slice(&token[..8]);
+        u64::from_be_bytes(current)
     }
 
     fn view_filter(&self, view: &crate::node::api::RoomView) -> Answer<Filter> {
@@ -1256,7 +1271,7 @@ impl View<'_> {
                         .key(&entry)?
                         .ok_or(Error::MalformedAtRest("held selection order missing"))?;
                     if let Some(fact) = fact {
-                        // Reordering elsewhere can alter the visible late label while this
+                        // An insertion elsewhere can alter the visible late label while this
                         // entry's own locator/order stays fixed. Hash only the derived bit,
                         // not the unrelated suffix root/count that produced it.
                         let (_, late) = self.rendered.display_timing(key, fact)?;
@@ -1268,17 +1283,18 @@ impl View<'_> {
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
             // The display token moves with whatever a person could see change, an arrival too:
-            // a client caching a summary refreshes on it. The read token moves only when the
-            // order of rows already read changed: a read spanning requests compares it.
+            // a client caching a summary refreshes on it. The read token a read spanning
+            // requests compares moves only when the saved or open room was replaced: no
+            // admission reorders rows already read (display keys are fixed at publication).
             query @ (Query::DisplayRevision | Query::ReadRevision) => {
                 use sha2::{Digest, Sha256};
-                let revision = Revision::of(self.ch, &self.rendered)?;
                 let mut hash = Sha256::new();
-                hash.update(b"vox-room-history-revision-v1");
+                hash.update(b"vox-room-history-revision-v2");
                 hash.update(self.ch.channel_id());
                 hash.update(self.rendered.history_instance());
                 hash.update(self.ch.incarnation.to_be_bytes());
-                hash.update(revision.order.to_be_bytes());
+                #[cfg(feature = "test-knobs")]
+                hash.update(Revision::of(self.ch).arrivals.to_be_bytes());
                 if matches!(query, Query::DisplayRevision) {
                     for fact in [
                         self.ch.generation,
@@ -1343,7 +1359,7 @@ impl View<'_> {
                 Ok(Reply::Order {
                     entries,
                     next: None,
-                    revision: self.rendered.order().revision(),
+                    revision: self.order_token(),
                 })
             }
             Query::Governance(_) => Err(Failure::Request(
@@ -1705,15 +1721,11 @@ impl View<'_> {
                 revision,
                 limit,
             } => {
-                // Only an entry that moved breaks the cursor; an added one lands where the walk
-                // finds it or in the part already listed. Another saved room is another order.
-                let token = crate::hash::sha256_concat(&[
-                    &self.rendered.history_instance(),
-                    &self.rendered.order().revision().to_be_bytes(),
-                ]);
-                let mut current = [0; 8];
-                current.copy_from_slice(&token[..8]);
-                let current = u64::from_be_bytes(current);
+                // Display keys never move, so an added entry lands where the walk finds it or in
+                // the part already listed. Another saved room is another order. The token also
+                // names the key kind: a cursor from a Vox whose keys were causal clocks is
+                // refused as a changed room, never read as a display key.
+                let current = self.order_token();
                 #[cfg(feature = "test-knobs")]
                 let current = if crate::node::mp11_mutant(
                     "VOX_MUTANT_READ_REFUSES_ARRIVALS",
@@ -1968,7 +1980,7 @@ impl View<'_> {
                 }
                 Ok(Reply::Located {
                     entries: found.into_iter().map(|(_, h)| h).collect(),
-                    revision: Revision::of(self.ch, &self.rendered)?,
+                    revision: Revision::of(self.ch),
                 })
             }
             Query::Locate { entries } => {
@@ -1988,11 +2000,11 @@ impl View<'_> {
                 }
                 Ok(Reply::Located {
                     entries: found.into_iter().map(|(_, h)| h).collect(),
-                    revision: Revision::of(self.ch, &self.rendered)?,
+                    revision: Revision::of(self.ch),
                 })
             }
             Query::Exact { entry, revision } => {
-                if !revision.current(self.ch, &self.rendered)? {
+                if !revision.current(self.ch) {
                     return Err(Failure::Request(CHANGED));
                 }
                 Ok(Reply::Exact(
@@ -2174,39 +2186,8 @@ impl State {
             ..Self::default()
         })
     }
-    pub(super) fn owed_range(&mut self, author: Digest32, from: u64, through: u64) {
-        let before = Some((author, from.saturating_sub(1)));
-        let end = Some((author, through));
-        if self.pending {
-            self.cursor = self.cursor.min(before);
-            if self.through.is_some() {
-                self.through = self.through.max(end);
-            }
-        } else {
-            self.pending = true;
-            self.cursor = before;
-            self.through = end;
-        }
-    }
 }
 impl ChannelState {
-    /// Caller has established missing membership in the current Batch.
-    pub(super) fn owed_visibility(
-        &self,
-        batch: &crate::node::store::Batch<'_>,
-        entry: &Entry,
-    ) -> Result<Option<(u64, u64)>> {
-        let hash = entry.entry_hash();
-        if entry.payload.is_some()
-            || self.private_contains_in(batch, &hash)?
-            || self.legacy_is_session_in(Transaction::Batch(batch), &hash)?
-        {
-            return Ok(None);
-        }
-        let ttl = self.entry_retention(Transaction::Batch(batch), entry)?;
-        Ok(owed_window(entry, self.now_hint, ttl))
-    }
-
     /// The "not received yet" row of a signed (v2) message whose body this node does not hold
     /// (ADR-008 LS-33): its created/expiry pair, or `None` when no row stands for it: the body is
     /// held, the entry is private, or it has expired by this node's own reckoning.

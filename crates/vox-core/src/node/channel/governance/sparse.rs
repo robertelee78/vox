@@ -6,12 +6,31 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32};
 use crate::log::entry::Entry;
 use crate::log::history::{
-    ConsistentPrefix, ControlContext, EntryReference, IncludedHeader, SignedEntryKind, TreeBinding,
-    WorkBudget,
+    ConsistentPrefix, ControlContext, Descriptor, EntryReference, IncludedHeader, SignedEntryKind,
+    TreeBinding, WorkBudget,
 };
 
-/// Exact authenticated input with complete signed causal evidence. A control may enter the
-/// existing evaluator through this token; its authority and effect are still unresolved.
+/// The `seen` parents whose exact receipts, control closure and frontier domination an
+/// entry's admission requires (ADR-053 M0). An ordinary signed-format Content entry names
+/// other authors' tips only as nonblocking references: one this node already published can
+/// lift where the entry is first displayed, but no receipt is fetched or awaited for them,
+/// and no authority, membership, cut, key, private-access or required-ancestor decision
+/// may read them as evidence. Every control kind keeps a checked parent for each reference.
+/// (Typed Content binds the room's own channel, `TypedSparseBody::verify`, so a legacy Drive
+/// carrier never takes this path.)
+pub(crate) fn checked_seen(v2: &crate::log::history::EntryV2) -> &[EntryReference] {
+    if v2.kind == SignedEntryKind::Content {
+        &[]
+    } else {
+        &v2.seen
+    }
+}
+
+/// Exact authenticated input with complete signed causal evidence: its own prefix, every
+/// coordinate of its signed context and, for a control, every `seen` parent. An ordinary
+/// Content entry's `seen` references are ordering hints only (ADR-053 M0) and are not part of
+/// this claim. A control may enter the existing evaluator through this token; its authority
+/// and effect are still unresolved.
 pub(crate) struct ValidatedSparseEntry {
     included: IncludedHeader,
     pre_context: ControlContext,
@@ -92,6 +111,149 @@ impl VerifiedParentPrefix {
     }
 }
 
+/// One parent of an entry under validation, as the validator needs it: the parent's header at
+/// its author and position, a committed head of its author covering it, and the accepted
+/// chain's prefix [1, seq] that ends with it (its frontier is the parent's control context).
+/// Located by author and position (`admission::parent_evidence`), never by the head an answer
+/// named.
+// Both variants are per-parent of every entry under validation, kept inline in its parents
+// list; boxing either would allocate per parent.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SparseParent {
+    /// Proven by one answer: inclusion and own prefix against one root.
+    Receipt(VerifiedParentPrefix),
+    /// Published here: its own admission validated it under a committed head of its author,
+    /// which stays committed; `head` is the author's committed head when it was looked up, and
+    /// `prefix` the range [1, seq] that admission required before validating it.
+    Published {
+        head: Digest32,
+        binding: TreeBinding,
+        header: Entry,
+        prefix: Descriptor,
+    },
+}
+impl SparseParent {
+    pub(crate) fn head_id(&self) -> Digest32 {
+        match self {
+            Self::Receipt(receipt) => receipt.included.head_id(),
+            Self::Published { head, .. } => *head,
+        }
+    }
+    fn binding(&self) -> TreeBinding {
+        match self {
+            Self::Receipt(receipt) => receipt.included.binding(),
+            Self::Published { binding, .. } => *binding,
+        }
+    }
+    pub(crate) fn header(&self) -> &Entry {
+        match self {
+            Self::Receipt(receipt) => receipt.included.header().entry(),
+            Self::Published { header, .. } => header,
+        }
+    }
+    pub(crate) fn prefix(&self) -> Descriptor {
+        match self {
+            Self::Receipt(receipt) => receipt.prefix.prefix(),
+            Self::Published { prefix, .. } => *prefix,
+        }
+    }
+    /// A published parent's positional prefix [1, seq] must end with this exact parent: its
+    /// frontier must be the whole context the parent leaves, derived from its own signed header
+    /// by the leaf rule (`leaf_descriptor`): its pre-context for a content entry, its pre-context
+    /// joined with its own coordinate for a control. A receipt's two proofs bind the two under
+    /// one root already. Checked where admission takes the parent, before anything follows the
+    /// frontier (`admission::start_entry`, `preflight`). A prefix of another history (an older
+    /// program kept a forking author's other branch in that slot; the accepted one cannot be
+    /// kept beside it) is a fault of this store, never evidence and never a need.
+    pub(crate) fn check_published(&self, input: &entry_store::Read<'_>) -> Result<()> {
+        let Self::Published {
+            binding,
+            header,
+            prefix,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let other =
+            || Error::MalformedAtRest("published parent's prefix range is another history's");
+        let v2 = header.skeleton.v2.as_ref().ok_or_else(other)?;
+        let leaves = if v2.kind.is_control() {
+            let pre = input
+                .history_context(&v2.pre_context)?
+                .ok_or(Error::MalformedAtRest(
+                    "published parent pre-context missing",
+                ))?;
+            pre.join(&ControlContext {
+                room: binding.room,
+                scope: binding.scope,
+                coordinates: vec![EntryReference {
+                    author: header.skeleton.author_id,
+                    seq: header.skeleton.seq,
+                    hash: header.entry_hash(),
+                }],
+            })
+            .map_err(|_| other())?
+            .hash()
+        } else {
+            v2.pre_context
+        };
+        if leaves != prefix.frontier {
+            return Err(other());
+        }
+        Ok(())
+    }
+    /// A receipt keeps its format-1 bytes (`VerifiedParentPrefix::checkpoint`); a published
+    /// parent is format 2.
+    fn checkpoint(&self) -> Result<Vec<u8>> {
+        let (head, binding, header, prefix) = match self {
+            Self::Receipt(receipt) => return receipt.checkpoint(),
+            Self::Published {
+                head,
+                binding,
+                header,
+                prefix,
+            } => (head, binding, header, prefix),
+        };
+        let mut e = crate::cbor::Encoder::new();
+        e.array(5).uint(2).bytes(head);
+        binding.encode(&mut e);
+        e.bytes(&header.header_wire());
+        prefix.encode(&mut e);
+        let bytes = e.finish();
+        if bytes.len() > 32 * 1024 {
+            return Err(Error::SizeLimitExceeded("parent receipt"));
+        }
+        Ok(bytes)
+    }
+    fn from_authenticated_checkpoint(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 32 * 1024 {
+            return Err(Error::SizeLimitExceeded("parent receipt"));
+        }
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if (d.array()?, d.uint()?) != (5, 2) {
+            return VerifiedParentPrefix::from_authenticated_checkpoint(bytes).map(Self::Receipt);
+        }
+        let head = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("published parent head"))?;
+        let binding = TreeBinding::decode(&mut d)?;
+        let header = Entry::from_wire(d.bytes()?)?;
+        let prefix = Descriptor::decode(&mut d)?;
+        d.finish()?;
+        if header.payload.is_some() || prefix.leaves != header.skeleton.seq {
+            return Err(Error::MalformedAtRest("published parent checkpoint"));
+        }
+        Ok(Self::Published {
+            head,
+            binding,
+            header,
+            prefix,
+        })
+    }
+}
+
 /// Typed payload shape/binding only. In particular this is not the governance verdict or a
 /// recipient-side key application result. Private ciphertext is never decrypted here.
 pub(crate) struct TypedSparseBody {
@@ -129,7 +291,7 @@ pub(crate) enum SparseValidationStep {
 /// and dropped before returning; only the completed token temporarily owns the signed map.
 pub(crate) struct SparseValidation {
     included: IncludedHeader,
-    parents: Vec<VerifiedParentPrefix>,
+    parents: Vec<SparseParent>,
     parent: usize,
     parent_coordinate: usize,
     coordinate: usize,
@@ -321,9 +483,7 @@ impl SparseValidation {
         }
         let mut parents = Vec::with_capacity(count);
         for _ in 0..count {
-            parents.push(VerifiedParentPrefix::from_authenticated_checkpoint(
-                d.bytes()?,
-            )?);
+            parents.push(SparseParent::from_authenticated_checkpoint(d.bytes()?)?);
         }
         let parent = usize::try_from(d.uint()?)
             .map_err(|_| Error::MalformedAtRest("sparse checkpoint offset"))?;
@@ -371,6 +531,19 @@ impl SparseValidation {
             hash: header.entry_hash(),
             state,
         };
+        // A format-1 Content cursor captured before ADR-053 M0 also carries a receipt for
+        // each `seen` hint. Keep its exact own-parent receipt and its position, and drop
+        // only the hint receipts: a cursor already past the own parent restarts at the
+        // context-coordinate phase, whose own cursor is unchanged.
+        let (mut parents, mut parent, mut parent_coordinate) = (parents, parent, parent_coordinate);
+        let own = usize::from(header.skeleton.seq > 1);
+        if v2.kind == SignedEntryKind::Content && parents.len() == own + v2.seen.len() {
+            parents.truncate(own);
+            if parent > own || (parent == own && parent_coordinate != 0) {
+                parent = own;
+                parent_coordinate = 0;
+            }
+        }
         let mut cursor = Self::new(included, body, parents)?;
         cursor.parent = parent;
         cursor.parent_coordinate = parent_coordinate;
@@ -381,7 +554,7 @@ impl SparseValidation {
     pub(crate) fn new(
         included: IncludedHeader,
         body: TypedSparseBody,
-        parents: Vec<VerifiedParentPrefix>,
+        parents: Vec<SparseParent>,
     ) -> Result<Self> {
         let entry = included.header().entry();
         let v2 = entry
@@ -390,8 +563,9 @@ impl SparseValidation {
             .as_ref()
             .ok_or(Error::MalformedBundle("sparse entry lacks v2 header"))?;
         let own = usize::from(entry.skeleton.seq > 1);
+        let seen = checked_seen(v2);
         if body.hash != entry.entry_hash()
-            || parents.len() != own + v2.seen.len()
+            || parents.len() != own + seen.len()
             || parents.len() > 17
         {
             return Err(Error::MalformedBundle(
@@ -406,11 +580,11 @@ impl SparseValidation {
                     hash: entry.skeleton.prev_hash,
                 }
             } else {
-                v2.seen[at - own].clone()
+                seen[at - own].clone()
             };
-            let header = parent.included.header().entry();
+            let header = parent.header();
             if header.skeleton.channel_id != entry.skeleton.channel_id
-                || parent.included.binding().scope != v2.scope
+                || parent.binding().scope != v2.scope
                 || header.skeleton.author_id != expected.author
                 || header.skeleton.seq != expected.seq
                 || header.entry_hash() != expected.hash
@@ -440,7 +614,7 @@ impl SparseValidation {
         budget: &mut WorkBudget,
     ) -> Result<SparseValidationStep> {
         if self.finished {
-            return Err(Error::MalformedBundle(
+            return Err(Error::MalformedAtRest(
                 "sparse validation already completed",
             ));
         }
@@ -478,30 +652,26 @@ impl SparseValidation {
         }
         if self.parent < self.parents.len() {
             let parent = &self.parents[self.parent];
-            if !input
-                .history_head_committed(&parent.included.head_id(), parent.included.binding())?
-            {
+            if !input.history_head_committed(&parent.head_id(), parent.binding())? {
                 return Err(Error::MalformedBundle(
                     "parent head has no accepted consistency",
                 ));
             }
-            let through = parent.prefix.prefix().leaves;
+            let through = parent.prefix().leaves;
             // ADR-053 MP-10: the author-local termination evidence. The own parent's prefix
             // is this author's own signed head and positions; every control it commits,
             // a Termination among them, must be a held source before a later position is
             // usable, so a withheld termination keeps this entry pending, never accepted.
             let own_parent = self.parent == 0 && entry.skeleton.seq > 1;
-            let waits = !(own_parent && termination_unchecked());
-            if waits && !input.control_sources_complete(&parent.included.head_id(), through)? {
+            if !input.control_sources_complete(&parent.head_id(), through)? {
                 return Ok(SparseValidationStep::ControlPrefixPending {
-                    head: parent.included.head_id(),
+                    head: parent.head_id(),
                     through,
                 });
             }
             // A termination in that prefix is now recorded: a later position is the
             // author's fault, refused here rather than at publication.
             if own_parent
-                && !termination_unchecked()
                 && input
                     .history_termination(&entry.skeleton.author_id)?
                     .is_some_and(|end| entry.skeleton.seq > end)
@@ -513,7 +683,10 @@ impl SparseValidation {
             if !budget.take_context_load() {
                 return Ok(SparseValidationStep::Yielded);
             }
-            let hash = parent.prefix.prefix().frontier;
+            // The same whole-context check admission made before preflight (`check_published`),
+            // again here, where the parent's context is consumed for authority.
+            parent.check_published(input)?;
+            let hash = parent.prefix().frontier;
             let Some(frontier) = input.history_context(&hash)? else {
                 return Ok(SparseValidationStep::MissingContext(hash));
             };
@@ -564,10 +737,8 @@ impl SparseValidation {
                 if !budget.take_control_lookup() {
                     return Ok(SparseValidationStep::Yielded);
                 }
-                if !(termination_unchecked() && earlier.author == entry.skeleton.author_id) {
-                    if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
-                        return Ok(pending);
-                    }
+                if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
+                    return Ok(pending);
                 }
                 self.parent_coordinate += 1;
             }
@@ -587,10 +758,8 @@ impl SparseValidation {
             if !budget.take_control_lookup() {
                 return Ok(SparseValidationStep::Yielded);
             }
-            if !(termination_unchecked() && coordinate.author == entry.skeleton.author_id) {
-                if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
-                    return Ok(pending);
-                }
+            if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
+                return Ok(pending);
             }
             self.coordinate += 1;
         }
@@ -604,55 +773,6 @@ impl SparseValidation {
             payload_state: self.payload_state,
         }))
     }
-}
-
-/// `VOX_MUTANT_TERMINATION=unchecked` (ADR-053 MP-10 (c)): accept a later position without the
-/// author-local termination evidence — no wait for the author's own control prefix or own
-/// context coordinates, no read of its recorded termination. `admitted` does the same, and
-/// [`termination_admitted`] holds too. Says so once when first read.
-#[cfg(feature = "test-knobs")]
-fn termination_unchecked() -> bool {
-    termination_mode().is_some()
-}
-
-#[cfg(not(feature = "test-knobs"))]
-const fn termination_unchecked() -> bool {
-    false
-}
-
-/// `VOX_MUTANT_TERMINATION=admitted` (ADR-053 MP-10 (c)): a later position is admitted as a
-/// source while its author's termination is withheld. Besides [`termination_unchecked`] here,
-/// every other place that needs the author's own controls under the head passes over them when
-/// absent: admission's preflight (`history_stream/admission.rs`), the effect stage
-/// (`pending_received.rs`), and the history runtime, which fetches a head's ordinary bodies
-/// before that head's control closure.
-#[cfg(feature = "test-knobs")]
-pub(crate) fn termination_admitted() -> bool {
-    termination_mode() == Some("admitted")
-}
-
-#[cfg(not(feature = "test-knobs"))]
-pub(crate) const fn termination_admitted() -> bool {
-    false
-}
-
-#[cfg(feature = "test-knobs")]
-fn termination_mode() -> Option<&'static str> {
-    static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
-        let mode = match std::env::var("VOX_MUTANT_TERMINATION").as_deref() {
-            Ok("unchecked") => Some("unchecked"),
-            Ok("admitted") => Some("admitted"),
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            eprintln!(
-                "vox: VOX_MUTANT_TERMINATION={mode} engaged: later positions accepted without \
-                 the author's own termination evidence"
-            );
-        }
-        mode
-    });
-    *MODE
 }
 
 fn validate_control_coordinate(

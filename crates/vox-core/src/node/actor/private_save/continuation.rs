@@ -3,22 +3,17 @@ use crate::node::channel::session_projection::{
     ProjectionProgress, ProjectionWork, Query, Reply as SessionReply,
 };
 use crate::node::history_budget::{BufferCharge, Job};
-use crate::node::ports::Token;
-use crate::transport::quic::VoxConnection;
 
 type ActorReply = Option<oneshot::Sender<Outcome>>;
 
 pub(in crate::node::actor) struct ArchiveReceipt {
     pub(in crate::node::actor) plan: PrivatePlan,
-    pub(in crate::node::actor) lifetime: Arc<maintenance_save::Lifetime>,
-    pub(in crate::node::actor) charge: BufferCharge,
 }
 
 #[derive(Clone, Copy)]
 enum DriveStage {
     Upgrade,
     Sessions,
-    Legacy,
     Support,
     Query,
 }
@@ -38,7 +33,7 @@ type PublicationWait = (
 );
 
 struct ReleaseWait {
-    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    instance: std::sync::Weak<crate::node::channel::RoomLock>,
     attachment: u64,
     authority: computer::ComputerAuthority,
     guard: Option<computer::ComputerPolicyGuard>,
@@ -80,7 +75,7 @@ struct UpgradeObligation {
 }
 
 pub(in crate::node::actor) struct ParkedPrivateDrive {
-    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    instance: std::sync::Weak<crate::node::channel::RoomLock>,
     attachment: u64,
     stage: DriveStage,
     guard: Option<computer::ComputerPolicyGuard>,
@@ -144,14 +139,6 @@ enum After {
         guard: Option<computer::ComputerPolicyGuard>,
     },
     SupportDiscovery(SupportStage),
-    Serving {
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
-        connection: Arc<VoxConnection>,
-        job: Job,
-        charge: BufferCharge,
-        guard: history_demand::CurrentPrivateGuard,
-    },
     Live {
         answer: oneshot::Sender<Result<pending_upgrade::LivePageResult>>,
         guard: history_demand::CurrentPrivateGuard,
@@ -189,9 +176,7 @@ impl Continuation {
         &self,
     ) -> Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
         match &self.after {
-            After::Serving { guard, .. }
-            | After::Live { guard, .. }
-            | After::Admission { guard, .. } => Some(guard.secret()),
+            After::Live { guard, .. } | After::Admission { guard, .. } => Some(guard.secret()),
             After::Archive { guard, .. } => Some(guard.secret()),
             After::Drive { .. } | After::SupportDiscovery(_) => None,
         }
@@ -921,7 +906,6 @@ impl Node {
                 finish_initial: false,
             }),
             DriveStage::Sessions => maintenance_save::Work::Projection(ProjectionWork::Sessions),
-            DriveStage::Legacy => maintenance_save::Work::Private(Work::AnnounceLegacy),
             DriveStage::Support => {
                 maintenance_save::Work::Consent(consent_save::Work::PrivateSupport {
                     discovery_ready: true,
@@ -1462,51 +1446,6 @@ impl Node {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::node::actor) async fn begin_owned_private_serving(
-        &mut self,
-        instance: SharedChannel,
-        ask: Ask,
-        peer: Digest32,
-        holders: BTreeSet<Digest32>,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
-        connection: Arc<VoxConnection>,
-        job: Job,
-        charge: BufferCharge,
-        page_charge: BufferCharge,
-        guard: history_demand::CurrentPrivateGuard,
-    ) -> bool {
-        let room = ask.room;
-        let work = Work::Serve {
-            ask,
-            peer,
-            holders,
-            charge: page_charge,
-            guard: guard.clone(),
-        };
-        let continuation = Continuation {
-            instance,
-            attachment: self.delivery_epoch,
-            lifetime: None,
-            after: After::Serving {
-                send,
-                recv,
-                connection,
-                job,
-                charge,
-                guard,
-            },
-        };
-        self.begin_pending_maintenance(
-            room,
-            maintenance_save::Work::Private(work),
-            maintenance_save::Continuation::Private(continuation),
-            None,
-        )
-        .await
-    }
-
     /// Decide one image request through the private serving rule; any refusal answers `false`.
     pub(in crate::node::actor) async fn begin_owned_private_admission(
         &mut self,
@@ -1541,7 +1480,6 @@ impl Node {
         room: Digest32,
         instance: SharedChannel,
         peer: Digest32,
-        _token: Token,
         revision: u64,
         page: Result<Page>,
         received_at: u64,
@@ -1700,9 +1638,6 @@ impl Node {
         }
         let fault = fault_of(&error);
         match continuation.after {
-            After::Serving {
-                mut send, mut recv, ..
-            } => crate::transport::streams::refuse(&mut send, &mut recv),
             After::Live { answer, .. } => {
                 let _ = answer.send(Err(error));
             }
@@ -1784,28 +1719,6 @@ impl Node {
         }
         match (continuation.after, result) {
             (
-                After::Serving {
-                    send,
-                    mut recv,
-                    connection,
-                    job,
-                    charge,
-                    guard,
-                },
-                maintenance_save::Saved::Private(Saved::Page(page)),
-            ) => {
-                self.spawn_join_housekeeping(async move {
-                    let (_lifetime, _guard, _connection, _job, _charge) =
-                        (lifetime, guard, connection, job, charge);
-                    let _ = &mut recv;
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        crate::node::sessionstream::answer(send, page, &_lifetime.store, &room),
-                    )
-                    .await;
-                });
-            }
-            (
                 After::Live {
                     answer,
                     guard,
@@ -1829,12 +1742,8 @@ impl Node {
                     pending_upgrade::PageResult::Archive(plan),
                 )),
             ) => {
-                let _ = answer.send(Ok(ArchiveReceipt {
-                    plan,
-                    lifetime,
-                    charge,
-                }));
-                drop((guard, job));
+                drop((lifetime, guard, job, charge));
+                let _ = answer.send(Ok(ArchiveReceipt { plan }));
             }
             (
                 After::Admission { answer, guard },
@@ -1890,9 +1799,7 @@ impl Node {
         let mut prerequisite = match stage {
             DriveStage::Sessions | DriveStage::Support => DriveWait::Support,
             DriveStage::Query => DriveWait::Projection,
-            DriveStage::Upgrade | DriveStage::Legacy => {
-                DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance)
-            }
+            DriveStage::Upgrade => DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance),
         };
         let next = match (stage, result) {
             (
@@ -2034,30 +1941,11 @@ impl Node {
                     self.sched_rooms.insert(room);
                 }
                 ready.then_some((
-                    DriveStage::Legacy,
-                    maintenance_save::Work::Private(Work::AnnounceLegacy),
+                    DriveStage::Support,
+                    maintenance_save::Work::Consent(consent_save::Work::PrivateSupport {
+                        discovery_ready: true,
+                    }),
                 ))
-            }
-            (
-                DriveStage::Legacy,
-                maintenance_save::Saved::Private(Saved::Announcement { count, complete }),
-            ) => {
-                if count != 0 {
-                    self.note_local_append(&room);
-                }
-                Some(if complete {
-                    (
-                        DriveStage::Support,
-                        maintenance_save::Work::Consent(consent_save::Work::PrivateSupport {
-                            discovery_ready: true,
-                        }),
-                    )
-                } else {
-                    (
-                        DriveStage::Legacy,
-                        maintenance_save::Work::Private(Work::AnnounceLegacy),
-                    )
-                })
             }
             (
                 DriveStage::Support,

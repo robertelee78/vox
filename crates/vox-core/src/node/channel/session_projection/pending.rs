@@ -170,19 +170,11 @@ impl ChannelState {
         if completed.entries_changed {
             self.entries.committed();
         }
-        let mut retraction = Ok(());
-        if completed.retracted {
-            self.remove_display_rows();
-            self.display_news = true;
-            match self
-                .entries
-                .render_view(store, &self.sek, &self.channel_id)
-                .and_then(|view| view.step(None, true, None, true))
-            {
-                Ok(row) => self.display_tail = row.map(|(key, _)| key),
-                Err(error) => retraction = Err(error),
-            }
-        }
+        let retraction = if completed.retracted {
+            self.rows_retracted(store)
+        } else {
+            Ok(())
+        };
         let CompletedProjection {
             mut pending,
             result,
@@ -303,6 +295,21 @@ impl ChannelState {
             return;
         }
         self.next_log_id = self.next_log_id.max(next_log_id);
+    }
+
+    /// A governance turn took shown rows away or brought retained ones back (MP-11), on any
+    /// path that runs it: readers folding a fixed range notice, the node says so to its clients
+    /// once (`display_news`, said as `Synced` with nothing applied), and the room's newest row
+    /// is read again.
+    pub(in crate::node::channel) fn rows_retracted(&mut self, store: &Store) -> Result<()> {
+        self.remove_display_rows();
+        self.display_news = true;
+        let row = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .step(None, true, None, true)?;
+        self.display_tail = row.map(|(key, _)| key);
+        Ok(())
     }
 }
 

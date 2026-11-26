@@ -1,31 +1,41 @@
-//! ADR-023 M23.2 / PRD-001 R13 — one order on every node, driven through the **shipped `vox`
-//! binary**.
+//! ADR-023 M23.2 — the room's order, driven through the **shipped `vox` binary**.
 //!
 //! Each entry's signed skeleton names the heads of the other authors' feeds its author had
-//! applied (`seen`) and the author's clock (`claimed_ms`). The room's order is a hybrid logical
-//! clock over that DAG, ties broken by `(claimed ms, entry hash)`, so it is a function of the
-//! entry set alone: every node that holds the same entries shows them in the same sequence,
-//! whatever order they arrived in.
+//! applied (`seen`) and the author's clock (`claimed_ms`). Each node fixes an entry's place once,
+//! when it first shows it: its signed time, but no later than ten minutes past that node's first
+//! sight of it (the first-sight cap), lifted to just after any entry it names in `seen` that the
+//! node already shows (a floor); ties are broken by entry hash. So the order is not a function of
+//! the entry set alone, and these proofs do not claim that every member always shows the same
+//! order (PRD-001 R13 in general): identical order is guaranteed only when every signed time is
+//! within every receiving member's first-sight cap and no floor is active.
 //!
-//! **Proof 1 (same order):** three real daemons. All three post at once; one goes offline while
-//! the other two keep posting; it comes back and all three post at once again. After
-//! convergence, `vox room read --hashes` (every entry the node holds, readable or not) prints
-//! the identical sequence on all three — its length and SHA-256 are printed per node — and each
-//! node's `vox room read` timeline is that sequence restricted to the rows it can read, in the
-//! same relative order.
+//! **Proof 1 (same order, one scenario):** three real daemons on one computer's clock. All three
+//! post at once; one goes offline while the other two keep posting; it comes back and all three
+//! post at once again. After convergence, `vox room read --hashes` (every entry the node holds,
+//! readable or not) prints the identical sequence on all three — its length and SHA-256 are
+//! printed per node — and each node's `vox room read` timeline is that sequence restricted to the
+//! rows it can read, in the same relative order. This is a regression for this scenario only, not
+//! a proof that rooms converge to one order: identical order is guaranteed only when every signed
+//! time is within every receiving member's first-sight cap and no floor is active, which this
+//! staging (one clock, no skew) aims at.
 //!
 //! **Proof 2 (causal):** the replier's clock is an hour behind (the test-only
 //! `VOX_TEST_CLOCK_SKEW_MS`, read by the shipped binary's millisecond clock). A member posts a
-//! question; the replier reads it and answers. On every node the answer is ordered after the
-//! question — although its claimed time is an hour earlier, which the gate reads back from the
-//! replier's own `vox room read --json` so the skew is proven to have reached the entry.
+//! question; the replier and the third member show it, then the replier answers, naming it in
+//! `seen`. On every node, each of which already had the question when the answer arrived, the
+//! answer is ordered after the question — although its claimed time is an hour earlier, which
+//! the gate reads back from the replier's own `vox room read --json` so the skew is proven to
+//! have reached the entry.
 //!
-//! **Proof 3 (a clock far ahead):** a member's clock is a day ahead. It posts; another member
-//! reads that post and then writes. The later post names the day-ahead one in `seen`, so without a
-//! cap it would be placed a day in the future, and so would everything after it. The gate reads
-//! each entry's placing clock from `vox room read --hashes`. It asserts the later post is placed
-//! less than 15 minutes ahead of when it was written, still after what it saw. It also reads the
-//! day-ahead claim back from `vox room read --json`.
+//! **Proof 3 (a clock far ahead):** Bob's own clock is a day ahead. He posts; Alice reads that
+//! post and then writes, so her post names his in `seen`. The gate reads each entry's placing
+//! clock from `vox room read --hashes`. On both screens both posts arrive and Alice's post follows
+//! Bob's. On Alice's screen (her clock is right) her post is placed less than 15 minutes ahead of
+//! when she wrote it: her node did not take in Bob's day-ahead claim as it is. Bob's screen is not
+//! held to Alice's clock: his own computer first saw his post a day ahead, so it places it there,
+//! and Alice's post, which names it, keeps to that floor. That is intended: a computer whose own
+//! clock is wrong shows its own room wrong. The gate also reads the day-ahead claim back from Bob's
+//! `vox room read --json`.
 //!
 //! Mutations (each run, each red): `seen` ignored when ordering (proof 2); the cap removed
 //! (proof 3); the order taken from arrival, the order each node stored the entries in (proof 1:
@@ -604,13 +614,17 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
     let room = room(alice, &[bob, carol]);
 
     post(alice, &room, "question");
+    // Bob reads it before he answers, and carol shows it before the answer exists: the answer
+    // is placed after the question on a node that already had the question when it arrived.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !texts(&read(bob, &room)).contains(&"question") {
-        assert!(
-            Instant::now() < deadline,
-            "PRODUCT (staging): bob never read the question"
-        );
-        std::thread::sleep(Duration::from_millis(200));
+    for (dir, who) in [(bob, "bob"), (carol, "carol")] {
+        while !texts(&read(dir, &room)).contains(&"question") {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT (staging): {who} never read the question"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
     post(bob, &room, "answer");
 
@@ -761,12 +775,16 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
             ti < ai,
             "PRODUCT: {who}: the post that saw it must still follow it"
         );
-        assert!(
-            a_clock < posted_at + 15 * 60_000,
-            "PRODUCT: {who}: a post written after seeing a day-ahead post was placed {} min ahead of \
-             when it was written — one member dragged the room's clock forward",
-            minutes(a_clock)
-        );
+        // Not on Bob: his own clock is a day ahead, so his node first saw his post a day ahead
+        // and places Alice's post, which names it, after that. Intended, not held to her clock.
+        if *who == "alice" {
+            assert!(
+                a_clock < posted_at + 15 * 60_000,
+                "PRODUCT: {who}: a post written after seeing a day-ahead post was placed {} min ahead of \
+                 when it was written — one member dragged the room's clock forward",
+                minutes(a_clock)
+            );
+        }
     }
 
     // The skew really reached the entry: the claimed time bob's node shows is a day ahead.

@@ -44,14 +44,9 @@ use crate::log::entry::{Entry, EntryRead, EntryWrite, ZERO_HASH};
 /// a value that could make its power-of-three loop diverge.
 pub const MAX_SEQ: u64 = 1 << 48;
 
-/// Whether `entry` ends its author's feed. A `mutant-sender` build in a `terminate*` mode keeps
-/// writing past its own `Termination` (ADR-053 MP-10 (c)); every other build reads the signed flag.
+/// Whether `entry` ends its author's feed.
 #[must_use]
 pub fn ends_feed(entry: &Entry) -> bool {
-    #[cfg(feature = "mutant-sender")]
-    if crate::log::sync::mutant::keeps_writing_after_end() {
-        return false;
-    }
     entry.skeleton.end_of_feed
 }
 
@@ -59,7 +54,7 @@ pub fn ends_feed(entry: &Entry) -> bool {
 /// one before them; every other build checks the chain.
 #[cfg(feature = "mutant-sender")]
 pub(crate) fn chain_unchecked() -> bool {
-    crate::log::sync::mutant::splits_chain()
+    crate::log::mutant::splits_chain()
 }
 
 #[cfg(not(feature = "mutant-sender"))]

@@ -1,44 +1,24 @@
-//! Charged, cancellable I/O for one bounded request. No room or actor lock crosses an await.
+//! Cancellable I/O for one bounded request. No room or actor lock crosses an await, and no
+//! shared admission crosses an await on the peer.
 
 use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
-use tokio::time::Instant;
 
-use super::{
-    Encoded, Frame, ACK_FRAME_MAX_BYTES, MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES,
-    MAX_WANT_FRAME_BYTES,
-};
+use super::{Encoded, Frame, MAX_FRAME_BYTES};
 use crate::error::{Error, Result};
-use crate::node::history_budget::{BufferCharge, Job};
+use crate::node::history_budget::Job;
 use crate::transport::framing::write_frame;
-use crate::transport::stream_transport::{Fence, SYNC_FRAME_TIMEOUT};
+use crate::transport::stream_transport::Fence;
 use crate::wire::WireError;
-
-// Covers a parsed HAVE vector or all bounded proof tokens/headers beside the raw input.
-// The separate verification slice owns context maps and verifier outputs, not this decoder.
-const DECODE_ENVELOPE: usize = 1024 * 1024;
 
 pub(super) struct Incoming {
     bytes: Vec<u8>,
-    availability: bool,
-    _charge: BufferCharge,
 }
 
 impl Incoming {
-    pub(super) fn job(&self) -> Job {
-        self._charge.job()
-    }
-
     pub(super) fn frame(&self) -> Result<Frame<'_>> {
-        let frame = Frame::decode(&self.bytes)?;
-        if matches!(&frame, Frame::Have { availability, .. } if availability.is_some() != self.availability)
-        {
-            return Err(Error::MalformedBundle(
-                "inventory availability not negotiated",
-            ));
-        }
-        Ok(frame)
+        Frame::decode(&self.bytes)
     }
 
     pub(super) fn wire_len(&self) -> usize {
@@ -49,42 +29,89 @@ impl Incoming {
 pub(super) enum Read {
     Frame(Incoming),
     End,
-    Busy,
 }
 
-#[derive(Clone, Copy)]
-enum ReadAdmission {
-    Optional,
-    Required,
-}
-
-pub(super) struct Transport {
+/// The asking side of one loop request, and the holder's side of an incoming request before its
+/// admission and after its answer is assembled: the request and its answer's frames are the
+/// connection's private assembly (ADR-054 PL-6), bounded by the frame and wire credit, never by
+/// the node's shared work or byte admission. It holds no job and no shared byte credit, so no
+/// local work waits behind its wait for the peer; the connection's end ends it.
+pub(super) struct Private {
     send: SendStream,
     recv: RecvStream,
-    job: Job,
     fence: Arc<Fence>,
-    deadline: Instant,
-    send_finished: bool,
-    pub(super) availability_connection: Option<u64>,
+}
+
+impl Private {
+    pub(super) fn new(send: SendStream, recv: RecvStream, fence: Arc<Fence>) -> Self {
+        Self { send, recv, fence }
+    }
+
+    /// One length-prefixed frame (or the preamble), written as the peer's flow control lets.
+    pub(super) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        let fence = Arc::clone(&self.fence);
+        let result = tokio::select! {
+            biased;
+            () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
+            result = write_frame(&mut self.send, bytes) => result,
+        };
+        if let Err(error) = &result {
+            self.abort(error_code(error));
+        }
+        result
+    }
+
+    /// One frame of at most `remaining_wire` bytes with its prefix, of one of `expected_tags`.
+    pub(super) async fn read(
+        &mut self,
+        remaining_wire: usize,
+        expected_tags: Option<&[u8]>,
+    ) -> Result<Read> {
+        let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
+        if maximum == 0 {
+            return Err(Error::SizeLimitExceeded("history response credit"));
+        }
+        let fence = Arc::clone(&self.fence);
+        let result = tokio::select! {
+            biased;
+            () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
+            result = read_frame(&mut self.recv, maximum, expected_tags) => result,
+        };
+        if let Err(error) = &result {
+            self.abort(error_code(error));
+        }
+        result
+    }
+
+    pub(super) fn abort(&mut self, code: WireError) {
+        let code = quinn::VarInt::from_u32(u32::from(code.code()));
+        let _ = self.send.reset(code);
+        let _ = self.recv.stop(code);
+    }
+
+    pub(super) fn finish(&mut self) -> Result<()> {
+        self.send
+            .finish()
+            .map_err(|_| Error::Unreachable("history stream closed before finish"))
+    }
+}
+
+/// The holder's answer to one request, assembled under its daemon-wide job before any of it is
+/// written: the job admits the local work (store reads, proofs, encoding); each encoded frame then
+/// leaves the shared byte pool and is kept here as the connection's own bytes, at most the
+/// request's wire credit (`credit::Response`, at most `MAX_RESPONSE_BYTES`). The answer awaits
+/// nothing from its asker: `serve` gives back the job and every shared charge before it writes
+/// these frames (`history_stream::serve`).
+pub(super) struct Transport {
+    job: Job,
+    frames: Vec<Vec<u8>>,
 }
 
 impl Transport {
-    pub(super) fn new(
-        send: SendStream,
-        recv: RecvStream,
-        job: Job,
-        fence: Arc<Fence>,
-        deadline: Instant,
-        availability_connection: Option<u64>,
-    ) -> Self {
+    pub(super) fn new(job: Job) -> Self {
         Self {
-            send,
-            recv,
             job,
-            fence,
-            deadline,
-            send_finished: false,
-            availability_connection,
+            frames: Vec::new(),
         }
     }
 
@@ -92,177 +119,23 @@ impl Transport {
         &self.job
     }
 
-    fn until(&self) -> Instant {
-        self.deadline.min(Instant::now() + SYNC_FRAME_TIMEOUT)
+    /// Add one frame the credit ledger has accepted. Its encoding charge is given back here; the
+    /// bytes are the connection's own from now on.
+    pub(super) fn push(&mut self, encoded: Encoded) {
+        let Encoded { bytes, .. } = encoded;
+        self.frames.push(bytes);
     }
 
-    /// The caller supplies its remaining response credit including the four-byte prefix.
-    /// An owned operation retains its exact capacity cause before consuming any prefix bytes.
-    pub(super) async fn read_required(&mut self, remaining_wire: usize) -> Result<Read> {
-        self.read_bounded(
-            remaining_wire,
-            DECODE_ENVELOPE,
-            None,
-            ReadAdmission::Required,
-        )
-        .await
-    }
-
-    /// HELLO has a fixed three-byte maximum and no decoded collection. Keep its reservation
-    /// ahead of the prefix while leaving the attacker-sized envelope on every variable frame.
-    pub(super) async fn read_hello(&mut self) -> Result<Read> {
-        self.read_bounded(
-            MAX_HELLO_FRAME_BYTES + 4,
-            0,
-            Some(&[0x01]),
-            ReadAdmission::Optional,
-        )
-        .await
-    }
-
-    pub(super) async fn read_hello_required(&mut self) -> Result<Read> {
-        self.read_bounded(
-            MAX_HELLO_FRAME_BYTES + 4,
-            0,
-            Some(&[0x01]),
-            ReadAdmission::Required,
-        )
-        .await
-    }
-
-    /// This handshake position accepts WANT's bounded scalar Query or a smaller CANCEL.
-    pub(super) async fn read_want_or_cancel(&mut self) -> Result<Read> {
-        self.read_bounded(
-            MAX_WANT_FRAME_BYTES + 4,
-            0,
-            Some(&[0x03, 0x09]),
-            ReadAdmission::Optional,
-        )
-        .await
-    }
-
-    /// ACK and CANCEL are fixed scalar frames. They need no variable-frame decode envelope;
-    /// reserve their structural bound before the prefix and reject every other tag there.
-    pub(super) async fn read_ack_or_cancel(&mut self, remaining_wire: usize) -> Result<Read> {
-        self.read_bounded(
-            remaining_wire.min(ACK_FRAME_MAX_BYTES + 4),
-            0,
-            Some(&[0x0A, 0x09]),
-            ReadAdmission::Optional,
-        )
-        .await
-    }
-
-    async fn read_bounded(
-        &mut self,
-        remaining_wire: usize,
-        decode_envelope: usize,
-        expected_tags: Option<&[u8]>,
-        admission: ReadAdmission,
-    ) -> Result<Read> {
-        let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
-        if maximum == 0 {
-            return Err(Error::SizeLimitExceeded("history response credit"));
-        }
-        let envelope = maximum
-            .checked_add(decode_envelope)
-            .ok_or(Error::SizeLimitExceeded("history frame envelope"))?;
-        let Some(work_job) = self.job.record_job(envelope).await else {
-            return Ok(Read::Busy);
-        };
-        let charge = match admission {
-            ReadAdmission::Optional => {
-                let Some(charge) = work_job.reserve(envelope) else {
-                    return Ok(Read::Busy);
-                };
-                charge
-            }
-            ReadAdmission::Required => work_job.reserve_or_pressure(envelope)?,
-        };
-        let until = self.until();
-        let fence = Arc::clone(&self.fence);
-        let result = tokio::select! {
-            biased;
-            () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(
-                until,
-                read_charged(&mut self.recv, maximum, charge, expected_tags, self.availability_connection.is_some()),
-            ) => {
-                result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
-            }
-        };
-        if let Err(error) = &result {
-            self.abort(error_code(error));
-        }
-        result
-    }
-
-    /// False is local buffer exhaustion before any bytes are sent. The encoded allocation and
-    /// its permit remain held through the complete write, including transport backpressure.
-    pub(super) async fn write(&mut self, frame: &Frame<'_>) -> Result<bool> {
-        let Some(encoded) = frame.encode(&self.job)? else {
-            return Ok(false);
-        };
-        self.write_encoded(&encoded).await?;
-        Ok(true)
-    }
-
-    /// The credit ledger measures this exact encoding before it commits wire credit. Keeping
-    /// it charged here avoids re-encoding after the ledger has accepted a frame.
-    pub(super) async fn write_encoded(&mut self, encoded: &Encoded) -> Result<()> {
-        self.write_bytes(encoded.as_slice()).await
-    }
-
-    /// The fixed preamble is charged separately from ordinary frame encodings.
-    pub(super) async fn write_preamble(&mut self, preamble: super::Preamble) -> Result<usize> {
-        let _charge = self.job.reserve_or_pressure(super::MAX_PREAMBLE * 2)?;
-        let bytes = preamble.encode();
-        self.write_bytes(&bytes).await?;
-        Ok(bytes.len() + 4)
-    }
-
-    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let until = self.until();
-        let fence = Arc::clone(&self.fence);
-        let result = tokio::select! {
-            biased;
-            () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(until, write_frame(&mut self.send, bytes)) => {
-                result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
-            }
-        };
-        if let Err(error) = &result {
-            self.abort(error_code(error));
-        }
-        result
-    }
-
-    pub(super) fn finish(&mut self) -> Result<()> {
-        self.send
-            .finish()
-            .map_err(|_| Error::Unreachable("history stream closed before finish"))?;
-        self.send_finished = true;
-        Ok(())
-    }
-
-    pub(super) fn abort(&mut self, code: WireError) {
-        let code = quinn::VarInt::from_u32(u32::from(code.code()));
-        // Quinn reset may discard queued bytes even after FIN was accepted. A later local
-        // cancellation must not erase an ACK whose graceful send completion already succeeded.
-        // This records queued FIN, not peer delivery; genuine wire failures remain failures.
-        if !self.send_finished {
-            let _ = self.send.reset(code);
-        }
-        let _ = self.recv.stop(code);
+    /// The assembled frames, in order; the job goes with the rest of `self`.
+    pub(super) fn into_frames(self) -> Vec<Vec<u8>> {
+        self.frames
     }
 }
 
-async fn read_charged(
+async fn read_frame(
     recv: &mut RecvStream,
     maximum: usize,
-    charge: BufferCharge,
     expected_tags: Option<&[u8]>,
-    availability: bool,
 ) -> Result<Read> {
     let mut prefix = [0; 4];
     match recv.read_exact(&mut prefix).await {
@@ -279,11 +152,7 @@ async fn read_charged(
     if expected_tags.is_some_and(|expected| !expected.contains(&bytes[0])) {
         return Err(Error::MalformedBundle("history unexpected fixed frame"));
     }
-    Ok(Read::Frame(Incoming {
-        availability,
-        bytes,
-        _charge: charge,
-    }))
+    Ok(Read::Frame(Incoming { bytes }))
 }
 
 fn read_error(error: quinn::ReadExactError) -> Error {

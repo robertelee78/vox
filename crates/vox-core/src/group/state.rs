@@ -371,6 +371,12 @@ impl ReceiverChain {
         self.epoch
     }
 
+    /// The iteration of the original release this receiver was installed from: the earliest
+    /// this receiver's retained release can open (no key bytes).
+    pub(crate) fn history_iteration(&self) -> u64 {
+        self.history_iteration
+    }
+
     /// Scalar binding for an auxiliary original release; the temporary body zeroizes and
     /// no chain-key bytes escape this receiver.
     pub(crate) fn history_release_binding(&self) -> (u64, crate::hash::Digest32) {

@@ -3,6 +3,8 @@ use super::*;
 
 pub(crate) struct StartupPolicy {
     pub(in crate::node::actor) trust: Keyring,
+    /// The durable incarnation (stored nonce) of exactly `trust`.
+    pub(in crate::node::actor) incarnation: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
     pub(in crate::node::actor) consent_keys: PendingConsents,
     pub(in crate::node::actor) revision: u64,
     pub(in crate::node::actor) expired: bool,
@@ -19,7 +21,7 @@ pub(in crate::node::actor) fn settle_startup_policy(
 ) -> crate::error::Result<StartupPolicy> {
     let signer = profile.signer()?;
     let store = profile.store();
-    let mut trust = Keyring::load(store, signer)?;
+    let (mut trust, mut incarnation) = Keyring::load_at(store, signer)?;
     let (mut revision, mut expired) = (0, false);
     if let Some(computer) = computer {
         let transition = transition.ok_or(Error::Profile(
@@ -77,6 +79,7 @@ pub(in crate::node::actor) fn settle_startup_policy(
                 .run(store, signer);
                 if let Some(saved) = native.committed {
                     trust = saved.trust;
+                    incarnation = saved.incarnation;
                 }
                 let settled = native.result?;
                 guard.active(Some(computer))?;
@@ -109,6 +112,7 @@ pub(in crate::node::actor) fn settle_startup_policy(
     let consent_keys = PendingConsents::load(store, signer)?;
     Ok(StartupPolicy {
         trust,
+        incarnation,
         consent_keys,
         revision,
         expired,

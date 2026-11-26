@@ -482,8 +482,53 @@ pub(in crate::node::channel) fn observe_public(
         }
     }
     merge_control(&mut index, &author, seen)?;
-    super::floor_index::observe(&mut index, room, entry, current_epoch)?;
-    index.seal()
+    let floors = super::floor_index::observe(&mut index, room, entry, current_epoch)?;
+    index.seal()?;
+    if floors {
+        // A Session floor or its signed source changed: in this same transaction, the room's
+        // private permission generation moves (`permission_generation`).
+        raise_permission_generation(batch, room)?;
+    }
+    Ok(())
+}
+
+/// A committed fact that per-record private permission reads changed in `batch`'s transaction
+/// (a Session floor or its signed source, `observe_public`; a per-record eligibility decision
+/// completed, `governance::member_fold::advance_eligibility`): the room's private permission
+/// generation moves with it, once per transaction that changed it.
+pub(in crate::node::channel) fn raise_permission_generation(
+    batch: &mut Batch<'_>,
+    room: &Digest32,
+) -> Result<()> {
+    batch.update_meta(&permission_key(room), |was| {
+        let was = was
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map_or(0, u64::from_be_bytes);
+        Ok((was.wrapping_add(1).to_be_bytes().to_vec(), ()))
+    })
+}
+
+fn permission_key(room: &Digest32) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(96);
+    key.push_str("room-private-permission/");
+    for byte in room {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// How many times a committed transaction changed a fact per-record private permission reads
+/// besides membership, removal, readiness and the keyring (`raise_permission_generation`):
+/// read with each room publication, it is part of what tells a connection's teller to decide
+/// again what it may tell (`history_stream::pull` tell).
+pub(in crate::node::channel) fn permission_generation(
+    store: &crate::node::store::Store,
+    room: &Digest32,
+) -> Result<u64> {
+    Ok(store
+        .get_meta_prefix::<8>(&permission_key(room))?
+        .map_or(0, u64::from_be_bytes))
 }
 
 fn candidate(saved: &Stored, id: u64) -> Option<Source> {

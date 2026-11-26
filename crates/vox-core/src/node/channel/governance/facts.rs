@@ -1682,6 +1682,31 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(())
     }
 
+    /// A per-record eligibility decision that private permission reads completed in this
+    /// transaction: the room's private permission generation moves with it
+    /// (`private_index::raise_permission_generation`), so a teller waiting on it decides again.
+    pub(super) fn private_permission_news(&mut self) -> Result<()> {
+        crate::node::channel::session_projection::private_index::raise_permission_generation(
+            self.batch, self.room,
+        )
+    }
+
+    /// Whether `hash` names a retained private Session record here, read in this transaction
+    /// from the private-record catalog (`private_index::find_in`, `Tree::PrivateHash`). A legacy
+    /// record is catalogued under its public entry's hash (`Record::hash`), which stays the same
+    /// when a migration prunes that entry's public payload (`Entry::prune_payload`).
+    pub(super) fn private_record(&self, hash: &Digest32) -> Result<bool> {
+        Ok(
+            crate::node::channel::session_projection::private_index::find_in(
+                &*self.batch,
+                self.sek,
+                self.room,
+                hash,
+            )?
+            .is_some(),
+        )
+    }
+
     pub(super) fn eligibility_replaying(&self) -> bool {
         self.header.cursors[Cursor::EligibilityReplay as usize] != 0
     }

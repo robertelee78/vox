@@ -376,7 +376,7 @@ impl From<&str> for PageFailure {
 }
 
 /// Fence a multi-request visible page without retaining a database snapshot or lock. The read
-/// token moves only when the order of rows already read changed, not when a row changes.
+/// token moves only when the room it reads was replaced; rows already read never reorder.
 async fn page_revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32, PageFailure> {
     match client
         .request(&Request::RoomReadRevision { channel_id: room })
@@ -972,6 +972,14 @@ impl DaemonCore {
             ) => {
                 self.asked = None;
                 CommandStatus::Done
+            }
+            // Joined again while its own history is still being recovered: said, not "done".
+            Ok(Frame::JoinedRecovering) => {
+                self.asked = None;
+                CommandStatus::Said(format!(
+                    "joined; {}",
+                    vox_core::node::api::Outcome::RECOVERING
+                ))
             }
             // **The link is the answer** (#406): set only as a notice, it sat under the "done" this
             // command's own status puts over every notice, and `:link` showed a person nothing to

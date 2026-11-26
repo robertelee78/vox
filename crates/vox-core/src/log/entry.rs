@@ -501,7 +501,7 @@ impl Entry {
         };
         // The mutant sender build only (MP-9 arm d): the other copy's entry may stand in for it.
         #[cfg(feature = "mutant-sender")]
-        let entry = crate::log::sync::mutant::own_entry(entry);
+        let entry = crate::log::mutant::own_entry(entry);
         Ok(entry)
     }
 

@@ -65,13 +65,12 @@ impl PageFlow {
                 "private live request or authority changed",
             ));
         }
-        channel.private_sessions.pulling.remove(&peer);
         let page = page?;
         channel.require_governance_ready(store, crate::time::Ms(now))?;
         if channel.poisoned.get()
             || !channel.private_peer_current(store, &peer)?
             || page.revision != revision
-            || page.query != PrivateQuery::LiveTail
+            || !matches!(page.query, PrivateQuery::LiveTail { .. })
         {
             return Err(Error::StreamRefused(
                 "private live request or authority changed",
@@ -189,7 +188,7 @@ impl PageFlow {
                 Stage::Inventory(0)
             }
             PrivateQuery::ArchiveRecords { .. } => Stage::Preview(0),
-            PrivateQuery::LiveTail => {
+            PrivateQuery::LiveTail { .. } => {
                 return Err(Error::StreamRefused(
                     "live delivery is not an archive quantum",
                 ))
@@ -225,7 +224,6 @@ impl PageFlow {
         now: u64,
         authority: TrustNonce,
     ) -> Result<Self> {
-        channel.private_sessions.pulling.remove(&peer);
         let selected = channel
             .private_sessions
             .automatic
@@ -544,9 +542,7 @@ impl PageFlow {
                         && channel.private_sessions.cursors.get(&self.peer)
                             == Some(&self.page.cursor)
                     {
-                        self.stage = Stage::Done(
-                            channel.private_sessions.auto_continue.contains(&self.peer),
-                        );
+                        self.stage = Stage::Done(false);
                         continue;
                     }
                     return channel
@@ -709,7 +705,10 @@ impl PageFlow {
                 }
                 Stage::Inventory(i + 1)
             }
-            Stage::Cursor if saved.cursor_committed => Stage::Done(true),
+            // A live answer with no records (the donor's echo of this node's own cursor when the
+            // told anchor no longer holds) advanced nothing, even if this was the first cursor
+            // saved for the donor: the announcement is consumed once (ruling-private-tip §5).
+            Stage::Cursor if saved.cursor_committed => Stage::Done(!self.page.records.is_empty()),
             Stage::AutoCursor if saved.cursor_committed => Stage::Done(true),
             _ => {
                 return Err(Error::Profile(

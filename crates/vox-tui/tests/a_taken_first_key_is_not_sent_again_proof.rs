@@ -87,8 +87,7 @@ fn lock(seen: &Mutex<Seen>) -> std::sync::MutexGuard<'_, Seen> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Answer every stream the victim opens on `conn` as mallory's node would: a sync is answered as a
-/// member, and a key is taken (`KEY_TAKEN`). Records what arrived, timed from `t0`.
+/// Take each pairwise key (`KEY_TAKEN`). Records what arrived, timed from `t0`.
 fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mutex<Seen>> {
     let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::default()));
     let record = Arc::clone(&seen);
@@ -100,20 +99,6 @@ fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mute
             tokio::spawn(async move {
                 lock(&record).streams += 1;
                 if kind != StreamKind::Pairwise {
-                    let Ok((_cid, _epoch)) =
-                        vox_core::node::syncstream::read_sync_request(&mut recv).await
-                    else {
-                        return;
-                    };
-                    let t = vox_core::node::syncstream::accept_sync(
-                        tokio::runtime::Handle::current(),
-                        send,
-                        recv,
-                    );
-                    let _ = tokio::task::spawn_blocking(move || {
-                        raw_sync::session(t, &raw_sync::Ask::Everything, None)
-                    })
-                    .await;
                     return;
                 }
                 lock(&record).pairwise += 1;

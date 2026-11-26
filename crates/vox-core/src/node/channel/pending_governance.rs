@@ -1,13 +1,12 @@
 //! Exact bounded governance cursor work. Preparation reads committed state only; native
 //! writer admission and commits run without actor, room, or Computer-state ownership.
-use super::semantic_projection::{PreparedContent, SemanticProjection};
+use super::semantic_projection::{PreparedContent, ProjectionOutcome, SemanticProjection};
 use super::*;
 use crate::atrest::sek::WeakSek;
 
 pub(crate) enum Work {
     Backfill,
     Contiguous,
-    ProviderPrune,
     CleanupProvisional {
         owner: legacy_provisional::LegacyProvisionalOwner,
     },
@@ -23,15 +22,15 @@ pub(crate) enum Saved {
     Backfill {
         rendered: usize,
         pending: bool,
+        /// This step worked the queue under current consent facts and positions remain queued:
+        /// the next step can go on at once, needing no refresh or other news.
+        more: bool,
         session_rendered: usize,
         placed: bool,
         #[cfg(feature = "test-knobs")]
         render_hold: Option<std::path::PathBuf>,
     },
     Contiguous {
-        pending: bool,
-    },
-    ProviderPrune {
         pending: bool,
     },
     CleanupProvisional {
@@ -69,10 +68,6 @@ enum Native {
     },
     Contiguous(Option<Digest32>),
     CleanupProvisional(legacy_provisional::LegacyProvisionalOwner),
-    Provider {
-        peer: Option<Digest32>,
-        forget: bool,
-    },
     Legacy {
         context: Box<legacy_session::LegacyProjectionContext>,
         was_pending: bool,
@@ -143,46 +138,6 @@ impl ChannelState {
                     })
                     .or_else(|| self.sparse_contiguous_pending.first().copied());
                 Native::Contiguous(author)
-            }
-            Work::ProviderPrune => {
-                if self.role_owed.take_key_provider_prune() {
-                    self.key_provider_prune_pending = true;
-                    self.key_provider_prune_after = None;
-                }
-                if self
-                    .key_provider_prune_wait
-                    .as_ref()
-                    .is_some_and(|wait| !wait.ready.load(std::sync::atomic::Ordering::Acquire))
-                {
-                    return Ok(None);
-                }
-                self.key_provider_prune_wait = None;
-                let peer = if self.key_provider_prune_pending {
-                    let wake = self.history_publication_wake();
-                    let read = self.history_read(store)?;
-                    if read.publication_busy() {
-                        drop(read);
-                        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let signal = Arc::clone(&ready);
-                        let owed = Arc::clone(&self.role_owed);
-                        let local = self.me();
-                        let task = tokio::spawn(async move {
-                            wake.await;
-                            signal.store(true, std::sync::atomic::Ordering::Release);
-                            owed.mark_key_provider_prune(local);
-                        });
-                        self.key_provider_prune_wait =
-                            Some(sparse_history::KeyProviderPruneWait { ready, task });
-                        return Ok(None);
-                    }
-                    read.key_provider_cursor_after(self.key_provider_prune_after)?
-                } else {
-                    None
-                };
-                Native::Provider {
-                    forget: peer.is_some_and(|peer| !self.is_member(&peer)),
-                    peer,
-                }
             }
             Work::Legacy => Native::Legacy {
                 context: Box::new(self.legacy_projection_context(store)?),
@@ -315,31 +270,17 @@ impl ChannelState {
             Delta::None => {}
         }
         if completed.result.is_ok() {
-            match &completed.pending.native {
-                Native::Contiguous(author) => {
-                    self.sparse_contiguous_after = *author;
-                    completed.result = Ok(Saved::Contiguous {
-                        pending: !self.sparse_contiguous_pending.is_empty(),
-                    });
-                }
-                Native::Provider { peer, .. } => {
-                    self.key_provider_prune_after = *peer;
-                    if peer.is_none() {
-                        self.key_provider_prune_pending = false;
-                    }
-                }
-                _ => {}
+            if let Native::Contiguous(author) = &completed.pending.native {
+                self.sparse_contiguous_after = *author;
+                completed.result = Ok(Saved::Contiguous {
+                    pending: !self.sparse_contiguous_pending.is_empty(),
+                });
             }
         }
         if let Native::Legacy { context, .. } = &completed.pending.native {
             self.install_legacy_projection_context(context);
         }
         self.release_pending_text(&completed.pending.owner, false);
-        if matches!(&completed.pending.native, Native::Contiguous(_)) && completed.result.is_ok() {
-            if let Err(error) = self.flush_available(store) {
-                completed.result = Err(error);
-            }
-        }
         if let Err(error) = &completed.result {
             if !matches!(
                 &completed.pending.native,
@@ -530,6 +471,7 @@ impl Prepared {
                         return Ok(Saved::Backfill {
                             rendered: 0,
                             pending: false,
+                            more: false,
                             session_rendered: 0,
                             placed: false,
                             #[cfg(feature = "test-knobs")]
@@ -544,6 +486,7 @@ impl Prepared {
                     for (_, prepared) in rows.iter() {
                         prepared.check_generation(&batch, sek, &self.room)?;
                     }
+                    let worked = !edits.is_empty();
                     {
                         let mut writer = index.write(&mut batch, sek, &self.room)?;
                         for (author, next) in edits {
@@ -551,8 +494,17 @@ impl Prepared {
                         }
                         writer.seal()?;
                     }
+                    // A row deferred on a governance refresh queued its author again from the
+                    // start, and the refresh it waits for is this room's governance fold, which
+                    // runs in the governance turn, not in this drain: the drain stops here and
+                    // the turn goes on to it (`pending` owes the rest), never stepping again on
+                    // a row that cannot change until the fold has run.
+                    let mut deferred = false;
                     for (entry, prepared) in std::mem::take(rows) {
-                        projection.apply_with(&mut batch, sek, prepared, &entry)?;
+                        deferred |= matches!(
+                            projection.apply_with(&mut batch, sek, prepared, &entry)?,
+                            ProjectionOutcome::Deferred
+                        );
                     }
                     if projection.receivers_advanced() {
                         projection.queue_receivers_with(&mut batch, sek)?;
@@ -568,11 +520,11 @@ impl Prepared {
                     projection.after_commit_with(store, sek)?;
                     #[cfg(feature = "test-knobs")]
                     let render_hold = render_hold_candidate(&self.room, &projection.rows);
-                    let pending =
-                        *refreshing || index.render_view(store, sek, &self.room)?.has_backfill();
+                    let queued = index.render_view(store, sek, &self.room)?.has_backfill();
                     Ok(Saved::Backfill {
                         rendered,
-                        pending,
+                        pending: *refreshing || queued,
+                        more: worked && queued && !deferred,
                         session_rendered,
                         placed: true,
                         #[cfg(feature = "test-knobs")]
@@ -596,20 +548,6 @@ impl Prepared {
                         progress,
                     };
                     Ok(Saved::Contiguous { pending })
-                }),
-                Native::Provider { peer, forget } => self.sek.with(|sek| {
-                    if let Some(peer) = peer.filter(|_| *forget) {
-                        let mut batch = store.batch()?;
-                        batch.derived();
-                        let mut writer = index.write(&mut batch, sek, &self.room)?;
-                        writer.forget_key_provider_cursor(peer)?;
-                        writer.seal()?;
-                        batch.commit()?;
-                        committed = true;
-                    }
-                    Ok(Saved::ProviderPrune {
-                        pending: peer.is_some(),
-                    })
                 }),
                 Native::Legacy {
                     context,
@@ -638,7 +576,8 @@ impl Prepared {
                             blocks_current: false,
                         });
                     }
-                    let preparation = index.cleanup_orphan_provisional(store, sek, &self.room)?;
+                    let preparation =
+                        index.cleanup_orphan_provisional(store, sek, &self.room, &mut |_| {})?;
                     let blocks_current = preparation == entry_store::Preparation::CleanupPending;
                     delta = Delta::Startup(preparation);
                     committed = true;

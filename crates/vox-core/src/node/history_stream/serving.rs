@@ -1,23 +1,23 @@
 //! The rooms this node answers other members' bounded requests for, on each connection's own
 //! task rather than the node actor's. The actor installs a room when it opens it and retires
 //! the answers in flight when it retires the room or a peer's port, as it retires its own.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use crate::hash::Digest32;
-use crate::node::channel::{ChannelState, RoomSnapshotCell};
+use crate::node::channel::RoomSnapshotCell;
 use crate::node::history_budget::Budget;
 use crate::node::status::SharedSyncBook;
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
 
-use super::HintInbox;
+use super::pull::Holdings;
 
 /// What an answer needs of one open room. Weak: a closed room is not kept alive by serving.
 #[derive(Clone)]
 pub(crate) struct OpenRoom {
-    pub(crate) channel: Weak<tokio::sync::Mutex<ChannelState>>,
+    pub(crate) channel: Weak<crate::node::channel::RoomLock>,
     pub(crate) snapshot: Weak<RoomSnapshotCell>,
     pub(crate) store: Weak<Store>,
     /// This node's identity, whose daemon-wide serving budget an answer is admitted under.
@@ -26,24 +26,27 @@ pub(crate) struct OpenRoom {
 
 struct Live {
     peer: Digest32,
+    /// The connection the request came on.
+    serial: u64,
     fence: Arc<Fence>,
     abort: Option<tokio::task::AbortHandle>,
+    /// Where its query counts, once read ([`Serving::place`]).
+    place: Option<Place>,
+}
+
+/// Where an answer counts once its query is read, decided by the holder from the query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// One of the old flows' queries, counted against the per-peer limit.
+    OldFlow,
+    /// The exchange of a connection's one loop: its Have (`have`), or its one ask (a Range, a
+    /// listed fork or head, its own receipt). One of each per connection and room.
+    Loop { have: bool },
 }
 
 struct Entry {
     room: OpenRoom,
     live: BTreeMap<u64, Live>,
-}
-
-/// What the answers to one member since the actor's last take ask of the actor
-/// (see [`Serving::answered`]).
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Answered {
-    /// An answer accepted a new inventory hint: the room is woken.
-    pub(crate) inventory_added: bool,
-    /// MP-9: the member's inventory listed a fork or an unresolved head this node would ask it
-    /// for (`client::listing_wanted`): this node's own round with it is raised.
-    pub(crate) ask_back: bool,
 }
 
 /// Node-wide: the open rooms and the answers running for them.
@@ -52,47 +55,58 @@ pub(crate) struct Serving {
     next: AtomicU64,
     pub(crate) budget: Arc<Budget>,
     pub(crate) book: SharedSyncBook,
-    pub(crate) inbox: Arc<HintInbox>,
-    /// The members answered since the actor last took them, by room and member, with what their
-    /// answers ask of the actor. See [`Self::answered`].
-    answered: StdMutex<BTreeMap<(Digest32, Digest32), Answered>>,
+    /// Every connected peer's last Have, which a peer's Have request updates.
+    pub(crate) holdings: Arc<Holdings>,
+    /// Members answered since the actor last took them, by room and member.
+    answered: StdMutex<BTreeSet<(Digest32, Digest32)>>,
     /// Woken when a member is marked answered; the actor takes the marks when it next runs.
     pub(crate) answered_wake: tokio::sync::Notify,
+    /// What the private Session serve needs of this node, off the actor: its keyring's Drive
+    /// holders, the secret-work lease and the policy authority, as the actor last published
+    /// them while unlocked (`actor::private_serve`). `None` while locked.
+    private: StdMutex<Option<Arc<crate::node::actor::PrivateServing>>>,
 }
 
 impl Serving {
-    pub(crate) fn new(budget: Arc<Budget>, book: SharedSyncBook, inbox: Arc<HintInbox>) -> Self {
+    pub(crate) fn new(budget: Arc<Budget>, book: SharedSyncBook, holdings: Arc<Holdings>) -> Self {
         Self {
             rooms: StdMutex::new(BTreeMap::new()),
             next: AtomicU64::new(0),
             budget,
             book,
-            inbox,
-            answered: StdMutex::new(BTreeMap::new()),
+            holdings,
+            answered: StdMutex::new(BTreeSet::new()),
             answered_wake: tokio::sync::Notify::new(),
+            private: StdMutex::new(None),
         }
+    }
+
+    pub(crate) fn private(&self) -> Option<Arc<crate::node::actor::PrivateServing>> {
+        self.private
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_private(&self, private: Option<Arc<crate::node::actor::PrivateServing>>) {
+        *self.private.lock().unwrap_or_else(|e| e.into_inner()) = private;
     }
 
     fn rooms(&self) -> std::sync::MutexGuard<'_, BTreeMap<Digest32, Entry>> {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A finished answer marks its member and wakes the actor, never waiting for it. What the
-    /// actor does with answers (make sure of the member's port, wake the room for a new
-    /// inventory hint, raise its own round with a member whose listing it would ask about) is the
-    /// same for one as for many, so the marks coalesce: one per room and member however many
-    /// answers finish while the actor is busy, and no task is left waiting.
-    pub(crate) fn answered(&self, id: Digest32, peer: Digest32, answered: Answered) {
-        let mut marks = self.answered.lock().unwrap_or_else(|e| e.into_inner());
-        let mark = marks.entry((id, peer)).or_default();
-        mark.inventory_added |= answered.inventory_added;
-        mark.ask_back |= answered.ask_back;
-        drop(marks);
+    /// A finished answer marks its member and wakes the actor, without waiting for it.
+    pub(crate) fn answered(&self, id: Digest32, peer: Digest32) {
+        self.answered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((id, peer));
         self.answered_wake.notify_one();
     }
 
     /// The members answered since the last take (see [`Self::answered`]).
-    pub(crate) fn take_answered(&self) -> BTreeMap<(Digest32, Digest32), Answered> {
+    pub(crate) fn take_answered(&self) -> BTreeSet<(Digest32, Digest32)> {
         std::mem::take(&mut *self.answered.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
@@ -114,27 +128,73 @@ impl Serving {
         self.rooms().get(id).map(|entry| entry.room.clone())
     }
 
-    /// Admit one answer to `peer`, or `None` when it already has
-    /// [`crate::node::ports::INBOUND_PER_PORT`] in flight: past that a request is refused at
-    /// once, never held, as the actor refused it. The token also names the answer in
-    /// `vox status`, apart from the actor's own tokens.
-    pub(crate) fn begin(&self, id: Digest32, peer: Digest32, fence: Arc<Fence>) -> Option<u64> {
+    /// Register one answer to `peer` on connection `serial`, so a retirement can end it; `None`
+    /// when the room is not served. The token also names the answer in `vox status`, apart from
+    /// the actor's own.
+    pub(crate) fn begin(
+        &self,
+        id: Digest32,
+        peer: Digest32,
+        serial: u64,
+        fence: Arc<Fence>,
+    ) -> Option<u64> {
         let mut rooms = self.rooms();
         let entry = rooms.get_mut(&id)?;
-        let running = entry.live.values().filter(|live| live.peer == peer).count();
-        if running >= crate::node::ports::INBOUND_PER_PORT {
-            return None;
-        }
         let token = (1 << 63) | self.next.fetch_add(1, Ordering::Relaxed);
         entry.live.insert(
             token,
             Live {
                 peer,
+                serial,
                 fence,
                 abort: None,
+                place: None,
             },
         );
         Some(token)
+    }
+
+    /// Count answer `token` where its query puts it, or `false` when it does not fit (or was
+    /// retired). An old flow's query past [`crate::node::ports::INBOUND_PER_PORT`] of its
+    /// peer's in flight is refused at once, never held, as the actor refuses it. A loop's
+    /// exchange takes its connection's one place of that kind in the room: its asker sends the
+    /// next only once the last ended or was abandoned, so an earlier answer still in that place
+    /// is over and is retired here. So, whatever the asker claims, one Have and one ask per
+    /// connection and room are answered at a time.
+    pub(crate) fn place(&self, id: Digest32, token: u64, place: Place) -> bool {
+        let retired: Vec<Live> = {
+            let mut rooms = self.rooms();
+            let Some(entry) = rooms.get_mut(&id) else {
+                return false;
+            };
+            let Some((peer, serial)) = entry.live.get(&token).map(|live| (live.peer, live.serial))
+            else {
+                return false;
+            };
+            let earlier: Vec<u64> = entry
+                .live
+                .iter()
+                .filter(|(_, live)| live.peer == peer && live.place == Some(place))
+                .filter(|(_, live)| place == Place::OldFlow || live.serial == serial)
+                .map(|(token, _)| *token)
+                .collect();
+            if place == Place::OldFlow && earlier.len() >= crate::node::ports::INBOUND_PER_PORT {
+                return false;
+            }
+            if let Some(live) = entry.live.get_mut(&token) {
+                live.place = Some(place);
+            }
+            if place == Place::OldFlow {
+                Vec::new()
+            } else {
+                earlier
+                    .into_iter()
+                    .filter_map(|token| entry.live.remove(&token))
+                    .collect()
+            }
+        };
+        retired.into_iter().for_each(Live::retire);
+        true
     }
 
     /// The task running answer `token`, so a retirement can end it.
@@ -149,12 +209,14 @@ impl Serving {
         }
     }
 
-    /// Whether answer `token` is still the room's: a retired answer is not counted.
-    pub(crate) fn end(&self, id: Digest32, token: u64) -> bool {
+    /// Whether answer `token` is still the room's (a retired answer is not counted), and if so
+    /// whether it answered one of the old flows' queries: a round of the peer's that `vox status`
+    /// counts, where a loop's exchange is not.
+    pub(crate) fn end(&self, id: Digest32, token: u64) -> Option<bool> {
         self.rooms()
             .get_mut(&id)
             .and_then(|entry| entry.live.remove(&token))
-            .is_some()
+            .map(|live| live.place == Some(Place::OldFlow))
     }
 
     /// End the answers in flight for the room, or for one peer of it.

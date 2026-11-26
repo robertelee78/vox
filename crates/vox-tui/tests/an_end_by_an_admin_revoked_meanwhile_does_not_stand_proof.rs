@@ -14,12 +14,14 @@
 //! **Staging (a real partition).** alice (the creator), bob and carol share a room through an
 //! anchor. alice names carol an admin; carol's node holds that. Carol's daemon is **down**, not
 //! frozen (a frozen daemon finds what was sent to it waiting in its socket when it resumes), while
-//! alice takes carol's admin back; bob's node holds the revocation. Then alice's and bob's daemons
-//! and the anchor (which holds the room's entries too) are frozen (SIGSTOP), and carol's daemon is
-//! started again: it can reach nobody who holds the revocation. Carol's node still lists her as an
-//! admin, and `vox room end` succeeds there. Then everyone is resumed (SIGCONT), and the proof
-//! waits until the logs have met: alice's and bob's nodes hold carol's end entry, and carol's node
-//! holds the revocation.
+//! alice takes carol's admin back; bob's node holds the revocation. Carol's daemon is stopped
+//! cleanly (SIGTERM), so what her node held is on disk: killed, it may lose the grant it has just
+//! received and not yet acknowledged to its sender (ADR-038 FX-30), and then the partition is not
+//! the one named here. Then alice's and bob's daemons and the anchor (which holds the room's
+//! entries too) are frozen (SIGSTOP), and carol's daemon is started again: it can reach nobody who
+//! holds the revocation. Carol's node still lists her as an admin, and `vox room end` succeeds
+//! there. Then everyone is resumed (SIGCONT), and the proof waits until the logs have met:
+//! alice's and bob's nodes hold carol's end entry, and carol's node holds the revocation.
 //!
 //! **Asserted:** alice's and bob's nodes take a post in the room (an ended room takes none), list
 //! it without an end, and do so still [`SETTLE`] later; and carol's node, once it holds the
@@ -136,8 +138,9 @@ fn partitioned(
         "PRODUCT (staging): carol's node never listed her as an admin"
     );
 
-    // Carol is down while alice takes her admin back; bob's node holds the revocation.
-    room.stop(2);
+    // Carol is down while alice takes her admin back; bob's node holds the revocation. Stopped
+    // cleanly, so the grant her node just listed is on disk (see the module docs).
+    room.workers[2].stop_daemon_cleanly();
     let o = room.workers[0].vox(None, &["room", "admin", "remove", id, &carol_fp]);
     assert!(
         o.ok,

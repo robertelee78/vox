@@ -10,7 +10,6 @@ struct Peer {
     _connection: Arc<crate::transport::quic::VoxConnection>,
     writers: Arc<RwLock<()>>,
     cancel: watch::Sender<()>,
-    interrupted: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct Gate {
@@ -29,41 +28,10 @@ impl Default for Gate {
 
 /// Owns the writer until the physical send task drops it, including cancellation.
 pub(crate) struct Writer {
-    peer: Arc<Peer>,
-    gate: Arc<Gate>,
+    // Keeps the peer in the gate's weak registry until this physical writer ends.
+    _peer: Arc<Peer>,
     _lease: OwnedRwLockReadGuard<()>,
     pub(crate) cancel: watch::Receiver<()>,
-}
-
-/// One coalesced, physically interrupted response to re-evaluate after admission reopens.
-pub(crate) struct Interrupted {
-    peer: Arc<Peer>,
-    pub(crate) gate: Arc<Gate>,
-}
-
-impl Drop for Interrupted {
-    fn drop(&mut self) {
-        self.peer
-            .interrupted
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-impl Writer {
-    pub(crate) fn interrupted(&self) -> Option<Interrupted> {
-        if self
-            .peer
-            .interrupted
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            None
-        } else {
-            Some(Interrupted {
-                peer: Arc::clone(&self.peer),
-                gate: Arc::clone(&self.gate),
-            })
-        }
-    }
 }
 
 /// Closes admission and holds the exact affected writers through the authority commit.
@@ -108,7 +76,6 @@ impl Gate {
                     _connection: Arc::clone(connection),
                     writers: Arc::new(RwLock::new(())),
                     cancel: watch::channel(()).0,
-                    interrupted: std::sync::atomic::AtomicBool::new(false),
                 });
                 peers.insert(key, Arc::downgrade(&peer));
                 peer
@@ -117,16 +84,10 @@ impl Gate {
         let lease = Arc::clone(&peer.writers).try_read_owned().ok()?;
         let cancel = peer.cancel.subscribe();
         Some(Writer {
-            peer,
-            gate: Arc::clone(self),
+            _peer: peer,
             _lease: lease,
             cancel,
         })
-    }
-
-    /// Hold admission briefly while rechecking authority and publishing a resumed edge.
-    pub(crate) fn try_open(&self) -> Option<OwnedMutexGuard<()>> {
-        Arc::clone(&self.admission).try_lock_owned().ok()
     }
 
     /// Wait for a transition to reopen admission; the caller revalidates its room afterwards.

@@ -96,6 +96,8 @@ impl Policy {
 /// a captured replacement PendingConsents/PendingLocks map: independent room saves update them.
 pub(super) struct PolicySaved {
     pub(super) trust: Keyring,
+    /// The durable incarnation (stored nonce) of exactly `trust`.
+    pub(super) incarnation: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
     pub(super) removed: Vec<Digest32>,
     pub(super) changed_drive: Vec<(Digest32, bool)>,
     pub(super) grant: Option<GrantSaved>,
@@ -119,16 +121,18 @@ impl PolicyWrite {
         before_commit: impl FnOnce() -> crate::error::Result<()>,
     ) -> crate::error::Result<PolicySaved> {
         let mut batch = store.batch()?;
-        let mut trust = Keyring::load(store, signer)?;
+        let (mut trust, mut incarnation) = Keyring::load_at(store, signer)?;
         if let Self::ImportBlacklist { history } = self {
             if !trust.local_history_imported() {
                 trust.import_local_removals(history.local_trust_removals()?);
-                trust.queue_save(&mut batch, signer)?;
+                let saved = trust.queue_save(&mut batch, signer)?;
                 before_commit()?;
                 batch.commit()?;
+                incarnation = Some(saved);
             }
             return Ok(PolicySaved {
                 trust,
+                incarnation,
                 removed: Vec::new(),
                 changed_drive: Vec::new(),
                 grant: None,
@@ -194,11 +198,12 @@ impl PolicyWrite {
         }
         ConsentOrder::queue_policy(&mut batch, signer, &removed, &newly, floor)?;
         locks.queue_save(&mut batch, signer)?;
-        trust.queue_save(&mut batch, signer)?;
+        let incarnation = Some(trust.queue_save(&mut batch, signer)?);
         before_commit()?;
         batch.commit()?;
         Ok(PolicySaved {
             trust,
+            incarnation,
             removed,
             changed_drive,
             grant: None,
@@ -601,13 +606,6 @@ impl Node {
                 net.forget_board_exchanges();
             }
         }
-        if let Some((room, peer, instance, request, generation)) =
-            self.history_demand.note_route_trust_change()
-        {
-            self.bounded_sync
-                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
-            self.sched_rooms.insert(room);
-        }
         for target in &saved.removed {
             // The native transaction deleted this target in every room, not a replacement map
             // captured before independent per-room held-key deletions completed.
@@ -620,6 +618,13 @@ impl Node {
                 .retain(|(_, peer)| peer != target);
         }
         self.trust = saved.trust;
+        self.trust_incarnation = saved.incarnation;
+        // The private serve's Drive holders and their incarnation move together, at once, and
+        // every open room's tellers decide again what they tell (permission news).
+        self.publish_private_serving();
+        for room in self.channels.keys() {
+            self.history_frontier.private_permission(*room);
+        }
         self.trust_generation = self.trust_generation.wrapping_add(1);
         self.note_key_body_trust_change();
         for (target, had_drive) in saved.changed_drive {

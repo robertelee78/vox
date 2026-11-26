@@ -2604,12 +2604,16 @@ async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)
 }
 
 /// `vox room read --hashes` — every entry the node holds for the room, one per line as
-/// `<entry-hash> <clock-ms>`, in the room's one order (ADR-023 decision 1). The clock is the
-/// key that placed the entry: its claimed time, capped and lifted by what it saw.
+/// `<entry-hash> <display-ms>`, in display order. The display time is fixed when this node
+/// first publishes the entry's header: its signed time, no later than ten minutes past this
+/// node's first sight of it, then lifted to just past any entry it names in `seen` that this
+/// node had already published. It is never moved by what arrives afterwards.
 ///
 /// The timeline shows only rows this node can decrypt, so two members' timelines can
 /// differ for reasons that have nothing to do with order: one holds a key the other
-/// does not yet. This is the sequence underneath both, and the one that must match.
+/// does not yet. This is the sequence underneath both. Members agree on it except where an
+/// entry was signed more than ten minutes ahead of when one of them first saw it, or names an
+/// entry one of them had already published when it arrived and another had not.
 pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
@@ -5902,7 +5906,7 @@ pub async fn join(
         })
         .await
     {
-        Ok(Frame::Ok) => {
+        Ok(answer @ (Frame::Ok | Frame::JoinedRecovering)) => {
             // The room's own name, as a member told it (ADR-028 R-1): the joiner names nothing.
             let joined = match vox_core::node::link::InviteLink::parse(link) {
                 Ok(parsed) => rooms_of(&mut client)
@@ -5915,6 +5919,11 @@ pub async fn join(
                 Err(_) => None,
             };
             println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
+            // The join's patience passed while this node's own history was still being
+            // recovered: it is a member again and reads, and says when it can post.
+            if answer == Frame::JoinedRecovering {
+                println!("     {}", vox_core::node::api::Outcome::RECOVERING);
+            }
             if let Some(token) = decision.as_deref() {
                 save_repo_binding(paths, token, link, &passphrase_kept).await?;
             }
@@ -5963,6 +5972,10 @@ pub async fn join(
         // gives, so a wrong passphrase is not reported as `Failed(Refused)`.
         Ok(Frame::Error { reason }) => Err(AppError::Usage(
             match crate::tunnel_cli::fault_named(&reason) {
+                // The room WAS joined again; only its own history cannot be recovered.
+                Some(fault @ vox_core::node::api::Fault::RejoinedOwnHistoryFrozen) => {
+                    fault.to_string()
+                }
                 Some(fault) => format!(
                     "cannot join: {}{}",
                     crate::tunnel_cli::join_advice_after(Some(fault), &reason),

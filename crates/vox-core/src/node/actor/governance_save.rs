@@ -127,7 +127,6 @@ enum TurnStage {
     Backfill,
     Contiguous,
     KeyDebt,
-    Provider,
     Legacy,
     Projection,
     Views,
@@ -423,6 +422,23 @@ impl Node {
                     .await;
                     return;
                 }
+                // A removal rotation is this node's own write. While its own earlier history is
+                // behind, the own-history fence refuses it, and only the recovery this same turn
+                // runs after it can lift that fence: ending the turn here would leave the room
+                // fenced for good. The rotation stays owed (its checkpoint is unchanged), every
+                // own write stays fenced meanwhile, and a later turn rotates once recovery is done.
+                if matches!(error, Error::OwnHistoryBehind)
+                    && matches!(
+                        &continuation.after,
+                        After::Turn(Turn {
+                            stage: TurnStage::RoomRotation | TurnStage::RoomDriveRotation,
+                            ..
+                        })
+                    )
+                {
+                    self.governance_after_fold(room, continuation, reply).await;
+                    return;
+                }
                 if matches!(error, Error::ComputerPolicySuperseded)
                     && matches!(&continuation.after, After::Turn(_))
                 {
@@ -468,7 +484,6 @@ impl Node {
                             TurnStage::Backfill
                             | TurnStage::Contiguous
                             | TurnStage::KeyDebt
-                            | TurnStage::Provider
                             | TurnStage::Legacy
                             | TurnStage::Projection
                             | TurnStage::Views,
@@ -733,17 +748,36 @@ impl Node {
                     (
                         TurnStage::Backfill,
                         Result::Governance(Saved::Backfill {
-                            rendered, pending, ..
+                            rendered,
+                            pending,
+                            more,
+                            ..
                         }),
                     ) => {
-                        turn.backfilled = rendered;
+                        turn.backfilled = turn.backfilled.saturating_add(rendered);
+                        // Posts whose gate is open are shown in this turn: while a step could
+                        // work the queue and positions remain, the next bounded step follows at
+                        // once, not after another sweep. A command that waits for this room's
+                        // saves (a person's own post among them) goes first: the drain stops, the
+                        // turn goes on as before and the sweep owes the rest again.
+                        if more && self.deferred_commands.is_empty() {
+                            if rendered > 0 {
+                                self.publish().await;
+                            }
+                            self.continue_governance_save(
+                                room,
+                                maintenance_save::Work::Governance(Work::Backfill),
+                                continuation,
+                                reply,
+                            )
+                            .await;
+                            return;
+                        }
                         self.governance_work.again |= pending;
                     }
-                    (TurnStage::Contiguous, Result::Governance(Saved::Contiguous { pending }))
-                    | (TurnStage::Provider, Result::Governance(Saved::ProviderPrune { pending })) => {
+                    (TurnStage::Contiguous, Result::Governance(Saved::Contiguous { pending })) => {
                         self.governance_work.again |= pending
                     }
-                    (TurnStage::Provider, Result::Unavailable) => {}
                     (TurnStage::KeyDebt, Result::Retention(installed)) => {
                         self.governance_work.again |= installed.more_key_debt
                     }
@@ -939,19 +973,15 @@ impl Node {
                     turn.stage = TurnStage::KeyDebt;
                     Save::Retention(Step::KeyDebt)
                 } else {
-                    turn.stage = TurnStage::Provider;
-                    Save::Governance(Work::ProviderPrune)
+                    turn.stage = TurnStage::Legacy;
+                    Save::Governance(Work::Legacy)
                 }
             }
-            TurnStage::Contiguous | TurnStage::KeyDebt => {
-                turn.stage = TurnStage::Provider;
-                Save::Governance(Work::ProviderPrune)
-            }
-            TurnStage::Provider if turn.ready => {
+            TurnStage::Contiguous | TurnStage::KeyDebt if turn.ready => {
                 turn.stage = TurnStage::Legacy;
                 Save::Governance(Work::Legacy)
             }
-            TurnStage::Provider => {
+            TurnStage::Contiguous | TurnStage::KeyDebt => {
                 return self
                     .finish_governance_room_work(room, continuation, reply)
                     .await

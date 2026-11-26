@@ -1,5 +1,4 @@
-//! PRD-001 R6, R7 and R10 — the three retention requirements that had no gate of their own,
-//! each driven through the **shipped `vox` binary** (ADR-023 decision 2, ADR-010).
+//! PRD-001 R6 and R7 retention requirements, driven through the shipped `vox` binary.
 //!
 //! `retention_proof` proves the retroactive shortening (R8) and the node-shorter-than-room rule
 //! (R9). What it did not prove on its own:
@@ -17,50 +16,31 @@
 //!   retention file asking for longer is ignored and the node says so. The admin's change applies
 //!   to what is already stored, on every member, in both directions: shortened, older messages go
 //!   everywhere; lengthened to forever, what is left stays.
-//! - **R10, a skeleton still does its job.** An expired entry keeps its signed skeleton, and that
-//!   skeleton still takes part in fork detection: a second, conflicting entry signed by the same
-//!   author for an **expired** position is caught as an equivocation, and the author is frozen
-//!   (ADR-008) — its later posts stop reaching the node that saw the fork. Below the author's
-//!   checkpoint, where ADR-023 decision 3 lets a node shed the signatures, the same conflict is
-//!   **refused as pre-checkpoint, never classified as a fork**, so the author is not frozen.
 //!
 //! **A red names its side.** A claim's assertion is PRODUCT and quotes what `vox` showed. A `vox`
 //! command that fails or a node that does not get there while the scene is set (an identity, a
 //! daemon, a room, a join, a trust, a post, a first read, a retention reaching every member) is
-//! the product failing: PRODUCT (staging); each wait says which it is. What R10's author-side
-//! client must achieve on its own (its profile, its connection, an answered session that lists
-//! and serves the position) is CANNOT MEASURE. The test's own processes, files, ports and runtime
-//! are APPARATUS.
+//! the product failing: PRODUCT (staging); each wait says which it is. The test's own processes,
+//! files, ports and runtime are APPARATUS.
 //!
 //! Mutations (each run, each red): a non-zero default retention (R6); the admin check skipped,
 //! and a change that reaches only new entries (R7); a member's own retention that cannot be saved
-//! reported as the store (R7, R36); the fork check skipped for a pruned position (R10); the
-//! pre-checkpoint refusal removed (R10: bob refuses nothing below the checkpoint; this claim was
-//! `checkpoint_proof`'s, offered in-process until #227).
+//! reported as the store (R7, R36).
 
 #![cfg(unix)]
 
-#[path = "support/ports.rs"]
-mod ports;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "../../vox-core/tests/support/raw_sync.rs"]
-mod raw_sync;
 #[path = "support/typed.rs"]
 mod typed;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use raw_sync::Ask;
-use vox_core::log::entry::Entry;
-use vox_core::log::sync::WantRange;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
@@ -149,16 +129,6 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-/// Where the daemon at `dir` listens, from its own `vox status --json` (#410): a daemon starts on
-/// port 0, and a restart that must come back on the address its peers know reads it here, never
-/// from a port picked ahead.
-fn listening(dir: &Path) -> String {
-    let (_, status, _) = vox(dir, &["status", "--json"], None);
-    ports::loopback_listen(&status)
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback listen address in {status}"))
-        .to_string()
 }
 
 /// `vox daemon` on `listen`, with `env` added, answering on its socket before this returns.
@@ -297,39 +267,6 @@ fn until_retention(dir: &Path, side: &str, who: &str, want: u64, secs: u64) -> D
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!("{side}: {who}'s room never reported retention {want} within {secs} s; last {last:?}");
-}
-
-/// What `dir`'s node reports it caught in the room: the authors it froze for a fork, and how
-/// many entries it refused as at or below their author's checkpoint. Polled until `done` holds,
-/// or `secs` pass. A listed room must name both, also while a session holds it (#58): a `null`
-/// is PRODUCT, at once.
-fn fork_watch(dir: &Path, secs: u64, done: impl Fn(&[String], u64) -> bool) -> (Vec<String>, u64) {
-    let started = Instant::now();
-    let mut last = None;
-    while started.elapsed() < Duration::from_secs(secs) {
-        let st = status(dir);
-        if let Some(room) = st["rooms"].get(0) {
-            let (Some(frozen), Some(refused)) = (
-                room["frozen"].as_array(),
-                room["refused_below_checkpoint"].as_u64(),
-            ) else {
-                panic!(
-                    "PRODUCT: `vox status --json` lists the room without its frozen members or \
-                     its refusals below a checkpoint: {room}"
-                );
-            };
-            let frozen: Vec<String> = frozen
-                .iter()
-                .filter_map(|f| f.as_str().map(str::to_owned))
-                .collect();
-            if done(&frozen, refused) {
-                return (frozen, refused);
-            }
-            last = Some((frozen, refused));
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    last.expect("PRODUCT (staging): the room was never listed in `vox status`")
 }
 
 /// `creator` makes a room; returns its short id as `vox room list` prints it.
@@ -701,458 +638,6 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
             "PRODUCT: {who}: lengthened, what is left must stay, and only it: {t:?}"
         );
     }
-}
-
-/// Open `dir`'s profile — its daemon must be stopped — and return its signer, plus an endpoint
-/// bound as that identity.
-async fn as_member(
-    dir: &Path,
-) -> (
-    Arc<vox_core::atrest::vault::VaultRootSigner>,
-    vox_core::transport::quic::VoxEndpoint,
-    vox_core::node::profile::Profile,
-) {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .expect("APPARATUS: the author's profile paths");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut profile = loop {
-        match vox_core::node::profile::Profile::open(paths.clone()) {
-            Ok(p) => break p,
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => panic!("CANNOT MEASURE: the author's stopped profile did not open: {e:?}"),
-        }
-    };
-    profile
-        .unlock(IDENTITY.as_bytes())
-        .expect("CANNOT MEASURE: the author's identity did not unlock");
-    let signer = profile
-        .signer_arc()
-        .expect("CANNOT MEASURE: the author's signer");
-    let ep = vox_core::transport::quic::VoxEndpoint::bind(
-        signer.clone(),
-        "127.0.0.1:0".parse().expect("APPARATUS: an address"),
-    )
-    .expect("CANNOT MEASURE: the author's endpoint did not bind");
-    (signer, ep, profile)
-}
-
-/// Where on the author's feed [`equivocate`] forks it.
-enum Position {
-    /// The author's first message: below everything posted after it. Found by what each entry
-    /// is, never by a fixed number, since how many governance entries precede it (the room's
-    /// name, trust, retention) and how many probes it took to see readers read are the room's.
-    FirstMessage,
-    /// Five below the author's head.
-    NearHead,
-}
-
-/// Whether `entry` is a message, the only kind of entry that expires: its body pruned, or a
-/// sealed group message. Governance and checkpoints are never pruned.
-fn is_message(entry: &Entry) -> bool {
-    entry
-        .payload
-        .as_ref()
-        .is_none_or(|p| p.starts_with(vox_core::group::wire::GROUP_MSG_SIGN_DOMAIN.as_bytes()))
-}
-
-/// As the room's author (whose node is stopped), connect to `victim` at `victim_at`, read the
-/// entry the victim holds at `at` on the author's feed — waiting, up to 60 s, until whether it
-/// still carries its signature is `expect_signed` (a checkpoint takes time to reach it) — and
-/// **offer** the victim a second entry for that position, signed by the author, as the head of
-/// the author's feed. The victim asks for it because that head differs from its own (V210-63);
-/// an entry it did not ask for it would refuse as a protocol violation (ADR-025 P9) before its
-/// log saw it. Returns `(seq, was the held entry's body pruned, was it still signed, how many
-/// offered entries the victim asked for, how the session ended)`.
-fn equivocate(
-    author: &Path,
-    author_id: vox_core::hash::Digest32,
-    victim_id: vox_core::hash::Digest32,
-    victim_at: &str,
-    channel_id: vox_core::hash::Digest32,
-    at: Position,
-    expect_signed: bool,
-) -> (u64, bool, bool, usize, Option<String>) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("APPARATUS: the author client's runtime");
-    rt.block_on(async {
-        let (signer, ep, profile) = as_member(author).await;
-        let conn = ep
-            .connect(
-                victim_at.parse().expect("APPARATUS: the victim's address"),
-                victim_id,
-                raw_sync::now(),
-            )
-            .await
-            .expect("CANNOT MEASURE: the author's client could not connect to the victim");
-        let mut have = None;
-        for _ in 0..40 {
-            let y = raw_sync::ask(&conn, channel_id, 0, Ask::Ranges(vec![]), None).await;
-            if y.hello {
-                have = y
-                    .have
-                    .iter()
-                    .find(|(a, _)| *a == author_id)
-                    .map(|(_, m)| *m);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let head = have
-            .expect("CANNOT MEASURE: no answered session listed the author's feed on the victim");
-        let seq = match at {
-            Position::NearHead => head - 4,
-            Position::FirstMessage => {
-                let mut feed = Vec::new();
-                for _ in 0..40 {
-                    let y = raw_sync::ask(
-                        &conn,
-                        channel_id,
-                        0,
-                        Ask::Ranges(vec![WantRange {
-                            author_id,
-                            from_seq: 1,
-                            to_seq: head,
-                        }]),
-                        None,
-                    )
-                    .await;
-                    if y.hello {
-                        feed = y.wires;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                let feed: Vec<Entry> = feed
-                    .iter()
-                    .map(|w| {
-                        Entry::from_wire(w)
-                            .expect("PRODUCT (staging): the victim served a malformed entry")
-                    })
-                    .collect();
-                let kinds: String = feed
-                    .iter()
-                    .map(|e| if is_message(e) { 'm' } else { 'g' })
-                    .collect();
-                println!("R10: alice's feed on bob, seq 1 up (m message, g other): {kinds}");
-                feed.iter()
-                    .find(|e| is_message(e))
-                    .map(|e| e.skeleton.seq)
-                    .expect("APPARATUS: staging not achieved: bob served no message of alice's")
-            }
-        };
-        let waiting = Instant::now();
-        let held = loop {
-            let mut held = None;
-            for _ in 0..40 {
-                let y = raw_sync::ask(
-                    &conn,
-                    channel_id,
-                    0,
-                    Ask::Ranges(vec![WantRange {
-                        author_id,
-                        from_seq: seq,
-                        to_seq: seq,
-                    }]),
-                    None,
-                )
-                .await;
-                if y.hello {
-                    held = y.wires.first().cloned();
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            let held = Entry::from_wire(&held.expect(
-                "CANNOT MEASURE: no answered session served the victim's entry at that position",
-            ))
-            .expect("PRODUCT (staging): the victim served a malformed entry");
-            if held.is_signed() == expect_signed || waiting.elapsed() > Duration::from_secs(60) {
-                break held;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-        assert!(
-            is_message(&held),
-            "APPARATUS: staging not achieved: alice's seq {seq} on bob is not a message (governance \
-             or a checkpoint), so it never expires"
-        );
-        let pruned = held.payload.is_none();
-        let signed = held.is_signed();
-        println!(
-            "R10: bob's entry at seq {seq} read signed={signed} after {:?} (waited for \
-             signed={expect_signed})",
-            waiting.elapsed()
-        );
-        // The same position, a different body: an equivocation only the author could sign.
-        let mut sk = held.skeleton.clone();
-        let body = format!("a conflicting entry for seq {seq}");
-        sk.payload_hash = vox_core::hash::sha256(body.as_bytes());
-        sk.payload_len = body.len() as u64;
-        let conflicting = Entry::build_signed_skeleton_only(&*signer, sk)
-            .expect("APPARATUS: sign the conflicting entry");
-        let head = vox_core::log::sync::FeedFrontier {
-            author_id,
-            max_seq: seq,
-            head_hash: conflicting.entry_hash(),
-        };
-        let mut ended = Some("never answered".to_owned());
-        let mut served = 0;
-        for _ in 0..40 {
-            let y = raw_sync::ask_offering(
-                &conn,
-                channel_id,
-                0,
-                Ask::Ranges(vec![]),
-                vec![(head, conflicting.to_wire())],
-            )
-            .await;
-            if y.hello {
-                ended = y.ended;
-                served = y.served;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        drop(conn);
-        drop(ep);
-        drop(profile);
-        (seq, pruned, signed, served, ended)
-    })
-}
-
-#[test]
-#[ignore = "real vox daemons and real seconds (about three minutes); CI runs it in release"]
-fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
-    watchdog::arm();
-    let t = tempfile::tempdir().expect("APPARATUS: a temporary directory");
-    let (alice, alice_fp) = identity(t.path(), "alice");
-    let (bob, bob_fp) = identity(t.path(), "bob");
-    let (carol, carol_fp) = identity(t.path(), "carol");
-    let mut alice_d = Some(daemon(
-        &alice,
-        "alice",
-        &format!("{IDENTITY}\n"),
-        "127.0.0.1:0",
-        &[],
-    ));
-    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), "127.0.0.1:0", &[]);
-    let bob_at = listening(&bob);
-    let _c = daemon(
-        &carol,
-        "carol",
-        &format!("{IDENTITY}\n"),
-        "127.0.0.1:0",
-        &[],
-    );
-    let room = create(&alice);
-    join(&alice, &bob, &room);
-    join(&alice, &carol, &room);
-    trust(&alice, &bob_fp, "bob");
-    trust(&alice, &carol_fp, "carol");
-    // Trust runs one way (V210-161): bob and carol read alice only once they trust her too.
-    trust(&bob, &alice_fp, "alice");
-    trust(&carol, &alice_fp, "alice");
-    until_readable(&alice, &[&bob, &carol], &room);
-    let (ok, said) = set_retention(&alice, &room, "20");
-    assert!(ok, "PRODUCT (staging): the admin sets 20 s: {said}");
-    until_retention(&bob, "PRODUCT (staging)", "bob", 20, 30);
-    let decode = |s: &str| {
-        vox_core::node::link::b32_decode(s, "fingerprint")
-            .unwrap_or_else(|e| panic!("PRODUCT (staging): vox printed no id in {s:?}: {e:?}"))
-    };
-    let (alice_id, bob_id) = (decode(&alice_fp), decode(&bob_fp));
-    let channel_id = decode(
-        status(&alice)["rooms"][0]["id"]
-            .as_str()
-            .expect("PRODUCT (staging): `vox status --json` names the room's id"),
-    );
-
-    // ---- below the author's checkpoint: refused as pre-checkpoint, not a fork -------------
-    // 40 expire — past the 32 that make alice post a checkpoint of her own feed.
-    for i in 1..=40 {
-        post(&alice, &room, &format!("a {i}"));
-    }
-    until(
-        &bob,
-        &room,
-        "PRODUCT (staging): bob to read the 40",
-        60,
-        |t| count(t, "a ") == 40,
-    );
-    until(
-        &bob,
-        &room,
-        "PRODUCT (staging): the 40 to expire on bob",
-        60,
-        |t| count(t, "a ") == 0,
-    );
-    std::thread::sleep(Duration::from_secs(15)); // alice's checkpoint reaches bob
-    let (frozen, refused) = fork_watch(&bob, 30, |_, _| true);
-    println!("R10: before — bob has frozen {frozen:?} and refused {refused} below a checkpoint");
-    assert!(
-        frozen.is_empty() && refused == 0,
-        "PRODUCT (staging): nothing has been caught yet: frozen {frozen:?}, refused {refused}"
-    );
-    // Alice's node is stopped so the conflicting entry is signed with her own key, and started
-    // again after: it finds bob and carol at the addresses it last reached them on.
-    drop(alice_d.take());
-    let (seq, pruned, signed, served, ended) = equivocate(
-        &alice,
-        alice_id,
-        bob_id,
-        &bob_at,
-        channel_id,
-        Position::FirstMessage,
-        false,
-    );
-    alice_d = Some(daemon(
-        &alice,
-        "alice-2",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        "127.0.0.1:0",
-        &[],
-    ));
-    println!(
-        "R10: below the checkpoint — bob held seq {seq} pruned={pruned} signed={signed}; the \
-         conflicting entry was asked for {served} time(s); its session ended {ended:?}"
-    );
-    assert!(
-        pruned,
-        "PRODUCT: bob must have pruned the expired message's body at seq {seq} (it read none of \
-         them)"
-    );
-    assert!(
-        !signed,
-        "PRODUCT (staging): below the checkpoint bob must have shed the signature (ADR-023 \
-         decision 3)"
-    );
-    // **The refusal itself, not the absence of a freeze.** A conflicting entry at a position whose
-    // held side has shed its signature cannot freeze anyone in any case — it cannot incriminate —
-    // so "bob still reads alice" is what both a refusal and a fork that proves nothing look like.
-    // Only bob's count of entries refused below a checkpoint tells them apart.
-    assert_eq!(
-        served, 1,
-        "PRODUCT: bob must ask for the conflicting entry offered as alice's head, once (V210-63): \
-         otherwise nothing reached his log to refuse"
-    );
-    assert!(
-        ended.is_none(),
-        "PRODUCT: a refused entry does not end the session (ADR-008): {ended:?}"
-    );
-    let (frozen, refused) = fork_watch(&bob, 30, |_, n| n > 0);
-    println!(
-        "R10: below the checkpoint — bob refused {refused} entry as at or below alice's \
-         checkpoint, and has frozen {frozen:?}"
-    );
-    assert_eq!(
-        (refused, frozen.len()),
-        (1, 0),
-        "PRODUCT: the conflicting entry must be refused as older than alice's checkpoint (ADR-023 \
-         decision 3), exactly once, and freeze nobody"
-    );
-    post(&alice, &room, "after-1");
-    until(
-        &bob,
-        &room,
-        "PRODUCT: bob must read alice's next post (she is not frozen)",
-        90,
-        |t| t.iter().any(|x| x == "after-1"),
-    );
-    println!(
-        "R10: below the checkpoint the conflict was refused, not a fork: bob still reads alice"
-    );
-
-    // ---- above it: an expired position's skeleton catches the fork ------------------------
-    for i in 1..=10 {
-        post(&alice, &room, &format!("b {i}"));
-    }
-    until(
-        &bob,
-        &room,
-        "PRODUCT (staging): bob to read the 10",
-        60,
-        |t| count(t, "b ") == 10,
-    );
-    until(
-        &bob,
-        &room,
-        "PRODUCT (staging): the 10 to expire on bob",
-        60,
-        |t| count(t, "b ") == 0,
-    );
-    drop(alice_d.take());
-    let (seq, pruned, signed, served, ended) = equivocate(
-        &alice,
-        alice_id,
-        bob_id,
-        &bob_at,
-        channel_id,
-        Position::NearHead,
-        true,
-    );
-    let _a = daemon(
-        &alice,
-        "alice-3",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        "127.0.0.1:0",
-        &[],
-    );
-    println!(
-        "R10: above the checkpoint — bob held seq {seq} pruned={pruned} signed={signed}; the \
-         conflicting entry was asked for {served} time(s); its session ended {ended:?}"
-    );
-    assert!(
-        pruned,
-        "PRODUCT: bob must have pruned the expired message's body at seq {seq} (it read none of \
-         them)"
-    );
-    assert!(
-        signed,
-        "PRODUCT (staging): above the checkpoint the expired skeleton keeps its signature"
-    );
-    assert_eq!(
-        served, 1,
-        "PRODUCT: bob must ask for the conflicting entry offered as alice's head, once (V210-63)"
-    );
-    assert!(
-        ended.is_none(),
-        "PRODUCT: a fork does not end the session (ADR-008): {ended:?}"
-    );
-    let (frozen, refused) = fork_watch(&bob, 30, |f, _| !f.is_empty());
-    println!(
-        "R10: above the checkpoint — bob has frozen {frozen:?} (alice is {alice_fp}), refused \
-         {refused} below a checkpoint"
-    );
-    assert_eq!(
-        (frozen, refused),
-        (vec![alice_fp.clone()], 1),
-        "PRODUCT: the conflicting entry at an expired position must freeze alice as a fork, not \
-         be refused as pre-checkpoint"
-    );
-    post(&alice, &room, "after-2");
-    until(
-        &carol,
-        &room,
-        "PRODUCT (staging): carol (who saw no fork) to read alice's next post",
-        90,
-        |t| t.iter().any(|x| x == "after-2"),
-    );
-    std::thread::sleep(Duration::from_secs(15));
-    let b = read(&bob, &room);
-    println!(
-        "R10: carol reads after-2; bob, who saw the fork, reads it {} times (0 = alice frozen)",
-        b.iter().filter(|x| *x == "after-2").count()
-    );
-    assert!(
-        !b.iter().any(|x| x == "after-2"),
-        "PRODUCT: a conflicting entry at an expired position must be caught as a fork and its \
-         author frozen: bob still accepts alice's posts"
-    );
 }
 
 /// The wall clock now, milliseconds since the Unix epoch.

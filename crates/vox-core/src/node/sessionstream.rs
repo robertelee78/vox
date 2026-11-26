@@ -6,6 +6,8 @@
 //! unfamiliar room-log entry. Pages are bounded; the store's incarnation makes cursors safe
 //! across reopen, retention and replay. Every page is authorized again by the serving node.
 
+use std::future::Future;
+
 use quinn::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
@@ -14,7 +16,7 @@ use crate::group::message::{GroupMessage, PrivateMessage};
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::log::entry::Entry;
-use crate::node::history_budget::{BufferCharge, Job};
+use crate::node::history_budget::BufferCharge;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
@@ -205,7 +207,12 @@ pub(crate) struct Locator {
 /// Current delivery never authorizes older private history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Query {
-    LiveTail,
+    /// The newest records up to `through`: the donor-local anchor the donor's Have told this
+    /// reader (`history_stream::pull` tell), copied unchanged. The donor serves only the fixed
+    /// window ending at it, never a search; the reader's own progress stays `Ask::cursor`.
+    LiveTail {
+        through: Cursor,
+    },
     ArchiveInventory {
         lo: u64,
         hi: u64,
@@ -219,7 +226,7 @@ pub(crate) enum Query {
 }
 impl Query {
     pub(crate) fn archive(&self) -> bool {
-        !matches!(self, Self::LiveTail)
+        !matches!(self, Self::LiveTail { .. })
     }
     fn validate(&self) -> Result<()> {
         let interval = |lo: u64, hi: u64| {
@@ -230,7 +237,12 @@ impl Query {
             }
         };
         match self {
-            Self::LiveTail => Ok(()),
+            Self::LiveTail { through } => {
+                if through.after == 0 {
+                    return Err(Error::MalformedBundle("private live anchor"));
+                }
+                Ok(())
+            }
             Self::ArchiveInventory { lo, hi, before } => {
                 interval(*lo, *hi)?;
                 if *before
@@ -257,8 +269,11 @@ impl Query {
     }
     fn put(&self, e: &mut Encoder) {
         match self {
-            Self::LiveTail => {
-                e.array(1).uint(0);
+            Self::LiveTail { through } => {
+                e.array(3)
+                    .uint(0)
+                    .bytes(&through.incarnation)
+                    .uint(through.after);
             }
             Self::ArchiveInventory { lo, hi, before } => {
                 e.array(4).uint(2).uint(*lo).uint(*hi).uint(*before);
@@ -271,7 +286,12 @@ impl Query {
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let query = match (d.array()?, d.uint()?) {
-            (1, 0) => Self::LiveTail,
+            (3, 0) => Self::LiveTail {
+                through: Cursor {
+                    incarnation: digest(d)?,
+                    after: d.uint()?,
+                },
+            },
             (4, 2) => Self::ArchiveInventory {
                 lo: d.uint()?,
                 hi: d.uint()?,
@@ -379,11 +399,59 @@ pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
     Ok(ask)
 }
 
+/// What a write of private Session information was decided under: the room's removal
+/// generation and `trust`, the keyring incarnation of the Drive holders that decided it (a
+/// Drive withdrawal commits a new one). One check for every such write: a served page
+/// (`answer`) and a Have's private section (`history_stream::pull`).
+#[derive(Clone, Copy)]
+pub(crate) struct Authority {
+    pub(crate) removal: u64,
+    pub(crate) trust: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
+}
+
+impl Authority {
+    /// Drive `write` only while this authority still holds: at its every physical step, under
+    /// the store's commit fence (which every keyring and removal commit holds too), so no byte
+    /// is handed to the stream after either changed.
+    pub(crate) async fn write<T>(
+        self,
+        store: &crate::node::store::Store,
+        room: &Digest32,
+        write: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        use std::task::Poll;
+        let mut write = std::pin::pin!(write);
+        std::future::poll_fn(|cx| {
+            match store.with_publication_fence(|| {
+                if crate::node::channel::governance::removal_generation(store, room)?
+                    != self.removal
+                {
+                    return Err(Error::StreamRefused("room authorization changed"));
+                }
+                if store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                    crate::node::trust::TRUST_META_KEY,
+                )? != self.trust
+                {
+                    return Err(Error::StreamRefused("private authority changed"));
+                }
+                Ok(write.as_mut().poll(cx))
+            }) {
+                Ok(result) => result,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    }
+}
+
+/// Write one served page under the authority it was prepared under (`Authority::write`). The
+/// stream stays the caller's, so an answer that fails or is ended part-way is refused on it.
 pub(crate) async fn answer(
-    mut send: SendStream,
+    send: &mut SendStream,
     page: Page,
     store: &crate::node::store::Store,
     room: &Digest32,
+    trust: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
 ) -> Result<()> {
     if page.records.len() > PAGE_RECORDS
         || page.records.len() != page.positions.len()
@@ -410,53 +478,32 @@ pub(crate) async fn answer(
     if wire.len() + 4 > MAX_PAGE {
         return Err(Error::SizeLimitExceeded("private Session page"));
     }
-    let generation = page
+    let removal = page
         .removal_generation
         .ok_or(Error::Profile("private Session authorization missing"))?;
-    {
-        use std::future::Future as _;
-        use std::task::Poll;
-        let mut write = std::pin::pin!(write_frame(&mut send, &wire));
-        std::future::poll_fn(|cx| {
-            match store.with_publication_fence(|| {
-                if crate::node::channel::governance::removal_generation(store, room)? != generation
-                {
-                    return Err(Error::StreamRefused("room authorization changed"));
-                }
-                Ok(write.as_mut().poll(cx))
-            }) {
-                Ok(result) => result,
-                Err(error) => Poll::Ready(Err(error)),
-            }
-        })
+    Authority { removal, trust }
+        .write(store, room, write_frame(send, &wire))
         .await?;
-    }
     send.finish()
         .map_err(|_| Error::Unreachable("private Session answer closed"))
 }
 
-pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Page> {
-    let charge = job
-        .reserve(PAGE_ENVELOPE)
-        .ok_or(Error::StreamRefused("private Session transfer busy"))?;
-    pull_precharged(conn, ask, charge).await
-}
-
-/// Pull one page using capacity the current-delivery owner admitted together with its later
-/// room/store application work. Explicit history keeps using [`pull`]'s independent envelope.
-pub(crate) async fn pull_precharged(
-    conn: &VoxConnection,
-    ask: Ask,
-    charge: BufferCharge,
-) -> Result<Page> {
+/// Ask one page and receive its bounded answer (at most `MAX_PAGE`) in the connection's own
+/// memory: no shared admission is held while the peer answers (`history_stream::private`).
+pub(crate) async fn pull(conn: &VoxConnection, ask: &Ask) -> Result<Vec<u8>> {
     let (mut send, mut recv) = open_typed(conn, StreamKind::Session).await?;
     write_frame(&mut send, &ask.wire()?).await?;
     send.finish()
         .map_err(|_| Error::Unreachable("private Session request closed"))?;
-    let bytes = read_frame(&mut recv, MAX_PAGE - 4)
+    read_frame(&mut recv, MAX_PAGE - 4)
         .await?
-        .ok_or(Error::MalformedBundle("private Session answer missing"))?;
-    let mut d = Decoder::new(&bytes);
+        .ok_or(Error::MalformedBundle("private Session answer missing"))
+}
+
+/// Check a received answer against its ask, under the capacity the loop admitted for checking
+/// it and for its later room/store application.
+pub(crate) fn read_page(ask: Ask, bytes: &[u8], charge: BufferCharge) -> Result<Page> {
+    let mut d = Decoder::new(bytes);
     if d.array()? != 6 || d.uint()? != 2 {
         return Err(Error::MalformedBundle("private Session answer version"));
     }
@@ -492,8 +539,13 @@ pub(crate) async fn pull_precharged(
         return Err(Error::MalformedBundle("private history donor changed"));
     }
     match &ask.query {
-        Query::LiveTail => {
-            if !hints.is_empty()
+        Query::LiveTail { through } => {
+            // Either the anchored window (the cursor is the anchor asked for) or the donor's
+            // no-result answer, which echoes the reader's own cursor and carries nothing.
+            let anchored = cursor == *through;
+            let echoed = cursor == ask.cursor && records.is_empty() && !more;
+            if !(anchored || echoed)
+                || !hints.is_empty()
                 || (cursor.incarnation == ask.cursor.incarnation && cursor.after < ask.cursor.after)
                 || positions.iter().any(|id| {
                     *id == 0 || *id > cursor.after || cursor.after - *id >= PAGE_RECORDS as u64

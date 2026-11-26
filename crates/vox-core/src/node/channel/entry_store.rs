@@ -79,6 +79,17 @@ fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
 }
 
+/// One step of the one-time upgrade of a store written before this version, in words: a line
+/// in the daemon log, and to whoever opens the room (`prepare_owned`'s `upgrading`), which shows
+/// it as what the room waits for.
+fn say_upgrade(channel: &Digest32, upgrading: &mut dyn FnMut(&str), what: &str) {
+    eprintln!(
+        "vox: room {} is upgrading its saved history once after the update: {what}",
+        crate::node::link::b32_encode(channel)
+    );
+    upgrading(what);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Locator {
     pub author: Digest32,
@@ -123,11 +134,19 @@ pub(crate) struct Roots {
     key_latest: u64,
     key_tip: u64,
     sparse: sparse::Roots,
+    /// Display time fixed at an entry's first admitted header publication: hash -> ms.
+    /// It is never rewritten; the causal `clock` above stays for semantic consumers only.
+    display_time: u64,
+    /// The display order `(display_time, hash)` over every published entry.
+    display_order: u64,
+    /// Every published entry by its signed claimed time `(claimed_ms, hash)`: what a new
+    /// post's stamp rises past.
+    claimed: u64,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(16)
+        e.array(19)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -144,10 +163,13 @@ impl Roots {
             .uint(self.key_latest)
             .uint(self.key_tip);
         self.sparse.write(e);
+        e.uint(self.display_time)
+            .uint(self.display_order)
+            .uint(self.claimed);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if !matches!(arity, 12 | 15 | 16) {
+        if !matches!(arity, 12 | 15 | 16 | 19) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -171,6 +193,9 @@ impl Roots {
             } else {
                 sparse::Roots::default()
             },
+            display_time: if arity >= 19 { d.uint()? } else { 0 },
+            display_order: if arity >= 19 { d.uint()? } else { 0 },
+            claimed: if arity >= 19 { d.uint()? } else { 0 },
         })
     }
 }
@@ -203,7 +228,6 @@ struct Promotion {
     after_page: u64,
     retired: u64,
     bodyless_prefix: bool,
-    reordered: u64,
     accepted: Option<crate::log::dag::PublishedFeed>,
     sparse_head: Option<Digest32>,
     /// Exact local request owning a remote sparse publication; never an authority grant.
@@ -311,7 +335,6 @@ struct Directory {
     promotion: Option<Promotion>,
     graph_ready: bool,
     origin: Option<u64>,
-    order_revision: u64,
     work: dag_facts::Work,
     render_epoch: u64,
     render_ready: bool,
@@ -324,7 +347,20 @@ struct Directory {
     next_package: u64,
     packages_ready: bool,
     packages_cursor: Option<u64>,
+    /// False only for a store written before display keys were fixed at first publication
+    /// (format 13 and earlier): its display selectors are keyed by the causal clock, and its
+    /// control facts by head, until the one-time reindex completes. No display or history
+    /// reader opens before that (`prepare_owned`).
+    display_ready: bool,
+    /// The reindex continuation: stage (0 keys, 1 rendered rows, 2 owed rows, 3 to
+    /// `LAST_REINDEX_STAGE` control facts by author) and last key.
+    display_cursor: Option<(u8, Key)>,
 }
+
+/// The last stage of the one-time reindex of a store written before format 14
+/// (`display_chunk`): stages 3 to 7 move its control facts from head to author keys
+/// (`sparse::Write::migrate_control_chunk`).
+const LAST_REINDEX_STAGE: u8 = 7;
 
 impl Default for Directory {
     fn default() -> Self {
@@ -343,7 +379,6 @@ impl Default for Directory {
             promotion: None,
             graph_ready: true,
             origin: None,
-            order_revision: 0,
             work: dag_facts::Work::default(),
             render_epoch: 0,
             render_ready: false,
@@ -356,6 +391,8 @@ impl Default for Directory {
             next_package: 1,
             packages_ready: false,
             packages_cursor: None,
+            display_ready: true,
+            display_cursor: None,
         }
     }
 }
@@ -372,7 +409,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(26).uint(13);
+        e.array(27).uint(14);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -405,7 +442,8 @@ impl Directory {
                     .uint(p.after_page)
                     .uint(p.retired)
                     .uint(u64::from(p.bodyless_prefix))
-                    .uint(p.reordered);
+                    // The slot of the former reorder count, read and discarded by format 13.
+                    .uint(0);
                 match &p.accepted {
                     Some(state) => {
                         e.array(1);
@@ -450,7 +488,6 @@ impl Directory {
                 e.array(0);
             }
         }
-        e.uint(self.order_revision);
         self.work.write(&mut e);
         e.uint(self.render_epoch).uint(u64::from(self.render_ready));
         match self.render_cursor {
@@ -505,6 +542,15 @@ impl Directory {
                 .bytes(&tip.hash);
         }
         self.retired_provisional.write(&mut e);
+        e.uint(u64::from(self.display_ready));
+        match &self.display_cursor {
+            Some((stage, key)) => {
+                e.array(2).uint(u64::from(*stage)).bytes(key);
+            }
+            None => {
+                e.array(0);
+            }
+        }
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -519,7 +565,7 @@ impl Directory {
         // cannot be treated as empty without silently losing accepted work.
         if !matches!(
             (arity, version),
-            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12) | (26, 13)
+            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12) | (26, 13) | (27, 14)
         ) {
             return Err(invalid("entry directory format"));
         }
@@ -563,11 +609,13 @@ impl Directory {
                 after_page: d.uint()?,
                 retired: d.uint()?,
                 bodyless_prefix: if promotion_arity >= 16 {
-                    flag(&mut d)?
+                    let prefix = flag(&mut d)?;
+                    // Format 13 kept a reorder count here; display keys no longer move.
+                    d.uint()?;
+                    prefix
                 } else {
                     true
                 },
-                reordered: if promotion_arity >= 16 { d.uint()? } else { 0 },
                 accepted: if promotion_arity >= 17 {
                     match d.array()? {
                         0 => None,
@@ -629,7 +677,10 @@ impl Directory {
         } else {
             None
         };
-        let order_revision = if version >= 2 { d.uint()? } else { 0 };
+        if (2..14).contains(&version) {
+            // The former display order revision: nothing reads it since keys stopped moving.
+            d.uint()?;
+        }
         let work = if version >= 2 {
             dag_facts::Work::read(&mut d)?
         } else {
@@ -746,6 +797,26 @@ impl Directory {
         } else {
             Roots::default()
         };
+        let (display_ready, display_cursor) = if version >= 14 {
+            let ready = flag(&mut d)?;
+            let cursor = match d.array()? {
+                0 => None,
+                2 => {
+                    let stage =
+                        u8::try_from(d.uint()?).map_err(|_| invalid("display reindex stage"))?;
+                    let key: Key = d
+                        .bytes()?
+                        .try_into()
+                        .map_err(|_| invalid("display reindex cursor"))?;
+                    Some((stage, key))
+                }
+                _ => return Err(invalid("display reindex cursor arity")),
+            };
+            (ready, cursor)
+        } else {
+            // Written by a Vox whose display keys moved with late parents: reindex once.
+            (false, None)
+        };
         // Retired roots can contain only the exact two provisional locator indexes. They
         // are disjoint from the current roots and cannot hide any accepted-history tree.
         if retired_provisional
@@ -784,6 +855,8 @@ impl Directory {
         if next_package == 0
             || active.key_tip >= next_package
             || (packages_ready && packages_cursor.is_some())
+            || (display_ready && display_cursor.is_some())
+            || display_cursor.is_some_and(|(stage, _)| stage > LAST_REINDEX_STAGE)
             || retention_stage > 2
             || (retention_stage == 2 && retention_cursor.is_some())
             || next_page == 0
@@ -801,6 +874,9 @@ impl Directory {
                 active.read_pending,
                 active.key_packages,
                 active.key_latest,
+                active.display_time,
+                active.display_order,
+                active.claimed,
                 provisional.sequence,
                 provisional.hash,
                 retired_provisional.sequence,
@@ -847,6 +923,9 @@ impl Directory {
                 || p.work.read_pending >= next_page
                 || p.work.key_packages >= next_page
                 || p.work.key_latest >= next_page
+                || p.work.display_time >= next_page
+                || p.work.display_order >= next_page
+                || p.work.claimed >= next_page
                 || p.work.key_tip >= next_package
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
@@ -874,7 +953,6 @@ impl Directory {
             promotion,
             graph_ready,
             origin,
-            order_revision,
             work,
             render_epoch,
             render_ready,
@@ -887,6 +965,8 @@ impl Directory {
             next_package,
             packages_ready,
             packages_cursor,
+            display_ready,
+            display_cursor,
         })
     }
 }
@@ -1387,22 +1467,6 @@ impl Read<'_> {
     fn source(&self) -> Source<'_> {
         Source::Cached(&self.snapshot, self.cache)
     }
-    pub(crate) fn staged(&self, author: &Digest32, seq: u64) -> Result<bool> {
-        if self.directory.provisional_hidden
-            || (self.directory.legacy_provisional.is_some() && !self.directory.provisional_attached)
-        {
-            return Ok(false);
-        }
-        Ok(self
-            .source()
-            .find(
-                self.sek,
-                self.channel,
-                self.directory.provisional.sequence,
-                &position(author, seq),
-            )?
-            .is_some())
-    }
     pub(crate) fn payload_present(&self, hash: &Digest32) -> Result<bool> {
         let Some(at) = self.source().find(
             self.sek,
@@ -1813,6 +1877,7 @@ impl<'s> Write<'_, 's> {
         self.directory.graph_ready =
             self.directory.active.sequence == 0 || self.directory.active.clock != 0;
         self.directory.phase = Phase::Idle;
+        self.batch.touch_history_all(self.channel);
         Ok(())
     }
     /// Strict old-wire inspection in the same Batch as the later exact refill.
@@ -1883,6 +1948,20 @@ impl<'s> Write<'_, 's> {
                 .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage);
         if acquiring_package || pruning_package {
             self.directory.active = self.forget_package_index(self.directory.active, log)?;
+        }
+        // A package's body stored or withdrawn here is what the held record advertises of its
+        // position (`HeldAuthor::position`): it reads the position again at the next publication.
+        if entry
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+        {
+            self.batch.touch_history(
+                self.channel,
+                entry.skeleton.author_id,
+                Some(entry.skeleton.seq),
+            );
         }
         if entry.skeleton.v2.is_none()
             || Source::Batch(self.batch).sparse_effect_finished(
@@ -2261,7 +2340,6 @@ impl Write<'_, '_> {
             after_page: self.directory.next_page,
             retired: 0,
             bodyless_prefix,
-            reordered: 0,
             accepted: Some(accepted),
             sparse_head: None,
             sparse_request: None,
@@ -2356,9 +2434,15 @@ impl Write<'_, '_> {
             {
                 return Err(invalid("promotion would overwrite an active log entry"));
             }
-            let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &wire)?;
-            self.batch
-                .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
+            // A sparse source's log record is written by `publish_promotion`, in the transaction
+            // that switches the roots and advances the governance facts over it: the room's log
+            // never holds an entry its facts have not taken in (`governance/facts.rs`
+            // `current_ready`), even while its DAG facts take more than one transaction.
+            if p.sparse_head.is_none() {
+                let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &wire)?;
+                self.batch
+                    .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
+            }
             // Bodyless skeletons have no decrypt/ratchet effect. Their first-seen facts still
             // land with their wire and locator; the witness effects are queued at publication.
             if p.cursor < p.through && p.bodyless_prefix {
@@ -2406,16 +2490,6 @@ impl Write<'_, '_> {
         Ok(complete)
     }
 
-    /// Capture the non-sparse promotion's exact restart cut before its batch commits.
-    /// Sparse promotions do not change that cut.
-    pub(crate) fn promotion_role_cut(&self) -> Option<(Digest32, u64)> {
-        let promotion = self.directory.promotion.as_ref()?;
-        if promotion.sparse_head.is_some() {
-            return None;
-        }
-        Some((promotion.author, promotion.accepted.as_ref()?.seq))
-    }
-
     /// Queue the root switch in the same Batch as the witness's ratchet/cache/governance
     /// effects. The caller must not publish the new head or stored credit before commit.
     pub(crate) fn publish_promotion(&mut self) -> Result<(u64, u64)> {
@@ -2429,6 +2503,31 @@ impl Write<'_, '_> {
             .ok_or(invalid("promotion missing"))?;
         if p.cursor <= p.through || !self.directory.work.is_empty() {
             return Err(invalid("promotion suffix or DAG facts incomplete"));
+        }
+        if p.sparse_head.is_some() {
+            // The one sparse source's log record lands with the root switch (`promotion_chunk`).
+            if p.from != p.through
+                || self
+                    .batch
+                    .get_segment(self.channel, SegmentKind::LogDb, p.first_log)?
+                    .is_some()
+            {
+                return Err(invalid("promotion would overwrite an active log entry"));
+            }
+            let wire = Source::Batch(self.batch)
+                .open(
+                    self.sek,
+                    self.channel,
+                    SegmentKind::ProvisionalLog,
+                    p.witness,
+                )?
+                .ok_or(invalid("promotion witness wire missing"))?;
+            if Entry::from_wire(&wire)?.entry_hash() != p.witness_hash {
+                return Err(invalid("promotion entry differs from authenticated suffix"));
+            }
+            let sealed = seal_segment(self.sek, SegmentKind::LogDb, p.first_log, &wire)?;
+            self.batch
+                .put_segment(self.channel, SegmentKind::LogDb, p.first_log, &sealed)?;
         }
         if p.sparse_head.is_none() {
             let accepted = p
@@ -2481,10 +2580,12 @@ impl Write<'_, '_> {
             }
         }
         let result = (p.through - p.from + 1, p.after_log);
-        let from = p.from;
+        let (from, author, through) = (p.from, p.author, p.through);
         self.directory.active = p.work;
-        self.directory.order_revision = self.directory.order_revision.wrapping_add(p.reordered);
         self.directory.phase = Phase::Switched;
+        for seq in from..=through {
+            self.batch.touch_history(self.channel, author, Some(seq));
+        }
         self.directory
             .promotion
             .as_mut()
@@ -2687,11 +2788,17 @@ impl EntryIndex {
     /// build carry the mark from their first transaction, so receipt-owned pieces survive.
     /// Runs only once the opening room's publication roots are idle, including the deferred
     /// startup path.
+    ///
+    /// Each slice is a derived (unflushed) commit: a deleted cache row is reclaimed space, not a
+    /// fact anyone relies on, so a slice lost to a crash is only scanned and deleted again.
+    /// Commits reach the disk in order, so the last transaction, which writes the mark and is
+    /// flushed, carries every slice before it: the mark is never on disk without them.
     fn cleanup_old_history_proof_ranges(
         &self,
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
+        upgrading: &mut dyn FnMut(&str),
     ) -> Result<()> {
         if let Some(segment) = store.snapshot()?.get_segment_bounded(
             channel,
@@ -2711,9 +2818,20 @@ impl EntryIndex {
             return Ok(());
         }
         let mut after = None;
+        let mut said = None;
         loop {
+            // Keys are ordered by object hash, so the first byte of the last one visited is
+            // where the scan is in the key space: scan position, not a share of the work.
+            let through = after.map_or(0, |key: Key| u32::from(key[0]) * 100 / 256);
+            if said != Some(through) {
+                said = Some(through);
+                say_upgrade(
+                    channel,
+                    upgrading,
+                    &format!("step 1 of 9, removing the old proof cache, scan {through}% through"),
+                );
+            }
             let mut batch = store.batch()?;
-            // Reclamation must survive interruption, not wait for an unrelated future flush.
             let mut writer = self.write(&mut batch, sek, channel)?;
             if writer.directory.phase != Phase::Idle || !writer.directory.active.sparse.enabled {
                 return Ok(());
@@ -2728,6 +2846,8 @@ impl EntryIndex {
                     SEG_PROOF_CACHE_CLEANED,
                     &marker,
                 )?;
+            } else {
+                writer.batch.derived();
             }
             if changed || done {
                 if changed {
@@ -2758,6 +2878,8 @@ impl EntryIndex {
         }
     }
 
+    /// `upgrading` is told, in words, each step of the one-time upgrade of a store written
+    /// before this version (`say_upgrade`); a store that needs none tells it nothing.
     pub(crate) fn prepare_owned(
         &self,
         store: &Store,
@@ -2765,13 +2887,14 @@ impl EntryIndex {
         channel: &Digest32,
         epoch: u64,
         mut paused_owner: impl FnMut(LegacyProvisionalOwner) -> Result<bool>,
+        upgrading: &mut dyn FnMut(&str),
     ) -> Result<Preparation> {
         // Current create/join seal these roots and the empty restart state in the same
         // transaction as the manifest and sender. Publication only switches sealed roots;
         // it cannot leave a supported room needing archive replay. Refuse an old/missing
         // bootstrap before any orphan cleanup, preserving all its durable data.
         // Never hold a transaction while the verifier opens node-owned demand.
-        let candidate = {
+        let (candidate, display_ready) = {
             let snapshot = store.snapshot()?;
             let directory = Source::Snapshot(&snapshot)
                 .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
@@ -2798,7 +2921,10 @@ impl EntryIndex {
             {
                 return Err(invalid("published restart indexes incomplete"));
             }
-            directory.legacy_provisional.map(|state| state.owner)
+            (
+                directory.legacy_provisional.map(|state| state.owner),
+                directory.display_ready,
+            )
         };
         self.legacy_attached.set(None);
         self.provisional_hidden.set(true);
@@ -2830,10 +2956,15 @@ impl EntryIndex {
             self.provisional_hidden.set(false); // owned roots remain detached by owner check
         } else {
             // This is the only orphan cleanup quantum performed by open, including when a
-            // publication needs many later rollback/retirement transactions.
-            if self.cleanup_orphan_provisional(store, sek, channel)? == Preparation::CleanupPending
+            // publication needs many later rollback/retirement transactions. A store still to
+            // be reindexed for display finishes that rollback here: the reindex rewrites the
+            // active roots and so runs only on an idle index, before any display reader.
+            while self.cleanup_orphan_provisional(store, sek, channel, upgrading)?
+                == Preparation::CleanupPending
             {
-                return Ok(Preparation::CleanupPending);
+                if display_ready {
+                    return Ok(Preparation::CleanupPending);
+                }
             }
         }
         // No request remains active across reopen. Recover only the capped verifier-work
@@ -2860,9 +2991,12 @@ impl EntryIndex {
             after = next;
         }
         if preserved {
-            self.cleanup_old_history_proof_ranges(store, sek, channel)?;
+            self.cleanup_old_history_proof_ranges(store, sek, channel, upgrading)?;
         }
         self.provisional_hidden.set(false);
+        if !display_ready {
+            self.reindex_display(store, sek, channel, upgrading)?;
+        }
         let read = self.read(store, sek, channel)?;
         Ok(if read.directory.retired_provisional == Roots::default() {
             Preparation::Ready
@@ -2877,6 +3011,7 @@ impl EntryIndex {
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
+        upgrading: &mut dyn FnMut(&str),
     ) -> Result<Preparation> {
         let hidden = self.provisional_hidden.get();
         let mut batch = store.batch()?;
@@ -2916,7 +3051,7 @@ impl EntryIndex {
         }
         if current_ready {
             self.provisional_hidden.set(false);
-            self.cleanup_old_history_proof_ranges(store, sek, channel)?;
+            self.cleanup_old_history_proof_ranges(store, sek, channel, upgrading)?;
             Ok(if retired {
                 Preparation::ReadyWithCleanup
             } else {
@@ -3130,9 +3265,6 @@ impl Write<'_, '_> {
 }
 
 impl Read<'_> {
-    pub(crate) fn legacy_required(&self, author: &Digest32) -> Option<LegacyRequired> {
-        self.directory.legacy_required.get(author).copied()
-    }
     pub(crate) fn legacy_required_any(&self) -> bool {
         !self.directory.legacy_required.is_empty()
     }
@@ -3162,63 +3294,6 @@ impl Write<'_, '_> {
         } else {
             false
         }
-    }
-
-    /// Caller verified the retained current-author signature and exact room/epoch. This
-    /// setter cannot accept history; a conflict retains the earlier obligation unchanged.
-    pub(crate) fn note_legacy_required(&mut self, tip: LegacyRequired) -> Result<bool> {
-        if self.directory.active.sparse.enabled
-            || tip.through == 0
-            || tip.through > crate::log::feed::MAX_SEQ
-        {
-            return Err(invalid("legacy required tip bounds"));
-        }
-        let accepted = self
-            .directory
-            .restart
-            .as_ref()
-            .and_then(|r| r.feeds.get(&tip.author));
-        if accepted.is_some_and(|f| f.ended && f.seq < tip.through) {
-            return Err(Error::StreamRefused(
-                "legacy tip extends accepted end of feed",
-            ));
-        }
-        if let Some(old) = self.directory.legacy_required.get(&tip.author) {
-            if old.through > tip.through {
-                return Ok(false);
-            }
-            if old.through == tip.through {
-                if old.hash != tip.hash {
-                    return Err(Error::MalformedBundle(
-                        "conflicting authenticated legacy tip",
-                    ));
-                }
-                return Ok(false);
-            }
-        }
-        if accepted.is_some_and(|f| f.seq >= tip.through) {
-            if Source::Batch(self.batch)
-                .find(
-                    self.sek,
-                    self.channel,
-                    self.directory.active.hash,
-                    &hashed(&tip.hash),
-                )?
-                .is_some_and(|at| at.author == tip.author && at.seq == tip.through)
-            {
-                return Ok(false);
-            }
-            return Err(Error::MalformedBundle(
-                "authenticated legacy tip conflicts with accepted feed",
-            ));
-        }
-        if !self.directory.legacy_required.contains_key(&tip.author)
-            && self.directory.legacy_required.len() >= super::AUTHORS_HARD_LIMIT
-        {
-            return Err(Error::SizeLimitExceeded("legacy required authors"));
-        }
-        self.directory.legacy_required.insert(tip.author, tip);
-        Ok(true)
     }
 }
 

@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sync_pair::{counter, failures, pct, Member, Reader, ID_PASS, VOX};
+use sync_pair::{pct, Member, Reader, ID_PASS, VOX};
 use vox_core::transport::quic::{STREAM_WINDOW, TUNNELS_PER_PEER};
 
 /// Posts timed each way with no tunnel (the control).
@@ -681,21 +681,11 @@ fn phase(
     room: &str,
     arm: &str,
 ) -> [Option<Duration>; 2] {
-    let a0 = alice.status();
-    let b0 = bob.status();
     let a2b = deliveries(alice, rb, cb, room, arm, FROZEN_POSTS);
     let b2a = deliveries(bob, ra, ca, room, arm, FROZEN_POSTS);
     let got = [
         summary(&format!("{arm} alice→bob"), &a2b),
         summary(&format!("{arm} bob→alice"), &b2a),
     ];
-    let (a1, b1) = (alice.status(), bob.status());
-    eprintln!(
-        "[proof] sync failures during the {arm} arm: alice {} bob {}; last: {:?} {:?}",
-        counter(&a1, "failed", None) - counter(&a0, "failed", None),
-        counter(&b1, "failed", None) - counter(&b0, "failed", None),
-        failures(&a1),
-        failures(&b1)
-    );
     got
 }

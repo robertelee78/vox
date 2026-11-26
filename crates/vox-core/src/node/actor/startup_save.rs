@@ -639,6 +639,7 @@ impl Node {
                 self.ended_rooms = loaded.ended;
                 if let Some(policy) = returned.policy {
                     self.trust = policy.trust;
+                    self.trust_incarnation = policy.incarnation;
                     self.consent_keys = policy.consent_keys;
                     self.computer_revision
                         .store(policy.revision, std::sync::atomic::Ordering::Release);
@@ -659,8 +660,6 @@ impl Node {
                             self.reopen_remembered().await;
                         }
                         self.ingress_scan_wake();
-                        self.resume_own_key_interruptions();
-                        self.resume_own_key_donor_busy();
                         self.resume_own_key_policy_waiting();
                         Outcome::Done
                     }

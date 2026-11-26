@@ -1,11 +1,26 @@
 //! The room's encrypted DAG facts and restartable late-parent work. These use the entry
 //! index's existing sealed pages and publication descriptor, never a second authority store.
+//!
+//! Two orders live here, and they never mix. The causal clock (`roots.clock`/`roots.order`)
+//! is recomputed when a late parent arrives; only semantic consumers read it (governance,
+//! lifecycle, notices, Session ordering, authored tips). The display key is fixed once, at an
+//! entry's first admitted header publication, and is the only order a person reads.
 
 use super::*;
 use crate::log::dag::MAX_LEAD_MS;
 
-/// Published display order: hybrid clock, then exact entry hash.
+/// How far past this node's first sight of an entry its signed time may place it in display.
+const FIRST_SIGHT_LEAD_MS: u64 = 600_000;
+
+/// Display order: the fixed display time, then exact entry hash.
 pub type OrderKey = (u64, Digest32);
+
+/// The base display time of one entry: its signed claim, no later than ten minutes past this
+/// node's first sight of it. No lower clamp: old history belongs above recent history. A held
+/// `seen` anchor can lift it (`fix_display_key`), so this is not a ceiling on the fixed key.
+fn display_time(claimed_ms: u64, first_seen_ms: u64) -> u64 {
+    claimed_ms.min(first_seen_ms.saturating_add(FIRST_SIGHT_LEAD_MS))
+}
 
 pub(super) fn ordered((clock, hash): OrderKey) -> Key {
     let mut key = [0; 64];
@@ -63,29 +78,34 @@ impl Read<'_> {
     }
 }
 
-/// One pinned published order view. Drop it before waiting on a client or network operation.
-/// A cursor across separate views must also carry `revision`: late parents can move keys.
+/// One pinned published display-order view. Drop it before waiting on a client or network
+/// operation. A display key is fixed at first publication and never moves, so a cursor
+/// across separate views stays exact: an admission only inserts.
 pub struct OrderView<'a> {
     pub(super) read: Read<'a>,
 }
 impl OrderView<'_> {
-    /// How many times a published entry has moved in this order (a late parent arrived after
-    /// it). An entry merely added does not move it: a cursor across views is still exact.
-    #[must_use]
-    pub fn revision(&self) -> u64 {
-        self.read.order_revision()
-    }
-    /// One exact published entry's display-order key, or absence; storage failures remain errors.
+    /// One exact published entry's display key, or absence; storage failures remain errors.
     pub fn key(&self, hash: &Digest32) -> Result<Option<OrderKey>> {
-        Ok(self.read.clock(hash)?.map(|clock| (clock, *hash)))
+        Ok(self.read.display_time(hash)?.map(|at| (at, *hash)))
     }
-    /// The first published key strictly after `after`; `None` starts at the oldest entry.
+    /// The first published display key strictly after `after`; `None` starts at the oldest.
     pub fn next(&self, after: Option<OrderKey>) -> Result<Option<OrderKey>> {
-        self.read.order_next(after)
+        self.read.source().order_next(
+            self.read.sek,
+            self.read.channel,
+            self.read.directory.active.display_order,
+            after,
+        )
     }
-    /// The first published key strictly before `before`; `None` starts at the newest entry.
+    /// The first published display key strictly before `before`; `None` starts at the newest.
     pub fn previous(&self, before: Option<OrderKey>) -> Result<Option<OrderKey>> {
-        self.read.order_previous(before)
+        self.read.source().order_previous(
+            self.read.sek,
+            self.read.channel,
+            self.read.directory.active.display_order,
+            before,
+        )
     }
     /// Open one rendering using the very same snapshot as the published order roots.
     pub(crate) fn cache(&self, id: u64) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -408,8 +428,17 @@ impl Read<'_> {
             after,
         )
     }
-    pub(crate) fn order_revision(&self) -> u64 {
-        self.directory.order_revision
+    /// One published entry's fixed display time; never the causal clock.
+    pub(crate) fn display_time(&self, hash: &Digest32) -> Result<Option<u64>> {
+        if !self.directory.display_ready {
+            return Err(invalid("display order not yet reindexed"));
+        }
+        self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.display_time,
+            &hashed(hash),
+        )
     }
 }
 impl EntryIndex {
@@ -423,7 +452,57 @@ impl EntryIndex {
         if !read.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
         }
+        if !read.directory.display_ready {
+            return Err(invalid("display order not yet reindexed"));
+        }
         Ok(OrderView { read })
+    }
+    /// The one-time, restartable reindex of a room written before display keys were fixed
+    /// (format 13 and earlier), run by open before any reader. Derived selectors and moved
+    /// facts only: causal roots, sources, arrivals, retention ages and every original record are
+    /// kept as they are. Each stage is said once as it starts (`say_upgrade`).
+    pub(crate) fn reindex_display(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        upgrading: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let mut said = None;
+        loop {
+            let mut batch = store.batch()?;
+            batch.derived();
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            if writer.directory.display_ready {
+                return Ok(());
+            }
+            if writer.directory.phase != Phase::Idle || !writer.directory.work.is_empty() {
+                return Err(invalid("display reindex needs an idle index"));
+            }
+            let stage = writer
+                .directory
+                .display_cursor
+                .map_or(0, |(stage, _)| stage);
+            if said != Some(stage) {
+                said = Some(stage);
+                let what = match stage {
+                    0 => "fixing each message's display time",
+                    1 => "re-sorting the messages it shows",
+                    2 => "re-sorting the messages it is missing",
+                    3..=6 => "moving what it knows of members' controls to the members",
+                    _ => "setting where each member's history is fetched from",
+                };
+                super::say_upgrade(
+                    channel,
+                    upgrading,
+                    &format!("step {} of 9, {what}", stage + 2),
+                );
+            }
+            writer.display_chunk()?;
+            writer.seal()?;
+            batch.commit()?;
+            self.committed();
+        }
     }
     pub(crate) fn finish_fact_work(
         &self,
@@ -663,14 +742,14 @@ impl Write<'_, '_> {
                 clock > prior
             }
         }) {
-            if let Some(old) = old {
-                roots.order = self.change_value(roots.order, ordered((old, hash)), None)?;
-                self.move_rendered(&mut roots, hash, old, clock)?;
-                if let Some(p) = &mut self.directory.promotion {
-                    p.reordered = p.reordered.wrapping_add(1);
-                } else {
-                    self.directory.order_revision = self.directory.order_revision.wrapping_add(1);
+            match old {
+                Some(old) => {
+                    // A late parent lifted the causal clock. Only its semantic indexes follow;
+                    // the display key fixed at first publication stays where it is.
+                    roots.order = self.change_value(roots.order, ordered((old, hash)), None)?;
+                    self.move_session_candidate(&mut roots, hash, old, clock)?;
                 }
+                None => self.fix_display_key(&mut roots, hash, sk.claimed_ms, &sk.seen)?,
             }
             roots.clock =
                 self.change_value(roots.clock, hashed(&hash), Some(Value::Number(clock)))?;
@@ -681,6 +760,161 @@ impl Write<'_, '_> {
         self.directory.work.placing = None;
         self.set_fact_roots(roots)?;
         Ok(spent + 1)
+    }
+
+    /// At an entry's first admitted header publication, persist its display key and its
+    /// signed time. Both are written once and never rewritten: a later admission, a refill,
+    /// a withdrawal and restoration of its row, and a reopen all keep them. First sight is
+    /// this node's receipt time of the publication that brought the header, the earliest
+    /// first-seen record it keeps for it, never a render, reconnect or upgrade time.
+    ///
+    /// The key's time is the base (`display_time`), lifted to one millisecond past the latest
+    /// fixed display time among the entries its signed `seen` names that this node had already
+    /// published before this publication began: the committed roots (`active`), never this
+    /// publication's unpublished work, so the order its work visits entries cannot change a
+    /// key. An absent reference contributes nothing and is never fetched or awaited; at most
+    /// `MAX_SEEN` lookups, no recursion, and a key already fixed is never revisited. The key
+    /// confers no authority: the causal clock above stays the only semantic order.
+    fn fix_display_key(
+        &mut self,
+        roots: &mut Roots,
+        hash: Digest32,
+        claimed: u64,
+        seen: &[Digest32],
+    ) -> Result<()> {
+        let first_seen = self
+            .directory
+            .promotion
+            .as_ref()
+            .filter(|_| self.directory.phase == Phase::Building)
+            .map(|p| p.received_ms)
+            .ok_or(invalid("DAG first placement outside a publication"))?;
+        let published = self.directory.active.display_time;
+        let mut at = display_time(claimed, first_seen);
+        for named in seen {
+            if let Some(anchor) = Source::Batch(self.batch).number(
+                self.sek,
+                self.channel,
+                published,
+                &hashed(named),
+            )? {
+                at = at.max(anchor.saturating_add(1));
+            }
+        }
+        self.put_display_key(roots, hash, at, claimed)
+    }
+    fn put_display_key(
+        &mut self,
+        roots: &mut Roots,
+        hash: Digest32,
+        at: u64,
+        claimed: u64,
+    ) -> Result<()> {
+        if Source::Batch(self.batch)
+            .number(self.sek, self.channel, roots.display_time, &hashed(&hash))?
+            .is_some()
+        {
+            return Err(invalid("display key already fixed"));
+        }
+        roots.display_time =
+            self.change_value(roots.display_time, hashed(&hash), Some(Value::Number(at)))?;
+        roots.display_order = self.change_value(
+            roots.display_order,
+            ordered((at, hash)),
+            Some(Value::Present),
+        )?;
+        roots.claimed = self.change_value(
+            roots.claimed,
+            ordered((claimed, hash)),
+            Some(Value::Present),
+        )?;
+        Ok(())
+    }
+
+    /// One bounded slice of the one-time reindex of a store written before display keys were
+    /// fixed (format 13 and earlier). Stage 0 gives every published entry its key from original
+    /// evidence; stages 1 and 2 (`render_facts`) move rendered and owed rows from the causal
+    /// clock to it; stages 3 to `LAST_REINDEX_STAGE` move its control facts from head to author
+    /// keys (`migrate_control_chunk`). The cursor is sealed with each slice, so an interrupted
+    /// reindex resumes, never restarts.
+    fn display_chunk(&mut self) -> Result<()> {
+        let (stage, start) = match self.directory.display_cursor {
+            Some((stage, key)) => (stage, Some(key)),
+            None => (0, None),
+        };
+        let next = match stage {
+            0 => self.display_key_chunk(start)?,
+            1 => self.display_rendered_chunk(start)?,
+            2 => self.display_owed_chunk(start)?,
+            _ => self.migrate_control_chunk(stage, start)?,
+        };
+        self.directory.display_cursor = match next {
+            Some(key) => Some((stage, key)),
+            None if stage < LAST_REINDEX_STAGE => Some((stage + 1, [0; 64])),
+            None => {
+                self.directory.display_ready = true;
+                None
+            }
+        };
+        Ok(())
+    }
+
+    /// Display keys for published entries, in hash order, from this node's original age
+    /// records: the entry's first-seen record beside its log page and its retention record,
+    /// the earlier of the two. An entry for which this node kept no age record (a control
+    /// entry's retained body, for instance) keeps the place main showed it in, its clock at
+    /// upgrade, frozen from now on: missing evidence is never replaced by the upgrade time.
+    fn display_key_chunk(&mut self, start: Option<Key>) -> Result<Option<Key>> {
+        let mut roots = self.directory.active;
+        let mut key = start.unwrap_or([0; 64]);
+        for _ in 0..PROMOTION_ENTRIES {
+            let source = Source::Batch(self.batch);
+            let Some((found, value)) = source.first(self.sek, self.channel, roots.hash, &key, 0)?
+            else {
+                self.directory.active = roots;
+                return Ok(None);
+            };
+            let at = value.locator()?;
+            let hash: Digest32 = found[..32]
+                .try_into()
+                .map_err(|_| invalid("display reindex hash"))?;
+            if source
+                .number(self.sek, self.channel, roots.display_time, &found)?
+                .is_none()
+            {
+                let clock = source
+                    .number(self.sek, self.channel, roots.clock, &found)?
+                    .ok_or(invalid("published entry has no clock"))?;
+                let header = self.order_header(roots, at)?;
+                if header.entry_hash() != hash {
+                    return Err(invalid("display reindex hash differs"));
+                }
+                let recorded = self
+                    .batch
+                    .get_segment(self.channel, SegmentKind::Index, at.log)?
+                    .map(|segment| {
+                        let bytes = open_segment(self.sek, SegmentKind::Index, at.log, &segment)?;
+                        super::super::parse_first_seen(&bytes).map(|(seen, _)| seen)
+                    })
+                    .transpose()?;
+                let tracked = self.retention(&hash)?.map(|t| t.first_seen_ms);
+                let claimed = header.skeleton.claimed_ms;
+                let at = match recorded.into_iter().chain(tracked).min() {
+                    Some(first_seen) => display_time(claimed, first_seen),
+                    None => clock,
+                };
+                self.put_display_key(&mut roots, hash, at, claimed)?;
+            }
+            match successor(found) {
+                Some(next) => key = next,
+                None => {
+                    self.directory.active = roots;
+                    return Ok(None);
+                }
+            }
+        }
+        self.directory.active = roots;
+        Ok(Some(key))
     }
 
     /// Each step visits at most one entry or one reverse edge; queued descendants stay sealed.
@@ -735,59 +969,27 @@ impl Write<'_, '_> {
         }
         Ok(self.directory.work.is_empty())
     }
-}
 
-impl EntryIndex {
-    /// Stage exactly one evidence-complete source. Subsequent work is sliced by the caller;
-    /// this entry point does not loop over its ancestry or wait while holding room state.
-    pub(crate) fn begin_sparse_publication(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        publication: SparsePublication<'_>,
-    ) -> Result<()> {
-        let mut batch = store.batch()?;
-        batch.derived();
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        writer.begin_sparse_publication(publication)?;
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        Ok(())
-    }
-
-    /// One source-copy or DAG-coordinate quantum. `true` means the unpublished roots are
-    /// ready for the caller's atomic source/evaluator transaction, not semantic acceptance.
-    pub(crate) fn advance_sparse_publication(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-    ) -> Result<bool> {
-        let mut batch = store.batch()?;
-        batch.derived();
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        let promotion = writer
+    /// One source-copy and one DAG-coordinate quantum of the room's sparse publication, in the
+    /// caller's transaction. `true` means the unpublished roots are ready for
+    /// `publish_promotion` in that same transaction, not semantic acceptance.
+    pub(crate) fn advance_sparse_publication(&mut self) -> Result<bool> {
+        let promotion = self
             .directory
             .promotion
             .as_ref()
             .ok_or(invalid("sparse publication absent"))?;
-        if writer.directory.phase != Phase::Building || promotion.sparse_head.is_none() {
+        if self.directory.phase != Phase::Building || promotion.sparse_head.is_none() {
             return Err(invalid("sparse publication phase differs"));
         }
-        let ready = if promotion.cursor <= promotion.through {
-            writer.promotion_chunk()?;
-            false
-        } else {
-            writer.fact_chunk()?
-        };
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        Ok(ready)
+        if promotion.cursor <= promotion.through {
+            self.promotion_chunk()?;
+        }
+        self.fact_chunk()
     }
+}
 
+impl EntryIndex {
     /// One cleanup quantum after the root switch. Live admission yields between calls.
     pub(crate) fn cleanup_publication(
         &self,

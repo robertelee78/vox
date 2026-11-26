@@ -1,8 +1,82 @@
 //! Local attention mutations share the room's authority, publication and sealed-store boundary.
+//! An operation is decided under the room's lock, from the room; the ledger write it decides is
+//! run after the lock is released ([`AttentionWrite`]).
 use super::*;
+use crate::atrest::sek::WeakSek;
 use crate::node::attention::{ledger::Ledger, Operation, Recipient, Reply, Wait, PAGE_SIZE};
 
+/// What an attention operation decided under the room's lock.
+pub(crate) enum Attention {
+    /// Its answer: nothing is left to write.
+    Answer(Reply),
+    /// The one write of this room's attention ledger it decided.
+    Write(AttentionWrite),
+}
+
+/// What one attention write does to the ledger, inside the store's write transaction.
+type Apply = Box<dyn for<'a, 's> FnOnce(&mut Ledger<'a, 's>) -> Result<Reply> + Send>;
+
+/// One write of a room's attention ledger, run without the room's lock. It reads and changes
+/// only that ledger, inside the store's one write transaction ([`Store::batch`]), which reads
+/// the ledger it changes: no room state is read or written, so the room's lock guards nothing
+/// here. One attention write runs at a time (the actor's Session bookkeeping reservation).
+pub(crate) struct AttentionWrite {
+    sek: WeakSek,
+    room: Digest32,
+    instance: [u8; 16],
+    apply: Apply,
+    #[cfg(feature = "test-knobs")]
+    proof_session: Option<String>,
+}
+
+impl AttentionWrite {
+    /// Write and commit flushed, or write nothing. A failure other than a refusal
+    /// (`Error::Profile`) is the room's save failure: the caller poisons the room with it.
+    pub(crate) fn run(self, store: &Store) -> Result<Reply> {
+        let Self {
+            sek,
+            room,
+            instance,
+            apply,
+            #[cfg(feature = "test-knobs")]
+            proof_session,
+        } = self;
+        sek.with(|sek| {
+            let mut batch = store.batch()?;
+            batch.ruled();
+            let mut ledger = Ledger::open(&mut batch, sek, room, instance)?;
+            let reply = apply(&mut ledger)?;
+            if ledger.finish()? {
+                #[cfg(feature = "test-knobs")]
+                if let Some(session) = &proof_session {
+                    crate::node::session_ingress::hold_flush_for_proof(session)?;
+                }
+                batch.commit()?;
+            }
+            Ok(reply)
+        })
+    }
+}
+
 impl ChannelState {
+    fn attention_write(
+        &self,
+        instance: [u8; 16],
+        #[cfg(feature = "test-knobs")] proof_session: Option<String>,
+        apply: impl for<'a, 's> FnOnce(&mut Ledger<'a, 's>) -> Result<Reply> + Send + 'static,
+    ) -> Attention {
+        Attention::Write(AttentionWrite {
+            sek: self.sek.reader(),
+            room: self.channel_id,
+            instance,
+            apply: Box::new(apply),
+            #[cfg(feature = "test-knobs")]
+            proof_session,
+        })
+    }
+
+    /// Decide `operation` from this room. Under the room's lock: only reads, never the store's
+    /// writer; the write it decides runs after the lock is released.
     pub(crate) fn attention(
         &mut self,
         store: &Store,
@@ -10,7 +84,7 @@ impl ChannelState {
         expected_instance: Option<[u8; 16]>,
         operation: Operation,
         now: u64,
-    ) -> std::result::Result<Reply, String> {
+    ) -> std::result::Result<Attention, String> {
         use super::session_projection::{Query as SessionQuery, Reply as SessionReply};
         let saved_page = matches!(operation, Operation::Page(_));
         if !saved_page && self.is_poisoned() {
@@ -73,7 +147,7 @@ impl ChannelState {
                         .filter(|row| row.node == owner)
                         .map(|row| self.attention_recipient(store, instance, row.id, row.opening))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok(Reply::Recipients { recipients, next })
+                    Ok(Attention::Answer(Reply::Recipients { recipients, next }))
                 }
                 _ => Err("unexpected attention Session page".into()),
             };
@@ -147,7 +221,7 @@ impl ChannelState {
                     }
                 }
             }
-            return Ok(Reply::Page(page));
+            return Ok(Attention::Answer(Reply::Page(page)));
         }
         let initial = if matches!(operation, Operation::Resolve { .. }) {
             match self
@@ -256,11 +330,8 @@ impl ChannelState {
         }
         let paused = self.room_pause().paused;
         let cutoff = self.pause_resume_after();
-        let result = (|| -> Result<Reply> {
-            let mut batch = store.batch()?;
-            batch.ruled();
-            let mut ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)?;
-            let reply = match operation {
+        let apply = move |ledger: &mut Ledger<'_, '_>| -> Result<Reply> {
+            Ok(match operation {
                 Operation::Resolve { .. } => {
                     ledger.initialize(&recipient, initial)?;
                     Reply::Resolved {
@@ -337,20 +408,14 @@ impl ChannelState {
                     ledger.observed(&receipt, now)?;
                     Reply::Done
                 }
-            };
-            if ledger.finish()? {
-                #[cfg(feature = "test-knobs")]
-                crate::node::session_ingress::hold_flush_for_proof(&proof_session)?;
-                batch.commit()?;
-            }
-            Ok(reply)
-        })();
-        result.map_err(|error| {
-            if !matches!(error, Error::Profile(_)) {
-                self.poison(&error);
-            }
-            error.to_string()
-        })
+            })
+        };
+        Ok(self.attention_write(
+            instance,
+            #[cfg(feature = "test-knobs")]
+            Some(proof_session),
+            apply,
+        ))
     }
 }
 
@@ -379,7 +444,7 @@ impl ChannelState {
         harness: &str,
         route: Option<Digest32>,
         now: u64,
-    ) -> std::result::Result<Reply, String> {
+    ) -> std::result::Result<Attention, String> {
         use crate::node::attention::ledger::ThreadScan;
         use vox_agentcomms::envelope::Envelope;
         let (mut through, audience_turn, audience_work) = {
@@ -397,7 +462,7 @@ impl ChannelState {
             (through, audience_turn, work)
         };
         if self.room_pause().paused {
-            return Ok(Reply::Done);
+            return Ok(Attention::Answer(Reply::Done));
         }
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
@@ -518,36 +583,31 @@ impl ChannelState {
             "opencode" | "claude" | "omp" if route.is_some() => None,
             _ => Some(Wait::AdapterUnavailable),
         };
-        let result = (|| -> Result<Reply> {
-            let mut batch = store.batch()?;
-            batch.ruled();
-            let mut ledger =
-                Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)?;
-            ledger.availability(recipient, wait, route)?;
+        let instance = recipient.instance;
+        let recipient = recipient.clone();
+        let apply = move |ledger: &mut Ledger<'_, '_>| -> Result<Reply> {
+            ledger.availability(&recipient, wait, route)?;
             for (source, arrival, urgent) in admitted {
-                ledger.admit(recipient, source, arrival, urgent, None, now)?;
+                ledger.admit(&recipient, source, arrival, urgent, None, now)?;
             }
             for (pending, urgent) in deferred {
-                ledger.defer_audience(recipient, pending, urgent, now)?;
+                ledger.defer_audience(&recipient, pending, urgent, now)?;
             }
             if let Some((pending, eligible)) = audience_result {
-                ledger.audience_progress(recipient, &pending, eligible)?;
+                ledger.audience_progress(&recipient, &pending, eligible)?;
             }
             for (source, answer) in answered {
-                ledger.answered(recipient, source, answer, now)?;
+                ledger.answered(&recipient, source, answer, now)?;
             }
-            ledger.scanned(recipient, through, audience_after)?;
-            if ledger.finish()? {
-                batch.commit()?;
-            }
+            ledger.scanned(&recipient, through, audience_after)?;
             Ok(Reply::Done)
-        })();
-        result.map_err(|error| {
-            if !matches!(error, Error::Profile(_)) {
-                self.poison(&error);
-            }
-            error.to_string()
-        })
+        };
+        Ok(self.attention_write(
+            instance,
+            #[cfg(feature = "test-knobs")]
+            None,
+            apply,
+        ))
     }
 }
 
@@ -596,7 +656,7 @@ impl ChannelState {
         owner: Digest32,
         instance: [u8; 16],
         now: u64,
-    ) -> std::result::Result<Reply, String> {
+    ) -> std::result::Result<Attention, String> {
         use super::session_projection::{Query as Q, Reply as R};
         let (after, records) = {
             let snapshot = store.snapshot().map_err(|e| e.to_string())?;
@@ -633,10 +693,7 @@ impl ChannelState {
                 expired.push((recipient, None, true));
             }
         }
-        let result = (|| -> Result<Reply> {
-            let mut batch = store.batch()?;
-            batch.ruled();
-            let mut ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)?;
+        let apply = move |ledger: &mut Ledger<'_, '_>| -> Result<Reply> {
             for (recipient, source, closed) in expired {
                 if let Some(source) = source {
                     ledger.retire(&recipient, source, closed, now)?;
@@ -645,17 +702,14 @@ impl ChannelState {
                 }
             }
             ledger.maintained(after);
-            if ledger.finish()? {
-                batch.commit()?;
-            }
             Ok(Reply::Done)
-        })();
-        result.map_err(|error| {
-            if !matches!(error, Error::Profile(_)) {
-                self.poison(&error);
-            }
-            error.to_string()
-        })
+        };
+        Ok(self.attention_write(
+            instance,
+            #[cfg(feature = "test-knobs")]
+            None,
+            apply,
+        ))
     }
 }
 

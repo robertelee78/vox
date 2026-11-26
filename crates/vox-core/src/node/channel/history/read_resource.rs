@@ -11,7 +11,6 @@ pub(super) struct ReadFacts {
     pub projection_ready: bool,
     pub display_rewrite: u64,
     pub display_removals: u64,
-    pub reorder_generation: u64,
     pub body_generation: u64,
     pub classification_revision: u64,
     pub incarnation: u64,
@@ -52,7 +51,6 @@ impl ReadFacts {
                     ]),
             display_rewrite: ch.display_rewrite,
             display_removals: ch.display_removals,
-            reorder_generation: ch.dag.reorder_generation(),
             body_generation: ch.dag.body_generation(),
             classification_revision: ch.legacy_sessions.display_revision(),
             incarnation: ch.projection_state.incarnation,
@@ -118,7 +116,6 @@ impl ReadFacts {
             && self.projection_ready == other.projection_ready
             && self.display_rewrite == other.display_rewrite
             && self.display_removals == other.display_removals
-            && self.reorder_generation == other.reorder_generation
             && self.body_generation == other.body_generation
             && self.classification_revision == other.classification_revision
             && self.incarnation == other.incarnation
@@ -479,11 +476,6 @@ impl ChannelState {
         trusted: Option<&BTreeSet<Digest32>>,
         retain_snapshot: bool,
     ) -> Result<Arc<ReadResource>> {
-        // Every admitted author has its serving scalar before the snapshot shares them.
-        let authors: Vec<Digest32> = self.authors.keys().copied().collect();
-        for author in authors {
-            self.availability_peer(author, None)?;
-        }
         self.publish_room_snapshot(&store);
         if self.poisoned.get() {
             // A definitive failed write cannot certify whatever roots redb exposes after

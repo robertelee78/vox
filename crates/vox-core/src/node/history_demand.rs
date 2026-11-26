@@ -4,9 +4,12 @@
 //! handle, and every mutation checks its durable fencing serial. Callers recheck current room,
 //! trust and audience authority before use. Partial pages are sealed provisional bytes, never
 //! canonical LogDb entries. Obtain a shared Job outside actor locks before calling this module.
-//! Archive has one fixed slot per node, including paused work. Live and control each have one
-//! separate fixed slot so neither a paused archive nor a large live body blocks essential control.
-//! Those slots add no workers or memory pool; their actual buffers use the shared foreground jobs.
+//! Legacy archive work, and an entry an earlier build admitted, keep one fixed slot per node,
+//! including paused work; a person's public and private requests are a set of saved records
+//! instead ([`owe_public`], [`owe_private`]), each owed by the loops from the step that saved it.
+//! Live and control each have one separate fixed slot so neither a paused archive nor a large
+//! live body blocks essential control. Those slots add no workers or memory pool; their actual
+//! buffers use the shared foreground jobs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,10 +57,8 @@ pub struct Context {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Archive,
-    OwnRecovery,
     Live,
     Control,
-    KeyBody,
 }
 
 /// The actor retains this handle to fence a worker even when a blocking disk call cannot abort.
@@ -74,7 +75,9 @@ impl Cancellation {
 }
 
 impl Context {
-    /// Explicit archive commands only. A retained record cannot create or resume this context.
+    /// Explicit archive commands, and the restore of a person's saved public requests when their
+    /// room opens under the binding they were saved with (ruling correction 4). A retained
+    /// private or legacy record cannot create or resume this context.
     pub fn unlocked(
         profile: &Profile,
         secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -93,23 +96,6 @@ impl Context {
             Purpose::History => return Err(invalid("archive requires explicit local demand")),
         };
         Self::with_slot(profile, slot, secret_work)
-    }
-    /// Recipient key bodies own a separate staging boundary from public control work.
-    pub(crate) fn key_body_unlocked(
-        profile: &Profile,
-        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
-    ) -> Result<Self> {
-        Self::with_slot(profile, Slot::KeyBody, secret_work)
-    }
-    /// Local durable own-feed recovery only; no public command or network request mints it.
-    pub(crate) fn own_recovery_unlocked(
-        profile: &Profile,
-        room: Digest32,
-        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
-    ) -> Result<Self> {
-        let mut context = Self::with_slot(profile, Slot::OwnRecovery, secret_work)?;
-        context.scope = own_recovery_scope(context.node, room);
-        Ok(context)
     }
     fn with_slot(
         profile: &Profile,
@@ -570,12 +556,6 @@ impl ResumeAdmission {
         &self.mutation
     }
 
-    pub(crate) fn take_followup(&mut self) -> Result<AdmissionCharge> {
-        self.followup
-            .take()
-            .ok_or_else(|| invalid("history resume follow-up credit"))
-    }
-
     pub(crate) fn is_private(&self) -> bool {
         self.followup.is_some()
     }
@@ -631,8 +611,9 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Archive => 0,
         Slot::Live => 1,
         Slot::Control => 2,
-        Slot::OwnRecovery => 3,
-        Slot::KeyBody => 4,
+        // 3 was the automatic own-recovery slot; its namespace is `own_recovery_scope`, purged
+        // with the room (`purge_own_recovery_in`). Never reused.
+        // Scope code 4 was used for key bodies and is retired.
     });
     sha256(&bytes)
 }
@@ -730,10 +711,18 @@ fn decode(
     scope: &Digest32,
     segment: &crate::atrest::store::SealedSegment,
 ) -> Result<State> {
+    decode_at(key, scope, HEADER, segment)
+}
+fn decode_at(
+    key: &Sek,
+    scope: &Digest32,
+    id: u64,
+    segment: &crate::atrest::store::SealedSegment,
+) -> Result<State> {
     if segment.ciphertext.len() > STATE_BYTES + 16 {
         return Err(bad());
     }
-    let bytes = open_segment(key, KIND, HEADER, segment)?;
+    let bytes = open_segment(key, KIND, id, segment)?;
     let (version, bound, mut state): (u8, Digest32, State) =
         serde_json::from_slice(&bytes).map_err(|_| bad())?;
     if version != 1 || bound != *scope {
@@ -750,17 +739,21 @@ fn load(batch: &Batch<'_>, key: &Sek, scope: &Digest32) -> Result<Option<State>>
         .transpose()
 }
 fn put(batch: &mut Batch<'_>, key: &Sek, scope: &Digest32, state: &State) -> Result<()> {
+    put_at(batch, key, scope, HEADER, state)
+}
+fn put_at(
+    batch: &mut Batch<'_>,
+    key: &Sek,
+    scope: &Digest32,
+    id: u64,
+    state: &State,
+) -> Result<()> {
     state.validate()?;
     let bytes = Zeroizing::new(serde_json::to_vec(&(1u8, scope, state)).map_err(|_| bad())?);
     if bytes.len() > STATE_BYTES {
         return Err(bad());
     }
-    batch.put_segment(
-        scope,
-        KIND,
-        HEADER,
-        &seal_segment(key, KIND, HEADER, &bytes)?,
-    )
+    batch.put_segment(scope, KIND, id, &seal_segment(key, KIND, id, &bytes)?)
 }
 fn live(
     batch: &Batch<'_>,
@@ -867,88 +860,6 @@ pub(crate) fn has_admitted_recovery(
         ))
 }
 
-/// Start only after an explicit local request and current authorization. No abandoned namespaces.
-pub fn start(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    bounds: Bounds,
-    job: &Job,
-) -> Result<Active> {
-    start_plan(context, request, binding, bounds, None, job)
-}
-
-pub(crate) fn start_private(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    bounds: Bounds,
-    plan: PrivatePlan,
-    job: &Job,
-) -> Result<Active> {
-    bounds.validate()?;
-    plan.validate(bounds)?;
-    start_plan(context, request, binding, bounds, Some(plan), job)
-}
-fn start_plan(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    bounds: Bounds,
-    private: Option<PrivatePlan>,
-    job: &Job,
-) -> Result<Active> {
-    let _charge = charge(job, STATE_WORK)?;
-    bounds.validate()?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    authorize_in(&batch, context, binding)?;
-    let serial = match load(&batch, key, &scope)? {
-        Some(previous) => {
-            if !previous.progress.terminal() || previous.cleanup.is_some() {
-                return Err(invalid(
-                    "history demand already exists; resume it or cancel and reclaim it",
-                ));
-            }
-            if previous.request == request {
-                return Err(invalid("history request ID must be fresh"));
-            }
-            next_serial(previous.serial)?
-        }
-        None => 1,
-    };
-    let state = State {
-        scope,
-        request,
-        binding,
-        bounds,
-        remaining: bounds.entries,
-        body: None,
-        cursor: None,
-        admitted: None,
-        private,
-        legacy: None,
-        progress: Progress::Pending,
-        serial,
-        cleanup: None,
-    };
-    put(&mut batch, key, &scope, &state)?;
-    // Once the start is committed its durable owner exists. A later cancellation must not
-    // turn that completed mutation into an error that conceals the new request.
-    context.check()?;
-    batch.commit()?;
-    Ok(Active {
-        node: context.fingerprint(),
-        scope,
-        request,
-        serial,
-        valid: true,
-        binding,
-        cancellation: context.cancellation(),
-    })
-}
-
 /// The caller prepaid this mutation and supplies freshly rechecked authority. Bounds and
 /// remaining count come only from disk. Public archive demand may renew its activation's trust
 /// nonce after current authorization is checked, without changing its selected scope. Private
@@ -1009,121 +920,6 @@ pub(crate) fn resume_precharged(
     })
 }
 
-/// Reconstruct deletion ownership after a crash, never a live admission capability.
-pub(crate) fn own_recovery_cleanup(context: &Context, state: &State) -> Result<Active> {
-    if context.slot != Slot::OwnRecovery || state.scope != context.scope {
-        return Err(invalid("own recovery cleanup binding"));
-    }
-    Ok(Active {
-        node: context.node,
-        scope: context.scope,
-        request: state.request,
-        serial: state.serial,
-        valid: false,
-        binding: state.binding,
-        cancellation: context.cancellation(),
-    })
-}
-
-/// Automatic recovery rechecks current authority in this Batch while preserving its original
-/// signed interval and body cursor. A trust nonce change is not permission to replace the page.
-pub(crate) fn resume_own_recovery(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    job: &Job,
-) -> Result<Active> {
-    if context.slot != Slot::OwnRecovery {
-        return Err(invalid("own recovery context required"));
-    }
-    let _charge = charge(job, STATE_WORK)?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    authorize_in(&batch, context, binding)?;
-    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no own recovery"))?;
-    if state.request != request
-        || state.binding.room != binding.room
-        || state.binding.instance != binding.instance
-        || state.binding.epoch != binding.epoch
-        || state.binding.audience != binding.audience
-        || state.progress.terminal()
-        || state.cleanup.is_some()
-    {
-        return Err(invalid("own recovery lifetime changed"));
-    }
-    state.binding = binding;
-    state.serial = next_serial(state.serial)?;
-    state.progress = Progress::Pending;
-    put(&mut batch, key, &scope, &state)?;
-    context.check()?;
-    batch.commit()?;
-    Ok(Active {
-        node: context.node,
-        scope,
-        request,
-        serial: state.serial,
-        valid: true,
-        binding,
-        cancellation: context.cancellation(),
-    })
-}
-
-/// Record one authenticated exact-request header before provisional body bytes. Repetition
-/// consumes no count. Full inclusion/control/governance may still be pending; no entry or effect
-/// is admitted until entry_admitted runs in the final verified canonical-publication transaction.
-#[allow(clippy::too_many_arguments)] // One exact authenticated header/body binding.
-pub fn begin_body(
-    context: &Context,
-    active: &mut Active,
-    entry: Digest32,
-    seq: u64,
-    length: u64,
-    header: &[u8],
-    job: &Job,
-) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
-    if length > MAX_PAYLOAD_BYTES as u64 || header.is_empty() || header.len() > MAX_HEADER_BYTES {
-        return Err(invalid("history body/header bounds"));
-    }
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
-    if let Some(body) = &state.body {
-        return if body.entry == entry
-            && body.seq == seq
-            && body.length == length
-            && body.header == header
-        {
-            Ok(())
-        } else {
-            Err(invalid("another history body is unfinished"))
-        };
-    }
-    if state.cleanup.is_some()
-        || state.remaining == 0
-        || seq < state.bounds.lo
-        || seq > state.bounds.hi
-    {
-        return Err(invalid(
-            "history header exceeds original demand or reclamation is pending",
-        ));
-    }
-    state.remaining -= 1;
-    state.admitted = None;
-    state.body = Some(Body {
-        entry,
-        seq,
-        length,
-        offset: 0,
-        header: header.to_vec(),
-    });
-    state.cursor = None;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)
-}
-
 fn page_prefix(scope: &Digest32, request: &RequestId, entry: &Digest32, page: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(PAGE_PREFIX);
     bytes.push(1);
@@ -1157,85 +953,6 @@ fn held_in_page(offset: u64, page: u64) -> usize {
     offset
         .saturating_sub((page - 1) * PAGE_BYTES as u64)
         .min(PAGE_BYTES as u64) as usize
-}
-
-/// Commit at most two coalesced storage pages plus the exact offset before returning ACK credit.
-/// A duplicate chunk is idempotent only when every byte matches; its end was already persisted.
-/// Return the persisted offset and completion from this same checked state, without a second read.
-pub fn append(
-    context: &Context,
-    active: &mut Active,
-    entry: Digest32,
-    offset: u64,
-    bytes: &[u8],
-    job: &Job,
-) -> Result<(u64, bool)> {
-    let _charge = charge(job, STATE_WORK + 2 * PAGE_WORK)?;
-    if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
-        return Err(invalid("history chunk bounds"));
-    }
-    let end = offset
-        .checked_add(bytes.len() as u64)
-        .ok_or_else(|| invalid("history chunk offset"))?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
-    let body = state
-        .body
-        .as_mut()
-        .ok_or_else(|| invalid("history body header is missing"))?;
-    if body.entry != entry
-        || end > body.length
-        || offset > body.offset
-        || (offset < body.offset && end > body.offset)
-    {
-        return Err(invalid("history chunk request/hash/offset mismatch"));
-    }
-    let duplicate = offset < body.offset;
-    let mut consumed = 0;
-    while consumed < bytes.len() {
-        let at = offset + consumed as u64;
-        let page = at / PAGE_BYTES as u64 + 1;
-        let within = (at % PAGE_BYTES as u64) as usize;
-        let count = (bytes.len() - consumed).min(PAGE_BYTES - within);
-        let held = held_in_page(body.offset, page);
-        let mut data =
-            match batch.get_segment_bounded(&scope, KIND, page, PAGE_PREFIX + PAGE_BYTES)? {
-                Some(segment) => {
-                    open_page(key, &scope, &state.request, &entry, page, &segment, held)?
-                }
-                None if held == 0 => {
-                    Zeroizing::new(page_prefix(&scope, &state.request, &entry, page))
-                }
-                None => return Err(bad()),
-            };
-        if duplicate {
-            if data.get(PAGE_PREFIX + within..PAGE_PREFIX + within + count)
-                != Some(&bytes[consumed..consumed + count])
-            {
-                return Err(invalid("duplicate history chunk has different bytes"));
-            }
-        } else {
-            if data.len() != PAGE_PREFIX + within {
-                return Err(bad());
-            }
-            data.extend_from_slice(&bytes[consumed..consumed + count]);
-            let segment = seal_segment(key, KIND, page, &data)?;
-            batch.put_segment(&scope, KIND, page, &segment)?;
-        }
-        consumed += count;
-    }
-    if duplicate {
-        context.check()?;
-        return Ok((end, body.offset == body.length));
-    }
-    body.offset = end;
-    let complete = body.offset == body.length;
-    state.cursor = None;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)?;
-    Ok((end, complete))
 }
 
 fn read_bound(
@@ -1417,20 +1134,6 @@ pub(crate) fn role_header_admitted(
     put(batch, key, &scope, &state)
 }
 
-/// Persist a locally normalized cursor within the original authorization and actual credit.
-/// An Entry quantum's [seq,seq] wire bounds must first be rebound to the original local page;
-/// never treat the peer's narrower quantum, new query kind or count as fresh authorization.
-pub fn checkpoint(
-    context: &Context,
-    active: &mut Active,
-    progress: Progress,
-    cursor: Option<&Continuation>,
-    job: &Job,
-) -> Result<()> {
-    let charge = AdmissionCharge::reserve(job)?;
-    checkpoint_precharged(context, active, progress, cursor, &charge)
-}
-
 pub(crate) fn checkpoint_precharged(
     context: &Context,
     active: &mut Active,
@@ -1504,62 +1207,328 @@ pub(crate) fn checkpoint_precharged(
     Ok(())
 }
 
-/// Effects are committed before this acknowledgement. Repeated body admission is idempotent;
-/// a crash before this commit retries the same exact positions rather than skipping them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn checkpoint_private(
-    context: &Context,
-    active: &mut Active,
-    expected: &PrivatePlan,
-    next: PrivatePlan,
-    remaining: usize,
-    progress: Progress,
-    job: &Job,
-) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
-    next.validate(state.bounds)?;
-    if state.private.as_ref() != Some(expected)
-        || next.donor != expected.donor
-        || next.grant != expected.grant
-        || remaining > state.remaining
-        || !matches!(
-            progress,
-            Progress::More | Progress::Complete | Progress::Unavailable
-        )
-        || (progress == Progress::Complete && (!next.inventory_done || !next.positions.is_empty()))
-    {
-        return Err(invalid("private history checkpoint binding"));
-    }
-    state.private = Some(next);
-    state.remaining = remaining;
-    state.progress = progress;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)?;
-    if progress.terminal() {
-        active.valid = false;
-    }
-    Ok(())
+/// A person's public and private older-history requests (ruling correction 4, build order 6)
+/// are saved each in its own record under one scope of this node, never in the one archive
+/// slot: accepting one never displaces another. A record keeps the request, its binding, its
+/// original bounds, what remains, whether it is paused and, for a private request, its plan
+/// (original donor, Drive grant; the donor incarnation is `bounds.head`). Nothing is staged for
+/// it: the loops fetch its positions or private pages and the native admission admits them.
+pub(crate) const PUBLIC_REQUESTS: usize = 64;
+
+fn public_scope(node: Digest32) -> Digest32 {
+    let mut bytes = b"vox/history-demand-public/v1".to_vec();
+    bytes.extend_from_slice(&node);
+    sha256(&bytes)
 }
 
-pub(crate) fn pause_precharged(
+/// One saved request, as its record holds it.
+pub(crate) struct Public {
+    pub request: RequestId,
+    pub binding: Binding,
+    pub bounds: Bounds,
+    pub remaining: usize,
+    pub paused: bool,
+    /// A private request's plan as saved: its original donor and Drive grant.
+    pub private: Option<PrivatePlan>,
+}
+
+impl Public {
+    fn of(state: &State) -> Self {
+        Self {
+            request: state.request,
+            binding: state.binding,
+            bounds: state.bounds,
+            remaining: state.remaining,
+            paused: state.progress == Progress::Paused,
+            private: state.private.clone(),
+        }
+    }
+}
+
+/// Every saved public request with its record's segment, oldest first. At most
+/// [`PUBLIC_REQUESTS`] records, each within [`STATE_BYTES`].
+fn public_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32) -> Result<Vec<(u64, State)>> {
+    let mut saved = Vec::new();
+    let mut after = None;
+    while let Some(id) = batch.segment_id_after(scope, KIND, after)? {
+        if saved.len() >= PUBLIC_REQUESTS {
+            return Err(bad());
+        }
+        after = Some(id);
+        let segment = batch
+            .get_segment_bounded(scope, KIND, id, STATE_BYTES)?
+            .ok_or_else(bad)?;
+        let state = decode_at(key, scope, id, &segment)?;
+        if state.legacy.is_some()
+            || state.body.is_some()
+            || state.cursor.is_some()
+            || state.admitted.is_some()
+            || state.cleanup.is_some()
+            || state.progress.terminal()
+        {
+            return Err(bad());
+        }
+        saved.push((id, state));
+    }
+    Ok(saved)
+}
+
+fn save_public(batch: &mut Batch<'_>, key: &Sek, scope: &Digest32, state: &State) -> Result<()> {
+    let id = match batch.last_segment_id(scope, KIND)? {
+        Some(last) => last.checked_add(1).ok_or_else(bad)?,
+        None => 1,
+    };
+    put_at(batch, key, scope, id, state)
+}
+
+/// Durably accept a person's public request under current authorization: the caller owes it
+/// in the same step. A request for exactly the interval of one already saved and not paused is
+/// that request (its id is returned and nothing is written). Refused, displacing nothing, while
+/// this node keeps [`PUBLIC_REQUESTS`].
+pub(crate) fn owe_public(
     context: &Context,
-    active: &mut Active,
-    _charge: &AdmissionCharge,
-) -> Result<()> {
+    request: RequestId,
+    binding: Binding,
+    bounds: Bounds,
+) -> Result<RequestId> {
+    bounds.validate()?;
     let key = key(context)?;
-    let scope = scope(context);
+    let scope = public_scope(context.node);
     let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
+    authorize_in(&batch, context, binding)?;
+    let saved = public_in(&batch, key, &scope)?;
+    if let Some((_, same)) = saved.iter().find(|(_, state)| {
+        state.binding.room == binding.room
+            && state.private.is_none()
+            && state.bounds == bounds
+            && state.progress != Progress::Paused
+    }) {
+        return Ok(same.request);
+    }
+    if saved.iter().any(|(_, state)| state.request == request) {
+        return Err(invalid("history request ID must be fresh"));
+    }
+    if saved.len() >= PUBLIC_REQUESTS {
+        return Err(invalid(
+            "this node already keeps 64 older-history requests; cancel one first",
+        ));
+    }
+    let state = State {
+        scope,
+        request,
+        binding,
+        bounds,
+        remaining: bounds.entries,
+        body: None,
+        cursor: None,
+        admitted: None,
+        private: None,
+        legacy: None,
+        progress: Progress::Pending,
+        serial: 1,
+        cleanup: None,
+    };
+    save_public(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(request)
+}
+
+/// Durably accept a person's private archive request under current authorization: its
+/// original donor, Drive grant and bounds (the donor incarnation is `bounds.head`), owed by the
+/// caller in the same step to that donor's connection only. A request for exactly the interval
+/// of one already saved for the same donor and not paused is that request. Refused, displacing
+/// nothing, while this node keeps [`PUBLIC_REQUESTS`].
+pub(crate) fn owe_private(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    bounds: Bounds,
+    plan: PrivatePlan,
+) -> Result<RequestId> {
+    bounds.validate()?;
+    plan.validate(bounds)?;
+    if plan.inventory_done || binding.audience != plan.donor {
+        return Err(bad());
+    }
+    let key = key(context)?;
+    let scope = public_scope(context.node);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let saved = public_in(&batch, key, &scope)?;
+    if let Some((_, same)) = saved.iter().find(|(_, state)| {
+        state.binding.room == binding.room
+            && state.bounds == bounds
+            && state
+                .private
+                .as_ref()
+                .is_some_and(|held| held.donor == plan.donor && held.grant == plan.grant)
+            && state.progress != Progress::Paused
+    }) {
+        return Ok(same.request);
+    }
+    if saved.iter().any(|(_, state)| state.request == request) {
+        return Err(invalid("history request ID must be fresh"));
+    }
+    if saved.len() >= PUBLIC_REQUESTS {
+        return Err(invalid(
+            "this node already keeps 64 older-history requests; cancel one first",
+        ));
+    }
+    let state = State {
+        scope,
+        request,
+        binding,
+        bounds,
+        remaining: bounds.entries,
+        body: None,
+        cursor: None,
+        admitted: None,
+        private: Some(plan),
+        legacy: None,
+        progress: Progress::Pending,
+        serial: 1,
+        cleanup: None,
+    };
+    save_public(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(request)
+}
+
+/// Every saved public request, oldest first. Reading authorizes nothing: the caller owes a
+/// request again only under its current binding.
+pub(crate) fn public_requests(context: &Context) -> Result<Vec<Public>> {
+    let key = key(context)?;
+    let batch = context.store().batch()?;
+    Ok(public_in(&batch, key, &public_scope(context.node))?
+        .iter()
+        .map(|(_, state)| Public::of(state))
+        .collect())
+}
+
+/// The saved request `request` now stands at `progress` with `remaining` left: Complete and
+/// Cancelled end its record; Paused keeps it until an explicit Resume. Its bounds and binding are
+/// never changed here. Returns whether the record existed.
+pub(crate) fn settle_public(
+    context: &Context,
+    request: RequestId,
+    progress: Progress,
+    remaining: usize,
+) -> Result<bool> {
+    let key = key(context)?;
+    let scope = public_scope(context.node);
+    let mut batch = context.store().batch()?;
+    let Some((id, mut state)) = public_in(&batch, key, &scope)?
+        .into_iter()
+        .find(|(_, state)| state.request == request)
+    else {
+        return Ok(false);
+    };
+    if progress.terminal() {
+        batch.delete_segment(&scope, KIND, id)?;
+    } else {
+        state.serial = next_serial(state.serial)?;
+        state.progress = progress;
+        state.remaining = remaining.min(state.bounds.entries);
+        put_at(&mut batch, key, &scope, id, &state)?;
+    }
+    context.check()?;
+    batch.commit()?;
+    Ok(true)
+}
+
+/// An explicit Resume of a saved public request under current authority: the same request and
+/// original bounds, owed again under `binding`, which must name the record's room, instance and
+/// epoch (only the authorization nonce may be current rather than the saved one).
+pub(crate) fn resume_public(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+) -> Result<Public> {
+    let key = key(context)?;
+    let scope = public_scope(context.node);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let Some((id, mut state)) = public_in(&batch, key, &scope)?
+        .into_iter()
+        .find(|(_, state)| state.request == request)
+    else {
+        return Err(invalid("no such saved history request"));
+    };
+    if state.binding.room != binding.room
+        || state.binding.instance != binding.instance
+        || state.binding.epoch != binding.epoch
+        || state.binding.audience != binding.audience
+    {
+        return Err(invalid(
+            "history demand authority changed or operation ended",
+        ));
+    }
+    state.binding = binding;
     state.serial = next_serial(state.serial)?;
-    state.progress = Progress::Paused;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)?;
-    active.valid = false;
-    Ok(())
+    state.progress = Progress::Pending;
+    put_at(&mut batch, key, &scope, id, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(Public::of(&state))
+}
+
+/// A public or private request an earlier build saved in the node's one archive slot joins the
+/// saved set unchanged (request, binding, original bounds, what remains, a private request's
+/// plan), and the slot's record is cancelled in the same transaction with any body it staged
+/// scheduled for bounded reclamation ([`reclaim_precharged`]). A request whose admitted entry is
+/// still being recovered locally, a legacy one, or one already ended stays where it is. Returns
+/// the request moved.
+pub(crate) fn migrate_public_slot(context: &Context) -> Result<Option<RequestId>> {
+    if context.slot != Slot::Archive {
+        return Ok(None);
+    }
+    let key = key(context)?;
+    let slot = scope(context);
+    let public = public_scope(context.node);
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &slot)? else {
+        return Ok(None);
+    };
+    if state.legacy.is_some()
+        || state.admitted.is_some()
+        || state.cleanup.is_some()
+        || state.progress.terminal()
+    {
+        return Ok(None);
+    }
+    let saved = public_in(&batch, key, &public)?;
+    if saved.len() >= PUBLIC_REQUESTS || saved.iter().any(|(_, s)| s.request == state.request) {
+        return Ok(None);
+    }
+    let moved = State {
+        scope: public,
+        request: state.request,
+        binding: state.binding,
+        bounds: state.bounds,
+        remaining: state.remaining,
+        body: None,
+        cursor: None,
+        admitted: None,
+        private: state.private.clone(),
+        legacy: None,
+        progress: if state.progress == Progress::Paused {
+            Progress::Paused
+        } else {
+            Progress::Pending
+        },
+        serial: 1,
+        cleanup: None,
+    };
+    save_public(&mut batch, key, &public, &moved)?;
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Cancelled;
+    schedule_cleanup(&mut state);
+    put(&mut batch, key, &slot, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(Some(moved.request))
 }
 
 /// First fence demand atomically; bounded reclamation is separate and never starts peer traffic.
@@ -1704,56 +1673,5 @@ pub(crate) fn reclaim_precharged(
     state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)?;
-    Ok(state.cleanup.is_none())
-}
-
-/// Retirement deletion only. The room owner first verifies its unlocked incarnation and
-/// acquires Active in room->Active order, then releases the room before acquiring the writer.
-/// Observer cancellation cannot revoke permission to delete this exact abandoned staging;
-/// replacement request/binding/serial checks remain in the same transaction. This route cannot
-/// start/resume demand, admit entries, append bodies, acknowledge bytes or grant access.
-pub(crate) fn retire_staging(
-    context: &Context,
-    active: &mut Active,
-    _admission: &AdmissionCharge,
-    committed: &std::sync::atomic::AtomicBool,
-) -> Result<bool> {
-    let key = &context.key;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let Some(mut state) = load(&batch, key, &scope)? else {
-        return Ok(true);
-    };
-    if active.node != context.node
-        || active.scope != scope
-        || state.request != active.request
-        || state.binding != active.binding
-        || state.serial != active.serial
-    {
-        return Ok(true);
-    }
-    if state.progress.terminal() && state.cleanup.is_none() {
-        return Ok(true);
-    }
-    if !state.progress.terminal() {
-        state.serial = next_serial(state.serial)?;
-        state.progress = Progress::Cancelled;
-        schedule_cleanup(&mut state);
-    }
-    if let Some(mut cleanup) = state.cleanup {
-        let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
-        for page in cleanup.next..=end {
-            batch.delete_segment(&scope, KIND, page)?;
-        }
-        cleanup.next = end + 1;
-        state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
-    }
-    put(&mut batch, key, &scope, &state)?;
-    batch.commit()?;
-    committed.store(true, std::sync::atomic::Ordering::Release);
-    // Keep only this retired deletion owner's serial current across bounded page slices.
-    // It remains invalid for all ordinary body/admission/ACK operations.
-    active.serial = state.serial;
-    active.valid = false;
     Ok(state.cleanup.is_none())
 }

@@ -387,7 +387,6 @@ impl Node {
         original_lifetime: Option<Arc<maintenance_save::Lifetime>>,
     ) {
         self.history_demand.retire_room(room);
-        self.history_hints.retire_room(room);
         let Some(instance) = self.channels.get(&room).cloned() else {
             let held = self
                 .profile
@@ -671,7 +670,6 @@ impl Node {
         original_secret: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
     ) {
         self.history_demand.retire_room(room);
-        self.history_hints.retire_room(room);
         let held = self.channels.contains_key(&room)
             || self.reopening.contains(&room)
             || self.opening_rooms.contains_key(&room)
@@ -725,12 +723,11 @@ impl Node {
         room: Digest32,
         instance: SharedChannel,
         transition: crate::node::channel::own_writer_gate::Transition,
-        mut channel: tokio::sync::OwnedMutexGuard<ChannelState>,
+        mut channel: crate::node::channel::OwnedRoomGuard,
         purpose: Option<LeftPurgePurpose>,
         secret: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) {
         self.history_demand.retire_room(room);
-        self.history_hints.retire_room(room);
         if self.pending_policy.is_some()
             && !matches!(&purpose, Some(LeftPurgePurpose::Leave { lifetimes, .. }) if !lifetimes.is_empty())
         {
@@ -1059,11 +1056,8 @@ impl Node {
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
-        self.cancel_private_pulls(Some(*room));
         self.cancel_own_key_room(*room);
         self.own_recovery_rooms.remove(room);
-        self.own_recovery_body_debts.remove(room);
-        self.own_readable_effects.remove(room);
         self.governance_work.set_deadline(*room, None);
         self.legacy_cleanup_rooms.remove(room);
         let preparing = self.cancel_room_preparation(room, Fault::ChannelNotOpen);
@@ -1140,10 +1134,7 @@ impl Node {
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
-        self.cancel_private_pulls(Some(*room));
         self.own_recovery_rooms.remove(room);
-        self.own_recovery_body_debts.remove(room);
-        self.own_readable_effects.remove(room);
         self.governance_work.set_deadline(*room, None);
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
@@ -1236,7 +1227,7 @@ pub(super) enum Ready {
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
         lifetime: std::result::Result<Arc<maintenance_save::Lifetime>, Fault>,
-        retired: Option<bounded_sync::RetiredRoom>,
+        retired: Option<admission::RetiredRoom>,
         reply: oneshot::Sender<Outcome>,
     },
     Close {
@@ -1245,7 +1236,7 @@ pub(super) enum Ready {
         instance: Option<SharedChannel>,
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
-        retired: Option<bounded_sync::RetiredRoom>,
+        retired: Option<admission::RetiredRoom>,
         reply: oneshot::Sender<Outcome>,
     },
     LeftPurge {
@@ -1254,7 +1245,7 @@ pub(super) enum Ready {
         instance: SharedChannel,
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
-        retired: Option<bounded_sync::RetiredRoom>,
+        retired: Option<admission::RetiredRoom>,
         admission_fault: Option<Fault>,
         purpose: LeftPurgePurpose,
     },
@@ -1264,7 +1255,7 @@ pub(super) enum Ready {
         instance: SharedChannel,
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
-        retired: Option<bounded_sync::RetiredRoom>,
+        retired: Option<admission::RetiredRoom>,
     },
 }
 

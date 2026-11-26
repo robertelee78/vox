@@ -6,8 +6,6 @@
 //!
 //! **Staging.** `support/room.rs`: an anchor and three `vox daemon`s — alice, bob, carol — in one
 //! room, each trusting the others, each having read a post by each other.
-//! With `test-knobs`, alice is offline for a post after Carol returns. Bob transiently refuses
-//! the post's head to alice; after that refusal is recorded, bob reconnects and serves it.
 //!
 //! **Asserted.**
 //! 1. carol's `vox room leave` exits 0, and afterwards carol's `vox room list` does not name the
@@ -23,7 +21,6 @@
 //! A returner's retained Accepted may also be cancelled: its withdrawal must remove the
 //! witnessed return from the other members' rosters. The `readmission-no-withdrawal-veto`
 //! mutant must make that roster assertion red.
-//! Persisting the transient refusal must fail the post-rejoin history read.
 
 #![cfg(unix)]
 
@@ -210,77 +207,10 @@ fn a_node_leaves_a_room_and_the_others_see_it_gone() {
         &["room", "roster", &id],
         |o| o.ok && o.stdout.contains(&carol_fp),
     );
-    // Establish Carol's post-rejoin consent and actual readability before Alice goes offline.
-    // The separately staged post below must still reach Alice only after the refused head rearms.
-    #[cfg(feature = "test-knobs")]
-    until(
-        alice,
-        None,
-        "carol's warmup before the staged refusal",
-        &["room", "read", &id],
-        |o| o.ok && o.stdout.contains(warmup),
-    );
-    #[cfg(feature = "test-knobs")]
-    let (unavailable, declined, bob_fp) = {
-        let unavailable = tmp.path().join("transient-head");
-        let declined = tmp.path().join("transient-decline");
-        let alice_fp = room.workers[0].b32();
-        let bob_fp = room.workers[1].b32();
-        std::fs::write(&unavailable, format!("{carol_fp} {alice_fp}"))
-            .expect("APPARATUS: arm transient head response");
-        room.workers[0].stop_daemon_cleanly();
-        room.workers[1].restart_daemon_as(
-            support::VOX,
-            &[(
-                "VOX_TEST_UNAVAILABLE_HEAD_FILE",
-                unavailable.to_str().unwrap(),
-            )],
-            &tmp.path().join("bob-transient.daemon.err"),
-        );
-        (unavailable, declined, bob_fp)
-    };
-    let back = "carol's post after the transient refusal";
+    let back = "carol's post after she joined again";
     room.workers[2]
         .vox(None, &["room", "post", &id, back])
         .expect_ok("carol's post after returning");
-    #[cfg(feature = "test-knobs")]
-    {
-        until(
-            &room.workers[1],
-            None,
-            "bob to read carol's new post",
-            &["room", "read", &id],
-            |o| o.ok && o.stdout.contains(back),
-        );
-        room.workers[2].stop_daemon_cleanly();
-        let mut alice_env = vec![(
-            "VOX_TEST_TRANSIENT_DECLINE_MARKER",
-            declined.to_str().unwrap(),
-        )];
-        let mutant = std::env::var_os("HISTORY_REFUSAL_MUTANT").is_some();
-        if mutant {
-            alice_env.push(("VOX_TEST_DURABLE_TRANSIENT_DECLINE", "1"));
-        }
-        room.workers[0].restart_daemon_as(
-            support::VOX,
-            &alice_env,
-            &tmp.path().join("alice-transient.daemon.err"),
-        );
-        let expected = format!(
-            "{carol_fp} {bob_fp} {}",
-            if mutant { "durable" } else { "connection" }
-        );
-        let deadline = std::time::Instant::now() + support::TIMEOUT;
-        while std::fs::read_to_string(&declined).ok().as_deref() != Some(&expected) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "APPARATUS: alice did not record bob's staged transient refusal"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        std::fs::remove_file(&unavailable).expect("APPARATUS: release transient response");
-        room.workers[1].restart_daemon(&tmp.path().join("bob-reconnected.daemon.err"));
-    }
     let alice = &room.workers[0];
     let read = until(
         alice,
@@ -290,8 +220,6 @@ fn a_node_leaves_a_room_and_the_others_see_it_gone() {
         |o| o.ok && o.stdout.contains(back),
     );
     println!("[proof] alice reads:\n{}", read.stdout.trim());
-    #[cfg(feature = "test-knobs")]
-    room.workers[2].restart_daemon(&tmp.path().join("carol-after-transient.daemon.err"));
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let reply = "alice after carol recovered her history";
     alice

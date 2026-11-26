@@ -188,6 +188,7 @@ impl ChannelState {
             author,
             required.as_slice(),
             None,
+            kind,
         )
     }
 
@@ -449,9 +450,19 @@ impl<'r, 'a> AuthoredReach<'r, 'a> {
     }
 }
 
+/// The pre-context and `seen` an authored entry signs, and whether a Content entry first needs
+/// a ContextUpdate (ADR-053 M0). A control joins the prefix frontiers of up to sixteen settled
+/// tips, which it names with checked receipts, as before. Content signs its author's exact
+/// committed aggregate and names those tips only as ordering hints; it needs a preceding
+/// ContextUpdate only for a real change the aggregate does not reach: a required ancestor, or
+/// a Governance/StepPolicy row this node has applied. Another author's Content or empty
+/// ContextUpdate is never a reason. The ContextUpdate itself joins every such change directly,
+/// independently of the sixteen `seen` slots.
+///
 /// `reserved`: a removal's target. Its latest settled tip keeps one of the sixteen `seen` slots
 /// whatever the other authors' clocks, so the removal's cut is at the tip its author held
 /// (ADR-053 MP-6), never only at the target's last control the context reaches.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn authored_context(
     read: &entry_store::Read<'_>,
     channel_id: Digest32,
@@ -460,6 +471,7 @@ pub(super) fn authored_context(
     author: &Digest32,
     required: &[Digest32],
     reserved: Option<&Digest32>,
+    kind: SignedEntryKind,
 ) -> Result<(ControlContext, Vec<EntryReference>, bool)> {
     if authors.len() > MAX_CONTEXT_AUTHORS {
         return Err(Error::SizeLimitExceeded("local context authors"));
@@ -540,30 +552,29 @@ pub(super) fn authored_context(
     }
     let mut seen: Vec<_> = tips.into_values().collect();
     seen.sort_unstable_by_key(|reference| reference.author);
+    if kind == SignedEntryKind::Content {
+        let advance = required_positions.iter().any(|(required_author, seq)| {
+            reached_by(&context, author, own_seq, required_author) < *seq
+        }) || !applied_changes(read, binding, authors, &context, own_seq)?.is_empty();
+        return Ok((context, seen, advance));
+    }
     for reference in &seen {
-        let binding = TreeBinding {
-            author: reference.author,
-            ..binding
-        };
-        let prefix = read
-            .history_range(binding, 1, reference.seq)?
-            .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
-        let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
-            authored_missing("authored history settled peer frontier context missing")
-        })?;
-        context = context.join(&frontier)?;
+        context = join_prefix(read, binding, context, reference.author, reference.seq)?;
+    }
+    if kind == SignedEntryKind::ContextUpdate {
+        // The advance before Content acknowledges every applied real change and required
+        // ancestor, whether or not its author won one of the sixteen `seen` slots.
+        for (other, seq) in applied_changes(read, binding, authors, &context, own_seq)? {
+            context = join_prefix(read, binding, context, other, seq)?;
+        }
+        for (required_author, seq) in &required_positions {
+            if reached_by(&context, author, own_seq, required_author) < *seq {
+                context = join_prefix(read, binding, context, *required_author, *seq)?;
+            }
+        }
     }
     for (required_author, seq) in required_positions {
-        let reached = if required_author == *author {
-            own_seq
-        } else {
-            context
-                .coordinates
-                .iter()
-                .find(|coordinate| coordinate.author == required_author)
-                .map_or(0, |coordinate| coordinate.seq)
-        };
-        if reached < seq {
+        if reached_by(&context, author, own_seq, &required_author) < seq {
             return Err(authored_missing(
                 "required governance ancestors exceed the authored frontier",
             ));
@@ -571,6 +582,71 @@ pub(super) fn authored_context(
     }
     let changed = context.hash() != original;
     Ok((context, seen, changed))
+}
+
+/// The position of `who` that `context` reaches; the author's own feed is reached through its
+/// own committed size.
+fn reached_by(context: &ControlContext, author: &Digest32, own_seq: u64, who: &Digest32) -> u64 {
+    if who == author {
+        own_seq
+    } else {
+        context
+            .coordinates
+            .iter()
+            .find(|coordinate| coordinate.author == *who)
+            .map_or(0, |coordinate| coordinate.seq)
+    }
+}
+
+/// Applied real changes (`governance::applied_governance_after`) that `context` does not reach,
+/// each with its authenticated prefix held here (kept at its admission,
+/// `history_stream::admission::start_entry`), so the advance can always join it and a carrier
+/// is never repeated for an unjoinable row.
+fn applied_changes(
+    read: &entry_store::Read<'_>,
+    binding: TreeBinding,
+    authors: &BTreeMap<Digest32, CompositePublicKey>,
+    context: &ControlContext,
+    own_seq: u64,
+) -> Result<Vec<(Digest32, u64)>> {
+    let author = binding.author;
+    let reached: Vec<_> = authors
+        .keys()
+        .filter(|other| **other != author)
+        .map(|other| (*other, reached_by(context, &author, own_seq, other)))
+        .collect();
+    let mut joinable = Vec::new();
+    for (other, seq) in governance::applied_governance_after(read, &reached)? {
+        let other_binding = TreeBinding {
+            author: other,
+            ..binding
+        };
+        if read.history_range(other_binding, 1, seq)?.is_some() {
+            joinable.push((other, seq));
+        }
+    }
+    Ok(joinable)
+}
+
+/// Join the authenticated prefix frontier of `who` through `seq`.
+fn join_prefix(
+    read: &entry_store::Read<'_>,
+    binding: TreeBinding,
+    context: ControlContext,
+    who: Digest32,
+    seq: u64,
+) -> Result<ControlContext> {
+    let binding = TreeBinding {
+        author: who,
+        ..binding
+    };
+    let prefix = read
+        .history_range(binding, 1, seq)?
+        .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
+    let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
+        authored_missing("authored history settled peer frontier context missing")
+    })?;
+    context.join(&frontier)
 }
 
 pub(super) fn prepare(

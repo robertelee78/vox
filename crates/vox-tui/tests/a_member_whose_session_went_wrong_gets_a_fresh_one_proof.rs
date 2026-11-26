@@ -276,8 +276,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         (endpoint, Arc::new(conn))
     });
 
-    // Every stream the victim opens: a sync is answered as a member would, a pairwise one is
-    // recorded and, if it carries a key, refused with `CannotOpen`.
+    // Record pairwise streams and refuse keys with `CannotOpen`.
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let t0 = Instant::now();
     {
@@ -290,20 +289,6 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
                 let seen = Arc::clone(&seen);
                 tokio::spawn(async move {
                     if kind != StreamKind::Pairwise {
-                        let Ok((_cid, _epoch)) =
-                            vox_core::node::syncstream::read_sync_request(&mut recv).await
-                        else {
-                            return;
-                        };
-                        let t = vox_core::node::syncstream::accept_sync(
-                            tokio::runtime::Handle::current(),
-                            send,
-                            recv,
-                        );
-                        let _ = tokio::task::spawn_blocking(move || {
-                            raw_sync::session(t, &raw_sync::Ask::Everything, None)
-                        })
-                        .await;
                         return;
                     }
                     let mut frames = Vec::new();

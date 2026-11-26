@@ -15,36 +15,27 @@ use super::{Object, Proof, ProofKind, Query, RequestId};
 use entry_store::sparse::{CursorBinding, HistoryVerifier};
 
 // A bounded transient result covered by the existing verifier working reservation.
-// `brought` on an object says this node did not hold it before: what a round fetched, as
-// `vox status --json` counts an `empty` round (ADR-038 FX-29). An object already held is
-// not saved again: the round writes nothing for it.
-#[allow(clippy::large_enum_variant)]
 pub(super) enum Staged {
-    Object {
-        brought: bool,
-    },
+    Object,
     Head {
         head: Digest32,
         author: Digest32,
         tail: u64,
-        departure_receipt: bool,
-        /// The exact head is already in this author's accepted chain: nothing of it is
-        /// fetched or verified again (no header, no inclusion proof, no promotion).
-        held: bool,
-        brought: bool,
     },
-    Header {
-        entry: Entry,
-        head: Digest32,
-        body_allowed: bool,
-        brought: bool,
-    },
+    Header,
     Verifier(CursorBinding),
     Busy,
 }
 
 fn invalid(message: &'static str) -> Error {
     Error::MalformedBundle(message)
+}
+
+/// A fault in this node's own state (a stored object or locator it relies on is absent, a
+/// cursor of its own work contradicts itself, an author it admitted is gone), never a refusal
+/// of the author's evidence: a local failure of the admission (`runtime.rs` `turn_inner`).
+fn local(message: &'static str) -> Error {
+    Error::MalformedAtRest(message)
 }
 
 /// Caller owns the 4-MiB verifier envelope and reserved room publication, not its mutex.
@@ -113,7 +104,6 @@ pub(super) fn stage(
                 }
                 _ => false,
             };
-            let held = retained && input.history_head_accepted(&id, head.binding)?;
             // MP-9: a head of the accepted head's size with another root is opened and compared
             // like one of another size (promote_head), not only refused as a conflict.
             let equal_rival = *author != room.me()
@@ -147,21 +137,10 @@ pub(super) fn stage(
                     return Err(invalid("conflicting authenticated heads retained"));
                 }
             }
-            let departure_receipt = room.history_departure_matches(
-                store,
-                super::HeadHint {
-                    author: *author,
-                    head: id,
-                    size: head.root.leaves,
-                },
-            )?;
             Ok(Staged::Head {
                 head: id,
                 author: *author,
                 tail: head.root.leaves,
-                departure_receipt,
-                held,
-                brought,
             })
         }
         (Query::Context(expected), Object::Context(bytes)) => {
@@ -178,37 +157,14 @@ pub(super) fn stage(
                 .history_context(expected)?
                 .is_some()
             {
-                return Ok(Staged::Object { brought: false });
+                return Ok(Staged::Object);
             }
             room.history_write_tracked(store, committed, |index| {
                 index.keep_history_context(&context)
             })?;
-            Ok(Staged::Object { brought: true })
+            Ok(Staged::Object)
         }
         (Query::Entry { head, seq, .. } | Query::Header { head, seq }, Object::Header(bytes)) => {
-            stage_header(room, store, committed, *head, *seq, *seq, bytes, &mut work)
-        }
-        (
-            Query::KeyBody {
-                head,
-                author,
-                hash,
-                seq,
-                ..
-            },
-            Object::Header(bytes),
-        ) => {
-            let entry = Entry::from_wire(bytes)?;
-            if entry.skeleton.author_id != *author
-                || entry.entry_hash() != *hash
-                || !entry
-                    .skeleton
-                    .v2
-                    .as_ref()
-                    .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
-            {
-                return Err(invalid("requested key body header differs"));
-            }
             stage_header(room, store, committed, *head, *seq, *seq, bytes, &mut work)
         }
         (Query::Page { head, lo, hi, .. }, Object::Header(bytes)) => {
@@ -331,37 +287,28 @@ fn stage_header(
     else {
         return Ok(Staged::Busy);
     };
-    // A header already held under this head is not saved again (ADR-038 FX-29): a live retry
-    // of a missing body receives its header with every answer, and each one committed the
-    // same header and pending position unchanged.
-    let held = input
-        .history_pending_header(&head_id, entry.skeleton.seq)?
-        .is_some_and(|pending| pending.entry_hash() == entry.entry_hash());
+    // A header already held is not saved again (ADR-038 FX-29): a live retry of a missing body
+    // receives its header with every answer, and each one committed the same header and pending
+    // position unchanged. Held: published at this position under a head in the accepted chain,
+    // or pending (kept by position under an accepted head, whichever accepted head brought it;
+    // else under this head).
+    let published = if input.history_head_accepted(&head_id, head.binding)? {
+        input.history_position_header(&head.binding.author, entry.skeleton.seq)?
+    } else {
+        None
+    };
+    let held = published
+        .or(input.history_pending_header(&head_id, entry.skeleton.seq)?)
+        .is_some_and(|held| held.entry_hash() == entry.entry_hash());
     drop(input);
-    // Ordinary role queries need only another member's authenticated package header.
-    // An explicit KeyBody query separately admits the sealed bytes for opaque relay.
-    let body_allowed = !entry.skeleton.v2.as_ref().is_some_and(|v2| {
-        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
-            && v2.recipient != Some(room.me())
-    });
     if held {
-        return Ok(Staged::Header {
-            entry,
-            head: head_id,
-            body_allowed,
-            brought: false,
-        });
+        return Ok(Staged::Header);
     }
     room.history_write_tracked(store, committed, |index| {
         index.keep_history_header(&header)?;
         index.keep_history_pending_header(&head_id, &header)
     })?;
-    Ok(Staged::Header {
-        entry,
-        head: head_id,
-        body_allowed,
-        brought: true,
-    })
+    Ok(Staged::Header)
 }
 
 /// Contexts generated while a structurally bounded proof runs to its end. Committing a context
@@ -416,7 +363,7 @@ pub(super) fn advance(
     };
     let key = room
         .history_author_key(&binding.author)
-        .ok_or(invalid("verifier author is no longer admitted"))?;
+        .ok_or(local("verifier author is no longer admitted"))?;
     let mut work = WorkBudget::default();
     // A bounded transient result covered by the existing verifier working reservation.
     #[allow(clippy::large_enum_variant)]
@@ -462,7 +409,7 @@ pub(super) fn advance(
                 }
             }
             HistoryVerifier::Validation(_) => {
-                return Err(invalid("entry closure requires the admission driver"))
+                return Err(local("entry closure requires the admission driver"))
             }
         };
         overlay.generated.borrow_mut().push((step.hash(), step));
@@ -481,7 +428,7 @@ pub(super) fn advance(
             ranges
         }
         (ResultStep::Missing(_), _) => Vec::new(),
-        _ => return Err(invalid("completed proof range kind")),
+        _ => return Err(local("completed proof range kind")),
     };
     drop(input);
     let keep_generated = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
@@ -526,21 +473,6 @@ pub(super) fn advance(
                 *descriptor,
             )?;
         }
-        #[cfg(feature = "test-knobs")]
-        if !ranges.is_empty() {
-            if let Some(path) = std::env::var_os("VOX_TEST_HOLD_VERIFIED_FETCH") {
-                let path = std::path::PathBuf::from(path);
-                std::fs::write(path.with_extension("verified"), binding.head).map_err(|error| {
-                    Error::Storage {
-                        op: "verified fetch marker",
-                        detail: error.to_string(),
-                    }
-                })?;
-                while path.exists() {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
         Ok(())
     };
     match result {
@@ -559,7 +491,9 @@ pub(super) fn advance(
                 index.finish_history_verifier_cursor(*binding)
             })?;
             cache_ranges()?;
-            room.note_role_progress(binding.author, binding.from);
+            // The head first, as an answer's check does (bundle.rs): a receipt kept under a head
+            // this promotion commits gets its locator by author and position.
+            let advanced = promote_head(room, store, committed, binding.head)?;
             combine_parent(
                 room,
                 store,
@@ -568,12 +502,13 @@ pub(super) fn advance(
                 binding.author,
                 binding.from,
             )?;
-            promote_head(room, store, committed, binding.head)
+            keep_blocks(room, store, committed, binding.head, tree, &ranges)?;
+            Ok(advanced)
         }
         ResultStep::Prefix(prefix) => {
-            let input = room.history_read(store)?;
-            let unlinked = unlinked_prefix(&input, &prefix)?;
-            drop(input);
+            let accepted_before = room
+                .history_read(store)?
+                .history_head_accepted(&binding.head, tree)?;
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 keep_witness(
@@ -583,16 +518,25 @@ pub(super) fn advance(
                         prefix.root().leaves,
                     )?,
                 )?;
-                if unlinked {
-                    // MP-9: the head's prefix differs from the accepted chain. Kept under its
-                    // own head so the comparison resumes; never as an accepted range.
-                    index.keep_history_unlinked_prefix_receipt(&prefix)?;
-                } else {
-                    index.keep_history_prefix_receipt(&prefix)?;
-                }
+                // Under its head only, unless that head is already accepted: its range [1, n]
+                // is a fact of the accepted chain only once the head is (MP-9).
+                index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
             cache_ranges()?;
+            // The head first (as above).
+            let advanced = promote_head(room, store, committed, binding.head)?;
+            // A head this promotion accepted: the prefix's range [1, n] is now the accepted
+            // chain's (`keep_history_prefix_receipt` writes it only under an accepted head).
+            if !accepted_before
+                && room
+                    .history_read(store)?
+                    .history_head_accepted(&binding.head, tree)?
+            {
+                room.history_write_tracked(store, committed, |index| {
+                    index.keep_history_prefix_receipt(&prefix)
+                })?;
+            }
             combine_parent(
                 room,
                 store,
@@ -601,7 +545,8 @@ pub(super) fn advance(
                 binding.author,
                 binding.from,
             )?;
-            promote_head(room, store, committed, binding.head)
+            keep_blocks(room, store, committed, binding.head, tree, &ranges)?;
+            Ok(advanced)
         }
         ResultStep::Controls(controls) => {
             let input = room.history_read(store)?;
@@ -650,9 +595,12 @@ pub(super) fn advance(
                             collapsed = start + descriptor.leaves - 1;
                         }
                     }
+                    index.keep_history_blocks(tree, &ranges)?;
                 }
-                if index.keep_control_coverage(&controls, 0)?.is_some() {
-                    return Err(invalid("bounded control coverage unexpectedly incomplete"));
+                if let entry_store::sparse::CoverageKept::Partial =
+                    index.keep_control_coverage(&controls, 0)?
+                {
+                    return Err(local("bounded control coverage unexpectedly incomplete"));
                 }
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -662,7 +610,118 @@ pub(super) fn advance(
     }
 }
 
-fn combine_parent(
+/// The full aligned blocks of a trace verified under `head`, kept by author and position once
+/// `head` is on this node's accepted chain of the author (`keep_history_blocks`): run after the
+/// promotion that may have accepted it. Under a head that is not accepted, the trace keeps only
+/// what its owner kept under that head. A block already held writes nothing.
+pub(super) fn keep_blocks(
+    room: &impl HistoryAdmissionRoom,
+    store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
+    head: Digest32,
+    tree: crate::log::history::TreeBinding,
+    trace: &[(u64, Descriptor)],
+) -> Result<()> {
+    let input = room.history_read(store)?;
+    if !input.history_head_accepted(&head, tree)? {
+        return Ok(());
+    }
+    let mut blocks: Vec<(u64, Descriptor)> = trace
+        .iter()
+        .filter(|(start, descriptor)| entry_store::sparse::full_block(*start, descriptor.leaves))
+        .copied()
+        .collect();
+    blocks.sort_unstable_by_key(|(start, descriptor)| (*start, descriptor.leaves));
+    blocks.dedup_by_key(|(start, descriptor)| (*start, descriptor.leaves));
+    let mut new = Vec::with_capacity(blocks.len());
+    for (start, descriptor) in blocks {
+        if input
+            .history_range(tree, start, descriptor.leaves)?
+            .is_none()
+        {
+            new.push((start, descriptor));
+        }
+    }
+    drop(input);
+    if new.is_empty() {
+        return Ok(());
+    }
+    room.history_write_tracked(store, committed, |index| {
+        index.keep_history_blocks(tree, &new)
+    })
+}
+
+/// The inclusion receipt of `author`'s entry `seq`: under `head`, the head it was handed over
+/// under, else under the committed head its receipt is located by (`history_parent_head`). A
+/// position is one entry under every committed head of its author, so a receipt an answer
+/// brought under any of them serves; the caller still compares it with the entry.
+fn entry_inclusion(
+    input: &entry_store::Read<'_>,
+    head: &Digest32,
+    author: &Digest32,
+    seq: u64,
+) -> Result<Option<crate::log::history::IncludedHeader>> {
+    if let Some(included) = input.history_inclusion_receipt(head, author, seq)? {
+        return Ok(Some(included));
+    }
+    match input.history_parent_head(author, seq)? {
+        Some(located) => input.history_inclusion_receipt(&located, author, seq),
+        None => Ok(None),
+    }
+}
+
+/// What stands for position `seq` of `author` as a parent: ONE lookup by author and position on
+/// the accepted chain, for every reader (`start_entry`, `preflight`, and an answer's leading
+/// receipt in `bundle::check`). The caller compares its header with the hash it names.
+///
+/// - Published here: the position itself. Its own admission validated it under a committed head
+///   of its author (commitments are never undone) after requiring its prefix [1, seq]
+///   (`start_entry`, in every version since sparse history; an own append commits that range
+///   with its head), and ranges are never deleted; so the published header, the author's
+///   committed head and that range are the parent. This is what a store written before
+///   `ParentHead` locators existed holds for every position it admitted.
+/// - Else a parent receipt an answer proved, located by position (`history_parent_head`).
+/// - Else none: the caller asks for the receipt.
+///
+/// A published position without its range, or a locator without its receipt, is a fault of
+/// this node's store, never a need: a need for a position that is admitted here is met at once
+/// by every plan (`pull.rs` `choose`), so it must never be what admission returns for it. This
+/// is the parent's identity; admission then checks a published parent's range against its own
+/// whole context before following it (`SparseParent::check_published`), the same local fault.
+pub(super) fn parent_evidence(
+    input: &entry_store::Read<'_>,
+    author: &Digest32,
+    seq: u64,
+) -> Result<Option<governance::SparseParent>> {
+    if let Some(header) = input.history_position_header(author, seq)? {
+        let head = input
+            .sparse_author(author, LogScope::Public)?
+            .and_then(|state| state.committed)
+            .ok_or(local("published parent has no committed head"))?;
+        let binding = input
+            .history_head(&head)?
+            .ok_or(local("parent target missing"))?
+            .binding;
+        let prefix = input
+            .history_range(binding, 1, seq)?
+            .ok_or(local("published parent has no prefix range"))?;
+        return Ok(Some(governance::SparseParent::Published {
+            head,
+            binding,
+            header,
+            prefix,
+        }));
+    }
+    let Some(located) = input.history_parent_head(author, seq)? else {
+        return Ok(None);
+    };
+    input
+        .history_parent_receipt(&located, author, seq)?
+        .ok_or(local("located parent receipt missing"))
+        .map(|receipt| Some(governance::SparseParent::Receipt(receipt)))
+}
+
+pub(super) fn combine_parent(
     room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
@@ -697,7 +756,7 @@ pub(super) fn promote_head(
     let input = room.history_read(store)?;
     let signed = input
         .history_head(&id)?
-        .ok_or(invalid("promotion head missing"))?;
+        .ok_or(local("promotion head missing"))?;
     if input.history_head_accepted(&id, signed.binding)? {
         return Ok(Advanced::Complete);
     }
@@ -708,7 +767,7 @@ pub(super) fn promote_head(
         Some(old) => {
             let root = input
                 .history_head(&old)?
-                .ok_or(invalid("accepted baseline missing"))?
+                .ok_or(local("accepted baseline missing"))?
                 .root;
             (Some(old), root)
         }
@@ -747,7 +806,7 @@ pub(super) fn promote_head(
     }
     let prefix = input
         .history_prefix_receipt(&id, &signed.binding.author, baseline.leaves)?
-        .ok_or(invalid("promotion consistency receipt vanished"))?;
+        .ok_or(local("promotion consistency receipt vanished"))?;
     if signed.root.leaves != 0
         && input
             .history_inclusion_receipt(&id, &signed.binding.author, signed.root.leaves)?
@@ -760,7 +819,7 @@ pub(super) fn promote_head(
     }
     let key = room
         .history_author_key(&signed.binding.author)
-        .ok_or(invalid("head author disappeared"))?;
+        .ok_or(local("head author disappeared"))?;
     let HistoryStep::Complete(verified) = signed.verify(&key, &mut WorkBudget::default())? else {
         return Ok(Advanced::Busy);
     };
@@ -784,10 +843,6 @@ pub(super) fn promote_head(
         crate::node::link::b32_encode(&signed.binding.author),
         signed.root.leaves
     );
-    room.note_role_progress(signed.binding.author, signed.root.leaves);
-    if signed.binding.author != room.me() {
-        room.role_owed().mark_key_dirty(signed.binding.author);
-    }
     // A newly accepted remote head changes what this room must advertise. The actor touches
     // the room on completion so every port observes this generation immediately and can echo
     // the exact head back to its author.
@@ -825,7 +880,7 @@ pub(super) fn start_entry(
     let input = room.history_read(store)?;
     let author = entry.skeleton.author_id;
     let seq = entry.skeleton.seq;
-    let Some(included) = input.history_inclusion_receipt(&head, &author, seq)? else {
+    let Some(included) = entry_inclusion(&input, &head, &author, seq)? else {
         return Ok(EntryStart::Need(Query::Proof {
             head,
             kind: ProofKind::Inclusion,
@@ -836,19 +891,36 @@ pub(super) fn start_entry(
     if included.header().entry().header_wire() != entry.header_wire() {
         return Err(invalid("entry differs from exact inclusion"));
     }
-    if !input.history_head_accepted(&head, included.binding())? {
+    // The entry is verified under the head its receipt is kept under, which may be a committed
+    // head other than the one it was handed over with (`entry_inclusion`): every per-head state
+    // this verification makes (its cursor binding, its needs) names that one head, so a
+    // checkpoint never meets a target other than its own.
+    let head = included.head_id();
+    // The validator's own predicate (`governance::sparse` `advance`): an entry is admitted only
+    // under a head committed here, which stays committed once it is.
+    if !input.history_head_committed(&included.head_id(), included.binding())? {
         drop(input);
         return match promote_head(room, store, committed, head)? {
             Advanced::Need(query) => Ok(EntryStart::Need(query)),
             // The verifier path that opened the competing entry records the fork; an entry
             // under a head proven to be another history is never started.
             Advanced::Fork(_) => Err(invalid("entry head is a competing signed history")),
+            // An older prefix of the committed head is complete without being committed, and
+            // never is: no entry is handed over under one (`pull.rs` exchange), and one here
+            // fails its root. A head this promotion committed starts the entry again.
+            Advanced::Complete
+                if !room
+                    .history_read(store)?
+                    .history_head_committed(&head, included.binding())? =>
+            {
+                Err(invalid("entry head is not committed"))
+            }
             _ => Ok(EntryStart::Busy),
         };
     }
     let target = input
         .history_head(&head)?
-        .ok_or(invalid("entry target head missing"))?;
+        .ok_or(local("entry target head missing"))?;
     if input.history_range(target.binding, 1, seq)?.is_none() {
         // A settled entry is eligible to become an explicit parent of the next local append.
         // Retain its exact authenticated prefix before effects can mark it settled; inclusion
@@ -863,13 +935,16 @@ pub(super) fn start_entry(
     }
     let key = room
         .history_author_key(&author)
-        .ok_or(invalid("entry author is unknown"))?;
+        .ok_or(local("entry author is unknown"))?;
     let v2 = entry
         .skeleton
         .v2
         .as_ref()
         .ok_or(invalid("entry is not typed"))?;
-    let mut references = Vec::with_capacity(v2.seen.len() + 1);
+    // ADR-053 M0: an ordinary Content entry's `seen` are ordering hints; only its own
+    // predecessor needs a receipt here. Controls keep one per reference.
+    let seen = governance::checked_seen(v2);
+    let mut references = Vec::with_capacity(seen.len() + 1);
     if seq > 1 {
         references.push(crate::log::history::EntryReference {
             author,
@@ -877,46 +952,39 @@ pub(super) fn start_entry(
             hash: entry.skeleton.prev_hash,
         });
     }
-    references.extend(v2.seen.iter().cloned());
+    references.extend(seen.iter().cloned());
     let mut parents = Vec::with_capacity(references.len());
     for reference in references {
-        let parent_head = if let Some((id, held)) =
-            input.history_validated_header(&reference.author, reference.seq)?
-        {
+        // A validated parent must still be the entry it names.
+        if let Some((_, held)) = input.history_validated_header(&reference.author, reference.seq)? {
             if held.entry_hash() != reference.hash {
                 return Err(invalid("signed parent differs from validated position"));
             }
-            id
-        } else {
-            let Some(id) = input
-                .sparse_author(&reference.author, LogScope::Public)?
-                .and_then(|state| state.committed)
-            else {
-                return Ok(EntryStart::Need(Query::Head(reference.author)));
-            };
-            let target = input
-                .history_head(&id)?
-                .ok_or(invalid("parent target missing"))?;
-            if target.root.leaves < reference.seq {
-                return Ok(EntryStart::Need(Query::Head(reference.author)));
-            }
-            id
-        };
-        if let Some(parent) =
-            input.history_parent_receipt(&parent_head, &reference.author, reference.seq)?
-        {
+        }
+        if let Some(parent) = parent_evidence(&input, &reference.author, reference.seq)? {
+            // Before preflight follows its frontier: a published parent's positional prefix
+            // must be its own whole context, else a local fault of this store.
+            parent.check_published(&input)?;
             parents.push(parent);
             continue;
         }
+        // Neither published here nor proven by an answer: its receipt is asked under the
+        // author's committed head, and its admission or an answer that brings it meets that.
+        let Some(parent_head) = input
+            .sparse_author(&reference.author, LogScope::Public)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(EntryStart::Need(Query::Head(reference.author)));
+        };
         let target = input
             .history_head(&parent_head)?
-            .ok_or(invalid("parent target missing"))?;
+            .ok_or(local("parent target missing"))?;
+        if target.root.leaves < reference.seq {
+            return Ok(EntryStart::Need(Query::Head(reference.author)));
+        }
         if input
             .history_pending_header(&parent_head, reference.seq)?
             .is_none()
-            && input
-                .history_position_header(&reference.author, reference.seq)?
-                .is_none()
         {
             return Ok(EntryStart::Need(Query::Header {
                 head: parent_head,
@@ -1003,7 +1071,7 @@ pub(super) fn advance_entry(
     let input = room.history_read(store)?;
     let Some(HistoryVerifier::Validation(mut cursor)) = input.history_verifier_cursor(binding)?
     else {
-        return Err(invalid("entry validation cursor missing"));
+        return Err(local("entry validation cursor missing"));
     };
     let result = cursor.advance(&input, &mut WorkBudget::default())?;
     let outcome = match result {
@@ -1023,7 +1091,7 @@ pub(super) fn advance_entry(
                 Some(head) => {
                     let target = input
                         .history_head(&head)?
-                        .ok_or(invalid("control head missing"))?;
+                        .ok_or(local("control head missing"))?;
                     if target.root.leaves < reference.seq {
                         EntryAdvanced::Need(Query::Head(reference.author))
                     } else {
@@ -1046,7 +1114,7 @@ pub(super) fn advance_entry(
     drop(input);
     room.history_write_tracked(store, committed, |index| {
         if !index.keep_history_verifier_cursor(binding, &HistoryVerifier::Validation(cursor))? {
-            return Err(invalid("existing entry verifier capacity vanished"));
+            return Err(local("existing entry verifier capacity vanished"));
         }
         Ok(())
     })?;
@@ -1070,8 +1138,9 @@ pub(super) enum Preflight {
     Complete,
     Busy,
 }
+/// Read-only: it runs on the room under a read and writes nothing.
 pub(super) fn preflight(
-    room: &impl HistoryAdmissionRoom,
+    room: &crate::node::channel::ChannelState,
     store: &Store,
     head: Digest32,
     entry: &Entry,
@@ -1083,7 +1152,7 @@ pub(super) fn preflight(
     }
     let input = room.history_read(store)?;
     let Some(included) =
-        input.history_inclusion_receipt(&head, &entry.skeleton.author_id, entry.skeleton.seq)?
+        entry_inclusion(&input, &head, &entry.skeleton.author_id, entry.skeleton.seq)?
     else {
         return Ok(Preflight::Need(Query::Proof {
             head,
@@ -1101,9 +1170,18 @@ pub(super) fn preflight(
         .as_ref()
         .ok_or(invalid("preflight header is legacy"))?;
     let own = usize::from(entry.skeleton.seq > 1);
-    let parent_count = own + v2.seen.len();
+    let seen = governance::checked_seen(v2);
+    let parent_count = own + seen.len();
+    // A cursor captured before ADR-053 M0 may still point past Content's own parent at a
+    // hint it no longer needs: resume at the context phase.
+    let (parent, next) =
+        if v2.kind == crate::log::history::SignedEntryKind::Content && parent > parent_count {
+            (parent_count, 0)
+        } else {
+            (parent, next)
+        };
     if parent > parent_count {
-        return Err(invalid("preflight parent cursor"));
+        return Err(local("preflight parent cursor"));
     }
     let context_id = if parent == parent_count {
         v2.pre_context
@@ -1115,31 +1193,28 @@ pub(super) fn preflight(
                 hash: entry.skeleton.prev_hash,
             }
         } else {
-            v2.seen[parent - own].clone()
+            seen[parent - own].clone()
         };
-        let parent_head = match input.history_validated_header(&reference.author, reference.seq)? {
-            Some((id, prior)) => {
-                if prior.entry_hash() != reference.hash {
-                    return Err(invalid("preflight parent position differs"));
-                }
-                id
+        if let Some((_, prior)) =
+            input.history_validated_header(&reference.author, reference.seq)?
+        {
+            if prior.entry_hash() != reference.hash {
+                return Err(invalid("preflight parent position differs"));
             }
-            None => match input
-                .sparse_author(&reference.author, LogScope::Public)?
-                .and_then(|state| state.committed)
-            {
-                Some(id) => id,
-                None => return Ok(Preflight::Need(Query::Head(reference.author))),
-            },
-        };
-        let Some(receipt) =
-            input.history_parent_receipt(&parent_head, &reference.author, reference.seq)?
-        else {
+        }
+        // One lookup, by author and position, as `start_entry` does.
+        let Some(receipt) = parent_evidence(&input, &reference.author, reference.seq)? else {
             // Admission starts by acquiring every exact receipt. A changed current head can
             // require a fresh proof; it never permits substituting another parent position.
+            let Some(parent_head) = input
+                .sparse_author(&reference.author, LogScope::Public)?
+                .and_then(|state| state.committed)
+            else {
+                return Ok(Preflight::Need(Query::Head(reference.author)));
+            };
             let target = input
                 .history_head(&parent_head)?
-                .ok_or(invalid("preflight parent target missing"))?;
+                .ok_or(local("preflight parent target missing"))?;
             if target.root.leaves < reference.seq {
                 return Ok(Preflight::Need(Query::Head(reference.author)));
             }
@@ -1161,24 +1236,23 @@ pub(super) fn preflight(
                 },
             }));
         };
-        if receipt.included().header().entry().entry_hash() != reference.hash {
+        if receipt.header().entry_hash() != reference.hash {
             return Err(invalid("preflight parent receipt differs"));
         }
+        // Before anything follows the frontier (`start_entry` checked it too; a resumed
+        // preflight checks again).
+        receipt.check_published(&input)?;
+        let parent_head = receipt.head_id();
         // SparseValidation requires this exact parent prefix, not only the
         // control coordinates named in its frontier. Finish it before taking a body
         // slot; validation then cannot recursively discover an earlier control.
-        let through = receipt.prefix().prefix().leaves;
-        // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): the author's own
-        // parent prefix is not waited for.
-        let own_unchecked =
-            own == 1 && parent == 0 && crate::node::channel::governance::termination_admitted();
+        let through = receipt.prefix().leaves;
         for effects in [false, true] {
-            let complete = own_unchecked
-                || if effects {
-                    input.control_effects_complete(&parent_head, through)?
-                } else {
-                    input.control_sources_complete(&parent_head, through)?
-                };
+            let complete = if effects {
+                input.control_effects_complete(&parent_head, through)?
+            } else {
+                input.control_sources_complete(&parent_head, through)?
+            };
             if !complete {
                 return Ok(Preflight::Control {
                     head: parent_head,
@@ -1187,7 +1261,7 @@ pub(super) fn preflight(
                 });
             }
         }
-        receipt.prefix().prefix().frontier
+        receipt.prefix().frontier
     };
     let Some(context) = input.history_context(&context_id)? else {
         return Ok(Preflight::Need(Query::Context(context_id)));
@@ -1204,13 +1278,6 @@ pub(super) fn preflight(
         let Some((control_head, control)) =
             input.history_validated_header(&coordinate.author, coordinate.seq)?
         else {
-            // `VOX_MUTANT_TERMINATION=admitted`: an absent control of the entry's own author
-            // (its withheld termination) is passed over.
-            if coordinate.author == entry.skeleton.author_id
-                && crate::node::channel::governance::termination_admitted()
-            {
-                continue;
-            }
             let Some(control_head) = input
                 .sparse_author(&coordinate.author, LogScope::Public)?
                 .and_then(|state| state.committed)
@@ -1219,7 +1286,7 @@ pub(super) fn preflight(
             };
             let target = input
                 .history_head(&control_head)?
-                .ok_or(invalid("preflight control head missing"))?;
+                .ok_or(local("preflight control head missing"))?;
             if target.root.leaves < coordinate.seq {
                 return Ok(Preflight::Need(Query::Head(coordinate.author)));
             }
@@ -1286,7 +1353,7 @@ fn unequal(
 ) -> Result<Option<(Advanced, bool)>> {
     let author = signed.binding.author;
     if signed.root.leaves < baseline.leaves {
-        let baseline_id = baseline_id.ok_or(invalid("nonempty baseline has no head"))?;
+        let baseline_id = baseline_id.ok_or(local("nonempty baseline has no head"))?;
         let at = signed.root.leaves;
         // Rule 7: when both sides are already opened at m = |smaller head| they are compared
         // before any proof is asked of a peer that may hold only one of them; a different
@@ -1415,7 +1482,7 @@ pub(super) fn comparison_step(
     };
     let baseline = input
         .history_head(&baseline_id)?
-        .ok_or(invalid("accepted baseline missing"))?
+        .ok_or(local("accepted baseline missing"))?
         .root;
     // A resumed comparison asks a peer that kept this head what it proved under it: the
     // opening at the smaller size first, whichever head is larger. Matching there, today's
@@ -1456,8 +1523,10 @@ enum Overlap {
 const MAX_PREFIX_WALK: u64 = 64;
 
 /// MP-9 (rule 7): the entry at `at` under another signed head `head` and under the accepted
-/// chain, each authenticated under its own root: the other by inclusion under `head`, the
-/// accepted one as an admitted position or by inclusion under the accepted head.
+/// chain, each authenticated under its own root: the other by inclusion under `head` only (a
+/// head not linked to the accepted chain borrows nothing from it); the accepted one as an
+/// admitted position, or by inclusion under the accepted head or under any committed head of the
+/// author its receipt is located by (`entry_inclusion`): one entry per position on that chain.
 fn compare_overlap(
     input: &entry_store::Read<'_>,
     head: Digest32,
@@ -1473,8 +1542,7 @@ fn compare_overlap(
     } else {
         match input.history_position_header(&author, at)? {
             Some(entry) => Some(entry),
-            None => input
-                .history_inclusion_receipt(&accepted, &author, at)?
+            None => entry_inclusion(input, &accepted, &author, at)?
                 .map(|included| included.header().entry().clone()),
         }
     };
@@ -1520,8 +1588,7 @@ fn prefix_walk(
 }
 
 /// MP-9: a verified prefix that differs from the accepted chain's range of the same size. It is
-/// another history's prefix, kept under its own head only: the canonical range index holds the
-/// accepted chain (a conflicting write there fails, and would end the comparison).
+/// another history's prefix: it makes no parent receipt (`combine_parent`).
 fn unlinked_prefix(
     input: &entry_store::Read<'_>,
     prefix: &crate::log::history::ConsistentPrefix,
@@ -1539,7 +1606,7 @@ fn unlinked_prefix(
 /// `terminal-header-only`, a matching entry at the overlap ends the comparison (no prefix walk).
 /// Said once when first read.
 #[cfg(feature = "test-knobs")]
-pub(super) fn fork_mutant_is(which: &str) -> bool {
+pub(crate) fn fork_mutant_is(which: &str) -> bool {
     static VALUE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
         let value = std::env::var("VOX_MUTANT_FORK").ok();
         if let Some(value) = &value {
@@ -1551,7 +1618,7 @@ pub(super) fn fork_mutant_is(which: &str) -> bool {
 }
 
 #[cfg(not(feature = "test-knobs"))]
-pub(super) const fn fork_mutant_is(_: &str) -> bool {
+pub(crate) const fn fork_mutant_is(_: &str) -> bool {
     false
 }
 

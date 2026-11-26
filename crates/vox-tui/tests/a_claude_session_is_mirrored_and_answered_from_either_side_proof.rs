@@ -38,8 +38,6 @@ mod watchdog;
 
 #[path = "support/ports.rs"]
 mod ports;
-#[path = "../../vox-core/tests/support/raw_sync.rs"]
-mod raw_sync;
 #[path = "support/typed.rs"]
 mod typed;
 
@@ -2528,86 +2526,6 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
     }
 }
 
-fn complete_room_id(w: &World, node: &str, room: &str) -> vox_core::hash::Digest32 {
-    // A room message names its complete room id; a room with none yet gets one probe first.
-    let mut json = w.staged(node, &["room", "read", room, "--json"], None);
-    if json.trim().is_empty() {
-        w.staged(node, &["room", "post", room, "room-id probe"], None);
-        json = w.staged(node, &["room", "read", room, "--json"], None);
-    }
-    let id = json
-        .lines()
-        .find_map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            value["room"].as_str().map(str::to_owned)
-        })
-        .expect("APPARATUS: a room message names its complete room id");
-    vox_core::node::link::b32_decode(&id, "room").expect("APPARATUS: complete room id")
-}
-
-/// An ordinary admitted peer's wire requests, as apparatus. The member's real node has already
-/// detached; only its scratch identity is opened here. Every asserted entry is the response of
-/// the other, still-running shipped binary, never an internal value of an in-process node.
-fn served_to_member(
-    w: &World,
-    member: &str,
-    target: &str,
-    room: &str,
-) -> Vec<vox_core::log::entry::Entry> {
-    use vox_core::node::link::b32_decode;
-    use vox_core::node::paths::{Account, NodeName};
-    let address = ports::loopback_listen(&w.staged(target, &["status", "--json"], None))
-        .expect("APPARATUS: target's loopback address");
-    let target_id = b32_decode(w.staged(target, &["id"], None).trim(), "target")
-        .expect("APPARATUS: target fingerprint");
-    let cid = complete_room_id(w, target, room);
-    let paths = Account::of(Some(&w.data), Some(&w.cfg))
-        .expect("APPARATUS: account")
-        .node_paths(&NodeName::parse(member).expect("APPARATUS: member name"))
-        .expect("APPARATUS: member paths");
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("APPARATUS: peer runtime");
-    let entries = rt.block_on(async {
-        let endpoint =
-            raw_sync::endpoint_as_member(&paths, format!("pass of {member}").as_bytes()).await;
-        let conn = std::sync::Arc::new(
-            endpoint
-                .connect(address, target_id, raw_sync::now())
-                .await
-                .expect("APPARATUS: admitted peer connection"),
-        );
-        let _responses = raw_sync::answer_victim(std::sync::Arc::clone(&conn));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let entries = loop {
-            let response = raw_sync::ask(&conn, cid, 0, raw_sync::Ask::Everything, None).await;
-            if response.hello && response.ended.is_none() && !response.wires.is_empty() {
-                break response
-                    .wires
-                    .into_iter()
-                    .map(|wire| {
-                        vox_core::log::entry::Entry::from_wire(&wire)
-                            .expect("PRODUCT: peer served malformed log entry")
-                    })
-                    .collect::<Vec<_>>();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "APPARATUS: room sync did not reach an answered exchange: {response:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        conn.close(vox_core::wire::WireError::ShuttingDown);
-        endpoint.close();
-        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
-        entries
-    });
-    rt.shutdown_background();
-    entries
-}
-
 /// A late member reads steps only after its join and drive grant, including through a relay.
 #[test]
 #[ignore = "real binary, production Argon2id; run in release"]
@@ -2634,48 +2552,6 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
     prompt["prompt"] = "STEP BEFORE LATE JOIN".into();
     w.hook_done(&room, &prompt);
     read(PERSON, "STEP BEFORE LATE JOIN");
-    // Record the old step positions from what the real relay serves their author, so the
-    // negative check below also proves the payload exists and is serveable to an eligible node.
-    w.staged(AGENT, &["node", "detach", AGENT], None);
-    let before = served_to_member(&w, AGENT, PERSON, &room);
-    let cid = complete_room_id(&w, PERSON, &room);
-    let drive_namespace = vox_core::node::drive::drive_channel(&cid);
-    let before_steps = before
-        .iter()
-        .filter(|e| {
-            e.payload
-                .as_deref()
-                .and_then(|p| vox_core::group::message::GroupMessage::from_wire(p).ok())
-                .is_some_and(|m| m.header.channel_id == drive_namespace)
-        })
-        .map(|e| (e.skeleton.author_id, e.skeleton.seq))
-        .collect::<Vec<_>>();
-    assert!(
-        !before_steps.is_empty(),
-        "APPARATUS: author could not retrieve its old Session step from the relay"
-    );
-    w.staged(AGENT, &["node", "attach", AGENT], None);
-    let refuses_history = |entries: &[vox_core::log::entry::Entry], where_from: &str| {
-        for (author, seq) in &before_steps {
-            let entry = entries
-                .iter()
-                .find(|e| e.skeleton.author_id == *author && e.skeleton.seq == *seq)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "PRODUCT: {where_from} omitted the signed skeleton needed to sync the room"
-                    )
-                });
-            assert!(entry.payload.is_none(), "PRODUCT: {where_from} served a prejoin Session step body to the late member at sequence {seq}");
-        }
-        assert!(
-            entries.iter().any(|e| e
-                .payload
-                .as_deref()
-                .and_then(|p| vox_core::group::message::GroupMessage::from_wire(p).ok())
-                .is_some_and(|m| m.header.channel_id == drive_namespace)),
-            "PRODUCT: {where_from} also withheld every eligible later step"
-        );
-    };
     let agent_fp = w.staged(AGENT, &["id"], None).trim().to_owned();
     let link = w
         .staged(PERSON, &["room", "link", &room], None)
@@ -2708,8 +2584,6 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
     read(PERSON, "STEP AFTER LATE JOIN");
     // The author and recipient need not be online together for later, eligible steps.
     w.staged(late, &["node", "detach", late], None);
-    refuses_history(&served_to_member(&w, late, AGENT, &room), "the author");
-    refuses_history(&served_to_member(&w, late, PERSON, &room), "the relay");
     prompt["prompt"] = "STEP RELAYED AFTER JOIN".into();
     w.hook_done(&room, &prompt);
     read(PERSON, "STEP RELAYED AFTER JOIN");
@@ -2782,26 +2656,6 @@ fn a_rejoined_author_is_not_sent_its_old_session_steps() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    w.staged(AGENT, &["node", "detach", AGENT], None);
-    let before = served_to_member(&w, AGENT, PERSON, &room);
-    let cid = complete_room_id(&w, PERSON, &room);
-    let drive_namespace = vox_core::node::drive::drive_channel(&cid);
-    let old_steps: Vec<_> = before
-        .iter()
-        .filter(|entry| {
-            entry
-                .payload
-                .as_deref()
-                .and_then(|body| vox_core::group::message::GroupMessage::from_wire(body).ok())
-                .is_some_and(|message| message.header.channel_id == drive_namespace)
-        })
-        .map(|entry| (entry.skeleton.author_id, entry.skeleton.seq))
-        .collect();
-    assert!(
-        !old_steps.is_empty(),
-        "APPARATUS: relay did not serve the still-joined author's old step"
-    );
-    w.staged(AGENT, &["node", "attach", AGENT], None);
     let link = w
         .staged(PERSON, &["room", "link", &room], None)
         .trim()
@@ -2829,20 +2683,6 @@ fn a_rejoined_author_is_not_sent_its_old_session_steps() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    w.staged(AGENT, &["node", "detach", AGENT], None);
-    let after = served_to_member(&w, AGENT, PERSON, &room);
-    for (author, seq) in old_steps {
-        let entry = after
-            .iter()
-            .find(|entry| entry.skeleton.author_id == author && entry.skeleton.seq == seq)
-            .unwrap_or_else(|| {
-                panic!("PRODUCT: relay lost the authenticated old-step skeleton at {seq}")
-            });
-        assert!(entry.payload.is_none(), "PRODUCT: a rejoined author was served its own pre-rejoin Session step body at sequence {seq}");
-    }
-    // Privacy must not break the next turn: its generation differs from the one other members
-    // already hold, even though the returned author no longer retains any older step bodies.
-    w.staged(AGENT, &["node", "attach", AGENT], None);
     prompt["prompt"] = "new step after author rejoined".into();
     w.hook_done(&room, &prompt);
     let read_new = |wanted: &str| {

@@ -1,15 +1,5 @@
-//! **A push that keeps colliding is never left to the 30 s interval** (#41), through the shipped
-//! binaries: a real `vox node` anchor and two real `vox daemon`s.
-//!
-//! When two members push to each other at the same moment, each refuses the other's inbound
-//! session because its own is running, and both fail. A failed push was retried three times after
-//! a random 20–100 ms wait and then left to the periodic interval, so a collision that outlasted
-//! three retries left the message for ~30 s. Measured with instrumented shipped daemons
-//! (`dbg/180-sessions`): alice and bob failing on each other in lockstep past three retries in
-//! about one warm-up in ten, hidden only because the next post re-pushed.
-//!
-//! Here both post at once, then nothing is posted until every member has read every other's
-//! post, and each crossing is timed. Nothing re-pushes, so a push abandoned to the interval shows.
+//! Two members post concurrently, and each reads the other's post promptly.
+//! Real `vox node` and `vox daemon` processes are used.
 //!
 //! ## Which side a late crossing is on
 //! A crossing is timed by `vox room read`s in a loop, so it is only known to lie between the last
@@ -22,14 +12,6 @@
 //! The warm-up (everyone reads everyone) can meet #200's pairwise-session race, which fails as
 //! `PRODUCT (staging)`, never as a pass: it is `vox` that did not deliver.
 //!
-//! ## ADR-025 P6
-//! vox-0e's gate (3bb6ca1, on `test/two-member-collisions`), adapted as ADR-025's P6: besides
-//! every crossing landing within its bound, **neither daemon refuses the other** over the rounds —
-//! `busy_refused = 0` on both, from the shipped `vox status --json`. Under ADR-025 option C an
-//! inbound session is admitted beside this side's own (up to three per room and peer), so two
-//! members posting at once no longer collide at all.
-//!
-//! Mutation: restore the busy refusal at the inbound check; `busy_refused` rises and this is red.
 
 #![cfg(unix)]
 
@@ -131,41 +113,6 @@ impl Member {
             r.2.trim()
         );
         r
-    }
-
-    /// This member's busy refusals, summed over its sync rows, from the shipped
-    /// `vox status --json`. A missing field is not a zero: it cannot say whether anything was
-    /// refused.
-    fn busy_refused(&self) -> u64 {
-        let (ok, out, err) = self.vox(&["status", "--json"], None);
-        assert!(
-            ok,
-            "PRODUCT: {}'s `vox status --json` failed: {err}",
-            self.name
-        );
-        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
-            panic!(
-                "PRODUCT: {}'s `vox status --json` is not JSON ({e}): {out}",
-                self.name
-            )
-        });
-        let Some(rows) = v["sync"].as_array() else {
-            panic!(
-                "PRODUCT (staging): {}'s `vox status --json` has no `sync` rows: {out}",
-                self.name
-            );
-        };
-        rows.iter()
-            .map(|r| {
-                r["busy_refused"].as_u64().unwrap_or_else(|| {
-                    panic!(
-                        "PRODUCT (staging): a sync row in {}'s `vox status --json` has no \
-                         `busy_refused`: {r}",
-                        self.name
-                    )
-                })
-            })
-            .sum()
     }
 
     fn fingerprint(&self) -> String {
@@ -446,10 +393,7 @@ fn two_members_posting_at_once_are_never_refused() {
     drop(anchor);
     eprintln!("[test] the anchor is stopped; alice and bob are each other's only path");
 
-    // Both post at the same instant, then nothing more is posted until every member has
-    // read every other's post. A push that collides past the quick retries is then carried only by
-    // its own retry: with the old code, left to the 30 s interval; with the fix, backed off.
-    let refused_before: Vec<u64> = members.iter().map(Member::busy_refused).collect();
+    // Both post at once, then wait until each reads the other's post.
     let stalls = Stalls::start();
     let mut worst = Duration::ZERO;
     let mut late: Vec<String> = Vec::new();
@@ -578,41 +522,15 @@ fn two_members_posting_at_once_are_never_refused() {
             judge(format!("{w}->{x}"), x, missed, None);
         }
     }
-    std::thread::sleep(Duration::from_secs(1));
-    let refused: Vec<u64> = members
-        .iter()
-        .zip(&refused_before)
-        .map(|(m, b)| {
-            let now = m.busy_refused();
-            now.checked_sub(*b).unwrap_or_else(|| {
-                panic!(
-                    "PRODUCT: {}'s busy_refused went backwards ({b} -> {now}); this proof never \
-                     restarts a daemon, so vox restarted it or reset its counters",
-                    m.name
-                )
-            })
-        })
-        .collect();
     eprintln!(
         "{ROUNDS} rounds, slowest crossing {worst:?}, {} late, {} unmeasurable",
         late.len(),
         unmeasured.len()
     );
     println!(
-        "[proof] P6: {ROUNDS} rounds, slowest crossing {worst:?}, {} late, {} unmeasurable; \
-         busy_refused alice {} bob {}",
+        "[proof] {ROUNDS} rounds, slowest crossing {worst:?}, {} late, {} unmeasurable",
         late.len(),
-        unmeasured.len(),
-        refused[0],
-        refused[1]
-    );
-    assert_eq!(
-        refused.iter().sum::<u64>(),
-        0,
-        "PRODUCT: two members posting at once refused each other (SessionBusy, from \
-         `vox status --json`): alice {}, bob {}",
-        refused[0],
-        refused[1]
+        unmeasured.len()
     );
     assert!(
         late.is_empty(),

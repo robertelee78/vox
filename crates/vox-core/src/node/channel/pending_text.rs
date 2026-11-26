@@ -9,16 +9,9 @@ pub(crate) mod consent_delivery;
 pub(crate) mod held_consent;
 #[path = "pending_text/leave.rs"]
 pub(crate) mod leave;
-#[path = "pending_text/legacy_session.rs"]
-mod legacy_session;
 pub(crate) mod read;
 #[path = "pending_recovery.rs"]
 pub(crate) mod recovery;
-
-/// How long a write waits for the room's one pending write before it reports the room busy.
-/// An authored save or a served write holds `pending_text` for one blocking store commit,
-/// and every release wakes the waiters; this bounds a wait behind a holder that stalls.
-pub(crate) const PENDING_WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// An authored save registered as waiting for the room's pending write. While it lives, a
 /// served write that wakes on the room's release stands aside; it is dropped once the save
@@ -678,15 +671,12 @@ impl ChannelState {
             self.key_packages
                 .published(self.next_log_id.saturating_sub(1));
             self.entries.committed();
-            let order = (|| -> Result<_> {
+            let newest = (|| -> Result<_> {
                 let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-                Ok((
-                    read.order_revision(),
-                    read.order_previous(None)?.map(|(clock, _)| clock),
-                ))
+                Ok(read.order_previous(None)?.map(|(clock, _)| clock))
             })();
-            match order {
-                Ok((revision, newest)) => self.dag.set_order_revision(revision, newest),
+            match newest {
+                Ok(newest) => self.dag.set_newest_clock(newest),
                 Err(error) => failure = Some(error.to_string()),
             }
             self.gen.fetch_add(
@@ -940,6 +930,7 @@ impl PendingText {
         store: &Store,
         signer: &dyn RootSigner,
         required: &[Digest32],
+        kind: SignedEntryKind,
     ) -> Result<Option<(ControlContext, Vec<EntryReference>, bool)>> {
         if !self.sparse {
             return Ok(None);
@@ -955,6 +946,7 @@ impl PendingText {
                 &signer.fingerprint(),
                 required,
                 self.reserved_tip_author.as_ref(),
+                kind,
             )
             .map(Some)
         })
@@ -963,8 +955,10 @@ impl PendingText {
     fn append_text(&mut self, store: &Store, signer: &dyn RootSigner, text: &str) -> Result<()> {
         let content = Content::text(self.now_millis, text)?;
         let required = self.required(SignedEntryKind::Content)?;
+        // ADR-053 M0: a ContextUpdate precedes this post only for a real change the
+        // author's committed aggregate does not reach, never to absorb other authors' posts.
         if self
-            .context(store, signer, &required)?
+            .context(store, signer, &required, SignedEntryKind::Content)?
             .is_some_and(|(_, _, changed)| changed)
         {
             self.append(
@@ -979,29 +973,14 @@ impl PendingText {
             )?;
             self.cleanup(store)?;
         }
-        // ADR-053 MP-10 (c): the attacker terminates its own feed and posts on past it.
-        #[cfg(feature = "mutant-sender")]
-        if crate::log::sync::mutant::terminates_now() {
-            self.append(
-                store,
-                signer,
-                Vec::new(),
-                EntryKind::Content,
-                SignedEntryKind::Termination,
-                None,
-                &[],
-                None,
-            )?;
-            self.cleanup(store)?;
-        }
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let payload = self.sender.encrypt(&plaintext)?.to_wire();
         #[cfg(feature = "mutant-sender")]
-        let payload = crate::log::sync::mutant::authored(payload);
+        let payload = crate::log::mutant::authored(payload);
         // `author-misbound`: a real consent grant, signed with kind Governance, whose body names
         // an epoch 7 past the entry's own, so a reader reaches the governance binding check.
         #[cfg(feature = "mutant-sender")]
-        let (payload, kind, signed_kind) = if crate::log::sync::mutant::misbound() {
+        let (payload, kind, signed_kind) = if crate::log::mutant::misbound() {
             let (iteration, key) = self.sender.current_position();
             let skdm = self.sender.skdm_for(signer, iteration, key)?;
             let grant = crate::governance::membership::issue_consent_grant(
@@ -1064,7 +1043,7 @@ impl PendingText {
             && crate::wire::parse_frame(&payload)?.tag == crate::wire::StructTag::ConsentGrant);
         let keep_log = kind == EntryKind::Governance || signed_kind == SignedEntryKind::StepPolicy;
         let required = self.required(signed_kind)?;
-        let context = self.context(store, signer, &required)?;
+        let context = self.context(store, signer, &required, signed_kind)?;
         let recipient = if self.sparse && signed_kind == SignedEntryKind::KeyPackage {
             Some(crate::node::keypackage::KeyPackage::from_wire(&payload)?.recipient)
         } else {

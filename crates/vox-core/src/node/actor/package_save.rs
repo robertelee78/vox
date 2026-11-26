@@ -4,6 +4,7 @@ use crate::node::channel::pending_package as native;
 use crate::node::store::Store;
 use maintenance_save::{Lifetime, Saved as CommonSaved, Work as CommonWork};
 pub(super) use native::{Attempt, Saved, Work};
+use std::future::Future;
 
 type Reply = Option<oneshot::Sender<Outcome>>;
 
@@ -44,12 +45,8 @@ impl Completed {
     ) -> Option<crate::node::channel::history::PendingHistoryRead> {
         self.0.take_history_pin()
     }
-    pub(super) fn finish(
-        self,
-        channel: &mut ChannelState,
-        store: &Store,
-    ) -> crate::error::Result<Saved> {
-        channel.finish_pending_package(store, self.0)
+    pub(super) fn finish(self, channel: &mut ChannelState) -> crate::error::Result<Saved> {
+        channel.finish_pending_package(self.0)
     }
     pub(super) fn into_result(self) -> crate::error::Result<Saved> {
         self.0.into_result()
@@ -69,7 +66,6 @@ enum Stage {
     HelloInitiate,
     HelloForget,
     HelloRefuse,
-    Reoffer,
     Reset,
 }
 
@@ -112,10 +108,6 @@ enum After {
     },
     Preparation(Box<preparation_save::Continuation>),
     Inbound(Box<Inbound>),
-    Reoffer {
-        target: Digest32,
-        remaining: Redelivery,
-    },
     Probe(Digest32),
     Rejoin(Digest32),
     AdoptJoin {
@@ -146,16 +138,10 @@ pub(super) struct AdoptionWait {
     lifetime: Arc<Lifetime>,
 }
 
-struct ReofferTarget {
-    room: Digest32,
-    target: Digest32,
-    instance: SharedChannel,
-}
+/// An answered join's tail, run once the owed-consent pass its adoption started has ended.
 pub(super) struct Redelivery {
     attachment: u64,
-    lifetime: Arc<Lifetime>,
-    targets: VecDeque<ReofferTarget>,
-    answered: Option<AnsweredJoin>,
+    answered: AnsweredJoin,
 }
 
 pub(super) struct Continuation {
@@ -264,18 +250,6 @@ impl Node {
         reply: Reply,
     ) {
         let attached = continuation.attached(self, &room);
-        if attached {
-            let peers: Vec<_> = self
-                .private_pulls
-                .iter()
-                .filter_map(|((candidate, peer), owner)| {
-                    (*candidate == room && owner.selecting && owner.task.is_none()).then_some(*peer)
-                })
-                .collect();
-            for peer in peers {
-                self.start_installed_private_pull(room, peer);
-            }
-        }
         let lifetime = continuation.lifetime();
         match continuation.after {
             After::Preparation(next) => self.reject_owned_preparation(room, error, *next, reply),
@@ -343,23 +317,53 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
                 }
             }
-            After::Reoffer { target, remaining } => {
-                if attached {
-                    self.reoffer.insert((room, target));
-                    self.reject_package_redelivery(remaining);
-                }
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                }
-            }
             After::Probe(_) | After::Rejoin(_) => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
                 }
             }
-            After::AdoptJoin { peer, next, .. } => {
+            After::AdoptJoin {
+                peer,
+                session,
+                mine,
+                next,
+                ..
+            } => {
                 let fault = fault_of(&error);
-                self.reject_package_join_adoption(room, peer, error, next, lifetime);
+                // **A busy publication is waited out, as before the save began** (the
+                // `pending_posts` branch of `continue_package_join_adoption`): the join keeps
+                // its session, in the owner that already waits for it, and resumes once the
+                // publication changes.
+                let busy = attached
+                    && matches!(
+                        error,
+                        Error::Profile("room publication is busy; retry this operation")
+                    );
+                match (next, lifetime) {
+                    (JoinNext::Answered, Some(lifetime)) if busy => {
+                        self.wait_package_adoption(
+                            AdoptionWait {
+                                room,
+                                peer,
+                                session,
+                                instance: Arc::clone(&continuation.instance),
+                                attachment: continuation.attachment,
+                                lifetime,
+                            },
+                            None,
+                        );
+                    }
+                    // This device's own join: kept in `pending_metadata.join_replies`, whose
+                    // advance waits for the publication (`advance_metadata_join_replies`).
+                    (JoinNext::Metadata(after), Some(lifetime)) if busy => {
+                        self.defer_metadata_join_adoption(
+                            room, peer, *session, mine, lifetime, after,
+                        );
+                    }
+                    (next, lifetime) => {
+                        self.reject_package_join_adoption(room, peer, error, next, lifetime)
+                    }
+                }
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Failed(fault));
                 }
@@ -407,8 +411,9 @@ impl Node {
         let work = match (continuation.stage, saved) {
             (Stage::Select, CommonSaved::Packages(Saved::Selected { progress, context })) => {
                 if progress.floor_changed {
-                    self.wake_private_refetch(room, &continuation.instance)
-                        .await;
+                    // A floor changed: old automatic private debt may be runnable now, and what
+                    // this node may serve a peer may have changed (permission news).
+                    self.history_frontier.private_permission(room);
                 }
                 let Some(pending) = progress.package else {
                     if progress.pending {
@@ -454,16 +459,6 @@ impl Node {
                     self.governance_work.wake_room(room);
                 }
                 let backfill = attempt.accepted.is_some_and(|accepted| accepted.changed);
-                if backfill && attempt.drive {
-                    if let Some(author) = attempt.author {
-                        self.retain_installed_private_pull(
-                            room,
-                            author,
-                            &continuation.instance,
-                            lifetime.authority.clone(),
-                        );
-                    }
-                }
                 if backfill {
                     continuation.attempt = Some(attempt);
                     self.governance_work.pending = true;
@@ -527,11 +522,9 @@ impl Node {
             }
             (Stage::Acknowledge, CommonSaved::Packages(Saved::Attempted(attempt))) => {
                 if attempt.drive && attempt.accepted.is_some_and(|accepted| accepted.changed) {
-                    if let Some(author) = attempt.author {
-                        self.start_installed_private_pull(room, author);
-                    }
-                    self.wake_private_refetch(room, &continuation.instance)
-                        .await;
+                    // A Drive key arrived: a step owed for it (a blocked mark whose release
+                    // evidence changed) is asked again by the loops; nothing is forgotten.
+                    self.history_frontier.private_wake(room);
                 }
                 let peer = match &continuation.after {
                     After::Inbound(inbound) => Some(inbound.peer),
@@ -579,11 +572,9 @@ impl Node {
                                 }
                                 taken.push_back(delivery);
                             }
-                            if attempt.fresh {
-                                self.reoffer
-                                    .insert((room, attempt.author.unwrap_or(inbound.peer)));
-                            }
                         }
+                        let fresh = (accepted && attempt.fresh)
+                            .then(|| (room, attempt.author.unwrap_or(inbound.peer)));
                         answer_inbound(
                             inbound,
                             Some(if accepted {
@@ -595,12 +586,9 @@ impl Node {
                         if let Some(reply) = reply {
                             let _ = reply.send(Outcome::Done);
                         }
-                        self.finish_pairwise_package_effects(lifetime).await;
+                        self.finish_pairwise_package_effects(lifetime, fresh).await;
                     }
-                    After::Reoffer { .. }
-                    | After::Probe(_)
-                    | After::Rejoin(_)
-                    | After::AdoptJoin { .. } => {
+                    After::Probe(_) | After::Rejoin(_) | After::AdoptJoin { .. } => {
                         unreachable!("non-package continuation has no key attempt")
                     }
                 }
@@ -632,11 +620,11 @@ impl Node {
                     }
                     Ok(None) => {
                         answer_inbound(inbound, None);
-                        self.finish_pairwise_package_effects(lifetime).await;
+                        self.finish_pairwise_package_effects(lifetime, None).await;
                     }
                     Err(why) => {
                         answer_inbound(inbound, Some(Err(why)));
-                        self.finish_pairwise_package_effects(lifetime).await;
+                        self.finish_pairwise_package_effects(lifetime, None).await;
                     }
                 }
                 return;
@@ -722,7 +710,7 @@ impl Node {
                     Ok(session) => session,
                     Err(refusal) => {
                         answer_inbound(*inbound, Some(Err(refusal)));
-                        self.finish_pairwise_package_effects(lifetime).await;
+                        self.finish_pairwise_package_effects(lifetime, None).await;
                         return;
                     }
                 };
@@ -734,7 +722,7 @@ impl Node {
                     if let Some(reply) = reply {
                         let _ = reply.send(Outcome::Failed(Fault::Internal));
                     }
-                    self.finish_pairwise_package_effects(lifetime).await;
+                    self.finish_pairwise_package_effects(lifetime, None).await;
                     return;
                 };
                 match opening {
@@ -830,7 +818,7 @@ impl Node {
                     *inbound,
                     Some(Err(crate::node::pairwise_stream::KeyRefusal::HelloRefused)),
                 );
-                self.finish_pairwise_package_effects(lifetime).await;
+                self.finish_pairwise_package_effects(lifetime, None).await;
                 return;
             }
             (Stage::Reset, CommonSaved::Packages(Saved::DeliveryReset { error })) => {
@@ -885,23 +873,6 @@ impl Node {
                 if let Some(reply) = reply {
                     let _ = reply.send(fault.map_or(Outcome::Done, Outcome::Failed));
                 }
-                return;
-            }
-            (Stage::Reoffer, CommonSaved::Packages(Saved::Reoffered)) => {
-                let After::Reoffer { target, remaining } = continuation.after else {
-                    unreachable!("reoffer owner")
-                };
-                self.key_backoff.remove(&(room, target));
-                Box::pin(self.begin_owned_rekeys_for(
-                    room,
-                    false,
-                    Some(lifetime),
-                    consent_release::RekeyAfter::Packages {
-                        next: remaining,
-                        reply,
-                    },
-                ))
-                .await;
                 return;
             }
             (_, CommonSaved::Unavailable) => {
@@ -1026,7 +997,7 @@ impl Node {
             _ => {
                 answer_inbound(inbound, None);
                 if let Some(lifetime) = lifetime {
-                    self.finish_pairwise_package_effects(lifetime).await;
+                    self.finish_pairwise_package_effects(lifetime, None).await;
                 }
             }
         }
@@ -1081,107 +1052,42 @@ impl Node {
         .await;
     }
 
-    async fn finish_pairwise_package_effects(&mut self, lifetime: Arc<Lifetime>) {
-        let targets = std::mem::take(&mut self.reoffer)
-            .into_iter()
-            .filter_map(|(room, target)| {
-                self.channels
-                    .get(&room)
-                    .cloned()
-                    .map(|instance| ReofferTarget {
-                        room,
-                        target,
-                        instance,
-                    })
-            })
-            .collect();
-        let next = Redelivery {
-            attachment: self.delivery_epoch,
-            lifetime: Arc::clone(&lifetime),
-            targets,
-            answered: None,
-        };
-        if std::mem::take(&mut self.redeliver_now) {
-            let (reply, result) = oneshot::channel();
-            self.begin_owned_owed_consents(lifetime, reply).await;
-            self.join_tasks.spawn(async move {
-                let result = result
-                    .await
-                    .unwrap_or_else(|_| Err(Error::Profile("consent redelivery owner stopped")));
-                roster_save::AnsweredJoin::PackageRedelivery { next, result }
-            });
-        } else {
-            Box::pin(self.resume_package_redelivery(next, Ok(()))).await;
-        }
-    }
-
-    pub(super) fn reject_package_redelivery(&mut self, next: Redelivery) {
-        if next.attachment != self.delivery_epoch {
-            return;
-        }
-        for selected in next.targets {
-            if self
-                .channels
-                .get(&selected.room)
-                .is_some_and(|current| Arc::ptr_eq(current, &selected.instance))
-            {
-                self.reoffer.insert((selected.room, selected.target));
-            }
-        }
-    }
-
-    pub(super) async fn resume_package_redelivery(
+    /// `fresh` is the `(room, member)` whose fresh key the answered stream accepted. That key's
+    /// install already wrote, in the same transaction, what the member is owed again
+    /// (V210-118; `owed_again`), so the periodic rekeys (`deliver_owed_rekeys`) own its delivery.
+    /// The pass started here only delivers it at once; refused (a busy room, a locked profile,
+    /// a replaced room, revoked authority), it loses nothing.
+    async fn finish_pairwise_package_effects(
         &mut self,
-        mut next: Redelivery,
-        result: crate::error::Result<()>,
+        lifetime: Arc<Lifetime>,
+        fresh: Option<(Digest32, Digest32)>,
     ) {
-        if next.attachment != self.delivery_epoch {
-            return;
+        if std::mem::take(&mut self.redeliver_now) {
+            // Nothing here waits on this pass's end.
+            let (reply, _) = oneshot::channel();
+            self.begin_owned_owed_consents(lifetime, reply).await;
         }
-        if let Some(answered) = next.answered.take() {
-            if self
+        if let Some((room, member)) = fresh {
+            self.key_backoff.remove(&(room, member));
+            Box::pin(self.begin_owned_rekeys_for(
+                room,
+                false,
+                None,
+                consent_release::RekeyAfter::Automatic,
+            ))
+            .await;
+        }
+    }
+
+    pub(super) fn resume_package_redelivery(&mut self, next: Redelivery) {
+        let answered = next.answered;
+        if next.attachment == self.delivery_epoch
+            && self
                 .channels
                 .get(&answered.room)
                 .is_some_and(|current| Arc::ptr_eq(current, &answered.instance))
-            {
-                self.finish_answered_join_tail(answered.room, answered.peer);
-            }
-            return;
-        }
-        if result.is_err() {
-            self.reject_package_redelivery(next);
-            return;
-        }
-        while let Some(selected) = next.targets.pop_front() {
-            if !self
-                .channels
-                .get(&selected.room)
-                .is_some_and(|current| Arc::ptr_eq(current, &selected.instance))
-            {
-                continue;
-            }
-            let continuation = Continuation {
-                instance: selected.instance,
-                attachment: next.attachment,
-                lifetime: Some(Arc::clone(&next.lifetime)),
-                after: After::Reoffer {
-                    target: selected.target,
-                    remaining: next,
-                },
-                stage: Stage::Reoffer,
-                attempt: None,
-            };
-            Box::pin(self.begin_pending_maintenance(
-                selected.room,
-                CommonWork::Packages(Work::Reoffer {
-                    target: selected.target,
-                    history: true,
-                }),
-                maintenance_save::Continuation::Packages(continuation),
-                None,
-            ))
-            .await;
-            return;
+        {
+            self.finish_answered_join_tail(answered.room, answered.peer);
         }
     }
 
@@ -1626,6 +1532,36 @@ impl Node {
         .await;
     }
 
+    /// An answered join's session adoption that finds the room's publication busy keeps its
+    /// session and resumes (`resume_package_adoption`) on the publication's wake: one rule for
+    /// both places that meet it. `armed` is a wake subscribed while the room's own save was
+    /// pending; without it the busy state was seen by a save's worker earlier, whose end may
+    /// already have been published, so the wake is subscribed under the room lock and the state
+    /// looked at again before waiting.
+    fn wait_package_adoption(
+        &mut self,
+        next: AdoptionWait,
+        armed: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
+    ) {
+        self.join_tasks.spawn(async move {
+            let wake = match armed {
+                Some(armed) => Some(armed),
+                None => {
+                    let channel = next.instance.lock().await;
+                    let wake = channel.history_publication_wake();
+                    channel
+                        .history_publication_busy(&next.lifetime.store)
+                        .unwrap_or(false)
+                        .then_some(wake)
+                }
+            };
+            if let Some(wake) = wake {
+                wake.await;
+            }
+            roster_save::AnsweredJoin::PackageAdoption { next }
+        });
+    }
+
     async fn continue_package_join_adoption(
         &mut self,
         room: Digest32,
@@ -1660,10 +1596,7 @@ impl Node {
                         attachment: self.delivery_epoch,
                         lifetime,
                     };
-                    self.join_tasks.spawn(async move {
-                        wake.await;
-                        roster_save::AnsweredJoin::PackageAdoption { next }
-                    });
+                    self.wait_package_adoption(next, Some(wake));
                 }
             }
             return;
@@ -1791,21 +1724,17 @@ impl Node {
                 }
                 let next = Redelivery {
                     attachment: self.delivery_epoch,
-                    lifetime: Arc::clone(&lifetime),
-                    targets: VecDeque::new(),
-                    answered: Some(AnsweredJoin {
+                    answered: AnsweredJoin {
                         room,
                         peer,
                         instance,
-                    }),
+                    },
                 };
                 let (reply, completed) = oneshot::channel();
                 self.begin_owned_owed_consents(lifetime, reply).await;
                 self.join_tasks.spawn(async move {
-                    let result = completed
-                        .await
-                        .unwrap_or_else(|_| Err(Error::Profile("join consent owner stopped")));
-                    roster_save::AnsweredJoin::PackageRedelivery { next, result }
+                    let _ = completed.await;
+                    roster_save::AnsweredJoin::PackageRedelivery { next }
                 });
             }
         }

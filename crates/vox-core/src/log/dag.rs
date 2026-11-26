@@ -14,7 +14,7 @@
 //!   are signed into each entry, so the same entry set is the same graph on every
 //!   replica, whatever order it arrived in — Strong Eventual Consistency.
 //!
-//! ## The one order (PRD-001 R13)
+//! ## The causal order (PRD-001 R13 as amended by ADR-054)
 //! Every entry gets a **hybrid logical clock**:
 //!
 //! ```text
@@ -36,10 +36,14 @@
 //! out of order (a member was offline, a sync session died half-way), and refusing
 //! an entry until its parents arrive would let one lost entry stall a room. The
 //! missing parent simply contributes nothing yet; when it arrives, the clocks of
-//! everything that named it are raised and propagated to their descendants
-//! ([`Dag::reorder_generation`] counts those moves, so a timeline knows to re-sort).
+//! everything that named it are raised and propagated to their descendants.
 //! Because a clock only ever rises to what the full set requires, the result is the
 //! same as if everything had arrived in causal order.
+//!
+//! This clock serves semantic consumers only (governance, lifecycle and idle end, notice
+//! placement, authored tips, Session ordering). The rows a person reads are ordered by a
+//! display key the entry index fixes at an entry's first publication and never moves
+//! (`node::channel::entry_store`), so a late parent cannot reverse two rows already shown.
 //!
 //! ## What this module owns
 //! - The **store**: feeds keyed by author, plus a content-addressed index by
@@ -249,10 +253,7 @@ pub struct Dag {
     /// each checkpoint's range is walked once. An entry there that still had its body is
     /// handled when it is pruned ([`Dag::drop_signature_if_checkpointed`]).
     swept_to: HashMap<Digest32, u64>,
-    /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
-    /// so a timeline can tell a re-sort is due without recomputing anything.
-    reorder_generation: u64,
-    /// One published tail clock, refreshed with the durable order revision.
+    /// One published tail clock, refreshed after each root publication commits.
     newest_clock: Option<u64>,
     /// Body presence changed without replacing a signed skeleton. Display projections must
     /// notice this even if the caller's later persistence or rendering step fails.
@@ -295,7 +296,6 @@ impl Dag {
             checkpoints: self.checkpoints.clone(),
             unverified_from: self.unverified_from.clone(),
             swept_to: self.swept_to.clone(),
-            reorder_generation: self.reorder_generation,
             newest_clock: self.newest_clock,
             body_generation: self.body_generation,
             refused_below_checkpoint: self.refused_below_checkpoint,
@@ -944,36 +944,20 @@ impl Dag {
         Ok(seen)
     }
 
-    /// Read one published display key. Absence and local read failure are distinct.
-    pub fn order_key(
-        &self,
-        entries: &impl EntryRead,
-        hash: &Digest32,
-    ) -> Result<Option<(u64, Digest32)>> {
-        Ok(entries.clock(hash)?.map(|clock| (clock, *hash)))
-    }
-
-    /// Install the durable late-parent revision only after its root publication commits.
-    pub(crate) fn set_order_revision(&mut self, revision: u64, newest: Option<u64>) {
-        self.reorder_generation = revision;
+    /// Install the newest published causal clock only after its root publication commits.
+    pub(crate) fn set_newest_clock(&mut self, newest: Option<u64>) {
         self.newest_clock = newest;
     }
 
-    /// How many times an already-stored entry has moved in the order (a parent it
-    /// named arrived after it). A consumer that keeps its own sorted copy re-sorts
-    /// when this changes.
-    #[must_use]
-    pub fn reorder_generation(&self) -> u64 {
-        self.reorder_generation
-    }
-
-    /// Whether `a` **happened before** `b`: `a` is a proper causal ancestor of `b`
-    /// through `b`'s own feed and the `seen` edges, as far as this node holds them.
+    /// Whether `a` **happened before** `b`: `a` is a proper ancestor of `b` through `b`'s own
+    /// feed and the `seen` edges, as far as this node holds them.
     ///
-    /// This is the relation claims are to be built on (PRD-001 R17, ADR-020): a claim
-    /// that saw another claim follows it. `false` means concurrent **or** not yet
-    /// known to be ordered — `a` may be an ancestor through an entry this node has not
-    /// received. Neither entry held is `false`.
+    /// This is **hint-graph ancestry only** (ADR-053 M0): an ordinary signed-format Content
+    /// entry's `seen` are unchecked ordering hints, so this relation is never evidence for an
+    /// authority, membership, cut, key, private-access or required-ancestor decision; such a
+    /// consumer must prove its fact from verified contexts and own chains instead. `false`
+    /// means concurrent **or** not yet known to be ordered — `a` may be an ancestor through an
+    /// entry this node has not received. Neither entry held is `false`.
     pub fn happened_before(
         &self,
         entries: &impl EntryRead,

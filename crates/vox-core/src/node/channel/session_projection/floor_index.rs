@@ -14,8 +14,45 @@ use crate::node::store::Store;
 
 type Generation = (u64, u64);
 pub(in crate::node::channel) const REFRESHING: &str = "Session authorization facts are refreshing";
+/// Every fact a permission needs is here, but its bounded local preparation (floor selection,
+/// floor authorization, continuity) has more steps to take: another bounded step finishes it.
+pub(in crate::node::channel) const PREPARING: &str =
+    "Session authorization facts are being prepared";
+/// Not decidable yet, for either reason: a fact still missing (`REFRESHING`) or local
+/// preparation unfinished (`PREPARING`).
 pub(in crate::node::channel) fn refreshing(error: &Error) -> bool {
-    matches!(error, Error::StreamRefused(REFRESHING))
+    matches!(error, Error::StreamRefused(REFRESHING | PREPARING))
+}
+/// Only the unfinished-local-preparation case of [`refreshing`].
+pub(in crate::node::channel) fn preparing(error: &Error) -> bool {
+    matches!(error, Error::StreamRefused(PREPARING))
+}
+
+/// One bounded step of a permission prerequisite's preparation.
+pub(in crate::node::channel) enum Step<T> {
+    /// Prepared: the answer.
+    Done(T),
+    /// Progress was saved and more bounded steps remain; nothing external is missing.
+    Unfinished,
+    /// A fact this preparation needs is not here yet (or its basis moved under it).
+    Missing,
+}
+impl<T> Step<T> {
+    /// The answer, or `None` while not decidable for either reason.
+    pub(in crate::node::channel) fn done(self) -> Option<T> {
+        match self {
+            Self::Done(answer) => Some(answer),
+            Self::Unfinished | Self::Missing => None,
+        }
+    }
+    /// The answer, or the error naming why it is not decidable yet.
+    pub(in crate::node::channel) fn decided(self) -> Result<T> {
+        match self {
+            Self::Done(answer) => Ok(answer),
+            Self::Unfinished => Err(Error::StreamRefused(PREPARING)),
+            Self::Missing => Err(Error::StreamRefused(REFRESHING)),
+        }
+    }
 }
 fn bad() -> Error {
     Error::MalformedAtRest("Session authorization index")
@@ -270,12 +307,14 @@ pub(in crate::node::channel) fn source_after(
 }
 /// The caller has authenticated and published the entry in this same Batch. Contiguous
 /// progress is independent of whether it contains a floor, so an absent lookup is meaningful.
+/// Fold one authenticated public entry's floor facts. Returns whether a floor or its signed
+/// source changed (the author's floor revision moved).
 pub(super) fn observe(
     index: &mut Write<'_, '_>,
     room: &Digest32,
     entry: &crate::log::entry::Entry,
     current_epoch: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let author = entry.skeleton.author_id;
     let key = author_key(&author);
     let mut state = index
@@ -348,7 +387,7 @@ pub(super) fn observe(
     if changed || state.through != old_through {
         replace(index, Tree::FloorAuthors, key, &state.bytes())?;
     }
-    Ok(())
+    Ok(changed)
 }
 #[derive(Default)]
 struct FloorProof {
@@ -423,7 +462,7 @@ pub(in crate::node::channel) fn authorization_step(
     now: u64,
     entry: &crate::log::entry::Entry,
     recipient_current: bool,
-) -> Result<Option<bool>> {
+) -> Result<Step<bool>> {
     use crate::governance::entry::{GovBody, GovEntry};
     use crate::node::channel::governance::{ContentEligibility, View};
     let floor = entry
@@ -441,8 +480,8 @@ pub(in crate::node::channel) fn authorization_step(
     let view = View::pinned(&snapshot, sek, room, root, now)?;
     match view.floor_recipient_eligibility(entry)? {
         ContentEligibility::Eligible => {}
-        ContentEligibility::Ineligible => return Ok(Some(false)),
-        ContentEligibility::Refreshing => return Ok(None),
+        ContentEligibility::Ineligible => return Ok(Step::Done(false)),
+        ContentEligibility::Refreshing => return Ok(Step::Missing),
     }
     let generation = view.authority_generation();
     let revision = author(Transaction::Snapshot(&snapshot), sek, room, &floor.author)?.revision;
@@ -519,7 +558,7 @@ pub(in crate::node::channel) fn authorization_step(
                 match view.causal_contains(&entry.entry_hash(), &restoration)? {
                     Some(true) => {}
                     Some(false) => continue,
-                    None => return Ok(None),
+                    None => return Ok(Step::Missing),
                 }
                 if recipient_current {
                     state.phase = 0;
@@ -541,7 +580,7 @@ pub(in crate::node::channel) fn authorization_step(
                 };
                 state.after_source = seq;
                 let Some(other) = view.source(&hash)? else {
-                    return Ok(None);
+                    return Ok(Step::Missing);
                 };
                 let Some(other_floor) = other.payload.as_deref().and_then(Floor::read) else {
                     return Err(bad());
@@ -560,11 +599,11 @@ pub(in crate::node::channel) fn authorization_step(
                         state.phase = 1;
                         state.restoration = None;
                     }
-                    None => return Ok(None),
+                    None => return Ok(Step::Missing),
                 }
             }
-            3 => return Ok(Some(true)),
-            4 => return Ok(Some(false)),
+            3 => return Ok(Step::Done(true)),
+            4 => return Ok(Step::Done(false)),
             _ => return Err(bad()),
         }
     }
@@ -575,10 +614,10 @@ pub(in crate::node::channel) fn authorization_step(
     {
         let view = View::in_batch(&batch, sek, room, root, now)?;
         if view.authority_generation() != generation {
-            return Ok(None);
+            return Ok(Step::Missing);
         }
         if author(Transaction::Batch(&batch), sek, room, &floor.author)?.revision != revision {
-            return Ok(None);
+            return Ok(Step::Missing);
         }
     }
     let mut index = Write::open(&mut batch, sek, room)?;
@@ -586,9 +625,9 @@ pub(in crate::node::channel) fn authorization_step(
     index.seal()?;
     batch.commit()?;
     Ok(match state.phase {
-        3 => Some(true),
-        4 => Some(false),
-        _ => None,
+        3 => Step::Done(true),
+        4 => Step::Done(false),
+        _ => Step::Unfinished,
     })
 }
 
@@ -649,7 +688,8 @@ impl FloorSelection {
 }
 
 /// Resolve an exact recipient/generation floor from authenticated source entries.
-/// The returned boundary is published only after the bounded scan completes.
+/// The returned boundary is published only after the bounded scan completes. `None` while not
+/// decidable yet ([`authorized_floor_progress`] says why).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::node::channel) fn authorized_floor_step(
     store: &Store,
@@ -661,6 +701,36 @@ pub(in crate::node::channel) fn authorized_floor_step(
     membership: u64,
     recipient_current: bool,
 ) -> Result<Option<Option<SessionFloorBoundary>>> {
+    authorized_floor_progress(
+        store,
+        sek,
+        room,
+        root,
+        now,
+        key,
+        membership,
+        recipient_current,
+        true,
+    )
+    .map(Step::done)
+}
+
+/// [`authorized_floor_step`], saying whether a step that did not finish saved progress with
+/// more steps to take (`Unfinished`) or stopped at a missing fact (`Missing`). `step: false`
+/// only looks: a preparation not complete under the current basis is `Unfinished`, and nothing
+/// is written (no store writer is taken).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::node::channel) fn authorized_floor_progress(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    root: Digest32,
+    now: u64,
+    key: &SessionFloorKey,
+    membership: u64,
+    recipient_current: bool,
+    step: bool,
+) -> Result<Step<Option<SessionFloorBoundary>>> {
     use crate::node::channel::governance::View;
     let snapshot = store.snapshot()?;
     let view = View::pinned(&snapshot, sek, room, root, now)?;
@@ -693,19 +763,25 @@ pub(in crate::node::channel) fn authorized_floor_step(
         };
     }
     if state.done {
-        return Ok(Some(
+        return Ok(Step::Done(
             state
                 .best
                 .map(|(iteration, first)| (membership, iteration, first)),
         ));
     }
+    if !step {
+        return Ok(Step::Unfinished);
+    }
+    // Why this step stops short of done, unless the scan completes: its 64 iterations ran out
+    // (`Unfinished`) or an authorization step below stopped for its own reason.
+    let mut short = Step::Unfinished;
     for _ in 0..64 {
         let Some((seq, hash)) = source_after(&snapshot, sek, room, &key.0, state.after)? else {
             state.done = true;
             break;
         };
         let Some(entry) = view.source(&hash)? else {
-            return Ok(None);
+            return Ok(Step::Missing);
         };
         let floor = entry
             .payload
@@ -716,15 +792,19 @@ pub(in crate::node::channel) fn authorized_floor_step(
             && floor.membership == membership
         {
             match authorization_step(store, sek, room, root, now, &entry, false)? {
-                Some(true) => {
+                Step::Done(true) => {
                     if recipient_current {
                         match authorization_step(store, sek, room, root, now, &entry, true)? {
-                            Some(true) => {}
-                            Some(false) => {
+                            Step::Done(true) => {}
+                            Step::Done(false) => {
                                 state.after = seq;
                                 continue;
                             }
-                            None => break,
+                            Step::Unfinished => break,
+                            Step::Missing => {
+                                short = Step::Missing;
+                                break;
+                            }
                         }
                     }
                     let boundary = (floor.iteration, floor.first_seq);
@@ -732,8 +812,12 @@ pub(in crate::node::channel) fn authorized_floor_step(
                         state.best = Some(boundary);
                     }
                 }
-                Some(false) => {}
-                None => break,
+                Step::Done(false) => {}
+                Step::Unfinished => break,
+                Step::Missing => {
+                    short = Step::Missing;
+                    break;
+                }
             }
         }
         state.after = seq;
@@ -745,21 +829,25 @@ pub(in crate::node::channel) fn authorized_floor_step(
     {
         let view = View::in_batch(&batch, sek, room, root, now)?;
         if view.authority_generation() != generation {
-            return Ok(None);
+            return Ok(Step::Missing);
         }
         if author(Transaction::Batch(&batch), sek, room, &key.0)?.revision != revision {
-            return Ok(None);
+            return Ok(Step::Missing);
         }
     }
     let mut index = Write::open(&mut batch, sek, room)?;
     replace(&mut index, Tree::FloorSelection, tree_key, &state.bytes())?;
     index.seal()?;
     batch.commit()?;
-    Ok(state.done.then_some(
-        state
-            .best
-            .map(|(iteration, first)| (membership, iteration, first)),
-    ))
+    Ok(if state.done {
+        Step::Done(
+            state
+                .best
+                .map(|(iteration, first)| (membership, iteration, first)),
+        )
+    } else {
+        short
+    })
 }
 
 #[derive(Default)]
@@ -826,6 +914,49 @@ pub(in crate::node::channel) fn continuity_step(
     recipient: &Digest32,
     membership: u64,
 ) -> Result<Option<Option<(Generation, Generation)>>> {
+    continuity_progress(store, sek, room, author, recipient, membership).map(Step::done)
+}
+
+/// [`continuity_progress`] that only looks, in a store snapshot (no store writer): the range
+/// if its preparation is complete under the author's current floor revision and `membership`,
+/// else `Unfinished` (a write step prepares more).
+pub(in crate::node::channel) fn continuity_prepared(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    who: &Digest32,
+    recipient: &Digest32,
+    membership: u64,
+) -> Result<Step<Option<(Generation, Generation)>>> {
+    let snapshot = store.snapshot()?;
+    let revision = author(Transaction::Snapshot(&snapshot), sek, room, who)?.revision;
+    let work = descriptor(
+        Transaction::Snapshot(&snapshot),
+        sek,
+        room,
+        Tree::FloorContinuity,
+        &author_key(&pair(who, recipient)),
+    )?
+    .map(|bytes| Continuity::read(&bytes))
+    .transpose()?;
+    Ok(match work {
+        Some(work) if work.revision == revision && work.membership == membership && work.ready => {
+            Step::Done(work.lower.zip(work.upper))
+        }
+        _ => Step::Unfinished,
+    })
+}
+
+/// [`continuity_step`] as a `Step`: it reads only facts already indexed here, so a step that
+/// did not finish saved its progress and is always `Unfinished`, never `Missing`.
+pub(in crate::node::channel) fn continuity_progress(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+    recipient: &Digest32,
+    membership: u64,
+) -> Result<Step<Option<(Generation, Generation)>>> {
     let mut batch = store.batch()?;
     batch.derived();
     let mut index = Write::open(&mut batch, sek, room)?;
@@ -886,7 +1017,11 @@ pub(in crate::node::channel) fn continuity_step(
         index.seal()?;
         batch.commit()?;
     }
-    Ok(work.ready.then(|| work.lower.zip(work.upper)))
+    Ok(if work.ready {
+        Step::Done(work.lower.zip(work.upper))
+    } else {
+        Step::Unfinished
+    })
 }
 
 /// Resume an own-feed search without retaining entries. This is only used while publishing
