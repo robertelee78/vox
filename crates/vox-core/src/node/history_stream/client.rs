@@ -2,31 +2,24 @@
 //! another request; provisional bodies and verifier cursors survive only in bounded local slots.
 
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{
-    entry_store::sparse::CursorBinding, ChannelState, HistoryAdmissionRoom, ServedRoom,
+    entry_store::sparse::CursorBinding, ChannelState, HistoryAdmissionRoom,
 };
-use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
 use crate::node::store::{ReceivedFlow, Store};
-use crate::wire::WireError;
 
 use super::admission::{self, Advanced, Staged};
-use super::credit::Response;
-use super::source::{Held, Lookup, PreparedRead, Source};
-use super::transport::{Read, Transport};
-use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
+use super::source::{Lookup, OwnedRoom, Source};
+use super::{ProofKind, Query, RequestId};
 
 // Includes the actual maximum descriptor trace capacity, overlapping the verifier,
 // generated contexts and Directory scratch under the existing 12-MiB record job.
 const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024 + crate::log::history::PROOF_RANGE_BYTES;
 const RECORD_METADATA_WORK: usize = 64 * 1024;
 const ENTRY_VALIDATION_WORK: usize = 512 * 1024;
-// One atomic metadata object, or one selected staged body, per receiver handoff.
-const MAX_NEEDS: usize = 1;
 
 fn fresh_worker_peak(job: &crate::node::history_budget::Job, bytes: usize) -> Result<usize> {
     bytes
@@ -41,18 +34,6 @@ fn fresh_worker_peak(job: &crate::node::history_budget::Job, bytes: usize) -> Re
             "history record reconstruction envelope",
         ))
 }
-
-/// Proof-only interruption point after a hostile nonrecipient body has been refused and the
-/// archive cursor is durably parked on its authenticated header, but before semantic settlement.
-/// The trigger is renamed with `.engaged`; removing that engaged marker releases the worker.
-#[cfg(feature = "test-knobs")]
-pub const TEST_HOLD_ROLE_SETTLEMENT_ENV: &str = "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE";
-
-/// Proof-only interruption after a body which its authenticated header says belongs to another
-/// member is nevertheless durably appended by a mutant. The marker's exact 32 bytes are the entry
-/// hash; removing it releases the worker.
-#[cfg(feature = "test-knobs")]
-pub const TEST_BODY_DURABLE_ENV: &str = "VOX_TEST_HISTORY_BODY_DURABLE_FILE";
 
 /// Owned activation supplied by the actor after explicit archive demand or current live/control
 /// scheduling. Constructing a receiver never starts, resumes or replaces that activation.
@@ -71,74 +52,22 @@ pub(crate) struct Receiver {
     historical: bool,
     key_body: Option<super::KeyBodyNeed>,
     own_head_observed: Arc<std::sync::atomic::AtomicBool>,
+    /// The admission root's checked entry held in memory by the connection that fetched it:
+    /// the admission frontier's record source instead of the node's staging record (C5).
+    held: Option<super::pull::Ready>,
 }
 
 pub(crate) enum LocalProof {
-    AlreadyHeld,
     Verified(CursorBinding),
     Busy,
     Missing,
-}
-
-/// All results are bounded scheduling information, not permission to fetch another page.
-pub(crate) struct Received {
-    pub(crate) status: Status,
-    pub(crate) offered_availability: Option<super::super::channel::availability::Token>,
-    pub(crate) continuation: Option<Continuation>,
-    pub(crate) needs: Vec<Query>,
-    pub(crate) verifiers: Vec<CursorBinding>,
-    pub(crate) body_ready: Option<Digest32>,
-    /// Exact authenticated header whose private body this node's role must not receive. Its
-    /// inclusion and semantic settlement still have to complete before the archive can advance.
-    pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
-    pub(crate) body_progress: bool,
-    /// Local metadata admission found another publication, not a peer refusal or verifier yield.
-    pub(crate) local_publication_busy: bool,
-    pub(crate) inventory: Option<Inventory>,
-    pub(crate) key_availability: super::KeyAvailabilityResult,
-    pub(crate) heads: Vec<super::HeadHint>,
-    pub(crate) own_head_incarnations: Option<(u64, u64)>,
-    pub(crate) departure_receipt: Option<super::HeadHint>,
-    /// The exchange fetched an object this node did not hold (a head, header, context or
-    /// proof it saved): what makes a round not `empty` in `vox status --json` (ADR-038 FX-29).
-    pub(crate) brought: bool,
-}
-impl Received {
-    fn pending(status: Status) -> Self {
-        Self {
-            status,
-            offered_availability: None,
-            continuation: None,
-            needs: Vec::new(),
-            verifiers: Vec::new(),
-            body_ready: None,
-            role_ready: None,
-            body_progress: false,
-            local_publication_busy: false,
-            inventory: None,
-            key_availability: None,
-            heads: Vec::new(),
-            own_head_incarnations: None,
-            departure_receipt: None,
-            brought: false,
-        }
-    }
-    fn need(&mut self, query: Query) -> Result<()> {
-        if !self.needs.contains(&query) {
-            if self.needs.len() == MAX_NEEDS {
-                return Err(Error::SizeLimitExceeded("history missing evidence queue"));
-            }
-            self.needs.push(query);
-        }
-        Ok(())
-    }
 }
 
 impl Receiver {
     // The receiver retains one exact room, peer, grant, staging slot and cancellation scope.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        room: Arc<Mutex<ChannelState>>,
+        room: Arc<crate::node::channel::RoomLock>,
         store: Arc<Store>,
         peer: Digest32,
         epoch: u64,
@@ -173,53 +102,14 @@ impl Receiver {
             historical,
             key_body,
             own_head_observed,
+            held: None,
         }
     }
 
-    pub(super) async fn inventory(
-        &self,
-        job: &crate::node::history_budget::Job,
-    ) -> Result<
-        Lookup<(
-            Vec<super::HeadHint>,
-            Option<super::source::RoleAnnouncement>,
-            Option<([u8; 16], u64)>,
-            Option<super::source::CatalogAnnouncement>,
-            super::super::channel::availability::Token,
-            (Vec<Digest32>, Vec<super::HeadHint>),
-        )>,
-    > {
-        self.source.inventory(job).await
-    }
-
-    pub(super) async fn acknowledge_role(
-        &self,
-        job: &crate::node::history_budget::Job,
-        notice: super::source::RoleAnnouncement,
-    ) -> Result<()> {
-        self.source.acknowledge_role(job, notice).await
-    }
-
-    pub(super) async fn acknowledge_key_catalog(
-        &self,
-        job: &crate::node::history_budget::Job,
-        notice: super::source::CatalogAnnouncement,
-        connection_serial: u64,
-    ) -> Result<()> {
-        self.source
-            .acknowledge_key_catalog(job, notice, connection_serial)
-            .await
-    }
-
-    pub(super) async fn observe_availability(
-        &self,
-        job: &Job,
-        connection: u64,
-        token: super::super::channel::availability::Token,
-    ) -> Result<()> {
-        self.source
-            .observe_availability(job, connection, token)
-            .await
+    /// Admit from the body held in memory, never from the staging record.
+    pub(crate) fn with_held(mut self, held: super::pull::Ready) -> Self {
+        self.held = Some(held);
+        self
     }
 
     /// Build an exact control proof from this node's own canonical history and admit it through
@@ -246,34 +136,6 @@ impl Receiver {
         else {
             return Ok(LocalProof::Missing);
         };
-        // A relay may have the body under a different accepted head. Reuse only the
-        // exact locally authenticated inclusion receipt for this key-body request.
-        if let Some(need) = self.key_body.filter(|need| {
-            kind == super::ProofKind::Inclusion
-                && head == need.head
-                && from == need.seq
-                && to == need.seq
-        }) {
-            let held = self
-                .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-                    let input = room.history_read(store)?;
-                    let Some(receipt) =
-                        input.history_inclusion_receipt(&head, &need.target.author, need.seq)?
-                    else {
-                        return Ok(Some(false));
-                    };
-                    if receipt.header().entry().entry_hash() != need.hash {
-                        return Err(Error::MalformedAtRest("key body inclusion changed entry"));
-                    }
-                    Ok(Some(input.history_head_accepted(&head, receipt.binding())?))
-                })
-                .await?;
-            match held {
-                Lookup::Found(held) if held.value => return Ok(LocalProof::AlreadyHeld),
-                Lookup::Found(_) | Lookup::Missing => {}
-                Lookup::Busy => return Ok(LocalProof::Busy),
-            }
-        }
         let local = self.node;
         let signed = self
             .read(
@@ -346,629 +208,6 @@ impl Receiver {
         })
     }
 
-    /// The caller opens/handshakes the stream and owns its tracked cancellation fence.
-    pub(super) async fn pull(
-        &self,
-        io: &mut Transport,
-        request: RequestId,
-        query: Query,
-        handshake_bytes: usize,
-    ) -> Result<Received> {
-        let mut credit = Response::new(request, query.clone())?;
-        credit.charge_handshake(handshake_bytes)?;
-        let mut result = Received::pending(Status::ControlPending);
-        #[cfg(feature = "test-knobs")]
-        let mut unexpected_body = None;
-        loop {
-            let incoming = match io.read_required(credit.remaining_wire()).await? {
-                Read::Frame(frame) => frame,
-                Read::Busy => {
-                    io.abort(WireError::SessionBusy);
-                    result.status = Status::Busy;
-                    return Ok(result);
-                }
-                Read::End => return Err(Error::Unreachable("history response ended before DONE")),
-            };
-            // The parsed proof vector dies before moving the still-charged raw frame into a
-            // blocking worker. Its second decode never overlaps this first allocation.
-            let action = {
-                let frame = incoming.frame()?;
-                if let Err(error) = credit.accept(&frame, incoming.wire_len()) {
-                    // A hostile authenticated source can send the private bytes which its own
-                    // signed header says belong to somebody else. Refuse those bytes, but do not
-                    // discard the already authenticated header handoff. Its inclusion/effect
-                    // work remains queued locally and the archive resumes below it only after
-                    // that durable settlement. Any other malformed frame still fails the peer.
-                    let refused_exact_role_body = matches!(
-                        (&result.role_ready, &frame),
-                        (
-                            Some((_, _, expected)),
-                            Frame::Chunk {
-                                request: chunk_request,
-                                entry,
-                                offset: 0,
-                                bytes,
-                            }
-                        ) if *chunk_request == request && entry == expected && !bytes.is_empty()
-                    );
-                    if refused_exact_role_body {
-                        let Some((_, seq, _)) = result.role_ready else {
-                            unreachable!()
-                        };
-                        let Query::Page {
-                            head,
-                            lo,
-                            hi,
-                            entries,
-                            ..
-                        } = &query
-                        else {
-                            return Err(error);
-                        };
-                        let continuation = Continuation {
-                            query_kind: 4,
-                            head: *head,
-                            lo: *lo,
-                            hi: *hi,
-                            next_seq: seq,
-                            entry: None,
-                            offset: 0,
-                            entries_remaining: *entries,
-                        };
-                        result.continuation = self
-                            .checkpoint_response(
-                                io.job(),
-                                request,
-                                &query,
-                                Status::More,
-                                Some(continuation),
-                            )
-                            .await?;
-                        io.abort(WireError::ProtocolLimits);
-                        self.hold_role_settlement().await?;
-                        result.status = Status::ControlPending;
-                        return Ok(result);
-                    }
-                    return Err(error);
-                }
-                match frame {
-                    Frame::Meta { .. } => Action::Meta,
-                    Frame::Have {
-                        hints,
-                        role,
-                        key_catalog,
-                        availability,
-                        forks,
-                        unresolved,
-                    } => Action::Inventory(
-                        hints,
-                        role,
-                        key_catalog,
-                        availability,
-                        (forks, unresolved),
-                    ),
-                    Frame::KeyAvailability { instance, page, .. } => {
-                        Action::KeyAvailability(instance, page)
-                    }
-                    Frame::Chunk {
-                        entry,
-                        offset,
-                        bytes,
-                        ..
-                    } => Action::Chunk {
-                        entry,
-                        next: offset + bytes.len() as u64,
-                    },
-                    Frame::Done {
-                        status,
-                        continuation,
-                        ..
-                    } => Action::Done(status, continuation),
-                    _ => return Err(Error::MalformedBundle("unexpected history response")),
-                }
-            };
-            match action {
-                Action::Inventory(hints, role, key_catalog, token, (forks, unresolved)) => {
-                    if let (Some(connection), Some(token)) = (io.availability_connection, token) {
-                        self.observe_availability(io.job(), connection, token)
-                            .await?;
-                    }
-                    // MP-9: at most one listed fork this node has not frozen is asked for per
-                    // inventory; a listing alone records nothing. Rule 6: at most one unresolved
-                    // head is fetched by id or one own unresolved comparison resumed.
-                    let peer_heads: Vec<(Digest32, Digest32)> =
-                        hints.iter().map(|hint| (hint.author, hint.head)).collect();
-                    #[cfg(feature = "test-knobs")]
-                    let listed = (forks.len(), unresolved.len());
-                    let (fork, step) = match self
-                        .source
-                        .read(io.job(), 0, move |room, store| {
-                            let fork = if forks.is_empty() {
-                                None
-                            } else {
-                                room.history_fork_wanted(&forks)
-                            };
-                            let step = unresolved_ask(room, store, &unresolved, &peer_heads)?;
-                            Ok(Some((fork, step)))
-                        })
-                        .await?
-                    {
-                        Lookup::Found(found) => found.value,
-                        Lookup::Busy | Lookup::Missing => (None, None),
-                    };
-                    let ask = match step {
-                        Some(Advanced::Need(query)) => Some(query),
-                        Some(Advanced::Fork(pair)) => {
-                            // Held openings already prove it: recorded as any found fork.
-                            let (existing, conflicting) = *pair;
-                            if let Some(recorded) =
-                                self.record_fork(io.job(), existing, conflicting).await?
-                            {
-                                result.brought |= recorded;
-                            }
-                            None
-                        }
-                        _ => None,
-                    };
-                    #[cfg(feature = "test-knobs")]
-                    if listed != (0, 0) || ask.is_some() {
-                        eprintln!(
-                            "history inventory listed forks={} unresolved={} fork_asked={} \
-                             ask={ask:?}",
-                            listed.0,
-                            listed.1,
-                            fork.is_some()
-                        );
-                    }
-                    let charge = io.job().reserve_or_pressure(
-                        hints.capacity() * std::mem::size_of::<super::HeadHint>(),
-                    )?;
-                    result.inventory = Some(Inventory {
-                        hints,
-                        role,
-                        key_catalog,
-                        fork,
-                        ask,
-                        _charge: charge,
-                    });
-                    drop(incoming);
-                }
-                Action::KeyAvailability(instance, page) => {
-                    result.key_availability = Some((instance, page));
-                    drop(incoming);
-                }
-                Action::Meta if matches!(query, Query::Fork(_)) => {
-                    let &Query::Fork(author) = &query else {
-                        return Err(Error::MalformedBundle("fork response query changed"));
-                    };
-                    let Frame::Meta {
-                        object:
-                            super::Object::Fork {
-                                existing,
-                                conflicting,
-                            },
-                        ..
-                    } = incoming.frame()?
-                    else {
-                        return Err(Error::MalformedBundle("fork response kind"));
-                    };
-                    let existing = crate::log::entry::Entry::from_wire(existing)?;
-                    let conflicting = crate::log::entry::Entry::from_wire(conflicting)?;
-                    drop(incoming);
-                    if existing.payload.is_some()
-                        || conflicting.payload.is_some()
-                        || existing.skeleton.author_id != author
-                        || conflicting.skeleton.author_id != author
-                    {
-                        return Err(Error::MalformedBundle("fork response differs from request"));
-                    }
-                    let Some(recorded) = self.record_fork(io.job(), existing, conflicting).await?
-                    else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
-                    result.brought |= recorded;
-                }
-                Action::Meta => {
-                    let generation = self.generation;
-                    let peer = self.source.peer;
-                    let selected = query.clone();
-                    let committed = self.source.commit_ledger();
-                    let own_observed = Arc::clone(&self.own_head_observed);
-                    // The decoded frame still owns its admitted foreground worker. Reuse that
-                    // exact worker for the dependent room read: asking the original Control job
-                    // for a second foreground worker while retaining `incoming` can deadlock the
-                    // bounded worker pool. Its charges still account the complete overlapping
-                    // frame, directory and verifier peak on one owner.
-                    let work_job = incoming.job();
-                    let grant = self.grant();
-                    let staged = self
-                        .source
-                        .write_owned(
-                            &work_job,
-                            (VERIFY_ENVELOPE, 4 * 1024 * 1024, false),
-                            move |room, store| {
-                                grant.check(room, store)?;
-                                let incarnations = room
-                                    .history_inventory_incarnation(&peer)
-                                    .zip(room.history_author_inventory_incarnation(&room.me()));
-                                let pending = room.prepare_history_admission(
-                                    store,
-                                    Some((grant.node, grant.generation)),
-                                )?;
-                                Ok((pending, incarnations))
-                            },
-                            move |(pending, incarnations), store| {
-                                let Frame::Meta { object, .. } = incoming.frame()? else {
-                                    return Err(Error::MalformedBundle("metadata frame changed"));
-                                };
-                                let staged = pending.with(|room| {
-                                    admission::stage(
-                                        room,
-                                        store,
-                                        (&committed, &own_observed),
-                                        request,
-                                        generation,
-                                        &selected,
-                                        object,
-                                    )
-                                })?;
-                                Ok((staged, incarnations))
-                            },
-                            |_, _, value| Ok(value),
-                        )
-                        .await?;
-                    let Lookup::Found(staged) = staged else {
-                        result.local_publication_busy = matches!(staged, Lookup::Busy);
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
-                    match &staged.value.0 {
-                        Staged::Object { brought } => result.brought |= *brought,
-                        Staged::Busy => {
-                            io.abort(WireError::SessionBusy);
-                            result.status = Status::Busy;
-                            return Ok(result);
-                        }
-                        Staged::Head {
-                            head,
-                            tail,
-                            author,
-                            departure_receipt,
-                            held,
-                            brought,
-                        } => {
-                            if result.heads.len() >= MAX_NEEDS {
-                                return Err(Error::SizeLimitExceeded("history head result bound"));
-                            }
-                            if *author == self.node {
-                                result.own_head_incarnations = staged.value.1;
-                            }
-                            result.brought |= *brought;
-                            result.heads.push(super::HeadHint {
-                                author: *author,
-                                head: *head,
-                                size: *tail,
-                            });
-                            if *departure_receipt {
-                                result.departure_receipt = Some(super::HeadHint {
-                                    author: *author,
-                                    head: *head,
-                                    size: *tail,
-                                });
-                            } else if *held {
-                                // Already in the author's accepted chain: its tail header,
-                                // inclusion proof and promotion are done. Fetching and
-                                // verifying them again every period wrote a cursor, a
-                                // context per join and a receipt for nothing (ADR-038
-                                // FX-29); the window below resumes from what is held.
-                            } else if *tail == 0 {
-                                // The canonical empty head has no position-zero header. Its
-                                // ordinary empty consistency proof is the complete promotion
-                                // path and makes the exact head available for peer echo.
-                                result.need(Query::Proof {
-                                    head: *head,
-                                    kind: ProofKind::Consistency,
-                                    from: 0,
-                                    to: 0,
-                                })?;
-                            } else {
-                                result.need(Query::Header {
-                                    head: *head,
-                                    seq: *tail,
-                                })?;
-                            }
-                        }
-                        Staged::Verifier(binding) => {
-                            if result.verifiers.len() == MAX_NEEDS {
-                                return Err(Error::SizeLimitExceeded("history verifier handoff"));
-                            }
-                            result.brought = true;
-                            result.verifiers.push(*binding);
-                        }
-                        Staged::Header {
-                            entry,
-                            head,
-                            body_allowed,
-                            brought,
-                        } => {
-                            result.brought |= *brought;
-                            let seq = entry.skeleton.seq;
-                            result.need(Query::Proof {
-                                head: *head,
-                                kind: ProofKind::Inclusion,
-                                from: seq,
-                                to: seq,
-                            })?;
-                            if matches!(query, Query::Header { .. }) {
-                                continue;
-                            }
-                            // The authenticated header says this private package belongs to a
-                            // different member.  Do not create a body staging target or grant
-                            // chunk credit.  An honest peer completes the role-visible entry
-                            // header-only; an unexpected body frame is refused by credit.accept
-                            // before Action::Chunk can persist a byte.
-                            #[cfg(feature = "test-knobs")]
-                            if !body_allowed {
-                                unexpected_body = Some(entry.entry_hash());
-                            }
-                            if !body_allowed && !matches!(query, Query::KeyBody { .. }) {
-                                if result
-                                    .role_ready
-                                    .replace((*head, seq, entry.entry_hash()))
-                                    .is_some()
-                                {
-                                    return Err(Error::SizeLimitExceeded(
-                                        "history role-complete header handoff",
-                                    ));
-                                }
-                                continue;
-                            }
-                            let Some(staging) = &self.staging else {
-                                io.abort(WireError::SessionBusy);
-                                return Err(Error::Profile(
-                                    "history body has no authorized staging activation",
-                                ));
-                            };
-                            let header = entry.header_wire();
-                            let hash = entry.entry_hash();
-                            let length = entry.skeleton.payload_len;
-                            let staging = staging.clone();
-                            let job = io.job().clone();
-                            let head = *head;
-                            let expected_offset = match query {
-                                Query::Entry { offset, .. } | Query::KeyBody { offset, .. } => {
-                                    offset
-                                }
-                                _ => 0,
-                            };
-                            let fence = self.source.fence.clone();
-                            let deadline = self.source.deadline;
-                            let offset = tokio::task::spawn_blocking(move || {
-                                let _held_header = staged;
-                                current(&fence, deadline)?;
-                                let mut active = staging.active.lock().map_err(|_| {
-                                    Error::Profile("history activation lock failed")
-                                })?;
-                                let state = demand::inspect(&staging.context, &job)?
-                                    .ok_or(Error::Profile("history activation is absent"))?;
-                                if !active.matches(state.state())
-                                    || active.request() != request
-                                    || state.state().bounds.head != head
-                                {
-                                    return Err(Error::Profile(
-                                        "history activation binding changed",
-                                    ));
-                                }
-                                if let Some(body) = &state.state().body {
-                                    if body.entry != hash || body.offset != expected_offset {
-                                        return Err(Error::Profile(
-                                            "history response differs from persisted body",
-                                        ));
-                                    }
-                                } else if expected_offset != 0 {
-                                    return Err(Error::Profile(
-                                        "history continuation has no persisted body",
-                                    ));
-                                }
-                                drop(state);
-                                demand::begin_body(
-                                    &staging.context,
-                                    &mut active,
-                                    hash,
-                                    seq,
-                                    length,
-                                    &header,
-                                    &job,
-                                )?;
-                                Ok(expected_offset)
-                            })
-                            .await
-                            .map_err(|_| Error::Unreachable("history body staging stopped"))??;
-                            credit.expect_body(hash, length, offset)?;
-                            if length == offset {
-                                result.body_ready = Some(hash);
-                                result.continuation = self
-                                    .checkpoint_response(
-                                        io.job(),
-                                        request,
-                                        &query,
-                                        Status::ControlPending,
-                                        None,
-                                    )
-                                    .await?;
-                                io.abort(WireError::SessionBusy);
-                                return Ok(result);
-                            }
-                        }
-                    }
-                }
-                Action::Chunk { entry, next } => {
-                    let Some(staging) = &self.staging else {
-                        return Err(Error::Profile("history chunk has no activation"));
-                    };
-                    // The decoded chunk remains live through its durable append. Pre-admit the
-                    // mandatory post-append authority read on that exact foreground worker;
-                    // asking the original Control job for another worker while retaining this
-                    // one recreates the same bounded-pool ownership cycle as metadata staging.
-                    let work_job = incoming.job();
-                    let final_chunk = credit.pending_ack_completes(request, entry, next)?;
-                    let ack = Frame::Ack {
-                        request,
-                        entry,
-                        next_offset: next,
-                    };
-                    let encoded = ack.encode_required(io.job())?;
-                    credit.charge_overhead(encoded.as_slice().len() + 4)?;
-                    let Some(authority) = self.source.prepare_committed_read(&work_job).await?
-                    else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
-                    let checkpoint = final_chunk
-                        .then(|| {
-                            Ok::<_, Error>((
-                                demand::AdmissionCharge::reserve(io.job())?,
-                                demand::AdmissionCharge::reserve(io.job())?,
-                            ))
-                        })
-                        .transpose()?;
-                    let staging = staging.clone();
-                    let job = io.job().clone();
-                    let fence = self.source.fence.clone();
-                    let deadline = self.source.deadline;
-                    let committed = self.source.commit_ledger();
-                    let (persisted, complete) = tokio::task::spawn_blocking(move || {
-                        current(&fence, deadline)?;
-                        let Frame::Chunk {
-                            entry: exact,
-                            offset,
-                            bytes,
-                            ..
-                        } = incoming.frame()?
-                        else {
-                            return Err(Error::MalformedBundle("history chunk frame changed"));
-                        };
-                        let mut active = staging
-                            .active
-                            .lock()
-                            .map_err(|_| Error::Profile("history activation lock failed"))?;
-                        let progress = demand::append(
-                            &staging.context,
-                            &mut active,
-                            exact,
-                            offset,
-                            bytes,
-                            &job,
-                        )?;
-                        // Keep the successful persisted append visible even if this exchange is
-                        // cancelled before later metadata or ACK handling can report its work.
-                        committed.store(true, std::sync::atomic::Ordering::Release);
-                        Ok(progress)
-                    })
-                    .await
-                    .map_err(|_| Error::Unreachable("history chunk persistence stopped"))??;
-                    if persisted != next {
-                        return Err(Error::MalformedAtRest("history persisted offset differs"));
-                    }
-                    if complete != final_chunk {
-                        return Err(Error::MalformedAtRest(
-                            "history completed body differs from ACK credit",
-                        ));
-                    }
-                    #[cfg(feature = "test-knobs")]
-                    if complete && unexpected_body == Some(entry) {
-                        self.hold_unexpected_body_durable(&entry).await?;
-                    }
-                    // Durable nonempty chunk progress remains progress even if later metadata
-                    // or wire delivery fails within this same bounded response.
-                    result.body_progress = true;
-                    // The prepared read owns every byte needed for this exact post-commit
-                    // authority check. Elapsed observation time cannot replace the durable
-                    // append, while lifecycle and the captured grant remain exact fences.
-                    self.authorize_committed(authority).await?;
-                    credit.acknowledge(request, entry, persisted)?;
-                    io.write_encoded(&encoded).await?;
-                    if complete {
-                        result.body_ready = Some(entry);
-                        // Queue the final ACK and FIN before any local metadata operation. The
-                        // transport remembers this success, so a later local failure cannot reset
-                        // and discard the sender's causal Live-grant release.
-                        io.finish()?;
-                        let checkpoint = checkpoint
-                            .ok_or(Error::Profile("completed body has no prepaid checkpoint"))?;
-                        result.continuation = self
-                            .checkpoint_response_precharged(
-                                io.job(),
-                                request,
-                                &query,
-                                Status::ControlPending,
-                                None,
-                                checkpoint,
-                            )
-                            .await?;
-                        result.status = Status::ControlPending;
-                        return Ok(result);
-                    }
-                }
-                Action::Done(status, continuation) => {
-                    drop(incoming);
-                    result.status = status;
-                    result.continuation = self
-                        .checkpoint_response(io.job(), request, &query, status, continuation)
-                        .await?;
-                    io.finish()?;
-                    return Ok(result);
-                }
-            }
-        }
-    }
-
-    async fn hold_role_settlement(&self) -> Result<()> {
-        #[cfg(feature = "test-knobs")]
-        {
-            let Some(trigger) = std::env::var_os(TEST_HOLD_ROLE_SETTLEMENT_ENV)
-                .filter(|path| !path.is_empty())
-                .map(std::path::PathBuf::from)
-                .filter(|path| path.is_file())
-            else {
-                return Ok(());
-            };
-            let mut engaged = trigger.as_os_str().to_os_string();
-            engaged.push(".engaged");
-            let engaged: std::path::PathBuf = engaged.into();
-            std::fs::rename(&trigger, &engaged).map_err(|_| {
-                Error::Profile("test role-settlement marker could not record engagement")
-            })?;
-            while engaged.is_file() {
-                current(&self.source.fence, self.source.deadline)?;
-                // Apparatus polling only: removing the marker is the causal release; elapsed
-                // time never changes product state or makes the proof pass.
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "test-knobs")]
-    async fn hold_unexpected_body_durable(&self, entry: &Digest32) -> Result<()> {
-        if let Some(path) = std::env::var_os(TEST_BODY_DURABLE_ENV)
-            .filter(|path| !path.is_empty())
-            .map(std::path::PathBuf::from)
-        {
-            std::fs::write(&path, entry)
-                .map_err(|_| Error::Profile("test durable-body marker could not be written"))?;
-            while path.is_file() {
-                current(&self.source.fence, self.source.deadline)?;
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }
-        Ok(())
-    }
-
     /// MP-9: apply a fork proof (found by comparing two signed heads, or a peer's kept proof)
     /// through the room, as a fork at a held position is applied. `None` is local busy.
     async fn record_fork(
@@ -983,7 +222,7 @@ impl Receiver {
                 job,
                 (64 * 1024, 0, false),
                 |_, _| Ok(()),
-                |(), _| Ok(()),
+                |(), _, _| Ok(()),
                 move |room, store, ()| room.record_history_fork(store, existing, conflicting),
             )
             .await?;
@@ -1023,23 +262,6 @@ impl Receiver {
     }
 }
 
-enum Action {
-    KeyAvailability([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>),
-    Inventory(
-        Vec<super::HeadHint>,
-        Option<super::HeadHint>,
-        Option<([u8; 16], u64)>,
-        Option<super::super::channel::availability::Token>,
-        (Vec<Digest32>, Vec<super::HeadHint>),
-    ),
-    Meta,
-    Chunk {
-        entry: Digest32,
-        next: u64,
-    },
-    Done(Status, Option<Continuation>),
-}
-
 /// The complete record and its entire parse/seal/render working envelope travel together.
 /// No actor handoff may retain the entry while dropping this reservation.
 pub(crate) struct Record {
@@ -1048,6 +270,8 @@ pub(crate) struct Record {
     _charge: crate::node::history_budget::BufferCharge,
     admission: Option<demand::AdmissionCharge>,
     staged: Option<(RequestId, Digest32, StagedAdmission)>,
+    /// Its body came from the connection's private assembly, not from staging.
+    memory: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1145,6 +369,7 @@ impl Receiver {
                 _charge: charge,
                 admission,
                 staged: Some((active.request(), generation, StagedAdmission::Body)),
+                memory: false,
             })))
         })
         .await
@@ -1222,170 +447,6 @@ fn current(
 }
 
 impl Receiver {
-    /// Persist the peer's hint only after rebinding it to the original local authorization.
-    /// Metadata/control queries do not change an archive operation's page bounds or credit.
-    async fn checkpoint_response(
-        &self,
-        job: &crate::node::history_budget::Job,
-        request: RequestId,
-        query: &Query,
-        status: Status,
-        hint: Option<Continuation>,
-    ) -> Result<Option<Continuation>> {
-        self.checkpoint_response_inner(job, request, query, status, hint, None)
-            .await
-    }
-
-    async fn checkpoint_response_precharged(
-        &self,
-        job: &crate::node::history_budget::Job,
-        request: RequestId,
-        query: &Query,
-        status: Status,
-        hint: Option<Continuation>,
-        admission: (demand::AdmissionCharge, demand::AdmissionCharge),
-    ) -> Result<Option<Continuation>> {
-        // The job is unused on the prepaid branch; retain the common helper's exact state and
-        // cursor checks without permitting it to allocate after the durable append.
-        self.checkpoint_response_inner(job, request, query, status, hint, Some(admission))
-            .await
-    }
-
-    async fn checkpoint_response_inner(
-        &self,
-        job: &crate::node::history_budget::Job,
-        request: RequestId,
-        query: &Query,
-        status: Status,
-        hint: Option<Continuation>,
-        admission: Option<(demand::AdmissionCharge, demand::AdmissionCharge)>,
-    ) -> Result<Option<Continuation>> {
-        if !matches!(
-            query,
-            Query::Entry { .. } | Query::KeyBody { .. } | Query::Page { .. }
-        ) {
-            return Ok(hint);
-        }
-        let staging = self
-            .staging
-            .clone()
-            .ok_or(Error::Profile("history response has no staging activation"))?;
-        let fence = self.source.fence.clone();
-        let deadline = self.source.deadline;
-        let job = job.clone();
-        let requested_zero_entry = match query {
-            Query::Entry {
-                head,
-                seq,
-                offset: 0,
-            }
-            | Query::KeyBody {
-                head,
-                seq,
-                offset: 0,
-                ..
-            } => Some((*head, *seq)),
-            _ => None,
-        };
-        tokio::task::spawn_blocking(move || {
-            let committed = admission.is_some();
-            if !committed {
-                current(&fence, deadline)?;
-            }
-            let mut active = staging
-                .active
-                .lock()
-                .map_err(|_| Error::Profile("history activation lock failed"))?;
-            let (snapshot, write) = match admission {
-                Some((inspect, write)) => (
-                    demand::inspect_precharged(&staging.context, inspect)?,
-                    Some(write),
-                ),
-                None => (demand::inspect(&staging.context, &job)?, None),
-            };
-            let snapshot = snapshot.ok_or(Error::Profile("history activation disappeared"))?;
-            let state = snapshot.state();
-            if !active.matches(state) || active.request() != request {
-                return Err(Error::Profile("history response activation changed"));
-            }
-            let normalized = if let Some(body) = &state.body {
-                if hint.as_ref().is_some_and(|cursor| {
-                    // An honest Busy before the header carries no new body hash. A prior
-                    // response may already have persisted this exact header at offset zero;
-                    // preserve that durable knowledge rather than treating absence as conflict.
-                    let busy_before_header = status == Status::Busy
-                        && requested_zero_entry == Some((state.bounds.head, body.seq))
-                        && body.offset == 0
-                        && cursor.entry.is_none()
-                        && cursor.offset == 0;
-                    cursor.head != state.bounds.head
-                        || cursor.next_seq != body.seq
-                        || (!busy_before_header
-                            && (cursor.entry != Some(body.entry) || cursor.offset != body.offset))
-                }) {
-                    return Err(Error::MalformedBundle(
-                        "history body hint differs from storage",
-                    ));
-                }
-                Some(Continuation {
-                    query_kind: 3,
-                    head: state.bounds.head,
-                    lo: state.bounds.lo,
-                    hi: state.bounds.hi,
-                    next_seq: body.seq,
-                    entry: Some(body.entry),
-                    offset: body.offset,
-                    entries_remaining: state.remaining,
-                })
-            } else if let Some(hint) = hint {
-                if hint.head != state.bounds.head || hint.entry.is_some() || hint.offset != 0 {
-                    return Err(Error::MalformedBundle("history hint differs from storage"));
-                }
-                Some(Continuation {
-                    query_kind: 4,
-                    head: state.bounds.head,
-                    lo: state.bounds.lo,
-                    hi: state.bounds.hi,
-                    next_seq: hint.next_seq,
-                    entry: None,
-                    offset: 0,
-                    entries_remaining: state.remaining,
-                })
-            } else {
-                None
-            };
-            let progress = match status {
-                Status::EvidenceUnavailable | Status::BodyNotHeld => demand::Progress::Unavailable,
-                Status::More if normalized.is_some() => demand::Progress::More,
-                Status::Complete if state.body.is_none() && !state.reclaiming() => {
-                    demand::Progress::Complete
-                }
-                _ => demand::Progress::Pending,
-            };
-            drop(snapshot);
-            if let Some(write) = write.as_ref() {
-                demand::checkpoint_precharged(
-                    &staging.context,
-                    &mut active,
-                    progress,
-                    normalized.as_ref(),
-                    write,
-                )?;
-            } else {
-                demand::checkpoint(
-                    &staging.context,
-                    &mut active,
-                    progress,
-                    normalized.as_ref(),
-                    &job,
-                )?;
-            }
-            Ok(normalized)
-        })
-        .await
-        .map_err(|_| Error::Unreachable("history checkpoint worker stopped"))?
-    }
-
     /// Load one exact authenticated provisional header. Reserving from its signed length also
     /// covers a later effect worker opening an already held body; no archive scan is involved.
     pub(super) async fn header_record(
@@ -1402,7 +463,18 @@ impl Receiver {
         let header = self
             .read(&work_job, RECORD_METADATA_WORK, move |room, store| {
                 let input = room.history_read(store)?;
-                input.history_pending_header(&head, seq)
+                if let Some(pending) = input.history_pending_header(&head, seq)? {
+                    return Ok(Some(pending));
+                }
+                // A pending header is deleted when its position is published; under a head
+                // in the accepted chain the published one is the same header.
+                let Some(target) = input.history_head(&head)? else {
+                    return Ok(None);
+                };
+                if !input.history_head_accepted(&head, target.binding)? {
+                    return Ok(None);
+                }
+                input.history_position_header(&target.binding.author, seq)
             })
             .await?;
         let Lookup::Found(header) = header else {
@@ -1448,55 +520,223 @@ impl Receiver {
             _charge: charge,
             admission,
             staged: None,
+            memory: false,
         })))
     }
 
-    /// One preparation quantum. It never loops through an archive or through a fresh budget.
-    pub(super) async fn advance_source(
+    /// The whole checked entry the admitting connection holds in memory for `head`/`seq`.
+    async fn held_record(
+        &self,
+        job: &crate::node::history_budget::Job,
+        head: Digest32,
+        seq: u64,
+    ) -> Result<Option<Assembly>> {
+        let Some(entry) = self
+            .held
+            .as_ref()
+            .filter(|held| held.head == head && held.entry.skeleton.seq == seq)
+            .map(|held| &held.entry)
+            .filter(|entry| entry.payload.is_some())
+        else {
+            return Ok(None);
+        };
+        let envelope = 5
+            * (entry.skeleton.payload_len as usize + crate::log::history::MAX_HEADER_BYTES + 9)
+            + VERIFY_ENVELOPE;
+        let Some(record_job) = job.record_job(envelope).await else {
+            return Ok(Some(Assembly::Busy));
+        };
+        let pressure = record_job.byte_pressure(fresh_worker_peak(&record_job, envelope)?)?;
+        let Some(charge) = record_job.reserve(envelope) else {
+            return Ok(Some(Assembly::BytePressure(pressure)));
+        };
+        Ok(Some(Assembly::Ready(Arc::new(Record {
+            entry: (**entry).clone(),
+            job: record_job,
+            _charge: charge,
+            admission: None,
+            staged: None,
+            memory: true,
+        }))))
+    }
+
+    /// One entry's admission as ONE owned write of the room (`design/adopt/
+    /// ruling-admission-order.md`, Amendment 1 §3). From Begin (`begin`), or from its own
+    /// unfinished publication (`Publish`), one transaction publishes the source together with the
+    /// governance facts over it (`PendingHistorySource::publish_in`). Then, the room's
+    /// publication idle, the fold's bounded turn a governance change owes and one effect
+    /// quantum, each prepared and installed under the room lock and saved off it, all under the
+    /// one pending write this step reserved; the room is published once, at the write's end. A
+    /// departure's own-key response writers are stopped before the write starts: the one wait
+    /// it needs outside the room.
+    pub(super) async fn admit_entry(
         &self,
         record: Arc<Record>,
         binding: CursorBinding,
-    ) -> Result<Lookup<(Arc<Record>, bool)>> {
+        now: crate::time::Ms,
+        begin: bool,
+    ) -> Result<Lookup<(Arc<Record>, Admitted)>> {
         if binding.generation != self.generation {
             return Err(Error::Profile("history publication activation changed"));
         }
+        if begin {
+            self.hold_incoming_consent(&record).await?;
+        }
+        let kind = record.entry.skeleton.v2.as_ref().map(|header| header.kind);
+        // A join cannot narrow membership. If classification fails, gate conservatively until
+        // the effect verifies or rejects the body.
+        let needs_transition = kind == Some(crate::log::history::SignedEntryKind::Governance)
+            && match crate::governance::entry::GovEntry::body_bound_to(&record.entry) {
+                Ok(crate::governance::entry::GovBody::Presence(presence)) => !presence.body.here,
+                Ok(_) => false,
+                Err(_) => true,
+            };
+        let (transition, hold_effect) = self
+            .departure_transition(needs_transition, record.entry.skeleton.author_id)
+            .await?;
+        // The fold's turn runs inside this write: reserve its scratch as `Operation::Governance`.
+        let scratch = if matches!(
+            kind,
+            Some(
+                crate::log::history::SignedEntryKind::Governance
+                    | crate::log::history::SignedEntryKind::StepPolicy
+            )
+        ) {
+            4 * 1024 * 1024
+        } else {
+            0
+        };
         let job = record.job.clone();
-        let committed = self.source.commit_ledger();
         let grant = self.grant();
+        let effect = self.effect_inputs(now);
+        if begin {
+            let authorization = self.source.authorization();
+            return self
+                .source
+                .begin_owned(
+                    &job,
+                    (64 * 1024, scratch),
+                    binding.request,
+                    move |room, store| {
+                        grant.check(room, store)?;
+                        if record.entry.skeleton.author_id != binding.author
+                            || record.entry.skeleton.seq != binding.from
+                        {
+                            return Err(Error::Profile("history entry record changed"));
+                        }
+                        if room.channel_id() != binding.room {
+                            return Err(Error::Profile("history entry room changed"));
+                        }
+                        let facts = room.prepare_history_admission(store, authorization)?;
+                        let instance = room.history_instance(store)?;
+                        let epoch = room.epoch();
+                        let pending =
+                            room.prepare_history_begin(store, &record.entry, binding.request)?;
+                        Ok((record, facts, pending, instance, epoch))
+                    },
+                    move |(record, facts, pending, instance, epoch), store, owned| {
+                        let _transition = transition;
+                        // The validation token, re-derived from its sealed cursor in this write.
+                        let validated = match facts.with(|room| {
+                            admission::advance_entry(room, store, &effect.committed, binding)
+                        })? {
+                            admission::EntryAdvanced::Validated(validated) => validated,
+                            admission::EntryAdvanced::Busy => return Ok((record, Admitted::Busy)),
+                            _ => {
+                                return Err(Error::Profile(
+                                    "completed history validation requires renewed evidence",
+                                ))
+                            }
+                        };
+                        let saved = effect.received.scope(|| {
+                            pending.commit(
+                                store,
+                                &effect.committed,
+                                binding.request,
+                                &record.entry,
+                                &validated,
+                                binding,
+                                now,
+                                &effect.received,
+                                |batch| grant.check_batch(batch, binding.room, instance, epoch),
+                            )
+                        });
+                        let published = {
+                            let mut room = owned.lock()?;
+                            match room.finish_history_begin(saved)? {
+                                crate::node::channel::HistorySourceStart::Busy => {
+                                    return Ok((record, Admitted::Busy));
+                                }
+                                crate::node::channel::HistorySourceStart::Duplicate => {
+                                    return Ok((record, Admitted::Duplicate));
+                                }
+                                crate::node::channel::HistorySourceStart::Started(published) => {
+                                    room.install_history_source(&record.entry, &published)?;
+                                    published
+                                }
+                            }
+                        };
+                        let admitted =
+                            after_source(owned, store, &record, &published, hold_effect, &effect)?;
+                        Ok((record, admitted))
+                    },
+                    |_, _, value| Ok(value),
+                )
+                .await;
+        }
+        let retirement_request = self.source.retirement_request()?;
         self.source
             .write_owned(
                 &job,
-                (64 * 1024, 0, true),
+                (64 * 1024, scratch, true),
                 move |room, store| {
                     grant.check(room, store)?;
-                    let pending = room.prepare_history_publication(
-                        store,
-                        Some(record.entry.entry_hash()),
-                        Some(binding.request),
-                    )?;
-                    Ok((record, pending))
+                    if binding.room != room.channel_id()
+                        || binding.author != record.entry.skeleton.author_id
+                        || binding.from != record.entry.skeleton.seq
+                    {
+                        return Err(Error::Profile("history publication record changed"));
+                    }
+                    let instance = room.history_instance(store)?;
+                    let epoch = room.epoch();
+                    let pending =
+                        room.prepare_history_source(store, &record.entry, binding.request)?;
+                    Ok((record, pending, instance, epoch))
                 },
-                move |(record, pending), store| {
-                    pending
-                        .advance(store, &committed)
-                        .map(|advanced| (record, advanced))
+                move |(record, pending, instance, epoch), store, owned| {
+                    let _transition = transition;
+                    let published = pending.publish(
+                        store,
+                        &effect.committed,
+                        &record.entry,
+                        binding,
+                        now,
+                        &effect.received,
+                        |batch| grant.check_batch(batch, binding.room, instance, epoch),
+                    )?;
+                    {
+                        let mut room = owned.lock()?;
+                        room.install_history_source(&record.entry, &published)?;
+                        if published.cleaned() {
+                            room.settle_history_publication_flow(
+                                store,
+                                binding.request,
+                                retirement_request,
+                            )?;
+                        }
+                    }
+                    let admitted =
+                        after_source(owned, store, &record, &published, hold_effect, &effect)?;
+                    Ok((record, admitted))
                 },
                 |_, _, value| Ok(value),
             )
             .await
     }
 
-    pub(super) async fn commit_source(
-        &self,
-        record: Arc<Record>,
-        binding: CursorBinding,
-        now: crate::time::Ms,
-    ) -> Result<Lookup<(Arc<Record>, ())>> {
-        if binding.generation != self.generation {
-            return Err(Error::Profile("history publication activation changed"));
-        }
-        // Hold this exact signed consent before writer admission; sender-key delivery remains
-        // independent. The optional retained-row journey observes real rows on both sides.
+    /// Hold this exact signed consent before writer admission; sender-key delivery remains
+    /// independent. The optional retained-row journey observes real rows on both sides.
+    async fn hold_incoming_consent(&self, record: &Record) -> Result<()> {
         #[cfg(feature = "test-knobs")]
         if let Ok(crate::governance::entry::GovBody::ConsentGrant(consent)) =
             crate::governance::entry::GovEntry::body_bound_to(&record.entry)
@@ -1542,46 +782,62 @@ impl Receiver {
                 }
             }
         }
-        let job = record.job.clone();
-        let grant = self.grant();
-        let received = self.received.clone();
-        let committed = self.source.commit_ledger();
-        self.source
-            .write_owned(
-                &job,
-                (64 * 1024, 0, true),
-                move |room, store| {
-                    grant.check(room, store)?;
-                    if binding.room != room.channel_id()
-                        || binding.author != record.entry.skeleton.author_id
-                        || binding.from != record.entry.skeleton.seq
-                    {
-                        return Err(Error::Profile("history publication record changed"));
-                    }
-                    let instance = room.history_instance(store)?;
-                    let epoch = room.epoch();
-                    let pending =
-                        room.prepare_history_source(store, &record.entry, binding.request)?;
-                    Ok((record, pending, instance, epoch))
-                },
-                move |(record, pending, instance, epoch), store| {
-                    let saved = pending.commit(
-                        store,
-                        &committed,
-                        &record.entry,
-                        now,
-                        &received,
-                        |batch| grant.check_batch(batch, binding.room, instance, epoch),
-                    )?;
-                    Ok((record, saved))
-                },
-                |room, _, (record, saved)| {
-                    room.install_history_source(&record.entry, &saved)?;
-                    // Keep the verifier until the separately bounded Switched cleanup finishes.
-                    Ok((record, ()))
-                },
-            )
-            .await
+        #[cfg(not(feature = "test-knobs"))]
+        let _ = record;
+        Ok(())
+    }
+
+    /// Stop the departing author's own-key response writers before its departure's effect
+    /// commits, so no own-key release reaches it after; `true` when the test departure hold
+    /// keeps that effect pending instead.
+    async fn departure_transition(
+        &self,
+        needs_transition: bool,
+        author: Digest32,
+    ) -> Result<(
+        Option<crate::node::channel::own_writer_gate::Transition>,
+        bool,
+    )> {
+        if !needs_transition {
+            return Ok((None, false));
+        }
+        let (gate, me) = {
+            let room = tokio::select! {
+                biased;
+                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                room = self.source.room.lock() => room,
+            };
+            (Arc::clone(&room.own_writer_gate), room.me())
+        };
+        let self_departure = author == me;
+        // Keep a remote departure's effect pending while the leaver probes a live head.
+        #[cfg(feature = "test-knobs")]
+        if !self_departure
+            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).is_file())
+        {
+            return Ok((None, true));
+        }
+        let targets = (!self_departure).then(|| std::slice::from_ref(&author));
+        Ok((
+            Some(tokio::select! {
+                biased;
+                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                transition = gate.transition(targets) => transition,
+            }),
+            false,
+        ))
+    }
+
+    fn effect_inputs(&self, now: crate::time::Ms) -> EffectInputs {
+        EffectInputs {
+            grant: self.grant(),
+            received: self.received.clone(),
+            committed: self.source.commit_ledger(),
+            staging: self.staging.clone(),
+            historical: self.historical,
+            now,
+        }
     }
 
     pub(super) async fn cleanup_source(
@@ -1613,7 +869,7 @@ impl Receiver {
                     let input = room.history_read(store)?;
                     let included = input
                         .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
-                        .ok_or(Error::Profile("history cleanup inclusion missing"))?;
+                        .ok_or(Error::MalformedAtRest("history cleanup inclusion missing"))?;
                     if included.header().entry().header_wire() != record.entry.header_wire() {
                         return Err(Error::Profile("history cleanup head/entry changed"));
                     }
@@ -1625,7 +881,7 @@ impl Receiver {
                         room.prepare_history_publication(store, source, Some(binding.request))?;
                     Ok((record, pending))
                 },
-                move |(record, pending), store| {
+                move |(record, pending), store, _| {
                     Ok((
                         record,
                         pending.cleanup(store, &committed, Some(binding), None),
@@ -1661,18 +917,13 @@ impl Receiver {
         )>,
     > {
         let job = record.job.clone();
-        let staging = self.staging.clone();
-        let grant = self.grant();
-        let historical = self.historical;
-        let received = self.received.clone();
-        let committed = self.source.commit_ledger();
         // A staged record may contain only a header. Inspect the authenticated stored body
         // off actor so unrelated governance does not cancel an active key response.
         let governance =
             record.entry.skeleton.v2.as_ref().is_some_and(|header| {
                 header.kind == crate::log::history::SignedEntryKind::Governance
             });
-        let (needs_transition, self_departure) = if governance {
+        let needs_transition = if governance {
             let classified = self
                 .read_precharged(
                     &job,
@@ -1685,25 +936,22 @@ impl Receiver {
                             return Ok(None);
                         }
                         if input.history_effect_finished(&hash)? {
-                            return Ok(Some((false, false)));
+                            return Ok(Some(false));
                         }
                         let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
                             "pending history body record missing",
                         ))?;
                         // A join cannot narrow membership. If classification fails, gate
                         // conservatively until the effect verifies or rejects the body.
-                        let needs_transition =
+                        Ok(Some(
                             match crate::governance::entry::GovEntry::body_bound_to(&entry) {
                                 Ok(crate::governance::entry::GovBody::Presence(presence)) => {
                                     !presence.body.here
                                 }
                                 Ok(_) => false,
                                 Err(_) => true,
-                            };
-                        Ok(Some((
-                            needs_transition,
-                            record.entry.skeleton.author_id == room.me(),
-                        )))
+                            },
+                        ))
                     },
                 )
                 .await?;
@@ -1713,103 +961,44 @@ impl Receiver {
                 Lookup::Missing => return Ok(Lookup::Missing),
             }
         } else {
-            (false, false)
+            false
         };
-        // Keep a remote departure's effect pending while the leaver probes a live head.
-        #[cfg(feature = "test-knobs")]
-        if needs_transition
-            && !self_departure
-            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
-                .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
+        let (transition, hold_effect) = self
+            .departure_transition(needs_transition, record.entry.skeleton.author_id)
+            .await?;
+        if hold_effect {
             return Ok(Lookup::Busy);
         }
-        let transition = if needs_transition {
-            let gate = {
-                let room = tokio::select! {
-                    biased;
-                    () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                    room = self.source.room.lock() => room,
-                };
-                Arc::clone(&room.own_writer_gate)
-            };
-            let targets =
-                (!self_departure).then(|| std::slice::from_ref(&record.entry.skeleton.author_id));
-            Some(tokio::select! {
-                biased;
-                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                transition = gate.transition(targets) => transition,
-            })
-        } else {
-            None
-        };
-        let source = self.source.clone();
-        // Own both native quanta as one continuation. Cancelling the protocol waiter cannot
-        // drop the original post-render migration cadence between matching installations.
-        tokio::spawn(async move {
-            let _transition = transition;
-            let migration_received = received.clone();
-            let saved = source
-                .write_owned(
-                    &job,
-                    (64 * 1024, 0, false),
-                    move |room, store| {
-                        grant.check(room, store)?;
-                        let binding = (
-                            room.channel_id(),
-                            room.history_instance(store)?,
-                            room.epoch(),
-                        );
-                        let pending = room.prepare_received_effect(
-                            store,
-                            cursor,
-                            now,
-                            record.staged.is_some(),
-                            historical,
-                        )?;
-                        Ok((record, pending, binding))
-                    },
-                    move |(record, pending, (room, instance, epoch)), store| {
-                        let completed = pending.save(
-                            store,
-                            &committed,
-                            &received,
-                            None,
-                            |batch| grant.check_batch(batch, room, instance, epoch),
-                            |batch, hash| complete_staged(batch, staging.as_ref(), &record, hash),
-                        );
-                        Ok((record, completed, instance))
-                    },
-                    |room, store, (record, completed, instance)| {
-                        let migrate = completed.legacy_migration();
-                        let progress = room.finish_received(store, completed)?;
-                        Ok(((record, progress), migrate.map(|now| (instance, now))))
-                    },
-                )
-                .await?;
-            match saved {
-                Lookup::Found(saved) => {
-                    let saved = if let Some((instance, maintenance_now)) = saved.value.1 {
-                        migrate_received_legacy(
-                            &source,
-                            saved,
-                            grant,
-                            migration_received,
-                            maintenance_now,
-                            instance,
-                        )
-                        .await?
-                    } else {
-                        saved
-                    };
-                    Ok(Lookup::Found(saved.map(|(value, _)| value)))
-                }
-                Lookup::Busy => Ok(Lookup::Busy),
-                Lookup::Missing => Ok(Lookup::Missing),
-            }
-        })
-        .await
-        .map_err(|_| Error::Profile("history semantic continuation stopped"))?
+        let staged = record.staged.is_some() || record.memory;
+        let effect = self.effect_inputs(now);
+        self.source
+            .write_owned(
+                &job,
+                (64 * 1024, 0, false),
+                |_, _| Ok(()),
+                move |(), store, owned| {
+                    let _transition = transition;
+                    let progress = effect_quantum(
+                        owned,
+                        store,
+                        &record,
+                        &effect,
+                        |room, store| {
+                            room.prepare_received_effect(
+                                store,
+                                cursor,
+                                effect.now,
+                                staged,
+                                effect.historical,
+                            )
+                        },
+                        None,
+                    )?;
+                    Ok((record, progress))
+                },
+                |_, _, value| Ok(value),
+            )
+            .await
     }
 
     /// A body for a previously source-complete header is validated before replacing storage.
@@ -1820,138 +1009,189 @@ impl Receiver {
         now: crate::time::Ms,
     ) -> Result<Lookup<(Arc<Record>, crate::node::channel::HistoryEffectProgress)>> {
         let job = record.job.clone();
-        let staging = self.staging.clone();
-        let grant = self.grant();
-        let historical = self.historical;
         let key_body = self.key_body.filter(|need| {
-            need.target.author == record.entry.skeleton.author_id
+            need.author == record.entry.skeleton.author_id
                 && need.seq == record.entry.skeleton.seq
                 && need.hash == record.entry.entry_hash()
         });
-        let received = self.received.clone();
-        let committed = self.source.commit_ledger();
-        let source = self.source.clone();
-        tokio::spawn(async move {
-            let migration_received = received.clone();
-            let saved = source
-                .write_owned(
-                    &job,
-                    (64 * 1024, 0, false),
-                    move |room, store| {
-                        use crate::node::channel::governance::{
-                            PayloadValidation, TypedSparseBody,
-                        };
-                        grant.check(room, store)?;
-                        let key = room
-                            .history_author_key(&record.entry.skeleton.author_id)
-                            .ok_or(Error::MalformedBundle("history refill author vanished"))?;
-                        let body = match TypedSparseBody::verify(
-                            &record.entry,
-                            &key,
-                            &mut crate::log::history::WorkBudget::default(),
-                        )? {
-                            PayloadValidation::Complete(body) => body,
-                            _ => {
-                                return Err(Error::MalformedBundle(
-                                    "history refill body is incomplete",
-                                ))
-                            }
-                        };
-                        let binding = (
-                            room.channel_id(),
-                            room.history_instance(store)?,
-                            room.epoch(),
-                        );
-                        let pending = room.prepare_received_refill(
-                            store,
-                            &record.entry,
-                            &body,
-                            now,
-                            historical,
-                            key_body,
-                        )?;
-                        Ok((record, pending, binding))
-                    },
-                    move |(record, pending, (room, instance, epoch)), store| {
-                        let completed = pending.save(
-                            store,
-                            &committed,
-                            &received,
-                            Some(&record.entry),
-                            |batch| grant.check_batch(batch, room, instance, epoch),
-                            |batch, hash| complete_staged(batch, staging.as_ref(), &record, hash),
-                        );
-                        Ok((record, completed, instance))
-                    },
-                    |room, store, (record, completed, instance)| {
-                        let migrate = completed.legacy_migration();
-                        let (_, progress) = room.finish_received(store, completed)?;
-                        Ok(((record, progress), migrate.map(|now| (instance, now))))
-                    },
-                )
-                .await?;
-            match saved {
-                Lookup::Found(saved) => {
-                    let saved = if let Some((instance, maintenance_now)) = saved.value.1 {
-                        migrate_received_legacy(
-                            &source,
-                            saved,
-                            grant,
-                            migration_received,
-                            maintenance_now,
-                            instance,
-                        )
-                        .await?
-                    } else {
-                        saved
-                    };
-                    Ok(Lookup::Found(saved.map(|(value, _)| value)))
-                }
-                Lookup::Busy => Ok(Lookup::Busy),
-                Lookup::Missing => Ok(Lookup::Missing),
-            }
-        })
-        .await
-        .map_err(|_| Error::Profile("history refill continuation stopped"))?
+        let effect = self.effect_inputs(now);
+        self.source
+            .write_owned(
+                &job,
+                (64 * 1024, 0, false),
+                |_, _| Ok(()),
+                move |(), store, owned| {
+                    let (_, progress) = effect_quantum(
+                        owned,
+                        store,
+                        &record,
+                        &effect,
+                        |room, store| {
+                            use crate::node::channel::governance::{
+                                PayloadValidation, TypedSparseBody,
+                            };
+                            let key = room
+                                .history_author_key(&record.entry.skeleton.author_id)
+                                .ok_or(Error::MalformedAtRest("history refill author vanished"))?;
+                            let body = match TypedSparseBody::verify(
+                                &record.entry,
+                                &key,
+                                &mut crate::log::history::WorkBudget::default(),
+                            )? {
+                                PayloadValidation::Complete(body) => body,
+                                _ => {
+                                    return Err(Error::MalformedBundle(
+                                        "history refill body is incomplete",
+                                    ))
+                                }
+                            };
+                            room.prepare_received_refill(
+                                store,
+                                &record.entry,
+                                &body,
+                                effect.now,
+                                effect.historical,
+                                key_body,
+                            )
+                        },
+                        Some(&record.entry),
+                    )?;
+                    Ok((record, progress))
+                },
+                |_, _, value| Ok(value),
+            )
+            .await
     }
 }
 
-/// Preserve exactly one original legacy migration quantum after a committed semantic turn.
-/// Every native migration transaction rechecks the same flow grant, not a freshly acquired one.
-async fn migrate_received_legacy<V: Send + 'static>(
-    source: &Source,
-    held: Held<V>,
+/// How far one entry's owned admission write reached (`Receiver::admit_entry`).
+pub(super) enum Admitted {
+    /// Another publication owns the room, or validation found it busy.
+    Busy,
+    /// The position already holds this entry: its body/effect continue.
+    Duplicate,
+    /// The publication's DAG facts (`switched == false`: nothing of it is history yet) or its
+    /// cleanup continue in the next quantum.
+    Source { switched: bool },
+    /// Published, the room's publication idle, and one effect quantum ran.
+    Effect(
+        crate::node::channel::HistoryEffectCursor,
+        crate::node::channel::HistoryEffectProgress,
+    ),
+    /// Published; the test departure hold keeps its effect pending.
+    EffectHeld,
+}
+
+/// What an effect quantum needs from its receiver, owned by the native write running it.
+struct EffectInputs {
     grant: Grant,
     received: ReceivedFlow,
+    committed: Arc<std::sync::atomic::AtomicBool>,
+    staging: Option<Staging>,
+    historical: bool,
     now: crate::time::Ms,
-    expected_instance: [u8; 16],
-) -> Result<Held<V>> {
-    source
-        .continue_owned(
-            held,
-            expected_instance,
-            move |room, store| {
-                grant.check(room, store)?;
-                let binding = (room.channel_id(), expected_instance, room.epoch());
-                Ok((room.prepare_legacy_migration(store, now)?, binding))
-            },
-            move |(pending, (room, instance, epoch)), store| {
-                received.scope(|| {
-                    Ok(pending.map(|pending| {
-                        pending.run_guarded(store, |batch| {
-                            grant.check_batch(batch, room, instance, epoch)
-                        })
-                    }))
+}
+
+/// What follows a publication transaction inside the same owned write: once the room's
+/// publication is idle, the fold's bounded turn a governance change owes, as an unpublished
+/// room's construction takes it (`actor/construction_save.rs` `fold_unpublished_governance`:
+/// `advance_governance`, which also moves the room's governance display and its news), so the
+/// effect reads the governance it changed; then one effect quantum.
+fn after_source(
+    owned: &OwnedRoom<'_>,
+    store: &Store,
+    record: &Record,
+    published: &crate::node::channel::PublishedHistorySource,
+    hold_effect: bool,
+    effect: &EffectInputs,
+) -> Result<Admitted> {
+    if !published.cleaned() {
+        return Ok(Admitted::Source {
+            switched: published.switched(),
+        });
+    }
+    if published.governance_changed() {
+        let mut room = owned.lock_for_write()?;
+        effect.grant.check(&room, store)?;
+        match room.advance_governance(store, effect.now) {
+            Err(error) if ChannelState::governance_refreshing(&error) => {}
+            folded => {
+                folded?;
+            }
+        }
+    }
+    if hold_effect {
+        return Ok(Admitted::EffectHeld);
+    }
+    let staged = record.staged.is_some() || record.memory;
+    let cursor = crate::node::channel::HistoryEffectCursor::new(record.entry.entry_hash());
+    let (cursor, progress) = effect_quantum(
+        owned,
+        store,
+        record,
+        effect,
+        |room, store| {
+            room.prepare_received_effect(store, cursor, effect.now, staged, effect.historical)
+        },
+        None,
+    )?;
+    Ok(Admitted::Effect(cursor, progress))
+}
+
+/// One semantic effect (or refill) quantum and the legacy migration quantum it owes, inside an
+/// owned write: each prepared and installed under the room lock, each saved off it. Every
+/// native transaction rechecks the same flow grant.
+fn effect_quantum(
+    owned: &OwnedRoom<'_>,
+    store: &Store,
+    record: &Record,
+    effect: &EffectInputs,
+    prepare: impl FnOnce(
+        &mut ChannelState,
+        &Store,
+    ) -> Result<crate::node::channel::pending_received::PendingReceived>,
+    refill: Option<&crate::log::entry::Entry>,
+) -> Result<(
+    crate::node::channel::HistoryEffectCursor,
+    crate::node::channel::HistoryEffectProgress,
+)> {
+    let grant = effect.grant;
+    let (pending, (room, instance, epoch)) = {
+        let mut room = owned.lock_for_write()?;
+        grant.check(&room, store)?;
+        let binding = (
+            room.channel_id(),
+            room.history_instance(store)?,
+            room.epoch(),
+        );
+        (prepare(&mut room, store)?, binding)
+    };
+    let completed = pending.save(
+        store,
+        &effect.committed,
+        &effect.received,
+        refill,
+        |batch| grant.check_batch(batch, room, instance, epoch),
+        |batch, hash| complete_staged(batch, effect.staging.as_ref(), record, hash),
+    );
+    let migrate = completed.legacy_migration();
+    let progress = owned.lock()?.finish_received(store, completed)?;
+    if let Some(maintenance_now) = migrate {
+        let pending = {
+            let room = owned.lock()?;
+            grant.check(&room, store)?;
+            room.prepare_legacy_migration(store, maintenance_now)?
+        };
+        if let Some(pending) = pending {
+            let completed = effect.received.scope(|| {
+                pending.run_guarded(store, |batch| {
+                    grant.check_batch(batch, room, instance, epoch)
                 })
-            },
-            |room, _, completed| {
-                if let Some(completed) = completed {
-                    room.finish_legacy_migration(completed)?;
-                }
-                Ok(())
-            },
-        )
-        .await
+            });
+            owned.lock()?.finish_legacy_migration(completed)?;
+        }
+    }
+    Ok(progress)
 }
 
 fn complete_staged(
@@ -2013,12 +1253,17 @@ pub(crate) enum LocalStep {
 #[derive(Clone, Copy)]
 pub(crate) enum EntryPhase {
     Start,
-    Preflight { parent: usize, next: usize },
+    Preflight {
+        parent: usize,
+        next: usize,
+    },
     Body,
     Validate(CursorBinding),
+    /// Validation done: one owned write begins the publication and, as far as its quantum
+    /// reaches, publishes the source and runs its fold turn and first effect quantum.
     Begin(CursorBinding),
-    Prepare(CursorBinding),
-    Commit(CursorBinding),
+    /// The same write resuming this request's publication whose DAG facts are unfinished.
+    Publish(CursorBinding),
     Cleanup(CursorBinding),
     Refill,
     Effect(Option<crate::node::channel::HistoryEffectCursor>),
@@ -2048,6 +1293,9 @@ pub(crate) struct LocalResult {
     pub(crate) governance: bool,
     pub(crate) busy: bool,
     pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
+    /// A control-effects step made its author's Session controls current here, which they were
+    /// not: permission news for the room's tellers (`Flow::controls_ready`).
+    pub(crate) controls_ready: bool,
 }
 impl LocalResult {
     fn next(step: LocalStep) -> Self {
@@ -2059,6 +1307,7 @@ impl LocalResult {
             governance: false,
             busy: false,
             byte_pressure: None,
+            controls_ready: false,
         }
     }
     fn done() -> Self {
@@ -2070,6 +1319,7 @@ impl LocalResult {
             governance: false,
             busy: false,
             byte_pressure: None,
+            controls_ready: false,
         }
     }
     fn wait(step: LocalStep, need: LocalNeed) -> Self {
@@ -2081,6 +1331,7 @@ impl LocalResult {
             governance: false,
             busy: false,
             byte_pressure: None,
+            controls_ready: false,
         }
     }
     fn busy(step: LocalStep) -> Self {
@@ -2092,6 +1343,7 @@ impl LocalResult {
             governance: false,
             busy: true,
             byte_pressure: None,
+            controls_ready: false,
         }
     }
 
@@ -2112,7 +1364,7 @@ impl Receiver {
         step: LocalStep,
         now: crate::time::Ms,
     ) -> Result<LocalResult> {
-        use crate::node::channel::{HistoryEffectProgress as Effect, HistorySourceStart as Start};
+        use crate::node::channel::HistoryEffectProgress as Effect;
         match step {
             LocalStep::Verify(binding) => {
                 let Lookup::Found(value) = self.advance(job, binding).await? else {
@@ -2168,14 +1420,22 @@ impl Receiver {
                 phase,
                 EntryPhase::Body
                     | EntryPhase::Begin(_)
-                    | EntryPhase::Commit(_)
+                    | EntryPhase::Publish(_)
                     | EntryPhase::Refill
                     | EntryPhase::Effect(_)
             );
-        let completion =
-            matches!(phase, EntryPhase::Refill | EntryPhase::Effect(_)) && (body || role_header);
+        let completion = matches!(
+            phase,
+            EntryPhase::Begin(_)
+                | EntryPhase::Publish(_)
+                | EntryPhase::Refill
+                | EntryPhase::Effect(_)
+        ) && (body || role_header);
         let assembly = if full {
-            self.assemble(job, completion).await?
+            match self.held_record(job, head, seq).await? {
+                Some(assembly) => assembly,
+                None => self.assemble(job, completion).await?,
+            }
         } else {
             let local_work = if matches!(phase, EntryPhase::Validate(_)) {
                 ENTRY_VALIDATION_WORK
@@ -2202,7 +1462,7 @@ impl Receiver {
         if record.entry.skeleton.seq != seq {
             return Err(Error::Profile("history local step entry changed"));
         }
-        if (body && !full) || role_header {
+        if self.held.is_none() && ((body && !full) || role_header) {
             let staged = Some((
                 request,
                 self.generation,
@@ -2285,8 +1545,36 @@ impl Receiver {
                     governance: is_governance,
                     busy: false,
                     byte_pressure: None,
+                    controls_ready: false,
                 },
             }
+        };
+        // An effect quantum's outcome, whichever write ran it: a continuation resumes at its
+        // exact cursor in the Effect phase.
+        let effect_step = |cursor, progress| -> LocalResult {
+            if let Effect::RefillPending { governance } = progress {
+                let refill = next(EntryPhase::Refill);
+                return if governance {
+                    LocalResult::wait(refill, LocalNeed::Governance)
+                } else {
+                    LocalResult::next(refill)
+                };
+            }
+            let mut result = effect_result(progress);
+            if let Some(LocalStep::Entry {
+                body, role_header, ..
+            }) = result.next
+            {
+                result.next = Some(LocalStep::Entry {
+                    request,
+                    head,
+                    seq,
+                    body,
+                    role_header,
+                    phase: EntryPhase::Effect(Some(cursor)),
+                });
+            }
+            result
         };
         Ok(match phase {
             EntryPhase::Start | EntryPhase::Body => {
@@ -2404,83 +1692,28 @@ impl Receiver {
                     admission::EntryAdvanced::Busy => LocalResult::busy(step),
                 }
             }
-            EntryPhase::Begin(binding) => {
-                let job = record.job.clone();
-                let committed = self.source.commit_ledger();
-                let verified = self.advance_entry(Arc::clone(&record), binding).await?;
-                let Lookup::Found(verified) = verified else {
-                    return Ok(LocalResult::busy(step));
-                };
-                let admission::EntryAdvanced::Validated(validated) = verified.value.1 else {
-                    return Err(Error::Profile(
-                        "completed history validation requires renewed evidence",
-                    ));
-                };
-                let grant = self.grant();
-                let received = self.received.clone();
-                let value = self
-                    .source
-                    .begin_owned(
-                        &job,
-                        (64 * 1024, 0),
-                        request,
-                        move |room, store| {
-                            grant.check(room, store)?;
-                            let instance = room.history_instance(store)?;
-                            let epoch = room.epoch();
-                            let pending =
-                                room.prepare_history_begin(store, &record.entry, &validated)?;
-                            Ok((record, validated, pending, instance, epoch))
-                        },
-                        move |(record, validated, pending, instance, epoch), store| {
-                            let saved = received.scope(|| {
-                                pending.commit(
-                                    store,
-                                    &committed,
-                                    request,
-                                    &record.entry,
-                                    &validated,
-                                    binding,
-                                    now,
-                                    |batch| grant.check_batch(batch, binding.room, instance, epoch),
-                                )
-                            });
-                            Ok((record, saved))
-                        },
-                        |room, _, (record, saved)| {
-                            room.finish_history_begin(saved)
-                                .map(|started| (record, started))
-                        },
-                    )
-                    .await?;
-                let Lookup::Found(value) = value else {
+            EntryPhase::Begin(binding) | EntryPhase::Publish(binding) => {
+                let begin = matches!(phase, EntryPhase::Begin(_));
+                let Lookup::Found(value) = self.admit_entry(record, binding, now, begin).await?
+                else {
                     return Ok(LocalResult::busy(step));
                 };
                 match value.value.1 {
-                    Start::Started => LocalResult::next(next(EntryPhase::Prepare(binding))),
-                    Start::Duplicate => LocalResult::next(next(if body {
+                    Admitted::Busy => LocalResult::busy(step),
+                    Admitted::Duplicate => LocalResult::next(next(if body {
                         EntryPhase::Refill
                     } else {
                         EntryPhase::Effect(None)
                     })),
-                    Start::Busy => LocalResult::busy(step),
+                    Admitted::Source { switched: false } => {
+                        LocalResult::next(next(EntryPhase::Publish(binding)))
+                    }
+                    Admitted::Source { switched: true } => {
+                        LocalResult::next(next(EntryPhase::Cleanup(binding)))
+                    }
+                    Admitted::EffectHeld => LocalResult::busy(next(EntryPhase::Effect(None))),
+                    Admitted::Effect(cursor, progress) => effect_step(cursor, progress),
                 }
-            }
-            EntryPhase::Prepare(binding) => {
-                let Lookup::Found(value) = self.advance_source(record, binding).await? else {
-                    return Ok(LocalResult::busy(step));
-                };
-                LocalResult::next(next(if value.value.1 {
-                    EntryPhase::Commit(binding)
-                } else {
-                    phase
-                }))
-            }
-            EntryPhase::Commit(binding) => {
-                let Lookup::Found(_) = self.commit_source(record, binding, now).await? else {
-                    return Ok(LocalResult::busy(step));
-                };
-                LocalResult::next(next(EntryPhase::Cleanup(binding)))
             }
             EntryPhase::Cleanup(binding) => {
                 let Lookup::Found(value) = self.cleanup_source(record, binding).await? else {
@@ -2526,29 +1759,7 @@ impl Receiver {
                     return Ok(LocalResult::busy(step));
                 };
                 let (cursor, progress) = value.value.1;
-                if let Effect::RefillPending { governance } = progress {
-                    let refill = next(EntryPhase::Refill);
-                    return Ok(if governance {
-                        LocalResult::wait(refill, LocalNeed::Governance)
-                    } else {
-                        LocalResult::next(refill)
-                    });
-                }
-                let mut result = effect_result(progress);
-                if let Some(LocalStep::Entry {
-                    body, role_header, ..
-                }) = result.next
-                {
-                    result.next = Some(LocalStep::Entry {
-                        request,
-                        head,
-                        seq,
-                        body,
-                        role_header,
-                        phase: EntryPhase::Effect(Some(cursor)),
-                    });
-                }
-                result
+                effect_step(cursor, progress)
             }
         })
     }
@@ -2568,41 +1779,46 @@ impl Receiver {
         let committed = self.source.commit_ledger();
         let value = self
             .source
-            .write_admission_available(
+            .write_admission(
                 &work_job,
                 (VERIFY_ENVELOPE, 4 * 1024 * 1024),
                 move |room, store| {
                     let input = room.history_read(store)?;
+                    let named = input
+                        .history_head(&head)?
+                        .ok_or(Error::MalformedAtRest("control target head missing"))?;
+                    // Control facts are kept per author (`control_prefix_complete`); an older
+                    // committed head is replaced by the author's current one only so that a
+                    // coverage need names the head this node and its peers hold now.
+                    let head = match input
+                        .sparse_author(&named.binding.author, named.binding.scope)?
+                        .and_then(|state| state.committed)
+                    {
+                        Some(current)
+                            if current != head
+                                && input.history_head_committed(&head, named.binding)? =>
+                        {
+                            current
+                        }
+                        _ => head,
+                    };
                     let target = input
                         .history_head(&head)?
                         .ok_or(Error::MalformedAtRest("control target head missing"))?;
                     if through == 0 || through > target.root.leaves {
-                        return Err(Error::Profile("control receipt bound exceeds target"));
+                        return Err(Error::MalformedAtRest(
+                            "control receipt bound exceeds target",
+                        ));
                     }
                     let complete = if effects {
                         input.control_effects_complete(&head, through)?
                     } else {
                         input.control_sources_complete(&head, through)?
                     };
-                    let mut serving_progress = !complete;
                     if complete {
-                        // Effects may finish while this signed head is still only observed. The
-                        // effect walker then cannot publish its exact-head receipt yet. Once the
-                        // same head commits, do one writer turn even though its prefix is already
-                        // complete so `advance_control_effects` can atomically promote it to
-                        // `control_ready`; otherwise every later inventory re-offers it forever.
-                        let state =
-                            input.sparse_author(&target.binding.author, target.binding.scope)?;
-                        let receipt_ready = !effects
-                            || through < target.root.leaves
-                            || state
-                                .as_ref()
-                                .is_some_and(|state| state.control_ready == Some(head));
-                        if receipt_ready {
-                            return Ok(((SourceProgress::Complete { through }, None), false));
-                        }
-                        serving_progress = state.is_some_and(|state| state.committed == Some(head));
+                        return Ok((SourceProgress::Complete { through }, None, head, false));
                     }
+                    let leaves = target.root.leaves;
                     drop(input);
                     let progress = room.history_write_tracked(store, &committed, |index| {
                         if effects {
@@ -2611,6 +1827,17 @@ impl Receiver {
                             index.advance_control_sources(&head, through)
                         }
                     })?;
+                    // The author's effect prefix was below its committed size (not complete
+                    // above, and `through` reaches that size) and this step brought it there:
+                    // its Session controls became current (`history_control_ready`) here.
+                    let ready = effects
+                        && through >= leaves
+                        && matches!(
+                            progress,
+                            SourceProgress::Complete { through: done }
+                                | SourceProgress::Progress { through: done }
+                                if done >= leaves
+                        );
                     let needed = if let SourceProgress::PendingEffect { hash } = &progress {
                         let input = room.history_read(store)?;
                         input
@@ -2626,18 +1853,15 @@ impl Receiver {
                     } else {
                         None
                     };
-                    let available = serving_progress
-                        && matches!(progress,
-                        SourceProgress::Complete { through: done }
-                        | SourceProgress::Progress { through: done } if done >= through);
-                    Ok(((progress, needed), available))
+                    Ok((progress, needed, head, ready))
                 },
             )
             .await?;
         let Lookup::Found(value) = value else {
             return Ok(LocalResult::busy(step));
         };
-        Ok(match value.value {
+        let (progress, needed, head, controls_ready) = value.value;
+        let mut result = match (progress, needed) {
             (
                 SourceProgress::Complete { through: done }
                 | SourceProgress::Progress { through: done },
@@ -2686,7 +1910,10 @@ impl Receiver {
                     "pending history effect header missing",
                 ));
             }
-        })
+        };
+        // The author's Session controls became current in this step: permission news, once.
+        result.controls_ready = controls_ready;
+        Ok(result)
     }
 }
 
@@ -2729,32 +1956,6 @@ impl Receiver {
         Grant {
             node: self.node,
             generation: self.generation,
-        }
-    }
-    /// The canonical body of this node's own held head that a head-bound request names (ADR-053
-    /// P). The provider treats it as an untrusted selector; this node keeps verifying every
-    /// response under the exact signed head.
-    pub(super) async fn request_target(
-        &self,
-        job: &crate::node::history_budget::Job,
-        head: Digest32,
-    ) -> Result<crate::log::history::HeadTarget> {
-        match self
-            .read(
-                job,
-                crate::log::history::MAX_HEADER_BYTES,
-                move |room, store| {
-                    Ok(room
-                        .history_read(store)?
-                        .history_head(&head)?
-                        .map(|signed| signed.target()))
-                },
-            )
-            .await?
-        {
-            Lookup::Found(held) => Ok(held.value),
-            Lookup::Busy => Err(Error::Unreachable("history request head read busy")),
-            Lookup::Missing => Err(Error::Unreachable("history request head is not held here")),
         }
     }
     async fn read<T, F>(
@@ -2800,101 +2001,4 @@ impl Receiver {
             })
             .await
     }
-    async fn authorize_committed(&self, admission: PreparedRead) -> Result<()> {
-        let grant = self.grant();
-        match self
-            .source
-            .read_committed(admission, move |room, store| {
-                grant.check(room, store)?;
-                Ok(Some(()))
-            })
-            .await?
-        {
-            Lookup::Found(_) => Ok(()),
-            Lookup::Busy | Lookup::Missing => Err(Error::Profile(
-                "committed history authority read disappeared",
-            )),
-        }
-    }
-}
-
-/// MP-9 (rule 6): what this node would ask for an unresolved head a peer listed, its author not
-/// frozen and its key held: the head by its id when not held here, else the next step of
-/// comparing it with the accepted head (a request to that peer, which proved under it what it
-/// kept, or the fork the held openings already prove).
-fn listed_step(
-    room: &dyn ServedRoom,
-    read: &crate::node::channel::entry_store::Read<'_>,
-    hint: &super::HeadHint,
-) -> Result<Option<Advanced>> {
-    if room.history_fork_wanted(&[hint.author]).is_none() {
-        return Ok(None);
-    }
-    if read.history_head(&hint.head)?.is_none() {
-        return Ok(Some(Advanced::Need(Query::HeadById(hint.head))));
-    }
-    admission::comparison_step(read, &hint.author, hint.head)
-}
-
-/// MP-9: whether a peer's inventory listing names something this node would ask that peer for:
-/// a fork it has not frozen, or (rule 6) an unresolved head it does not hold or has not finished
-/// comparing. A listing is never evidence; when a peer's inventory request carries one, it is
-/// this node's reason to run its own inventory exchange with that peer, as a new head hint is
-/// (`server::answer`).
-pub(super) fn listing_wanted(
-    room: &dyn ServedRoom,
-    store: &Store,
-    forks: &[Digest32],
-    unresolved: &[super::HeadHint],
-) -> Result<bool> {
-    if room.history_fork_wanted(forks).is_some() {
-        return Ok(true);
-    }
-    let read = room.history_read(store)?;
-    for hint in unresolved {
-        if listed_step(room, &read, hint)?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// MP-9 (rule 6), one per inventory: for an unresolved head the peer listed, fetch it by its id
-/// or take the next step of its comparison (`listed_step`); or else take the next step of this
-/// node's own kept unresolved comparison of an author the peer holds. A step a peer once declined
-/// is asked again here, at most one per inventory, never by a timer of its own.
-fn unresolved_ask(
-    room: &ChannelState,
-    store: &Store,
-    listed: &[super::HeadHint],
-    peer_heads: &[(Digest32, Digest32)],
-) -> Result<Option<Advanced>> {
-    let read = room.history_read(store)?;
-    for hint in listed {
-        if let Some(step) = listed_step(room, &read, hint)? {
-            return Ok(Some(step));
-        }
-    }
-    for (author, _) in peer_heads {
-        if room.history_author_frozen(author) {
-            continue;
-        }
-        if let Some(step) = admission::unresolved_step(&read, author)? {
-            return Ok(Some(step));
-        }
-    }
-    Ok(None)
-}
-
-/// Charged scalar hints only. They never advance a feed or authorize a body request.
-pub(crate) struct Inventory {
-    pub(crate) hints: Vec<super::HeadHint>,
-    pub(crate) role: Option<super::HeadHint>,
-    pub(crate) key_catalog: Option<([u8; 16], u64)>,
-    /// MP-9: one fork the peer listed that this node has not frozen, to ask for.
-    pub(crate) fork: Option<Digest32>,
-    /// MP-9 (rule 6): one request for an unresolved comparison: a listed head by its id, or
-    /// what this node's own kept unresolved head still needs.
-    pub(crate) ask: Option<Query>,
-    _charge: crate::node::history_budget::BufferCharge,
 }

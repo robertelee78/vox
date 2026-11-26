@@ -21,29 +21,68 @@ pub(crate) struct RoomSnapshot {
     left: BTreeSet<Digest32>,
     frozen: BTreeSet<Digest32>,
     /// MP-9: per frozen author whose kept proof is still signed, its two signed entry headers:
-    /// what the inventory lists and `Query::Fork` serves.
+    /// what `Query::Fork` serves (the Have's fork flag is the record's, `held_history`).
     forks: BTreeMap<Digest32, (Vec<u8>, Vec<u8>)>,
     back: BTreeMap<Digest32, u64>,
     left_at: BTreeMap<Digest32, u64>,
-    held: BTreeMap<Digest32, u64>,
     recovery: BTreeSet<Digest32>,
-    availability: BTreeMap<Digest32, Arc<availability::Peer>>,
     creator: Digest32,
     now_hint: u64,
     /// Whether the room syncs by bounded history requests at all.
     sparse: bool,
+    /// What this node holds of each author's history, as the commits up to this publication
+    /// left it; absent for a room without bounded history, or when it could not be read (the
+    /// next publication reads it whole).
+    history: Option<Arc<held_history::HeldHistory>>,
+    /// The room's generation at this publication: what a Have told from `history` credits.
+    generation: u64,
+    /// Per author, the original sender releases this node retains for it (key epoch, chain,
+    /// earliest iteration; never a key): the Have's own-release section, told only to that
+    /// author while it has recovery standing (`pull::tell`). Empty once this node has left.
+    releases: BTreeMap<Digest32, Vec<crate::node::history_stream::ReleaseHave>>,
+    /// The peers this room's private serve would answer now (room and peer preconditions,
+    /// `ChannelState::private_have_peers`); a Have tells each of them only a position a native
+    /// discovery found it may be served (`pull::tell`). Empty while this node cannot serve
+    /// private Sessions; `None` while the room cannot decide (its governance refreshing, its
+    /// Session upgrade work running): then nobody is told anything and a teller keeps its walk
+    /// until a publication that can decide.
+    private_peers: Option<BTreeSet<Digest32>>,
+    /// The room's private permission generation as this publication read it: moved by every
+    /// committed Session floor or floor-source change (`private_index::permission_generation`).
+    /// `None`: unreadable.
+    private_permission: Option<u64>,
 }
 
 /// Where a room publishes its [`RoomSnapshot`]; empty while the room is poisoned, locked or gone.
-#[derive(Default)]
-pub(crate) struct RoomSnapshotCell(StdMutex<Option<Arc<RoomSnapshot>>>);
+/// Every publication (and revocation) wakes the answers waiting for the room's next commit.
+pub(crate) struct RoomSnapshotCell {
+    current: StdMutex<Option<Arc<RoomSnapshot>>>,
+    published: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for RoomSnapshotCell {
+    fn default() -> Self {
+        Self {
+            current: StdMutex::new(None),
+            published: tokio::sync::watch::Sender::new(()),
+        }
+    }
+}
 
 impl RoomSnapshotCell {
     pub(crate) fn current(&self) -> Option<Arc<RoomSnapshot>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    /// Subscribe before a read: the receiver wakes at the next publication after it.
+    pub(crate) fn next_publication(&self) -> tokio::sync::watch::Receiver<()> {
+        self.published.subscribe()
     }
     fn set(&self, snapshot: Option<Arc<RoomSnapshot>>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        self.published.send_replace(());
     }
     pub(crate) fn revoke(&self) {
         self.set(None);
@@ -54,11 +93,33 @@ impl RoomSnapshot {
     pub(crate) fn room(&self) -> Digest32 {
         self.admission.room
     }
+    /// Whether this room's private serve would answer `peer` now (ruling (b)); `None` while the
+    /// room cannot decide (`private_peers`). Not read authorization: a Have tells such a peer
+    /// only what a native discovery found servable.
+    pub(crate) fn private_peer(&self, peer: &Digest32) -> Option<bool> {
+        self.private_peers
+            .as_ref()
+            .map(|peers| peers.contains(peer))
+    }
+    /// The private permission generation this publication read (`private_permission`).
+    pub(crate) fn private_permission(&self) -> Option<u64> {
+        self.private_permission
+    }
     pub(crate) fn epoch(&self) -> u64 {
         self.admission.epoch
     }
     pub(crate) fn sparse(&self) -> bool {
         self.sparse
+    }
+    pub(crate) fn history(&self) -> Option<&Arc<held_history::HeldHistory>> {
+        self.history.as_ref()
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// This node, as the room knows it.
+    pub(crate) fn me(&self) -> Digest32 {
+        self.admission.me
     }
     pub(crate) fn is_author(&self, id: &Digest32) -> bool {
         self.authors.contains(id)
@@ -77,6 +138,25 @@ impl RoomSnapshot {
         } else {
             self.is_member(id)
         }
+    }
+    /// The peer's [`Standing`] here, as the room judged it at publication ([`standing`]).
+    pub(crate) fn standing(&self, peer: &Digest32) -> Option<Standing> {
+        standing(
+            self.is_member(peer),
+            self.is_author(peer) && self.has_left(peer),
+            self.has_left(peer) && self.recovery.contains(peer),
+        )
+    }
+    /// The position of the author's departure, while it has left.
+    pub(crate) fn left_at(&self, author: &Digest32) -> Option<u64> {
+        self.left_at.get(author).copied()
+    }
+    /// What [`Self::releases`] holds for `author`: told only to that author (`pull::tell`).
+    pub(crate) fn own_releases(
+        &self,
+        author: &Digest32,
+    ) -> &[crate::node::history_stream::ReleaseHave] {
+        self.releases.get(author).map_or(&[], Vec::as_slice)
     }
     /// An author frozen by fork evidence (MP-9a), as the room knew it at publication.
     pub(crate) fn is_frozen(&self, id: &Digest32) -> bool {
@@ -157,7 +237,47 @@ impl Poisoned {
     }
 }
 
+/// Who a peer is to this room: the one rule for what this node serves the peer
+/// (`history_stream/source.rs` access checks, `actor.rs` `run_sync_session`) and whether a
+/// connection's loop keeps telling it (`history_stream/pull.rs` `standing`, its `current`,
+/// `actor.rs` `start_pull_loops`, `actor/admission.rs` `retire_departed_port`). The peer's
+/// applied removal ends every standing; its callers read it in the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// A current member: everything a member is served and told.
+    Member,
+    /// A departed author with a verified admission after its departure (recovery standing):
+    /// its own public tree, its own receipt, its own row and its own releases; nothing else.
+    Returning,
+    /// A departed author: its own departure receipt and its own row; nothing else.
+    Departed,
+}
+
+/// [`Standing`] from the room's facts: `member`, `departed_author` (an author that left), and
+/// `recovery` (a departed author's recovery standing).
+pub(crate) fn standing(member: bool, departed_author: bool, recovery: bool) -> Option<Standing> {
+    if member {
+        Some(Standing::Member)
+    } else if departed_author && recovery {
+        Some(Standing::Returning)
+    } else if departed_author {
+        Some(Standing::Departed)
+    } else {
+        None
+    }
+}
+
 impl ChannelState {
+    /// The peer's [`Standing`] here, read from the room itself ([`standing`]).
+    pub(crate) fn standing(&self, store: &Store, peer: &Digest32) -> Result<Option<Standing>> {
+        let departed_author = self.is_author(peer) && self.has_left(peer);
+        Ok(standing(
+            self.is_member(peer),
+            departed_author,
+            departed_author && self.recovery_standing(store, peer)?,
+        ))
+    }
+
     /// The cell serving reads this room's published snapshot from.
     pub(crate) fn room_snapshot(&self) -> Arc<RoomSnapshotCell> {
         Arc::clone(&self.room_snapshot)
@@ -195,6 +315,7 @@ impl ChannelState {
             .filter(|author| self.departed(author))
             .copied()
             .collect();
+        let sparse = self.uses_sparse_history(store)?;
         Ok(RoomSnapshot {
             admission: self.served_history_admission(store)?,
             back: authors
@@ -228,16 +349,48 @@ impl ChannelState {
                     )
                 })
                 .collect(),
-            held: self.held.clone(),
             recovery: left
                 .iter()
                 .filter(|author| self.recovery_standing(store, author).unwrap_or(false))
                 .copied()
                 .collect(),
-            availability: self.availability.peers(),
             creator: self.genesis.creator_pubkey().fingerprint(),
             now_hint: self.now_hint,
-            sparse: self.uses_sparse_history(store)?,
+            sparse,
+            history: sparse
+                .then(|| {
+                    let previous = self.room_snapshot.current().and_then(|s| s.history.clone());
+                    self.held_history(store, previous).ok()
+                })
+                .flatten(),
+            generation: self.gen.load(std::sync::atomic::Ordering::Acquire),
+            // What `own_original_release` (`channel.rs`) could serve: a current receiver of the
+            // author no later than this epoch, and this node not departed. Serving checks it all
+            // again, with the retained release itself.
+            releases: if self.has_left(&self.me()) {
+                BTreeMap::new()
+            } else {
+                let mut releases: BTreeMap<Digest32, Vec<_>> = BTreeMap::new();
+                for ((author, chain), receiver) in &self.receivers {
+                    if receiver.epoch() <= self.epoch {
+                        releases.entry(*author).or_default().push(
+                            crate::node::history_stream::ReleaseHave {
+                                author: *author,
+                                epoch: receiver.epoch(),
+                                chain: *chain,
+                                earliest: receiver.history_iteration(),
+                            },
+                        );
+                    }
+                }
+                releases
+            },
+            private_permission: super::session_projection::private_index::permission_generation(
+                store,
+                &self.channel_id,
+            )
+            .ok(),
+            private_peers: self.private_have_peers(store),
             authors,
             left,
         })
@@ -262,81 +415,66 @@ pub(crate) trait ServedRoom {
     fn is_member(&self, id: &Digest32) -> bool {
         self.is_author(id) && !self.has_left(id)
     }
-    fn held_through(&self, member: &Digest32) -> Option<u64>;
     fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64>;
     fn history_author_inventory_incarnation(&self, author: &Digest32) -> Option<u64>;
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed>;
-    fn availability_peer(&mut self, author: Digest32) -> Result<Arc<availability::Peer>>;
-    fn history_instance(&self, store: &Store) -> Result<[u8; 16]>;
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>>;
-    fn history_sek(&self) -> &Sek;
+    /// This node's Have pages of `author` whose body span meets `lo..=hi`, as its last
+    /// publication recorded them (the newest page, with its heads, first when it meets it).
+    fn held_pages(
+        &self,
+        author: &Digest32,
+        lo: u64,
+        hi: u64,
+    ) -> Vec<crate::node::history_stream::AuthorHave>;
     fn recipient_body_eligibility(
         &self,
         store: &Store,
         recipient: &Digest32,
         entry: &Entry,
     ) -> Result<governance::ContentEligibility>;
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool>;
-    fn forget_history_decline(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        author: Digest32,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<()>;
     /// An author frozen by a fork proof (MP-9a): its later history is refused, so nothing of it
     /// is fetched, and its unresolved head is not listed.
     fn history_author_frozen(&self, author: &Digest32) -> bool;
     /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending:
-    /// what its inventory lists so a peer that never met the second history can ask for it.
+    /// what its Have lists so a peer that never met the second history can ask for it.
     fn history_fork_authors(&self) -> Vec<Digest32>;
     /// MP-9: the two signed headers of the proof this node verified and kept for `author`.
     /// No body and no key material travel.
     fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)>;
     /// MP-9: of the authors a peer lists, the first one this node has not frozen and whose key
-    /// it holds. One per inventory: a listing never makes this node ask for more.
+    /// it holds. A listing never makes this node ask for more than one at a time.
     fn history_fork_wanted(&self, authors: &[Digest32]) -> Option<Digest32> {
         authors
             .iter()
             .copied()
             .find(|author| !self.history_author_frozen(author) && self.is_author(author))
     }
-    /// MP-9 (rule 6): per author the kept signed head whose continuity with the accepted chain
-    /// is still unresolved, ascending by author: what the inventory lists so a peer holding the
-    /// other history can fetch it by id and compare. An author frozen by a fork proof, or a head
+    /// MP-9 (rule 6): the author's kept signed head whose continuity with the accepted chain is
+    /// still unresolved: what this node's Have of the author lists so a peer holding the other
+    /// history can fetch it by id and compare. An author frozen by a fork proof, or a head
     /// accepted since, is resolved and not listed. At most one per author.
-    fn history_unresolved_hints(&self, store: &Store) -> Result<Vec<HistoryHeadHint>> {
-        let read = self.history_read(store)?;
-        let mut hints = Vec::new();
-        let mut after = None;
-        for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
-            let Some((author, _)) = read.history_author_after(after)? else {
-                break;
-            };
-            after = Some(author);
-            if self.history_author_frozen(&author) {
-                continue;
-            }
-            let Some(id) = read.history_unresolved_head(&author)? else {
-                continue;
-            };
-            let Some(head) = read.history_head(&id)? else {
-                continue;
-            };
-            if read.history_head_accepted(&id, head.binding)? {
-                continue;
-            }
-            hints.push(HistoryHeadHint {
-                author,
-                leaves: head.root.leaves,
-                head: id,
-            });
+    fn history_unresolved_hint(
+        &self,
+        read: &entry_store::Read<'_>,
+        author: &Digest32,
+    ) -> Result<Option<HistoryHeadHint>> {
+        if self.history_author_frozen(author) {
+            return Ok(None);
         }
-        Ok(hints)
+        let Some(id) = read.history_unresolved_head(author)? else {
+            return Ok(None);
+        };
+        let Some(head) = read.history_head(&id)? else {
+            return Ok(None);
+        };
+        if read.history_head_accepted(&id, head.binding)? {
+            return Ok(None);
+        }
+        Ok(Some(HistoryHeadHint {
+            author: *author,
+            leaves: head.root.leaves,
+            head: id,
+        }))
     }
     fn history_head_by_id(&self, store: &Store, head: &Digest32) -> Result<Option<SignedHead>> {
         let read = self.history_read(store)?;
@@ -354,7 +492,8 @@ pub(crate) trait ServedRoom {
         }
     }
 
-    /// One bounded page of commitments. No scan or signed-head vector survives this read.
+    /// One bounded page of commitments (archive paging's newest selection). No scan or
+    /// signed-head vector survives this read.
     fn history_head_hints(
         &self,
         store: &Store,
@@ -433,10 +572,7 @@ pub(crate) trait ServedRoom {
             read.history_validated_header(author, through)?
                 .map(|(head, _)| head)
         };
-        for id in [state.committed, state.control_ready, source]
-            .into_iter()
-            .flatten()
-        {
+        for id in [state.committed, source].into_iter().flatten() {
             let head = read
                 .history_head(&id)?
                 .ok_or(Error::MalformedAtRest("role receipt head missing"))?;
@@ -473,7 +609,9 @@ pub(crate) trait ServedRoom {
     /// Metadata-only fallback: an exact sealed inclusion receipt can retain a signed header
     /// before its source/effect has reached the canonical position index. This never supplies
     /// Entry/Page bodies or publishes a canonical position. The receipt is the resolved source
-    /// head's: its prefix through the asked size is the asked head's (ADR-053 P).
+    /// head's: its prefix through the asked size is the asked head's (ADR-053 P). Under a source
+    /// in the accepted chain a receipt kept under another head of that chain names the same
+    /// entry at this position, so it is found by author and position.
     fn history_proof_header(
         &self,
         store: &Store,
@@ -485,25 +623,34 @@ pub(crate) trait ServedRoom {
         // An admitted position is under the accepted chain only. Under another signed head
         // (MP-9: an unresolved second history, served as itself) only an entry proven under
         // that head is served. A prefix resolved to a committed source is under that chain.
-        if read.history_head_accepted(&target.source, binding)? {
+        let accepted = read.history_head_accepted(&target.source, binding)?;
+        if accepted {
             if let Some(entry) = read.history_position_header(&binding.author, seq)? {
                 return Ok(Some(HistoryHeader {
                     wire: entry.header_wire(),
                 }));
             }
         }
-        let Some(included) =
-            read.history_inclusion_receipt(&target.source, &binding.author, seq)?
-        else {
-            return Ok(None);
-        };
         let source = read
             .history_head(&target.source)?
             .ok_or(Error::MalformedAtRest("proof header source head missing"))?;
+        let included = match read.history_inclusion_receipt(&target.source, &binding.author, seq)? {
+            Some(included) => {
+                if included.head_id() != target.source || included.root() != source.root {
+                    return Err(Error::MalformedAtRest("proof header receipt binding"));
+                }
+                included
+            }
+            None if accepted && seq <= source.root.leaves => {
+                match read.history_included_header(&binding.author, seq)? {
+                    Some(included) => included,
+                    None => return Ok(None),
+                }
+            }
+            None => return Ok(None),
+        };
         let entry = included.header().entry();
-        if included.head_id() != target.source
-            || included.binding() != binding
-            || included.root() != source.root
+        if included.binding() != binding
             || entry.skeleton.channel_id != self.channel_id()
             || entry.skeleton.author_id != binding.author
             || entry.skeleton.seq != seq
@@ -539,63 +686,6 @@ pub(crate) trait ServedRoom {
             payload_len,
             bytes: payload,
         })
-    }
-    /// Enumerate one locally held sealed package using the durable acquisition cursor.
-    /// An ineligible catalog entry advances the cursor without advertising it.
-    fn history_key_available_page(
-        &self,
-        store: &Store,
-        after: Option<u64>,
-    ) -> Result<Option<(u64, Option<crate::node::history_stream::KeyBodyAvailable>)>> {
-        let read = self.history_read(store)?;
-        let Some((cursor, log)) = read.key_package_after(after)? else {
-            return Ok(None);
-        };
-        let sealed = store
-            .snapshot()?
-            .get_segment_bounded(
-                &self.channel_id(),
-                SegmentKind::LogDb,
-                log,
-                crate::node::keypackage::MAX_KEY_PACKAGE
-                    + crate::log::history::MAX_HEADER_BYTES
-                    + 9,
-            )?
-            .ok_or(Error::MalformedAtRest("key-package catalog body missing"))?;
-        let wire = open_segment(self.history_sek(), SegmentKind::LogDb, log, &sealed)?;
-        let entry = Entry::from_wire(&wire)?;
-        entry.verify_payload_binding()?;
-        let Some(v2) = entry.skeleton.v2.as_ref() else {
-            return Ok(Some((cursor, None)));
-        };
-        if v2.kind != crate::log::history::SignedEntryKind::KeyPackage {
-            return Err(Error::MalformedAtRest("key-package catalog entry differs"));
-        }
-        if entry.payload.is_none() {
-            return Ok(Some((cursor, None)));
-        }
-        let recipient = v2
-            .recipient
-            .ok_or(Error::MalformedAtRest("key-package recipient missing"))?;
-        let Some((head, header)) =
-            read.history_validated_header(&entry.skeleton.author_id, entry.skeleton.seq)?
-        else {
-            return Ok(Some((cursor, None)));
-        };
-        if header.entry_hash() != entry.entry_hash() {
-            return Err(Error::MalformedAtRest("key-package source header differs"));
-        }
-        Ok(Some((
-            cursor,
-            Some(crate::node::history_stream::KeyBodyAvailable {
-                cursor,
-                author: entry.skeleton.author_id,
-                head,
-                seq: entry.skeleton.seq,
-                hash: entry.entry_hash(),
-                recipient,
-            }),
-        )))
     }
 
     fn recovery_context_allowed(
@@ -633,29 +723,28 @@ impl ServedRoom for ChannelState {
     fn has_left(&self, id: &Digest32) -> bool {
         ChannelState::has_left(self, id)
     }
-    fn held_through(&self, member: &Digest32) -> Option<u64> {
-        ChannelState::held_through(self, member)
-    }
     fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
         ChannelState::history_inventory_incarnation(self, member)
     }
     fn history_author_inventory_incarnation(&self, author: &Digest32) -> Option<u64> {
         ChannelState::history_author_inventory_incarnation(self, author)
     }
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed> {
-        ChannelState::role_owed(self)
-    }
-    fn availability_peer(&mut self, author: Digest32) -> Result<Arc<availability::Peer>> {
-        ChannelState::availability_peer(self, author, None)
-    }
-    fn history_instance(&self, store: &Store) -> Result<[u8; 16]> {
-        ChannelState::history_instance(self, store)
-    }
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
         ChannelState::history_read(self, store)
     }
-    fn history_sek(&self) -> &Sek {
-        &self.sek
+    fn held_pages(
+        &self,
+        author: &Digest32,
+        lo: u64,
+        hi: u64,
+    ) -> Vec<crate::node::history_stream::AuthorHave> {
+        let snapshot = self.room_snapshot.current();
+        let row = snapshot
+            .as_ref()
+            .and_then(|s| s.history())
+            .and_then(|h| h.author(author));
+        row.map(|row| row.pages_over(lo, hi).cloned().collect())
+            .unwrap_or_default()
     }
     fn recipient_body_eligibility(
         &self,
@@ -664,22 +753,6 @@ impl ServedRoom for ChannelState {
         entry: &Entry,
     ) -> Result<governance::ContentEligibility> {
         ChannelState::recipient_body_eligibility(self, store, recipient, entry)
-    }
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool> {
-        ChannelState::history_departure_matches(self, store, hint)
-    }
-    fn forget_history_decline(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        author: Digest32,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<()> {
-        ChannelState::forget_history_decline(self, store, peer, author, committed)
     }
     fn history_author_frozen(&self, author: &Digest32) -> bool {
         self.dag.is_frozen(author)
@@ -720,9 +793,6 @@ impl ServedRoom for RoomView<'_> {
     fn has_left(&self, id: &Digest32) -> bool {
         self.snapshot.has_left(id)
     }
-    fn held_through(&self, member: &Digest32) -> Option<u64> {
-        self.snapshot.held.get(member).copied()
-    }
     fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
         self.is_member(member)
             .then(|| self.snapshot.back.get(member).copied().unwrap_or(0))
@@ -737,25 +807,18 @@ impl ServedRoom for RoomView<'_> {
                 .unwrap_or(0)
         })
     }
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed> {
-        HistoryAdmissionRoom::role_owed(self.room)
-    }
-    fn availability_peer(&mut self, author: Digest32) -> Result<Arc<availability::Peer>> {
-        self.snapshot
-            .availability
-            .get(&author)
-            .filter(|_| self.snapshot.is_author(&author))
-            .cloned()
-            .ok_or(Error::MalformedBundle("availability author not admitted"))
-    }
-    fn history_instance(&self, _store: &Store) -> Result<[u8; 16]> {
-        Ok(self.snapshot.admission.instance)
-    }
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
         HistoryAdmissionRoom::history_read(self.room, store)
     }
-    fn history_sek(&self) -> &Sek {
-        self.room.sek()
+    fn held_pages(
+        &self,
+        author: &Digest32,
+        lo: u64,
+        hi: u64,
+    ) -> Vec<crate::node::history_stream::AuthorHave> {
+        let row = self.snapshot.history().and_then(|h| h.author(author));
+        row.map(|row| row.pages_over(lo, hi).cloned().collect())
+            .unwrap_or_default()
     }
     fn recipient_body_eligibility(
         &self,
@@ -772,31 +835,6 @@ impl ServedRoom for RoomView<'_> {
             recipient,
             entry,
         )
-    }
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool> {
-        HistoryAdmissionRoom::history_departure_matches(self.room, store, hint)
-    }
-    fn forget_history_decline(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        author: Digest32,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<()> {
-        let read = self.history_read(store)?;
-        if read.history_declined_head(&peer, &author)?.is_none() {
-            return Ok(());
-        }
-        drop(read);
-        HistoryAdmissionRoom::history_write_classified(self.room, store, false, |index| {
-            index.forget_history_declined_head(peer, author)
-        })?;
-        committed.store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
     }
     fn history_author_frozen(&self, author: &Digest32) -> bool {
         self.snapshot.is_frozen(author)

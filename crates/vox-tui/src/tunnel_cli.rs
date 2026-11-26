@@ -1657,8 +1657,9 @@ pub async fn connect(
             }
         }
     }
+    let recovering = matches!(reply, Ok(Frame::JoinedRecovering));
     match reply {
-        Ok(Frame::Ok) => {}
+        Ok(Frame::Ok | Frame::JoinedRecovering) => {}
         // The node sends the outcome's name, with its steps and what each responder said; turn
         // it into the guidance a person can act on (V29-12, #192).
         Ok(Frame::Error { reason }) => {
@@ -1690,6 +1691,9 @@ pub async fn connect(
         )
     );
     println!("        use the commands beside each service to reach it through the daemon's proxy");
+    if recovering {
+        println!("        {}", vox_core::node::api::Outcome::RECOVERING);
+    }
     Ok(())
 }
 

@@ -7,6 +7,7 @@ use super::*;
 const POSITIONS_PER_PAGE: usize = 256;
 type Position = (Digest32, u64);
 type PositionPage = (Vec<Position>, Option<Position>);
+type HeldRuns = (Vec<(u64, u64)>, Vec<(u64, u64)>);
 
 fn contains(
     source: &Source<'_>,
@@ -98,6 +99,7 @@ impl Write<'_, '_> {
                 position(author, seq),
                 missing.then_some(Value::Present),
             )?;
+            self.batch.touch_history(self.channel, *author, Some(seq));
         }
         Ok(roots)
     }
@@ -146,6 +148,7 @@ impl Write<'_, '_> {
             position(author, seq),
             missing.then_some(Value::Present),
         )?;
+        self.batch.touch_history(self.channel, *author, Some(seq));
         self.set_render_roots(roots)?;
         Ok(true)
     }
@@ -158,21 +161,6 @@ impl Write<'_, '_> {
             self.render_roots()?.missing_positions,
             author,
             seq,
-        )
-    }
-
-    pub(crate) fn missing_page(
-        &self,
-        after: Option<(Digest32, u64)>,
-        limit: usize,
-    ) -> Result<PositionPage> {
-        positions(
-            &Source::Batch(self.batch),
-            self.sek,
-            self.channel,
-            self.render_roots()?.missing_positions,
-            after,
-            limit,
         )
     }
 }
@@ -202,6 +190,53 @@ impl Read<'_> {
             after,
             limit,
         )
+    }
+
+    /// The runs of `author`'s validated positions (headers this node serves with their
+    /// witnesses) and, apart from them, the runs whose bodies it holds: validated positions not
+    /// marked missing; oldest first, keys only, no record read.
+    pub(crate) fn history_held_runs(&self, author: &Digest32) -> Result<HeldRuns> {
+        let source = self.source();
+        let walk = |root: u64| -> Result<Vec<u64>> {
+            let mut out = Vec::new();
+            let mut key = position(author, 1);
+            while let Some((found, _)) = source.first(self.sek, self.channel, root, &key, 0)? {
+                if found[..32] != author[..] {
+                    break;
+                }
+                let seq = u64::from_be_bytes(
+                    found[32..40]
+                        .try_into()
+                        .map_err(|_| invalid("held position sequence"))?,
+                );
+                out.push(seq);
+                let Some(next) = successor(found) else {
+                    break;
+                };
+                key = next;
+            }
+            Ok(out)
+        };
+        let held = walk(self.directory.active.sparse.validated_positions)?;
+        let missing = walk(self.directory.active.missing_positions)?;
+        let runs = |seqs: &mut dyn Iterator<Item = u64>| {
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for seq in seqs {
+                match runs.last_mut() {
+                    Some(last) if last.1 + 1 == seq => last.1 = seq,
+                    _ => runs.push((seq, seq)),
+                }
+            }
+            runs
+        };
+        let proof = runs(&mut held.iter().copied());
+        let bodies = runs(
+            &mut held
+                .iter()
+                .copied()
+                .filter(|seq| missing.binary_search(seq).is_err()),
+        );
+        Ok((proof, bodies))
     }
 }
 

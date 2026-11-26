@@ -4,7 +4,7 @@
 use super::*;
 
 pub(crate) const LEGACY_HISTORY_REQUIRED: &str = super::UNSUPPORTED_ROOM_FORMAT;
-pub(crate) use entry_store::{LegacyProvisionalOwner, LegacyProvisionalState, LegacyRequired};
+pub(crate) use entry_store::{LegacyProvisionalOwner, LegacyProvisionalState};
 
 impl ChannelState {
     /// Accepted history stays readable while a legacy gap or its exact publication is
@@ -39,61 +39,6 @@ impl ChannelState {
         }
     }
 
-    /// Record only the exact authenticated current v1 header, never its body or peer HAVE.
-    pub(crate) fn note_legacy_required(&self, store: &Store, tip: &Entry) -> Result<bool> {
-        if self.poisoned.get() {
-            return Err(self.save_failure());
-        }
-        let sk = &tip.skeleton;
-        if sk.v2.is_some()
-            || !tip.is_signed()
-            || tip.payload.is_some()
-            || sk.channel_id != self.channel_id
-            || sk.epoch != self.epoch
-            || !self
-                .admission
-                .is_admitted(&self.channel_id, self.epoch, &sk.author_id)
-        {
-            return Err(Error::StreamRefused(
-                "legacy tip room, epoch or author differs",
-            ));
-        }
-        let key = self
-            .authors
-            .get(&sk.author_id)
-            .ok_or(Error::StreamRefused("legacy tip author unknown"))?;
-        tip.verify(key)?;
-        // An unsigned attached suffix is never evidence of an accepted end. The writer
-        // checks the sealed accepted restart feed; these are the DAG's actual refusals.
-        if self
-            .dag
-            .refused_from(&sk.author_id)
-            .is_some_and(|from| sk.seq >= from)
-            || (self.dag.is_frozen(&sk.author_id) && sk.seq > self.dag.verified_head(&sk.author_id))
-        {
-            return Err(Error::StreamRefused(
-                "legacy tip extends refused or frozen feed",
-            ));
-        }
-        let required = LegacyRequired {
-            author: sk.author_id,
-            through: sk.seq,
-            hash: tip.entry_hash(),
-        };
-        let mut batch = store.batch()?;
-        // This authenticated requirement is a re-fetchable restart index, not a user fact.
-        batch.derived();
-        let mut writer = self
-            .entries
-            .write(&mut batch, &self.sek, &self.channel_id)?;
-        let changed = writer.note_legacy_required(required)?;
-        if changed {
-            writer.seal()?;
-            batch.commit()?;
-            self.entries.committed();
-        }
-        Ok(changed)
-    }
     pub(crate) fn legacy_provisional_state(
         &self,
         store: &Store,

@@ -4,10 +4,7 @@ use super::super::own_history::{PendingOwnRecovery, Recovery};
 use super::*;
 use crate::log::history::{ControlContext, Descriptor, TreeBinding};
 
-type SettlementOffer = (Option<(Digest32, Digest32, u64)>, Vec<Digest32>);
-
 pub(crate) enum Work {
-    Offer(Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>),
     Settle,
     CatchUp,
     Presence,
@@ -22,10 +19,6 @@ pub(crate) enum Work {
 }
 
 pub(crate) enum Saved {
-    Offered {
-        hint: Option<(Digest32, Digest32, u64)>,
-        targets: Vec<Digest32>,
-    },
     Settlement {
         changed: bool,
         sparse: bool,
@@ -191,14 +184,17 @@ enum AppendMode {
     Shares(Vec<(String, ServiceKind)>),
 }
 impl AppendMode {
+    /// The receipt of the stage that prepared this append. An own-recovery rotation
+    /// (`Work::Complete`) also settles a room that was not settled yet; it is still that
+    /// stage's completion, and its installer clears both (`own_behind` and unsettled).
     fn saved(&self, changed: bool, sparse: bool) -> Saved {
         match self {
+            Self::Rotate { recover: true, .. } => Saved::Recovered(changed),
             Self::Rotate { settle: true, .. } => Saved::Settlement {
                 changed,
                 sparse,
                 eligible: true,
             },
-            Self::Rotate { recover: true, .. } => Saved::Recovered(changed),
             Self::Rotate { .. } => Saved::CaughtUp,
             Self::Presence => Saved::Presence(changed),
             Self::Shares(_) => Saved::Shares(changed),
@@ -250,7 +246,6 @@ impl ChannelState {
         &self,
         store: &Store,
         now: crate::time::Ms,
-        peers: impl FnOnce() -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
     ) -> Result<bool> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -259,33 +254,10 @@ impl ChannelState {
         if !self.settled && self.recovery_settlement_eligible(store, now, sparse)? {
             return Ok(true);
         }
-        let (_, targets) = self.recovery_settlement_offer(store, peers)?;
-        if !targets.is_empty() {
-            return Ok(true);
-        }
         if sparse && self.settled {
             return self.visit_unsaid_recovery_shares(|_| {});
         }
         Ok(false)
-    }
-
-    fn recovery_settlement_offer(
-        &self,
-        store: &Store,
-        peers: impl FnOnce() -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
-    ) -> Result<SettlementOffer> {
-        let hint = if self.uses_sparse_history(store)? {
-            self.sparse_settlement_pending_own_head(store)
-        } else {
-            None
-        };
-        let targets = match hint {
-            Some((_, head, size)) => {
-                self.history_own_receipt_targets(store, peers(), head, size)?
-            }
-            None => Vec::new(),
-        };
-        Ok((hint, targets))
     }
 
     fn recovery_settlement_eligible(
@@ -333,10 +305,6 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
         let operation = match work {
-            Work::Offer(peers) => {
-                let (hint, targets) = self.recovery_settlement_offer(store, || peers)?;
-                Operation::Unchanged(Saved::Offered { hint, targets })
-            }
             Work::Fence => {
                 if !self.uses_sparse_history(store)? {
                     Operation::Unchanged(Saved::Inactive)

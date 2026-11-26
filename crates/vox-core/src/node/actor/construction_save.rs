@@ -178,6 +178,7 @@ impl Work {
                         signer.fingerprint(),
                         now,
                         None,
+                        &mut |_| {},
                     )?,
                     (true, Some(_)) => return Err(Error::Profile("accepted join wrap changed")),
                     (_, None) => ChannelState::join_channel_from_sealed_owned(

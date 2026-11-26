@@ -496,6 +496,9 @@ fn render(v: &Value) -> Result<String, AppError> {
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");
             }
+            if let Some(said) = m.get("not_shown").and_then(Value::as_str) {
+                let _ = writeln!(o, "      {said}");
+            }
             if let Some(through) = m.get("held_through").and_then(Value::as_u64) {
                 let _ = writeln!(
                     o,
@@ -650,43 +653,24 @@ fn render(v: &Value) -> Result<String, AppError> {
     for r in sync {
         let _ = write!(
             o,
-            "  room {} peer {}: opened {} admitted {} completed {} empty {} partial {} failed {} \
-             busy-refused {} stale {} refused {} skipped {} queued {}",
+            "  room {} peer {}: completed {} empty {} partial {} failed {}",
             short(s(r, "room")),
             short(s(r, "peer")),
-            n(r, "opened"),
-            n(r, "admitted"),
             n(r, "completed"),
             n(r, "empty"),
             n(r, "partial"),
             n(r, "failed"),
-            n(r, "busy_refused"),
-            n(r, "stale"),
-            n(r, "refused"),
-            n(r, "skipped_at_cap"),
-            n(r, "queued"),
         );
         // Why each completed round ran (ADR-038 FX-15, #996): a round with no need a person
         // can read here is the defect, not the load.
         if let Some(why) = r.get("reasons").filter(|w| w.is_object()) {
             let _ = write!(
                 o,
-                "; why: offer {} hint {} announce {} periodic {} page {} request {} served {}",
-                n(why, "offer"),
+                "; why: hint {} announce {} page {} served {}",
                 n(why, "hint"),
                 n(why, "announce"),
-                n(why, "periodic"),
                 n(why, "page"),
-                n(why, "request"),
                 n(why, "served"),
-            );
-        }
-        if let Some(b) = r.get("backoff").filter(|b| !b.is_null()) {
-            let _ = write!(
-                o,
-                ", backing off ({}, {} failure(s))",
-                s(b, "kind"),
-                n(b, "failures")
             );
         }
         // A failure is named only while it is the peer's latest outcome: once a round with the

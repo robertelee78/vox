@@ -324,7 +324,6 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
             );
         (endpoint, Arc::new(conn))
     });
-    let _answered = raw_sync::answer_victim(Arc::clone(&conn));
 
     // ---- 1. the escalation: mallory's Pairwise stream reaches the pairwise handler ------
     let mut reached = None;

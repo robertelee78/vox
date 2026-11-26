@@ -547,24 +547,34 @@ impl Keyring {
     }
 
     /// Stage the keyring beside its pending delivery and removal records in one transaction.
+    /// Returns the incarnation (`TRUST_META_KEY`'s nonce) the commit makes durable.
     pub(crate) fn queue_save(
         &self,
         batch: &mut crate::node::store::Batch<'_>,
         signer: &dyn RootSigner,
-    ) -> Result<()> {
+    ) -> Result<[u8; NONCE_LEN]> {
         let sek = trust_sek(signer)?;
         let sealed = seal_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &self.to_bytes())?;
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        batch.put_meta(TRUST_META_KEY, &blob)
+        batch.put_meta(TRUST_META_KEY, &blob)?;
+        Ok(sealed.nonce)
     }
 
     /// Read and open the keyring, or an empty one if this node has never trusted
     /// anybody. Requires an unlocked identity.
     pub fn load(store: &Store, signer: &dyn RootSigner) -> Result<Self> {
+        Self::load_at(store, signer).map(|(keyring, _)| keyring)
+    }
+
+    /// [`Self::load`], with the incarnation (the stored nonce) of exactly the blob it opened.
+    pub(crate) fn load_at(
+        store: &Store,
+        signer: &dyn RootSigner,
+    ) -> Result<(Self, Option<[u8; NONCE_LEN]>)> {
         let Some(blob) = store.get_meta(TRUST_META_KEY)? else {
-            return Ok(Self::new());
+            return Ok((Self::new(), None));
         };
         if blob.len() < NONCE_LEN {
             return Err(Error::MalformedAtRest("keyring blob too short"));
@@ -578,6 +588,6 @@ impl Keyring {
         };
         let sek = trust_sek(signer)?;
         let plain = open_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &sealed)?;
-        Self::from_bytes(&plain)
+        Ok((Self::from_bytes(&plain)?, Some(nonce)))
     }
 }

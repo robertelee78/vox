@@ -12,6 +12,11 @@ use crate::log::history::{
     MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES,
 };
 
+/// One slice of the one-time proof-cache reclamation of an old store
+/// (`cleanup_history_proof_ranges`): object locators visited, and cache objects deleted.
+const PROOF_CLEANUP_VISITS: usize = 4096;
+const PROOF_CLEANUP_DELETES: usize = 256;
+
 // One pool shared across every node, room, Store and read snapshot in the daemon.
 // Descriptors are immutable serving math, never acceptance authority. Neither hits nor
 // replacements change FIFO order.
@@ -32,6 +37,8 @@ const PROOF_CACHE_CHARGE: usize =
 const _: () = assert!(PROOF_CACHE_CHARGE <= PROOF_CACHE_BYTES);
 static PROOF_CACHE: std::sync::Mutex<Option<ProofCache>> = std::sync::Mutex::new(None);
 
+/// A descriptor verified or rebuilt under one signed head, kept under that head: the head may
+/// be another branch of its author (unresolved, forked), so nothing else may read it.
 pub(crate) fn cache_history_proof_range(
     head: Digest32,
     binding: TreeBinding,
@@ -39,7 +46,45 @@ pub(crate) fn cache_history_proof_range(
     descriptor: Descriptor,
 ) -> Result<()> {
     descriptor.validate()?;
-    let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
+    cache_proof_descriptor(
+        proof_range_key(&head, binding, start, descriptor.leaves)?,
+        descriptor,
+    )
+}
+
+/// A descriptor rebuilt from the material of a committed source head while the author has no
+/// conflict (`ProofRangeRestore`): a node's value depends only on the entries it spans, and
+/// every committed head extends the one before, so it is kept by author, start and leaves and
+/// found under every later committed head. In memory only (ADR-053 P rule 6); a range never
+/// changes once its positions are committed, so nothing invalidates it.
+pub(crate) fn cache_history_range(
+    binding: TreeBinding,
+    start: u64,
+    descriptor: Descriptor,
+) -> Result<()> {
+    descriptor.validate()?;
+    cache_proof_descriptor(
+        cached_range_key(binding, start, descriptor.leaves)?,
+        descriptor,
+    )
+}
+
+/// A descriptor `cache_history_range` kept. Read only for a committed source (an unresolved
+/// head may be another branch).
+pub(crate) fn cached_history_range(
+    binding: TreeBinding,
+    start: u64,
+    leaves: u64,
+) -> Result<Option<Descriptor>> {
+    let key = cached_range_key(binding, start, leaves)?;
+    Ok(PROOF_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .and_then(|cache| cache.ranges.get(&key).copied()))
+}
+
+fn cache_proof_descriptor(key: Digest32, descriptor: Descriptor) -> Result<()> {
     let mut guard = PROOF_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -175,10 +220,15 @@ fn expected_entry_wire(header: &Entry) -> Result<usize> {
 pub(super) struct Roots {
     objects: u64,
     authors: u64,
-    validated_positions: u64,
+    pub(super) validated_positions: u64,
+    /// Control facts, keyed by AUTHOR (`control_prefix_complete`): coverage runs
+    /// (`keep_control_run`), enumerated control sources, and the source and effect prefixes.
+    /// A store written before format 14 kept them by head; its one-time reindex merges those of
+    /// committed heads into the author's rows (`migrate_control_chunk`).
     control_intervals: u64,
     obligations: u64,
     key_body_obligations: u64,
+    // Retired provider cursor directory slot; retain it for existing stores.
     key_body_providers: u64,
     key_body_debt_order: u64,
     key_body_debt_serial: u64,
@@ -187,10 +237,13 @@ pub(super) struct Roots {
     source_heads: u64,
     control_sources: u64,
     source_prefixes: u64,
-    source_cursors: u64,
+    /// Kept only for the directory format: no longer read or written (the walk finds the run
+    /// holding its prefix + 1 by one seek, `keep_control_run`).
+    retired_source_cursors: u64,
     settled_entries: u64,
     effect_prefixes: u64,
-    effect_cursors: u64,
+    /// As `retired_source_cursors`.
+    retired_effect_cursors: u64,
     terminations: u64,
     settled_tips: u64,
     prior_heads: u64,
@@ -214,10 +267,10 @@ impl Roots {
             .uint(self.source_heads)
             .uint(self.control_sources)
             .uint(self.source_prefixes)
-            .uint(self.source_cursors)
+            .uint(self.retired_source_cursors)
             .uint(self.settled_entries)
             .uint(self.effect_prefixes)
-            .uint(self.effect_cursors)
+            .uint(self.retired_effect_cursors)
             .uint(self.terminations)
             .uint(self.settled_tips)
             .uint(self.prior_heads)
@@ -253,10 +306,10 @@ impl Roots {
             source_heads: d.uint()?,
             control_sources: d.uint()?,
             source_prefixes: d.uint()?,
-            source_cursors: d.uint()?,
+            retired_source_cursors: d.uint()?,
             settled_entries: d.uint()?,
             effect_prefixes: d.uint()?,
-            effect_cursors: d.uint()?,
+            retired_effect_cursors: d.uint()?,
             terminations: d.uint()?,
             settled_tips: d.uint()?,
             prior_heads: d.uint()?,
@@ -293,10 +346,10 @@ impl Roots {
             self.source_heads,
             self.control_sources,
             self.source_prefixes,
-            self.source_cursors,
+            self.retired_source_cursors,
             self.settled_entries,
             self.effect_prefixes,
-            self.effect_cursors,
+            self.retired_effect_cursors,
             self.terminations,
             self.settled_tips,
             self.prior_heads,
@@ -331,13 +384,18 @@ pub(crate) enum ObjectKind {
     // MP-9 (rule 6): per author, the id of the one signed head whose continuity with the
     // accepted chain is unresolved. A local owner of a retained Head object, never authority.
     Unresolved = 11,
+    // The committed head under which a parent receipt for an author's position is kept.
+    ParentHead = 12,
+    // The first head of the author's accepted chain under which an inclusion receipt for an
+    // author's position is kept (`history_included_header`).
+    IncludedHead = 13,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
             Self::ProofRange => STATE_BYTES,
-            Self::RecoveryContext | Self::Unresolved => 32,
+            Self::RecoveryContext | Self::Unresolved | Self::ParentHead | Self::IncludedHead => 32,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
@@ -363,25 +421,15 @@ fn unresolved_key(author: &Digest32) -> Digest32 {
     sha256(&input)
 }
 
-fn declined_head_key(peer: &Digest32, author: &Digest32) -> Key {
-    let mut key = [0; 64];
-    key[..32].copy_from_slice(peer);
-    key[32..].copy_from_slice(author);
-    key
-}
-fn metadata_decline_key(peer: &Digest32, author: &Digest32) -> Key {
-    let mut bytes = b"vox/own-metadata-refusal/v1".to_vec();
-    bytes.extend_from_slice(peer);
-    bytes.extend_from_slice(author);
-    let mut key = [0; 64];
-    key[..32].copy_from_slice(peer);
-    key[32..].copy_from_slice(&sha256(&bytes));
-    key
-}
 fn author_key(author: &Digest32, scope: LogScope) -> Key {
     let mut key = hashed(author);
     key[32] = scope as u8;
     key
+}
+/// A full aligned block: `leaves` is a power of two and the block starts at a multiple of it, so
+/// it is one complete subtree, the same node in every tree over positions that contains it.
+pub(crate) fn full_block(start: u64, leaves: u64) -> bool {
+    start != 0 && leaves.is_power_of_two() && (start - 1).is_multiple_of(leaves)
 }
 fn range_key(binding: TreeBinding, start: u64, leaves: u64) -> Result<Key> {
     if start == 0
@@ -406,6 +454,16 @@ fn proof_range_key(
     let _ = range_key(binding, start, leaves)?;
     let mut e = Encoder::new();
     e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(head);
+    binding.encode(&mut e);
+    e.uint(start).uint(leaves);
+    Ok(sha256(&e.finish()))
+}
+/// The in-memory key of a rebuilt range of the accepted chain (`cache_history_range`); a
+/// different tag from `proof_range_key`, so no head-keyed descriptor is ever found by it.
+fn cached_range_key(binding: TreeBinding, start: u64, leaves: u64) -> Result<Digest32> {
+    let _ = range_key(binding, start, leaves)?;
+    let mut e = Encoder::new();
+    e.array(4).bytes(b"vox/proof-serving-position/v1");
     binding.encode(&mut e);
     e.uint(start).uint(leaves);
     Ok(sha256(&e.finish()))
@@ -455,92 +513,39 @@ fn read_hash_option(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
     }
 }
 
+/// A newcomer's walk floor for an author whose committed size is `size`: the lowest of its
+/// newest 128 positions (ADR-052 RG-6).
+fn newcomer_floor(size: u64) -> u64 {
+    size.saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
+        .max(1)
+}
+
 /// Compact exact object references. None of these is a contiguous feed position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AuthorState {
     pub observed: Option<Digest32>,
     pub committed: Option<Digest32>,
-    pub control_ready: Option<Digest32>,
     /// One attributable same-size contradiction, retaining both exact signed heads.
     pub observed_conflict: Option<(Digest32, Digest32)>,
-    /// A selected newest window, immutable while live-eligible and independent of
-    /// commitment/control progress. Aging may retire demand without deleting evidence.
-    pub live: Option<LiveWindow>,
-}
-
-/// A node's walk over one author's feed, visited newest first. Only the first window is the
-/// newest 128 positions; after it every newer position stays wanted until it is walked. A
-/// cursor is local demand, never authority or a claim that the author's older archive is
-/// held. It survives retired network workers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LiveWindow {
-    pub head: Digest32,
-    pub from: u64,
-    pub next: u64,
-    pub through: u64,
-}
-impl LiveWindow {
-    pub(crate) fn complete(self) -> bool {
-        self.next < self.from
-    }
-    fn validate(self) -> Result<()> {
-        if self.from == 0
-            || self.through > crate::log::feed::MAX_SEQ
-            || self.from > self.through.saturating_add(1)
-            || self.next > self.through
-            || self.next.saturating_add(1) < self.from
-        {
-            return Err(invalid("live history window bounds"));
-        }
-        Ok(())
-    }
-}
-
-/// Memory only, per author: on the window for `head`, once position `at` is walked the walk
-/// continues at `to`, past the positions it walked before that newer head came (ADR-052
-/// RG-6). Without it every new head during a catch-up walked back down through everything
-/// held, one store write each (29,804 positions while 60 posts arrived). A restart loses it;
-/// the first walk after it passes the held run once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LiveResume {
-    pub head: Digest32,
-    pub at: u64,
-    pub to: u64,
-}
-impl LiveResume {
-    /// The jump for `new`, selected over the unfinished `old` whose jump was `prior`. Two
-    /// unwalked ranges and one jump: the walk passes again whichever is fewer, the positions
-    /// `old` walked or those walked between `old` and `prior`'s target.
-    pub(crate) fn select(old: LiveWindow, prior: Option<Self>, new: LiveWindow) -> Option<Self> {
-        let walked = old.through - old.next;
-        match prior.filter(|r| r.head == old.head && r.at <= old.next) {
-            Some(r) if walked <= r.at - 1 - r.to => Some(Self {
-                head: new.head,
-                ..r
-            }),
-            _ => (walked > 0).then_some(Self {
-                head: new.head,
-                at: old.through + 1,
-                to: old.next,
-            }),
-        }
-    }
-    /// Positions of `window` still ahead of its cursor that this jump passes.
-    pub(crate) fn passes(self, window: LiveWindow) -> u64 {
-        if self.head == window.head && self.at <= window.next {
-            self.at - 1 - self.to
-        } else {
-            0
-        }
-    }
+    /// The walk's floor (ADR-052 RG-6), 0 until set: set once, by the author's first non-empty
+    /// committed head, to the lowest of its newest 128 positions, so a newcomer is never made
+    /// to read from message one; for a store written before floors existed, at its upgrade, from
+    /// what this member held of the author (`followed_floor`). Nothing below it is owed; it
+    /// never moves afterwards.
+    pub floor: u64,
 }
 impl AuthorState {
+    /// Version 4. Slot 3 is retired: it held `control_ready`, one head id, which a store
+    /// written by an older version still carries and which only that store's one-time upgrade
+    /// reads, into the author's effect prefix (`migrate_control_ready`; control readiness is
+    /// that prefix, `history_control_ready`). Version 3's slot 5 held a whole
+    /// window (head, from, next, through) of which only `from`, the floor, is still read.
     fn bytes(self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(6).uint(3);
+        e.array(6).uint(4);
         hash_option(&mut e, self.observed);
         hash_option(&mut e, self.committed);
-        hash_option(&mut e, self.control_ready);
+        hash_option(&mut e, None);
         match self.observed_conflict {
             Some((first, second)) => {
                 e.array(2).bytes(&first).bytes(&second);
@@ -549,77 +554,79 @@ impl AuthorState {
                 e.array(0);
             }
         }
-        match self.live {
-            Some(window) => {
-                e.array(1)
-                    .array(4)
-                    .bytes(&window.head)
-                    .uint(window.from)
-                    .uint(window.next)
-                    .uint(window.through);
-            }
-            None => {
-                e.array(0);
-            }
-        }
+        e.uint(self.floor);
         e.finish()
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_with_control_ready(bytes).map(|(state, _)| state)
+    }
+    /// The record and its retired slot 3, which only the upgrade of an older store reads
+    /// (`migrate_control_ready`); version 4 writes it empty.
+    fn parse_with_control_ready(bytes: &[u8]) -> Result<(Self, Option<Digest32>)> {
         if bytes.len() > STATE_BYTES {
             return Err(invalid("sparse author state size"));
         }
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (4, 1) | (5, 2) | (6, 3)) {
+        if !matches!((arity, version), (4, 1) | (5, 2) | (6, 3) | (6, 4)) {
             return Err(invalid("sparse author state format"));
         }
-        let state = Self {
-            observed: read_hash_option(&mut d)?,
-            committed: read_hash_option(&mut d)?,
-            control_ready: read_hash_option(&mut d)?,
-            observed_conflict: if version >= 2 {
-                match d.array()? {
-                    0 => None,
-                    2 => {
-                        let pair = (read_hash(&mut d)?, read_hash(&mut d)?);
-                        if pair.0 == pair.1 {
-                            return Err(invalid("observed conflict heads equal"));
-                        }
-                        Some(pair)
+        let observed = read_hash_option(&mut d)?;
+        let committed = read_hash_option(&mut d)?;
+        let control_ready = read_hash_option(&mut d)?;
+        let observed_conflict = if version >= 2 {
+            match d.array()? {
+                0 => None,
+                2 => {
+                    let pair = (read_hash(&mut d)?, read_hash(&mut d)?);
+                    if pair.0 == pair.1 {
+                        return Err(invalid("observed conflict heads equal"));
                     }
-                    _ => return Err(invalid("observed conflict arity")),
+                    Some(pair)
                 }
-            } else {
-                None
-            },
-            live: if version >= 3 {
-                match d.array()? {
-                    0 => None,
-                    1 => {
-                        if d.array()? != 4 {
-                            return Err(invalid("live history window arity"));
-                        }
-                        let window = LiveWindow {
-                            head: read_hash(&mut d)?,
-                            from: d.uint()?,
-                            next: d.uint()?,
-                            through: d.uint()?,
-                        };
-                        window.validate()?;
-                        Some(window)
+                _ => return Err(invalid("observed conflict arity")),
+            }
+        } else {
+            None
+        };
+        let floor = match version {
+            4 => d.uint()?,
+            3 => match d.array()? {
+                0 => 0,
+                1 => {
+                    if d.array()? != 4 {
+                        return Err(invalid("live history window arity"));
                     }
-                    _ => return Err(invalid("live history window option")),
+                    let _retired_head = read_hash(&mut d)?;
+                    let (from, next, through) = (d.uint()?, d.uint()?, d.uint()?);
+                    if from == 0
+                        || through > crate::log::feed::MAX_SEQ
+                        || from > through.saturating_add(1)
+                        || next > through
+                        || next.saturating_add(1) < from
+                    {
+                        return Err(invalid("live history window bounds"));
+                    }
+                    from
                 }
-            } else {
-                None
+                _ => return Err(invalid("live history window option")),
             },
+            _ => 0,
         };
         d.finish()?;
-        if state.control_ready.is_some() && state.committed.is_none() {
-            return Err(invalid("control-ready state without commitment"));
+        if floor > crate::log::feed::MAX_SEQ {
+            return Err(invalid("history walk floor"));
         }
-        Ok(state)
+        Ok((
+            Self {
+                observed,
+                committed,
+                observed_conflict,
+                floor,
+            },
+            control_ready,
+        ))
     }
 }
 
@@ -658,54 +665,6 @@ impl ObligationKind {
             _ => Err(invalid("sparse obligation kind")),
         }
     }
-}
-
-/// One durable progress cursor per provider. `after` remains before an in-flight body;
-/// a crash then repeats at most that item and cannot skip an uncommitted body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct KeyProviderCursor {
-    pub instance: [u8; 16],
-    pub connection: [u8; 16],
-    pub after: u64,
-    pub local_after: u64,
-    pub evidence_unavailable: bool,
-    pub authorization: Digest32,
-    pub peer_incarnation: u64,
-}
-
-fn key_provider_cursor_key(peer: &Digest32) -> Key {
-    let prefix = sha256(b"vox/key-provider-cursor/v1");
-    declined_head_key(&prefix, peer)
-}
-
-fn parse_key_provider_cursor(bytes: &[u8], peer: &Digest32) -> Result<KeyProviderCursor> {
-    let mut d = Decoder::new(bytes);
-    if d.array()? != 9 || d.uint()? != 2 || d.bytes()? != peer {
-        return Err(invalid("key provider cursor binding"));
-    }
-    let instance = d
-        .bytes()?
-        .try_into()
-        .map_err(|_| invalid("key provider cursor instance"))?;
-    let connection = d
-        .bytes()?
-        .try_into()
-        .map_err(|_| invalid("key provider cursor connection"))?;
-    let after = d.uint()?;
-    let local_after = d.uint()?;
-    let evidence_unavailable = flag(&mut d)?;
-    let authorization = read_hash(&mut d)?;
-    let peer_incarnation = d.uint()?;
-    d.finish()?;
-    Ok(KeyProviderCursor {
-        instance,
-        connection,
-        after,
-        local_after,
-        evidence_unavailable,
-        authorization,
-        peer_incarnation,
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -996,6 +955,54 @@ impl Source<'_> {
             .map(|id| AuthorState::parse(&self.sparse_record(sek, room, id, STATE_BYTES)?))
             .transpose()
     }
+    /// `head` is in its author's accepted chain (`Read::history_head_accepted`): committed here,
+    /// or shorter than the committed head with its root equal to the kept range [1, n].
+    fn sparse_head_accepted(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        head: &SignedHead,
+    ) -> Result<bool> {
+        let binding = head.binding;
+        if binding.room != *room {
+            return Ok(false);
+        }
+        if self.find_value(sek, room, roots.commitments, &hashed(&head.id()))?
+            == Some(Value::Present)
+        {
+            return Ok(true);
+        }
+        let Some(current_id) = self
+            .sparse_author(sek, room, roots, &binding.author, binding.scope)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(false);
+        };
+        let Some(current) = self.sparse_head(sek, room, roots, &current_id)? else {
+            return Err(invalid("accepted head missing"));
+        };
+        if current.binding != binding || head.root.leaves >= current.root.leaves {
+            return Ok(false);
+        }
+        let prefix = if head.root.leaves == 0 {
+            Descriptor::empty(binding)
+        } else {
+            let key = range_key(binding, 1, head.root.leaves)?;
+            let Some(id) = self.number(sek, room, roots.ranges, &key)? else {
+                return Ok(false);
+            };
+            let bytes = self.sparse_record(sek, room, id, STATE_BYTES)?;
+            let mut decoder = Decoder::new(&bytes);
+            let descriptor = Descriptor::decode(&mut decoder)?;
+            decoder.finish()?;
+            if descriptor.leaves != head.root.leaves {
+                return Err(invalid("stored tree range length"));
+            }
+            descriptor
+        };
+        Ok(prefix == head.root)
+    }
 }
 
 fn key_debt_order(serial: u64) -> Key {
@@ -1107,176 +1114,19 @@ impl Read<'_> {
         Ok(debts)
     }
 
-    pub(crate) fn key_provider_cursor(&self, peer: &Digest32) -> Result<Option<KeyProviderCursor>> {
-        let source = self.source();
-        let Some(id) = source.number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.key_body_providers,
-            &key_provider_cursor_key(peer),
-        )?
-        else {
-            return Ok(None);
-        };
-        parse_key_provider_cursor(
-            &source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
-            peer,
-        )
-        .map(Some)
-    }
-    /// One durable, monotonically ordered exact body debt, or true end of the index.
-    pub(crate) fn history_key_debt_after(
-        &self,
-        after: Option<u64>,
-    ) -> Result<Option<(u64, Obligation)>> {
-        let Some(next) = after.unwrap_or(0).checked_add(1) else {
-            return Ok(None);
-        };
-        let source = self.source();
-        let Some((key, value)) = source.first(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.key_body_debt_order,
-            &key_debt_order(next),
-            0,
-        )?
-        else {
-            return Ok(None);
-        };
-        if key[0] != 0 {
-            return Ok(None);
-        }
-        if key[9..].iter().any(|v| *v != 0) {
-            return Err(invalid("key debt order key"));
-        }
-        let serial = u64::from_be_bytes(
-            key[1..9]
-                .try_into()
-                .map_err(|_| invalid("key debt serial"))?,
-        );
-        let Value::Number(id) = value else {
-            return Err(invalid("key debt order locator"));
-        };
-        let obligation =
-            Obligation::parse(&source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?)?;
-        if obligation.kind != ObligationKind::KeyBody {
-            return Err(invalid("key debt order kind"));
-        }
-        Ok(Some((serial, obligation)))
-    }
-
-    /// Enumerate one provider cursor in the dedicated prefix, never body-scoped rows.
-    pub(crate) fn key_provider_cursor_after(
-        &self,
-        after: Option<Digest32>,
-    ) -> Result<Option<Digest32>> {
-        let prefix = sha256(b"vox/key-provider-cursor/v1");
-        let mut seek = declined_head_key(&prefix, &after.unwrap_or([0; 32]));
-        if after.is_some() {
-            let Some(next) = dag_facts::successor(seek) else {
-                return Ok(None);
-            };
-            seek = next;
-        }
-        let Some((key, value)) = self.source().first(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.key_body_providers,
-            &seek,
-            0,
-        )?
-        else {
-            return Ok(None);
-        };
-        if key[..32] != prefix {
-            return Ok(None);
-        }
-        let Value::Number(id) = value else {
-            return Err(invalid("key provider cursor locator"));
-        };
-        let peer: Digest32 = key[32..]
-            .try_into()
-            .map_err(|_| invalid("key provider cursor peer"))?;
-        parse_key_provider_cursor(
-            &self
-                .source()
-                .sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
-            &peer,
-        )?;
-        Ok(Some(peer))
+    /// Whether the published entry `hash` carries its body here. The one fact of possession for
+    /// a key package: serving sends exactly this body or answers that it is not held
+    /// (`ServedRoom::history_payload`), and the held record advertises it so
+    /// (`HeldAuthor::position`), whatever a body debt or the missing set says.
+    pub(crate) fn history_body_stored(&self, hash: &Digest32) -> Result<bool> {
+        Ok(self
+            .history_entry(hash)?
+            .is_some_and(|entry| entry.payload.is_some()))
     }
 
     pub(crate) fn sparse_history_instance(&self) -> [u8; 16] {
         self.directory.history_instance
     }
-    /// The exact inventory head this source refused for this author, and the authorization plus
-    /// two membership incarnations that scope that decision. One indexed scalar exists per real
-    /// relationship.
-    pub(crate) fn history_declined_head(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        self.history_declined_in_domain(peer, author, false)
-    }
-    pub(crate) fn history_declined_metadata(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        self.history_declined_in_domain(peer, author, true)
-    }
-    fn history_declined_in_domain(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-        metadata: bool,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        let key = if metadata {
-            metadata_decline_key(peer, author)
-        } else {
-            declined_head_key(peer, author)
-        };
-        let Some(id) = self.source().number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.declined_heads,
-            &key,
-        )?
-        else {
-            return Ok(None);
-        };
-        let bytes = self
-            .source()
-            .sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
-        let mut d = Decoder::new(&bytes);
-        let count = d.array()?;
-        let version = d.uint()?;
-        if count != 7 || !matches!(version, 2 | 3) || d.bytes()? != peer || d.bytes()? != author {
-            return Err(invalid("declined history head binding"));
-        }
-        let head = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("declined history head"))?;
-        let authorization = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("declined history authorization generation"))?;
-        let peer_incarnation = d.uint()?;
-        let author_incarnation = d.uint()?;
-        d.finish()?;
-        if version == 2 {
-            return Ok(None);
-        }
-        Ok(Some((
-            head,
-            authorization,
-            peer_incarnation,
-            author_incarnation,
-        )))
-    }
-
     pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
         let source = self.source();
         let Some(id) = source.number(
@@ -1299,21 +1149,28 @@ impl Read<'_> {
         }
         Ok(Some(header))
     }
-    /// Recheck one captured local obligation before body staging or transport admission.
-    pub(crate) fn history_key_body_owed(
+    /// The live body debt of the package published at `author`/`seq`: the durable KeyBody
+    /// obligation keyed by its accepted entry (its fixed validated source head, author,
+    /// position and entry hash), with that source head and header; `None` when nothing is owed.
+    /// No head of the author but the entry's own source names it, so a later head neither
+    /// recreates nor loses it, and a body missing everywhere leaves it owed.
+    pub(crate) fn history_key_body_owed_at(
         &self,
-        need: crate::node::history_stream::KeyBodyNeed,
-        _local: Digest32,
-    ) -> Result<bool> {
-        let obligation = Obligation {
-            head: need.head,
-            kind: ObligationKind::KeyBody,
-            object: need.hash,
-            author: need.target.author,
-            from: need.seq,
-            through: need.seq,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<(Digest32, Entry)>> {
+        let Some((head, entry)) = self.history_validated_header(author, seq)? else {
+            return Ok(None);
         };
-        if self
+        let obligation = Obligation {
+            head,
+            kind: ObligationKind::KeyBody,
+            object: entry.entry_hash(),
+            author: *author,
+            from: seq,
+            through: seq,
+        };
+        let owed = self
             .source()
             .number(
                 self.sek,
@@ -1321,24 +1178,8 @@ impl Read<'_> {
                 self.directory.active.sparse.key_body_obligations,
                 &obligation.key()?,
             )?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        let Some((head, header)) = self.history_validated_header(&need.target.author, need.seq)?
-        else {
-            return Err(invalid("key-body captured source missing"));
-        };
-        if head != need.head
-            || header.entry_hash() != need.hash
-            || !header.skeleton.v2.as_ref().is_some_and(|v| {
-                v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    && v.recipient == Some(need.recipient)
-            })
-        {
-            return Err(invalid("key-body captured source changed"));
-        }
-        Ok(true)
+            .is_some();
+        Ok(owed.then_some((head, entry)))
     }
 
     pub(crate) fn history_effect_finished(&self, hash: &Digest32) -> Result<bool> {
@@ -1360,6 +1201,40 @@ impl Read<'_> {
             .map(|feed| (feed.seq, feed.hash))
     }
     pub(crate) fn control_effects_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
+        self.control_prefix_complete(self.directory.active.sparse.effect_prefixes, head, through)
+    }
+    /// The author's control effects are complete through its whole committed head: its effect
+    /// prefix, kept by author (`control_prefix_complete`), reaches the committed size. One
+    /// predicate by position: whichever head's walk advanced the prefix, it holds as soon as
+    /// the prefix reaches the size, and no head id has to be republished.
+    pub(crate) fn history_control_ready(&self, author: &Digest32, scope: LogScope) -> Result<bool> {
+        let Some(committed) = self
+            .sparse_author(author, scope)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(false);
+        };
+        let head = self
+            .history_head(&committed)?
+            .ok_or(invalid("committed history head missing"))?;
+        Ok(self
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.effect_prefixes,
+                &hashed(author),
+            )?
+            .unwrap_or(0)
+            >= head.root.leaves)
+    }
+    /// A control prefix receipt `root` holds through `through` for committed `head`. Control
+    /// facts are kept per AUTHOR, not per head: which positions are controls (coverage), and how
+    /// far its controls are admitted (sources, effects), are facts about the author's positions,
+    /// proven once under a committed head and true under every later one, since each committed
+    /// head extends the one before (`commit_history_head`; a fork commits nothing). So the
+    /// answer never changes when the author's head moves.
+    fn control_prefix_complete(&self, root: u64, head: &Digest32, through: u64) -> Result<bool> {
         let source = self.source();
         if source.find_value(
             self.sek,
@@ -1370,12 +1245,18 @@ impl Read<'_> {
         {
             return Ok(false);
         }
+        let Some(target) = self.history_head(head)? else {
+            return Ok(false);
+        };
+        if through > target.root.leaves {
+            return Ok(false);
+        }
         Ok(source
             .number(
                 self.sek,
                 self.channel,
-                self.directory.active.sparse.effect_prefixes,
-                &hashed(head),
+                root,
+                &hashed(&target.binding.author),
             )?
             .unwrap_or(0)
             >= through)
@@ -1466,24 +1347,12 @@ impl Read<'_> {
         if target.binding != binding {
             return Ok(false);
         }
-        let Some(current_id) = self
-            .sparse_author(&binding.author, binding.scope)?
-            .and_then(|state| state.committed)
-        else {
-            return Ok(false);
-        };
-        let Some(current) = self.history_head(&current_id)? else {
-            return Err(invalid("accepted head missing"));
-        };
-        if current.binding != binding || target.root.leaves >= current.root.leaves {
-            return Ok(false);
-        }
-        let prefix = if target.root.leaves == 0 {
-            Some(Descriptor::empty(binding))
-        } else {
-            self.history_range(binding, 1, target.root.leaves)?
-        };
-        Ok(prefix == Some(target.root))
+        self.source().sparse_head_accepted(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse,
+            &target,
+        )
     }
     /// An individually evidence-complete published source and its exact inclusion target.
     /// This does not claim that the governance evaluator has applied the source's effect.
@@ -1514,25 +1383,7 @@ impl Read<'_> {
     /// A durable source-complete prefix receipt, built only from no-omission coverage and
     /// individually validated control sources. It grants no authority and performs no scan.
     pub(crate) fn control_sources_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
-        let source = self.source();
-        if source.find_value(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.commitments,
-            &hashed(head),
-        )? != Some(Value::Present)
-        {
-            return Ok(false);
-        }
-        Ok(source
-            .number(
-                self.sek,
-                self.channel,
-                self.directory.active.sparse.source_prefixes,
-                &hashed(head),
-            )?
-            .unwrap_or(0)
-            >= through)
+        self.control_prefix_complete(self.directory.active.sparse.source_prefixes, head, through)
     }
     /// The position at which `author` terminated its feed, once that Termination is a held
     /// source here (recorded at publication, `index_source_head`).
@@ -1669,34 +1520,10 @@ impl Read<'_> {
             })
             .transpose()
     }
-    /// The committed head this exact head was committed from, through this node's own verified
-    /// consistency proof (`commit_history_head`). None for a head committed from the empty
-    /// baseline or never committed here.
-    pub(crate) fn history_prior_head(&self, head: &Digest32) -> Result<Option<SignedHead>> {
-        let source = self.source();
-        source
-            .number(
-                self.sek,
-                self.channel,
-                self.directory.active.sparse.prior_heads,
-                &hashed(head),
-            )?
-            .map(|record| {
-                let prior = SignedHead::from_wire(&source.sparse_record(
-                    self.sek,
-                    self.channel,
-                    record,
-                    MAX_HEADER_BYTES,
-                )?)?;
-                if prior.binding.room != *self.channel || prior.id() == *head {
-                    return Err(invalid("prior head binding"));
-                }
-                Ok(prior)
-            })
-            .transpose()
-    }
     /// Head-scoped serving material is deliberately separate from canonical prefix ranges.
-    /// A verified proof may name a signed head whose consistency is still unresolved.
+    /// A verified proof may name a signed head whose consistency is still unresolved. Under a
+    /// head committed here a range rebuilt for serving is also found by position
+    /// (`cached_history_range`).
     pub(crate) fn history_proof_range(
         &self,
         head: &Digest32,
@@ -1716,9 +1543,17 @@ impl Read<'_> {
         {
             return Ok(Some(value));
         }
-        self.history_object(ObjectKind::ProofRange, &key)?
+        if let Some(value) = self
+            .history_object(ObjectKind::ProofRange, &key)?
             .map(|bytes| decode_proof_range(&bytes, head, binding, start, leaves))
-            .transpose()
+            .transpose()?
+        {
+            return Ok(Some(value));
+        }
+        if self.history_head_committed(head, binding)? {
+            return cached_history_range(binding, start, leaves);
+        }
+        Ok(None)
     }
     pub(crate) fn history_range(
         &self,
@@ -1750,6 +1585,92 @@ impl Read<'_> {
             })
             .transpose()
     }
+
+    /// How far the author's verified control coverage runs from position 1 (0: none), kept per
+    /// author whatever committed head proved it (`control_prefix_complete`): the author's first
+    /// run when it starts at 1 (`keep_control_run`). One seek, keys and scalar values only.
+    pub(crate) fn history_controls_covered(&self, author: &Digest32) -> Result<u64> {
+        let runs = self.directory.active.sparse.control_intervals;
+        Ok(
+            match control_run(&self.source(), self.sek, self.channel, runs, author, 1)? {
+                Some((_, 1, hi)) => hi,
+                _ => 0,
+            },
+        )
+    }
+
+    /// Position `seq` is a control of the author that verified coverage enumerated. One key.
+    pub(crate) fn history_is_control(&self, author: &Digest32, seq: u64) -> Result<bool> {
+        Ok(self
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.control_sources,
+                &position(author, seq),
+            )?
+            .is_some())
+    }
+
+    /// The positions of the author's controls its verified coverage enumerated, ascending.
+    /// Keys only.
+    pub(crate) fn history_control_positions(&self, author: &Digest32) -> Result<Vec<u64>> {
+        let source = self.source();
+        let mut positions = Vec::new();
+        let mut key = position(author, 1);
+        while let Some((found, _)) = source.first(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.control_sources,
+            &key,
+            0,
+        )? {
+            if found[..32] != author[..] {
+                break;
+            }
+            positions.push(u64::from_be_bytes(
+                found[32..40]
+                    .try_into()
+                    .map_err(|_| invalid("control source position"))?,
+            ));
+            let Some(next) = dag_facts::successor(found) else {
+                break;
+            };
+            key = next;
+        }
+        Ok(positions)
+    }
+}
+
+/// The author's control coverage run that ends at or after position `at`, as `(key, lo, hi)`.
+/// Runs are kept as `(author, hi) -> lo`, disjoint and never touching (`keep_control_run`), so
+/// the run holding `at`, if any, is this one when its `lo <= at`.
+fn control_run(
+    source: &Source<'_>,
+    sek: &Sek,
+    channel: &Digest32,
+    root: u64,
+    author: &Digest32,
+    at: u64,
+) -> Result<Option<(Key, u64, u64)>> {
+    let Some((key, value)) = source.first(sek, channel, root, &position(author, at), 0)? else {
+        return Ok(None);
+    };
+    if key[..32] != author[..] {
+        return Ok(None);
+    }
+    let hi = u64::from_be_bytes(
+        key[32..40]
+            .try_into()
+            .map_err(|_| invalid("coverage end"))?,
+    );
+    let Value::Number(lo) = value else {
+        return Err(invalid("coverage start"));
+    };
+    if lo == 0 || lo > hi {
+        return Err(invalid("coverage run"));
+    }
+    Ok(Some((key, lo, hi)))
 }
 
 /// One bounded source-closure step; neither Complete nor Progress grants authority.
@@ -1778,213 +1699,17 @@ pub(crate) enum SourceProgress {
     },
 }
 
+/// What one `keep_control_coverage` call kept.
+pub(crate) enum CoverageKept {
+    /// Only the enumeration's next 16 headers after `after` are kept; the coverage is not
+    /// published yet (the caller continues from `after + 16`).
+    Partial,
+    /// The coverage is published; `grew` when it covers a position the author's verified
+    /// coverage did not cover before (only then can an enumerated source be new).
+    Complete { grew: bool },
+}
+
 impl Write<'_, '_> {
-    pub(crate) fn key_provider_cursor(&self, peer: &Digest32) -> Result<Option<KeyProviderCursor>> {
-        let source = Source::Batch(self.batch);
-        let Some(id) = source.number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.key_body_providers,
-            &key_provider_cursor_key(peer),
-        )?
-        else {
-            return Ok(None);
-        };
-        parse_key_provider_cursor(
-            &source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
-            peer,
-        )
-        .map(Some)
-    }
-    /// Replaces only this provider's cursor inside the caller's authority-checked batch.
-    pub(crate) fn keep_key_provider_cursor(
-        &mut self,
-        peer: Digest32,
-        cursor: KeyProviderCursor,
-    ) -> Result<()> {
-        self.require_sparse_idle()?;
-        let key = key_provider_cursor_key(&peer);
-        let root = self.directory.active.sparse.key_body_providers;
-        let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
-        let mut e = Encoder::new();
-        e.array(9)
-            .uint(2)
-            .bytes(&peer)
-            .bytes(&cursor.instance)
-            .bytes(&cursor.connection)
-            .uint(cursor.after)
-            .uint(cursor.local_after)
-            .uint(u64::from(cursor.evidence_unavailable))
-            .bytes(&cursor.authorization)
-            .uint(cursor.peer_incarnation);
-        let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;
-        self.directory.active.sparse.key_body_providers =
-            self.change_value(root, key, Some(Value::Number(id)))?;
-        Ok(())
-    }
-    pub(crate) fn forget_key_provider_cursor(&mut self, peer: Digest32) -> Result<()> {
-        self.require_sparse_idle()?;
-        let key = key_provider_cursor_key(&peer);
-        let root = self.directory.active.sparse.key_body_providers;
-        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
-            self.retire(id)?;
-            self.directory.active.sparse.key_body_providers = self.change_value(root, key, None)?;
-        }
-        Ok(())
-    }
-    /// Read one refusal from this writer's transaction. This is deliberately the same batch
-    /// that checks the authorization nonce and, when needed, replaces the refusal record.
-    pub(crate) fn history_declined_head(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        self.history_declined_in_domain(peer, author, false)
-    }
-    pub(crate) fn history_declined_metadata(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        self.history_declined_in_domain(peer, author, true)
-    }
-    fn history_declined_in_domain(
-        &self,
-        peer: &Digest32,
-        author: &Digest32,
-        metadata: bool,
-    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        let key = if metadata {
-            metadata_decline_key(peer, author)
-        } else {
-            declined_head_key(peer, author)
-        };
-        let Some(id) = Source::Batch(self.batch).number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.declined_heads,
-            &key,
-        )?
-        else {
-            return Ok(None);
-        };
-        let bytes =
-            Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
-        let mut d = Decoder::new(&bytes);
-        let count = d.array()?;
-        let version = d.uint()?;
-        if count != 7 || !matches!(version, 2 | 3) || d.bytes()? != peer || d.bytes()? != author {
-            return Err(invalid("declined history head binding"));
-        }
-        let head = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("declined history head"))?;
-        let authorization = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("declined history authorization generation"))?;
-        let peer_incarnation = d.uint()?;
-        let author_incarnation = d.uint()?;
-        d.finish()?;
-        if version == 2 {
-            return Ok(None);
-        }
-        Ok(Some((
-            head,
-            authorization,
-            peer_incarnation,
-            author_incarnation,
-        )))
-    }
-
-    pub(crate) fn keep_history_declined_head(
-        &mut self,
-        peer: Digest32,
-        author: Digest32,
-        head: Digest32,
-        authorization: Digest32,
-        peer_incarnation: u64,
-        author_incarnation: u64,
-    ) -> Result<()> {
-        self.keep_history_declined_in_domain(
-            peer,
-            author,
-            head,
-            authorization,
-            peer_incarnation,
-            author_incarnation,
-            false,
-        )
-    }
-    pub(crate) fn keep_history_declined_metadata(
-        &mut self,
-        peer: Digest32,
-        author: Digest32,
-        head: Digest32,
-        authorization: Digest32,
-        peer_incarnation: u64,
-        author_incarnation: u64,
-    ) -> Result<()> {
-        self.keep_history_declined_in_domain(
-            peer,
-            author,
-            head,
-            authorization,
-            peer_incarnation,
-            author_incarnation,
-            true,
-        )
-    }
-    #[allow(clippy::too_many_arguments)] // Existing exact refusal tuple plus private domain.
-    fn keep_history_declined_in_domain(
-        &mut self,
-        peer: Digest32,
-        author: Digest32,
-        head: Digest32,
-        authorization: Digest32,
-        peer_incarnation: u64,
-        author_incarnation: u64,
-        metadata: bool,
-    ) -> Result<()> {
-        self.require_sparse_idle()?;
-        let key = if metadata {
-            metadata_decline_key(&peer, &author)
-        } else {
-            declined_head_key(&peer, &author)
-        };
-        let root = self.directory.active.sparse.declined_heads;
-        let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
-        let mut e = Encoder::new();
-        e.array(7)
-            .uint(3)
-            .bytes(&peer)
-            .bytes(&author)
-            .bytes(&head)
-            .bytes(&authorization)
-            .uint(peer_incarnation)
-            .uint(author_incarnation);
-        let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;
-        self.directory.active.sparse.declined_heads =
-            self.change_value(root, key, Some(Value::Number(id)))?;
-        Ok(())
-    }
-
-    pub(crate) fn forget_history_declined_head(
-        &mut self,
-        peer: Digest32,
-        author: Digest32,
-    ) -> Result<()> {
-        self.require_sparse_idle()?;
-        let key = declined_head_key(&peer, &author);
-        let root = self.directory.active.sparse.declined_heads;
-        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
-            self.retire(id)?;
-            self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn publish_local_history(
         &mut self,
         publication: LocalHistoryPublication<'_>,
@@ -2067,9 +1792,11 @@ impl Write<'_, '_> {
         result
     }
 
-    /// Inclusion of one exact signed header is complete class coverage of that one position.
+    /// Inclusion of one exact signed header is complete class coverage of that one position,
+    /// merged into the author's runs (`keep_control_run`).
     fn keep_single_control_coverage(&mut self, included: &IncludedHeader) -> Result<()> {
         let entry = included.header().entry();
+        let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
         if entry
             .skeleton
             .v2
@@ -2086,26 +1813,61 @@ impl Write<'_, '_> {
                 .ok_or(invalid("control header object absent"))?;
             self.directory.active.sparse.control_sources = self.change_value(
                 self.directory.active.sparse.control_sources,
-                position(&included.head_id(), entry.skeleton.seq),
+                position(&author, seq),
                 Some(Value::Number(id)),
             )?;
+            self.batch.touch_history(self.channel, author, Some(seq));
+        }
+        self.keep_control_run(&author, seq, seq)?;
+        Ok(())
+    }
+    /// The author's verified control coverage is kept as RUNS, `(author, hi) -> lo`, disjoint
+    /// and never touching: coverage `[lo, hi]` is merged on write with every run it overlaps
+    /// or touches, so an author admitted without gaps has one row. Each merged run is deleted
+    /// once; a covered run is found by one seek (`control_run`), so neither this write nor the
+    /// walk (`advance_control_receipt`) ever passes over older rows. Returns whether the
+    /// author's coverage grew.
+    fn keep_control_run(&mut self, author: &Digest32, lo: u64, hi: u64) -> Result<bool> {
+        if lo == 0 || lo > hi {
+            return Err(invalid("control coverage run"));
+        }
+        let (mut lo, mut hi) = (lo, hi);
+        let mut at = lo - 1;
+        let mut merged = false;
+        loop {
+            let root = self.directory.active.sparse.control_intervals;
+            let Some((key, run_lo, run_hi)) = control_run(
+                &Source::Batch(self.batch),
+                self.sek,
+                self.channel,
+                root,
+                author,
+                at,
+            )?
+            else {
+                break;
+            };
+            if run_lo > hi.saturating_add(1) {
+                break;
+            }
+            if !merged && run_lo <= lo && run_hi >= hi {
+                return Ok(false);
+            }
+            merged = true;
+            lo = lo.min(run_lo);
+            hi = hi.max(run_hi);
+            self.directory.active.sparse.control_intervals = self.change_value(root, key, None)?;
+            let Some(next) = run_hi.checked_add(1) else {
+                break;
+            };
+            at = next;
         }
         self.directory.active.sparse.control_intervals = self.change_value(
             self.directory.active.sparse.control_intervals,
-            position(&included.head_id(), entry.skeleton.seq),
-            Some(Value::Number(entry.skeleton.seq)),
+            position(author, hi),
+            Some(Value::Number(lo)),
         )?;
-        self.directory.active.sparse.source_cursors = self.change_value(
-            self.directory.active.sparse.source_cursors,
-            hashed(&included.head_id()),
-            None,
-        )?;
-        self.directory.active.sparse.effect_cursors = self.change_value(
-            self.directory.active.sparse.effect_cursors,
-            hashed(&included.head_id()),
-            None,
-        )?;
-        Ok(())
+        Ok(true)
     }
     /// The token can only be constructed by the channel's typed effect dispatcher after
     /// its exact signed context and current checks finish. This method grants nothing by
@@ -2191,6 +1953,11 @@ impl Write<'_, '_> {
             hashed(&entry.entry_hash()),
             Some(Value::Present),
         )?;
+        self.batch.touch_history(
+            self.channel,
+            entry.skeleton.author_id,
+            Some(entry.skeleton.seq),
+        );
         let tip = Source::Batch(self.batch)
             .number(
                 self.sek,
@@ -2240,9 +2007,9 @@ impl Write<'_, '_> {
         self.finish_history_obligation(&Obligation::authority(head.id(), entry))?;
         if expected_head.is_some() {
             // A local append extends only its already-ready predecessor, and this Batch contains
-            // the new entry's semantic effect. Publish the new exact-head receipt atomically;
-            // unlike a remote sparse effect, no separate prefix walk remains.
-            self.publish_control_ready(&head)?;
+            // the new entry's semantic effect: the author's effects are complete through the new
+            // head, so its effect prefix reaches it. No separate prefix walk remains.
+            self.finish_local_control_effects(&head)?;
         }
         Ok(())
     }
@@ -2382,7 +2149,6 @@ impl Write<'_, '_> {
             after_page: self.directory.next_page,
             retired: 0,
             bodyless_prefix: false,
-            reordered: 0,
             accepted: None,
             sparse_head: Some(included.head_id()),
             sparse_request: Some(request),
@@ -2491,6 +2257,17 @@ impl Write<'_, '_> {
             position(&entry.skeleton.author_id, entry.skeleton.seq),
             Some(Value::Number(id)),
         )?;
+        roots.sparse.objects = self.retire_pending_header(
+            roots.sparse.objects,
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            &head,
+        )?;
+        self.batch.touch_history(
+            self.channel,
+            entry.skeleton.author_id,
+            Some(entry.skeleton.seq),
+        );
         let head_record = Source::Batch(self.batch)
             .number(
                 self.sek,
@@ -2605,6 +2382,8 @@ impl Write<'_, '_> {
         let id = self.save_sparse_record(prior, head, ObjectKind::Unresolved.limit())?;
         self.directory.active.sparse.objects =
             self.change_value(root, key, Some(Value::Number(id)))?;
+        // The record of what this node holds lists the author's unresolved head (its Have).
+        self.batch.touch_history(self.channel, *author, None);
         Ok(())
     }
 
@@ -2699,8 +2478,11 @@ impl Write<'_, '_> {
         self.save_history_object(ObjectKind::Header, hash, &entry.header_wire())?;
         Ok(hash)
     }
-    /// A previously reconstructed tree node, retained for bounded proof serving. The
-    /// descriptor does not mark an interval as admitted or control-ready.
+    /// A tree node kept by author and position: the author's own appended nodes, a prefix
+    /// `[1, n]` of the accepted chain, or a full aligned block of a trace verified under a head
+    /// of that chain (`keep_history_blocks`). Each is the same value under every head of the
+    /// chain that contains it. The descriptor does not mark an interval as admitted or
+    /// control-ready.
     pub(crate) fn keep_history_range(
         &mut self,
         binding: TreeBinding,
@@ -2732,9 +2514,30 @@ impl Write<'_, '_> {
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
     }
+    /// Every full aligned block of a proof trace verified under a head on this node's accepted
+    /// chain of the author (the caller checked `history_head_accepted`). Such a block is one
+    /// complete subtree of the tree over positions, so it has the same descriptor under every head
+    /// of the chain that contains it (ADR-053 MP-7: identical aligned nodes may be reused): kept
+    /// once by author and position, it serves a proof under any later head without that head's
+    /// history being walked or rebuilt. Right-edge nodes stay per head.
+    pub(crate) fn keep_history_blocks(
+        &mut self,
+        binding: TreeBinding,
+        trace: &[(u64, Descriptor)],
+    ) -> Result<()> {
+        for (start, descriptor) in trace {
+            if full_block(*start, descriptor.leaves) {
+                self.keep_history_range(binding, *start, *descriptor)?;
+            }
+        }
+        Ok(())
+    }
     /// One fully verified wire piece of a durable inclusion/prefix receipt or of a control
     /// coverage's trace, written in that owner's transaction so it can be served again after a
-    /// restart. An existing key writes nothing. This does not change prefix acceptance.
+    /// restart. An existing key writes nothing. This does not change prefix acceptance. A full
+    /// aligned block under a head of the author's accepted chain is kept once, by author and
+    /// position (`keep_history_blocks`), the copy every committed source reads first; only the
+    /// right edge, and every piece under a head not accepted, is kept under the head.
     pub(crate) fn keep_history_proof_range(
         &mut self,
         head: Digest32,
@@ -2747,6 +2550,17 @@ impl Write<'_, '_> {
             return Err(invalid("proof-serving range room"));
         }
         descriptor.validate()?;
+        if full_block(start, descriptor.leaves) {
+            let roots = self.directory.active.sparse;
+            let source = Source::Batch(self.batch);
+            if let Some(target) = source.sparse_head(self.sek, self.channel, roots, &head)? {
+                if target.binding == binding
+                    && source.sparse_head_accepted(self.sek, self.channel, roots, &target)?
+                {
+                    return self.keep_history_range(binding, start, descriptor);
+                }
+            }
+        }
         let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
         if let Some(id) = Source::Batch(self.batch).number(
             self.sek,
@@ -2768,15 +2582,22 @@ impl Write<'_, '_> {
         descriptor.encode(&mut e);
         self.save_history_object(ObjectKind::ProofRange, key, &e.finish())
     }
-    /// Scan at most sixteen object locators, deleting only the obsolete serving-cache kind.
-    /// The object and its index reference retire in the same room transaction.
+    /// One slice of the one-time reclamation of an old store's proof-serving cache: it visits at
+    /// most `PROOF_CLEANUP_VISITS` object locators and deletes at most `PROOF_CLEANUP_DELETES`
+    /// of the obsolete serving-cache kind, each object with its index reference in this room
+    /// transaction (a delete rewrites one root-to-leaf path, so the second bound is what bounds
+    /// the transaction's pages).
     pub(super) fn cleanup_history_proof_ranges(
         &mut self,
         mut after: Option<Key>,
     ) -> Result<(bool, Option<Key>, bool)> {
         self.require_sparse_idle()?;
         let mut changed = false;
-        for _ in 0..16 {
+        let mut deleted = 0;
+        for _ in 0..PROOF_CLEANUP_VISITS {
+            if deleted == PROOF_CLEANUP_DELETES {
+                break;
+            }
             let seek = match after {
                 Some(key) => match dag_facts::successor(key) {
                     Some(next) => next,
@@ -2808,6 +2629,7 @@ impl Write<'_, '_> {
             self.retire(id)?;
             self.directory.active.sparse.objects = self.change_value(root, key, None)?;
             changed = true;
+            deleted += 1;
         }
         Ok((false, after, changed))
     }
@@ -2828,109 +2650,10 @@ impl Write<'_, '_> {
         if old.is_none() {
             self.directory.active.sparse.author_count += 1;
         }
+        self.batch.touch_history(self.channel, binding.author, None);
         Ok(())
     }
 
-    /// Resume an unfinished window. Only this node's first window for an author starts at the
-    /// newest 128 positions, so a newcomer is never made to read from message one; after it a
-    /// newer head keeps the start, and every position between it and the head stays wanted
-    /// until held, expired or answered as not held (ADR-052 RG-6, ledger 66).
-    pub(crate) fn select_history_live_window(
-        &mut self,
-        author: &Digest32,
-        head_id: Digest32,
-    ) -> Result<LiveWindow> {
-        self.require_sparse_idle()?;
-        let source = Source::Batch(self.batch);
-        let roots = self.directory.active.sparse;
-        let head = source
-            .sparse_head(self.sek, self.channel, roots, &head_id)?
-            .ok_or(invalid("live window head missing"))?;
-        if head.binding.author != *author || head.binding.scope != LogScope::Public {
-            return Err(invalid("live window author or scope differs"));
-        }
-        let mut state = source
-            .sparse_author(self.sek, self.channel, roots, author, LogScope::Public)?
-            .ok_or(invalid("live window author missing"))?;
-        if state.observed_conflict.is_some() {
-            return Err(invalid("live window author has conflicting heads"));
-        }
-        if let Some(window) = state.live {
-            if window.through >= head.root.leaves {
-                return Ok(window);
-            }
-        }
-        let through = head.root.leaves;
-        // A newer head over a finished window starts just above it: everything below was
-        // visited. Over an unfinished window it keeps that window's start, so the fresh
-        // positions above the old top are walked first and the old remainder after them
-        // (ADR-036: live before history). A floor that rose with the head used to leave a
-        // burst that outran the walk below it for good: 146 to 362 of 1,000 held.
-        let from = state.live.map_or(
-            through
-                .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
-                .max(1),
-            |old| {
-                if old.complete() {
-                    old.through + 1
-                } else {
-                    old.from
-                }
-            },
-        );
-        let window = LiveWindow {
-            head: head_id,
-            from,
-            next: through,
-            through,
-        };
-        window.validate()?;
-        state.live = Some(window);
-        self.save_sparse_author(head.binding, state)?;
-        Ok(window)
-    }
-
-    /// CAS the selected position, not the committed head. The caller has completed normal
-    /// admission or retained a verified missing-body position; this changes no effect flag.
-    /// `to` is the next position to walk: one below, or lower past a run already walked.
-    pub(crate) fn advance_history_live_window(
-        &mut self,
-        author: &Digest32,
-        expected: LiveWindow,
-        to: u64,
-    ) -> Result<bool> {
-        self.require_sparse_idle()?;
-        expected.validate()?;
-        if expected.complete() {
-            return Ok(false);
-        }
-        if to >= expected.next || to.saturating_add(1) < expected.from {
-            return Err(invalid("live window advance target"));
-        }
-        let source = Source::Batch(self.batch);
-        let roots = self.directory.active.sparse;
-        let mut state = source
-            .sparse_author(self.sek, self.channel, roots, author, LogScope::Public)?
-            .ok_or(invalid("live window author missing"))?;
-        if state.live != Some(expected) {
-            return Ok(false);
-        }
-        let head = source
-            .sparse_head(self.sek, self.channel, roots, &expected.head)?
-            .ok_or(invalid("live window head missing"))?;
-        if head.binding.author != *author
-            || head.binding.scope != LogScope::Public
-            || head.root.leaves != expected.through
-        {
-            return Err(invalid("live window binding differs"));
-        }
-        state.live = Some(LiveWindow {
-            next: to,
-            ..expected
-        });
-        self.save_sparse_author(head.binding, state)?;
-        Ok(true)
-    }
     /// Both observation and commitment preserve the highest authenticated observation.
     /// Commitment is a separate proof-gated position and cannot lower this requirement.
     fn merge_observed_head(&self, head: &SignedHead, state: &mut AuthorState) -> Result<()> {
@@ -3103,12 +2826,18 @@ impl Write<'_, '_> {
         }
         self.merge_observed_head(head, &mut state)?;
         state.committed = Some(head.id());
-        if head.root.leaves == 0 {
-            // An empty exact head has no control positions or effects to fetch. Mark that
-            // vacuous projection complete with the commitment; no control-source request can
-            // name position zero later to advance it.
-            state.control_ready = Some(head.id());
-        } else {
+        // The walk's floor is set once, by the author's first non-empty committed head: this
+        // node's first window is the newest 128 positions, so a newcomer is never made to read
+        // from message one; every position above the floor stays owed until walked (ADR-052
+        // RG-6). The rest of the walk is the in-memory record of what this node holds
+        // (`held_history`). An author a store written before floors existed committed got its
+        // floor at upgrade, from what this member held of it (`followed_floor`).
+        if state.floor == 0 && head.binding.scope == LogScope::Public && head.root.leaves != 0 {
+            state.floor = newcomer_floor(head.root.leaves);
+        }
+        // An empty head has no control positions or effects: the author's effect prefix (0)
+        // already reaches it (`history_control_ready`).
+        if head.root.leaves != 0 {
             self.keep_history_range(head.binding, 1, head.root)?;
         }
         self.directory.active.sparse.commitments = self.change_value(
@@ -3116,8 +2845,6 @@ impl Write<'_, '_> {
             hashed(&head.id()),
             Some(Value::Present),
         )?;
-        // Previously ready evidence remains exact to its older head; it is not upgraded by
-        // commitment alone. Readers must compare that ID with their requested target.
         self.save_sparse_author(head.binding, state)?;
         Ok(state.observed_conflict.is_some())
     }
@@ -3127,7 +2854,7 @@ impl Write<'_, '_> {
         &mut self,
         proof: &VerifiedControlRange,
         after: usize,
-    ) -> Result<Option<usize>> {
+    ) -> Result<CoverageKept> {
         self.require_sparse_idle()?;
         if proof.binding().room != *self.channel
             || proof.lo() == 0
@@ -3185,7 +2912,7 @@ impl Write<'_, '_> {
                     &object_key(ObjectKind::Header, &hash),
                 )?
                 .ok_or(invalid("control enumeration header missing"))?;
-            let key = position(&proof.head_id(), entry.skeleton.seq);
+            let key = position(&proof.binding().author, entry.skeleton.seq);
             let root = self.directory.active.sparse.control_sources;
             if let Some(prior) =
                 Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?
@@ -3202,10 +2929,16 @@ impl Write<'_, '_> {
             } else {
                 self.directory.active.sparse.control_sources =
                     self.change_value(root, key, Some(Value::Number(id)))?;
+                // The record of what this node holds adds this control position alone.
+                self.batch.touch_history(
+                    self.channel,
+                    proof.binding().author,
+                    Some(entry.skeleton.seq),
+                );
             }
         }
         if end < proof.headers().len() {
-            return Ok(Some(end));
+            return Ok(CoverageKept::Partial);
         }
         // Recheck the complete enumeration before publishing coverage, so an arbitrary
         // caller-supplied cursor can never skip required source rows. This is bounded by
@@ -3216,36 +2949,25 @@ impl Write<'_, '_> {
                     self.sek,
                     self.channel,
                     self.directory.active.sparse.control_sources,
-                    &position(&proof.head_id(), header.entry().skeleton.seq),
+                    &position(&proof.binding().author, header.entry().skeleton.seq),
                 )?
                 .is_none()
             {
                 return Err(invalid("control enumeration publication incomplete"));
             }
         }
-        let key = position(&proof.head_id(), proof.lo());
-        let root = self.directory.active.sparse.control_intervals;
-        let prior = Source::Batch(self.batch)
-            .number(self.sek, self.channel, root, &key)?
-            .unwrap_or(0);
-        if proof.hi() > prior {
-            self.directory.active.sparse.control_intervals =
-                self.change_value(root, key, Some(Value::Number(proof.hi())))?;
+        // Kept per author, whatever head proved it (`control_prefix_complete`), merged into the
+        // author's runs: no walk position is lost or moved back by new coverage.
+        let author = proof.binding().author;
+        let grew = self.keep_control_run(&author, proof.lo(), proof.hi())?;
+        if grew {
+            self.batch.touch_history(self.channel, author, None);
         }
-        self.directory.active.sparse.source_cursors = self.change_value(
-            self.directory.active.sparse.source_cursors,
-            hashed(&proof.head_id()),
-            None,
-        )?;
-        self.directory.active.sparse.effect_cursors = self.change_value(
-            self.directory.active.sparse.effect_cursors,
-            hashed(&proof.head_id()),
-            None,
-        )?;
-        Ok(None)
+        Ok(CoverageKept::Complete { grew })
     }
-    /// Advance one covered interval or one enumerated control. A source-complete receipt
-    /// is distinct from governance completion and never requires a whole head ready first.
+    /// Advance through one enumerated control of the covered run holding the prefix's next
+    /// position, or to that run's end. A source-complete receipt is distinct from governance
+    /// completion and never requires a whole head ready first.
     pub(crate) fn advance_control_sources(
         &mut self,
         head_id: &Digest32,
@@ -3273,11 +2995,6 @@ impl Write<'_, '_> {
         } else {
             roots.source_prefixes
         };
-        let cursor_root = if effects {
-            roots.effect_cursors
-        } else {
-            roots.source_cursors
-        };
         let source = Source::Batch(self.batch);
         if source.find_value(self.sek, self.channel, roots.commitments, &hashed(head_id))?
             != Some(Value::Present)
@@ -3301,119 +3018,54 @@ impl Write<'_, '_> {
         if head.id() != *head_id || head.binding.room != *self.channel {
             return Err(invalid("control source head binding"));
         }
+        // Kept per author whatever head proved them (`control_prefix_complete`): a moved head
+        // neither restarts nor inherits this progress, it is the same.
+        let author = head.binding.author;
         let through = source
-            .number(self.sek, self.channel, prefix_root, &hashed(head_id))?
+            .number(self.sek, self.channel, prefix_root, &hashed(&author))?
             .unwrap_or(0);
         if required == 0 || required > head.root.leaves {
             return Err(invalid("control receipt requested prefix"));
         }
         if through >= required {
-            if effects && through >= head.root.leaves {
-                self.publish_control_ready(&head)?;
-            }
             return Ok(SourceProgress::Complete { through });
         }
-        if let Some(record) =
-            source.number(self.sek, self.channel, roots.prior_heads, &hashed(head_id))?
-        {
-            let prior = SignedHead::from_wire(&source.sparse_record(
-                self.sek,
-                self.channel,
-                record,
-                MAX_HEADER_BYTES,
-            )?)?;
-            if prior.binding != head.binding
-                || prior.id() == *head_id
-                || prior.root.leaves > head.root.leaves
-            {
-                return Err(invalid("control receipt consistency baseline"));
-            }
-            if through < prior.root.leaves {
-                let inherited = source
-                    .number(self.sek, self.channel, prefix_root, &hashed(&prior.id()))?
-                    .unwrap_or(0)
-                    .min(prior.root.leaves)
-                    .min(required);
-                if inherited > through {
-                    let updated = self.change_value(
-                        prefix_root,
-                        hashed(head_id),
-                        Some(Value::Number(inherited)),
-                    )?;
-                    if effects {
-                        self.directory.active.sparse.effect_prefixes = updated;
-                    } else {
-                        self.directory.active.sparse.source_prefixes = updated;
-                    }
-                    return Ok(SourceProgress::Progress { through: inherited });
-                }
-                // Prior-head receipts are only reusable progress. If absent, prove the
-                // requested prefix under this already consistency-accepted head itself;
-                // do not recursively walk an arbitrarily long chain of prior heads.
-            }
-        }
-        let after = source
-            .number(self.sek, self.channel, cursor_root, &hashed(head_id))?
-            .unwrap_or(0);
-        let Some((key, value)) = source.first(
+        // The run holding `through + 1` (`keep_control_run`): one seek whatever the author's
+        // length. The prefix is the walk's only position; it only moves forward, and new
+        // coverage, merged into the runs, can neither hide a run from it nor move it back.
+        let Some((_, lo, hi)) = control_run(
+            &source,
             self.sek,
             self.channel,
             roots.control_intervals,
-            &position(
-                head_id,
-                after
-                    .checked_add(1)
-                    .ok_or(invalid("control source cursor overflow"))?,
-            ),
-            0,
+            &author,
+            through + 1,
         )?
         else {
             return Ok(SourceProgress::MissingCoverage { after: through });
         };
-        if key[..32] != head_id[..] {
-            return Ok(SourceProgress::MissingCoverage { after: through });
-        }
-        let lo = u64::from_be_bytes(
-            key[32..40]
-                .try_into()
-                .map_err(|_| invalid("coverage start"))?,
-        );
-        let Value::Number(hi) = value else {
-            return Err(invalid("coverage end"));
-        };
         if lo > through + 1 {
             return Ok(SourceProgress::MissingCoverage { after: through });
         }
-        if hi <= through {
-            let updated =
-                self.change_value(cursor_root, hashed(head_id), Some(Value::Number(lo)))?;
-            if effects {
-                self.directory.active.sparse.effect_cursors = updated;
-            } else {
-                self.directory.active.sparse.source_cursors = updated;
-            }
-            return Ok(SourceProgress::Progress { through });
-        }
         // A strict-past request must never require a later control (possibly the entry
-        // whose own admission is waiting here). Keep the interval cursor until its real
-        // end is reached, so a later request can continue this same authenticated range.
+        // whose own admission is waiting here).
         let stop = hi.min(required);
         let next = source.first(
             self.sek,
             self.channel,
             roots.control_sources,
-            &position(head_id, through + 1),
+            &position(&author, through + 1),
             0,
         )?;
-        let (next_through, finish_interval) = match next {
-            Some((key, Value::Number(id))) if key[..32] == head_id[..] => {
+        let next_through = match next {
+            Some((key, Value::Number(id))) if key[..32] == author[..] => {
                 let seq = u64::from_be_bytes(
                     key[32..40]
                         .try_into()
                         .map_err(|_| invalid("control source position"))?,
                 );
                 if seq > stop {
-                    (stop, stop == hi)
+                    stop
                 } else {
                     let wire =
                         source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?;
@@ -3449,35 +3101,23 @@ impl Write<'_, '_> {
                             hash: expected.entry_hash(),
                         });
                     }
-                    (seq, seq == hi)
+                    seq
                 }
             }
-            Some((key, _)) if key[..32] == head_id[..] => {
+            Some((key, _)) if key[..32] == author[..] => {
                 return Err(invalid("control source locator"));
             }
-            _ => (stop, stop == hi),
+            _ => stop,
         };
         let updated = self.change_value(
             prefix_root,
-            hashed(head_id),
+            hashed(&author),
             Some(Value::Number(next_through)),
         )?;
         if effects {
             self.directory.active.sparse.effect_prefixes = updated;
         } else {
             self.directory.active.sparse.source_prefixes = updated;
-        }
-        if finish_interval {
-            let updated =
-                self.change_value(cursor_root, hashed(head_id), Some(Value::Number(lo)))?;
-            if effects {
-                self.directory.active.sparse.effect_cursors = updated;
-            } else {
-                self.directory.active.sparse.source_cursors = updated;
-            }
-        }
-        if effects && next_through >= head.root.leaves {
-            self.publish_control_ready(&head)?;
         }
         Ok(if next_through >= required {
             SourceProgress::Complete {
@@ -3489,8 +3129,10 @@ impl Write<'_, '_> {
             }
         })
     }
-    fn publish_control_ready(&mut self, head: &SignedHead) -> Result<()> {
-        let mut state = Source::Batch(self.batch)
+    /// After a local append under `head`, the author's effect prefix reaches its size (see the
+    /// caller): the same claim the walk makes for a remote author, kept by author.
+    fn finish_local_control_effects(&mut self, head: &SignedHead) -> Result<()> {
+        let state = Source::Batch(self.batch)
             .sparse_author(
                 self.sek,
                 self.channel,
@@ -3499,11 +3141,245 @@ impl Write<'_, '_> {
                 head.binding.scope,
             )?
             .ok_or(invalid("control-ready author missing"))?;
-        if state.committed == Some(head.id()) && state.control_ready != Some(head.id()) {
-            state.control_ready = Some(head.id());
-            self.save_sparse_author(head.binding, state)?;
+        if state.committed != Some(head.id()) {
+            return Ok(());
+        }
+        let author = head.binding.author;
+        let root = self.directory.active.sparse.effect_prefixes;
+        let through = Source::Batch(self.batch)
+            .number(self.sek, self.channel, root, &hashed(&author))?
+            .unwrap_or(0);
+        if through < head.root.leaves {
+            self.directory.active.sparse.effect_prefixes =
+                self.change_value(root, hashed(&author), Some(Value::Number(head.root.leaves)))?;
         }
         Ok(())
+    }
+
+    /// One bounded slice of the one-time upgrade of the control facts of a store written before
+    /// format 14 (main and v0.4.30), run by open before any reader, as stages 3 to 7 of the
+    /// display reindex (`display_chunk`). Those versions kept each control fact under the head
+    /// that proved it; this one keeps it by author (`control_prefix_complete`). Every row under
+    /// a head COMMITTED here is a fact of the author's accepted chain and is merged into the
+    /// author's rows; a row under any other head (unresolved, forked, only observed) stays as
+    /// it is, under that head, and nothing reads it. A row's first 32 bytes name its head; an
+    /// author is never a committed head, so rows this slice writes are passed over.
+    ///
+    /// - 3, coverage `(head, lo) -> hi`: merged into the author's runs `(author, hi) -> lo`.
+    /// - 4, control sources `(head, seq) -> header`: `(author, seq) -> header`.
+    /// - 5, 6, source and effect prefixes `head -> through`: `author -> ` the greatest.
+    /// - 7, author records: one whose retired `control_ready` is its committed head raises the
+    ///   author's effect prefix to that head's size (an own append set only that); and every
+    ///   author with a non-empty committed head gets its walk floor (`followed_floor`).
+    ///
+    /// Each step is a merge, a maximum or the same header again, and no old row is changed or
+    /// deleted: a slice repeated after a crash adds nothing twice. The caller seals the cursor
+    /// with the slice.
+    pub(super) fn migrate_control_chunk(
+        &mut self,
+        stage: u8,
+        start: Option<Key>,
+    ) -> Result<Option<Key>> {
+        let mut key = start.unwrap_or([0; 64]);
+        for _ in 0..PROMOTION_ENTRIES {
+            let roots = self.directory.active.sparse;
+            let root = match stage {
+                3 => roots.control_intervals,
+                4 => roots.control_sources,
+                5 => roots.source_prefixes,
+                6 => roots.effect_prefixes,
+                _ => roots.authors,
+            };
+            let source = Source::Batch(self.batch);
+            let Some((found, value)) = source.first(self.sek, self.channel, root, &key, 0)? else {
+                return Ok(None);
+            };
+            let Value::Number(number) = value else {
+                return Err(invalid("upgraded control fact value"));
+            };
+            let id: Digest32 = found[..32]
+                .try_into()
+                .map_err(|_| invalid("upgraded control fact key"))?;
+            let at = u64::from_be_bytes(
+                found[32..40]
+                    .try_into()
+                    .map_err(|_| invalid("upgraded control fact position"))?,
+            );
+            if stage == 7 {
+                self.migrate_author_record(&found, number)?;
+            } else if source.find_value(self.sek, self.channel, roots.commitments, &hashed(&id))?
+                == Some(Value::Present)
+            {
+                let head = source
+                    .sparse_head(self.sek, self.channel, roots, &id)?
+                    .ok_or(invalid("committed history head missing"))?;
+                let author = head.binding.author;
+                match stage {
+                    3 => {
+                        if at == 0 || number < at || number > head.root.leaves {
+                            return Err(invalid("upgraded control coverage"));
+                        }
+                        self.keep_control_run(&author, at, number)?;
+                    }
+                    4 => self.migrate_control_source(&author, at, number)?,
+                    _ => {
+                        if found[32..].iter().any(|byte| *byte != 0) || number > head.root.leaves {
+                            return Err(invalid("upgraded control prefix"));
+                        }
+                        self.raise_control_prefix(stage == 6, &author, number)?;
+                    }
+                }
+            }
+            match dag_facts::successor(found) {
+                Some(next) => key = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(key))
+    }
+    /// Stage 4 of `migrate_control_chunk`: the author's control source at `seq` is the header
+    /// `record` (the same header object under every head).
+    fn migrate_control_source(&mut self, author: &Digest32, seq: u64, record: u64) -> Result<()> {
+        let source = Source::Batch(self.batch);
+        let header = |id| -> Result<Entry> {
+            Entry::from_wire(&source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?)
+        };
+        let entry = header(record)?;
+        if entry.skeleton.author_id != *author
+            || entry.skeleton.seq != seq
+            || !entry
+                .skeleton
+                .v2
+                .as_ref()
+                .is_some_and(|v| v.kind.is_control())
+        {
+            return Err(invalid("upgraded control source"));
+        }
+        let key = position(author, seq);
+        let root = self.directory.active.sparse.control_sources;
+        match source.number(self.sek, self.channel, root, &key)? {
+            None => {
+                self.directory.active.sparse.control_sources =
+                    self.change_value(root, key, Some(Value::Number(record)))?;
+            }
+            Some(held) if held != record && header(held)?.entry_hash() != entry.entry_hash() => {
+                return Err(invalid("control enumeration conflicts"));
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+    /// Stages 5 and 6 of `migrate_control_chunk`: the author's source or effect prefix is at
+    /// least `through`.
+    fn raise_control_prefix(
+        &mut self,
+        effects: bool,
+        author: &Digest32,
+        through: u64,
+    ) -> Result<()> {
+        let root = if effects {
+            self.directory.active.sparse.effect_prefixes
+        } else {
+            self.directory.active.sparse.source_prefixes
+        };
+        let held = Source::Batch(self.batch)
+            .number(self.sek, self.channel, root, &hashed(author))?
+            .unwrap_or(0);
+        if through > held {
+            let updated = self.change_value(root, hashed(author), Some(Value::Number(through)))?;
+            if effects {
+                self.directory.active.sparse.effect_prefixes = updated;
+            } else {
+                self.directory.active.sparse.source_prefixes = updated;
+            }
+        }
+        Ok(())
+    }
+    /// Stage 7 of `migrate_control_chunk`: an author record (`author_key`). Its retired
+    /// `control_ready`, when it names the committed head, claimed every control effect of that
+    /// head complete, which is the author's effect prefix reaching its size; and its walk floor
+    /// is set (`followed_floor`). Both are maxima or a fixed function of the store, so a
+    /// repeated slice changes nothing.
+    fn migrate_author_record(&mut self, key: &Key, record: u64) -> Result<()> {
+        if key[32] != LogScope::Public as u8 || key[33..].iter().any(|v| *v != 0) {
+            return Err(invalid("sparse author key"));
+        }
+        let author: Digest32 = key[..32]
+            .try_into()
+            .map_err(|_| invalid("sparse author identity"))?;
+        let source = Source::Batch(self.batch);
+        let bytes = source.sparse_record(self.sek, self.channel, record, STATE_BYTES)?;
+        let (mut state, control_ready) = AuthorState::parse_with_control_ready(&bytes)?;
+        let Some(committed) = state.committed else {
+            return Ok(());
+        };
+        let head = source
+            .sparse_head(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &committed,
+            )?
+            .ok_or(invalid("committed history head missing"))?;
+        if control_ready == Some(committed) {
+            self.raise_control_prefix(true, &author, head.root.leaves)?;
+        }
+        if head.root.leaves != 0 {
+            let floor = self.followed_floor(&author, state.floor, head.root.leaves)?;
+            if floor != state.floor {
+                state.floor = floor;
+                self.save_sparse_author(head.binding, state)?;
+            }
+        }
+        Ok(())
+    }
+    /// The walk floor of an author a store written before format 14 committed (stage 7): that
+    /// program left whatever it had not fetched missing anywhere in the author's history, so
+    /// the newest-128 start, which is for a newcomer, would make all of it older history nobody
+    /// fetches. A member that READ the author followed it from the lowest post of the author
+    /// shown here (a rendered row: a key of this member opened it, `put_rendered`), and owes
+    /// everything above. A published header alone is no such evidence: it may be ciphertext
+    /// this member could never read, or outlive its body. That program's own window start, if
+    /// it kept one (`floor`), is kept when lower: it already owed from there. A member with no
+    /// shown post of the author (none read, or every one expired) starts as a newcomer does.
+    fn followed_floor(&self, author: &Digest32, floor: u64, size: u64) -> Result<u64> {
+        let source = Source::Batch(self.batch);
+        let roots = self.directory.active.sparse;
+        let mut key = position(author, 1);
+        // The author's published positions in order, each header read once, until the first
+        // whose post is a shown row here.
+        let lowest = loop {
+            let Some((found, value)) =
+                source.first(self.sek, self.channel, roots.validated_positions, &key, 0)?
+            else {
+                break None;
+            };
+            if found[..32] != author[..] {
+                break None;
+            }
+            let Value::Number(record) = value else {
+                return Err(invalid("validated position locator"));
+            };
+            let header = Entry::from_wire(&source.sparse_record(
+                self.sek,
+                self.channel,
+                record,
+                MAX_HEADER_BYTES,
+            )?)?;
+            if self.has_rendered(&header.entry_hash())? {
+                break Some(header.skeleton.seq);
+            }
+            let Some(next) = dag_facts::successor(found) else {
+                break None;
+            };
+            key = next;
+        };
+        Ok(match (lowest, floor) {
+            (Some(seq), 0) => seq,
+            (Some(seq), floor) => seq.min(floor),
+            (None, 0) => newcomer_floor(size),
+            (None, floor) => floor,
+        })
     }
 
     /// The exact body debt must still exist at the publication transaction boundary.
@@ -3515,7 +3391,7 @@ impl Write<'_, '_> {
             head: need.head,
             kind: ObligationKind::KeyBody,
             object: need.hash,
-            author: need.target.author,
+            author: need.author,
             from: need.seq,
             through: need.seq,
         };
@@ -3569,6 +3445,10 @@ impl Write<'_, '_> {
                 )?;
                 self.directory.active.sparse.key_body_debt_order = order;
                 self.directory.active.sparse.key_body_debt_serial = serial;
+                // The held record reads this debt as "body owed, not held" (`held_history`):
+                // the position is read again at the next publication.
+                self.batch
+                    .touch_history(self.channel, obligation.author, Some(obligation.from));
             }
         } else {
             self.directory.active.sparse.obligations = next;
@@ -3604,6 +3484,13 @@ impl Write<'_, '_> {
                     let order = self.change_value(order, key_debt_order(serial), None)?;
                     self.directory.active.sparse.key_body_debt_order =
                         self.change_value(order, reverse, None)?;
+                    // The body is held now (refill) or no longer owed (expiry): the held record
+                    // reads the position again at the next publication.
+                    self.batch.touch_history(
+                        self.channel,
+                        obligation.author,
+                        Some(obligation.from),
+                    );
                 }
             } else {
                 self.directory.active.sparse.obligations = next;
@@ -3908,6 +3795,18 @@ fn receipt_key(head: &Digest32, author: &Digest32, seq: u64) -> Digest32 {
     bytes.extend_from_slice(&seq.to_be_bytes());
     sha256(&bytes)
 }
+fn parent_head_key(author: &Digest32, seq: u64) -> Digest32 {
+    let mut bytes = b"vox/local-parent-head/v1".to_vec();
+    bytes.extend_from_slice(author);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    sha256(&bytes)
+}
+fn included_head_key(author: &Digest32, seq: u64) -> Digest32 {
+    let mut bytes = b"vox/local-included-head/v1".to_vec();
+    bytes.extend_from_slice(author);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    sha256(&bytes)
+}
 
 impl Read<'_> {
     /// The caller owns the four-MiB verifier envelope through restoration and use.
@@ -3953,6 +3852,22 @@ impl Read<'_> {
             return Err(invalid("stored parent receipt binding"));
         }
         Ok(Some(result))
+    }
+    /// The committed head of `author` under which this node keeps a parent receipt for
+    /// position `seq` (the first one kept): found by author and position, whatever head the
+    /// answer that brought it was asked under. Committed heads of one author extend one
+    /// another, so each names the same entry at a position.
+    pub(crate) fn history_parent_head(
+        &self,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<Digest32>> {
+        self.history_object(ObjectKind::ParentHead, &parent_head_key(author, seq))?
+            .map(|bytes| {
+                <[u8; 32]>::try_from(bytes.as_slice())
+                    .map_err(|_| invalid("stored parent head locator"))
+            })
+            .transpose()
     }
 
     /// Snapshot discovery uses the same settled-position kernel as the native writer.
@@ -4203,14 +4118,41 @@ impl Write<'_, '_> {
         if included.binding().room != *self.channel {
             return Err(invalid("parent receipt room"));
         }
-        let key = receipt_key(
-            &included.head_id(),
-            &included.binding().author,
+        let (head, author, seq) = (
+            included.head_id(),
+            included.binding().author,
             included.header().entry().skeleton.seq,
         );
+        let key = receipt_key(&head, &author, seq);
         let prefix = receipt.prefix();
-        self.keep_history_range(prefix.binding(), 1, prefix.prefix())?;
-        self.save_history_object(ObjectKind::ParentReceipt, key, &receipt.checkpoint()?)
+        // The range [1, n] is a fact of the author's accepted chain only once this head is on
+        // it; under any other head the receipt stays bound to its head.
+        if self.accepted_head(&head)? {
+            self.keep_history_range(prefix.binding(), 1, prefix.prefix())?;
+        }
+        self.save_history_object(ObjectKind::ParentReceipt, key, &receipt.checkpoint()?)?;
+        // Only a committed head is a locator admission may use; commitments are never undone.
+        if Source::Batch(self.batch).find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(&head),
+        )? == Some(Value::Present)
+        {
+            self.save_history_object(ObjectKind::ParentHead, parent_head_key(&author, seq), &head)?;
+        }
+        Ok(())
+    }
+    /// `head` is on this node's accepted chain of its author, read in this transaction. A
+    /// receipt kept under it is then also a fact by author and position (`history_range`);
+    /// under a head not (yet) accepted it is a witness of that head only (audit §11).
+    fn accepted_head(&self, head: &Digest32) -> Result<bool> {
+        let roots = self.directory.active.sparse;
+        let source = Source::Batch(self.batch);
+        match source.sparse_head(self.sek, self.channel, roots, head)? {
+            Some(target) => source.sparse_head_accepted(self.sek, self.channel, roots, &target),
+            None => Ok(false),
+        }
     }
 }
 
@@ -4237,6 +4179,27 @@ impl Read<'_> {
             return Err(invalid("stored inclusion receipt binding"));
         }
         Ok(Some(result))
+    }
+    /// The inclusion receipt of `author`'s position `seq` kept under a head of the author's
+    /// accepted chain (the first one kept): found by author and position, whatever head asks.
+    /// Heads of the accepted chain extend one another, so each names the same entry there.
+    pub(crate) fn history_included_header(
+        &self,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<IncludedHeader>> {
+        let Some(bytes) =
+            self.history_object(ObjectKind::IncludedHead, &included_head_key(author, seq))?
+        else {
+            return Ok(None);
+        };
+        let head: Digest32 = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("stored included head locator"))?;
+        self.history_inclusion_receipt(&head, author, seq)?
+            .ok_or(invalid("located inclusion receipt missing"))
+            .map(Some)
     }
     pub(crate) fn history_prefix_receipt(
         &self,
@@ -4268,13 +4231,35 @@ impl Write<'_, '_> {
         if receipt.binding().room != *self.channel {
             return Err(invalid("inclusion receipt room"));
         }
-        let key = receipt_key(
-            &receipt.head_id(),
-            &receipt.binding().author,
+        let (head, author, seq) = (
+            receipt.head_id(),
+            receipt.binding().author,
             receipt.header().entry().skeleton.seq,
         );
-        self.save_history_object(ObjectKind::InclusionReceipt, key, &receipt.local_receipt()?)
+        let key = receipt_key(&head, &author, seq);
+        self.save_history_object(ObjectKind::InclusionReceipt, key, &receipt.local_receipt()?)?;
+        // Located by position only under a head of the accepted chain (an unresolved or forked
+        // head borrows nothing); kept again once its head is accepted (`bundle::check`).
+        let roots = self.directory.active.sparse;
+        let source = Source::Batch(self.batch);
+        let accepted = match source.sparse_head(self.sek, self.channel, roots, &head)? {
+            Some(target) => source.sparse_head_accepted(self.sek, self.channel, roots, &target)?,
+            None => false,
+        };
+        if accepted {
+            self.save_history_object(
+                ObjectKind::IncludedHead,
+                included_head_key(&author, seq),
+                &head,
+            )?;
+        }
+        Ok(())
     }
+    /// A verified prefix [1, n] of one signed head, kept under that head. Its range [1, n] is
+    /// kept by author and position only while the head is on the author's accepted chain: a
+    /// prefix of a head not accepted (unresolved, of another history, or not yet promoted) is a
+    /// witness of that head and never a fact of the accepted chain (MP-9). A caller that
+    /// promotes the head keeps the receipt again after the promotion (`bundle::check`).
     pub(crate) fn keep_history_prefix_receipt(&mut self, receipt: &ConsistentPrefix) -> Result<()> {
         if receipt.binding().room != *self.channel {
             return Err(invalid("prefix receipt room"));
@@ -4284,32 +4269,27 @@ impl Write<'_, '_> {
             &receipt.binding().author,
             receipt.prefix().leaves,
         );
-        if receipt.prefix().leaves != 0 {
+        if receipt.prefix().leaves != 0 && self.accepted_head(&receipt.head_id())? {
             self.keep_history_range(receipt.binding(), 1, receipt.prefix())?;
         }
         self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
     }
-    /// MP-9: a verified prefix of a signed head that is not the accepted chain's. Kept under its
-    /// own head only, so the comparison of the two histories resumes; never a canonical range.
-    pub(crate) fn keep_history_unlinked_prefix_receipt(
-        &mut self,
-        receipt: &ConsistentPrefix,
-    ) -> Result<()> {
-        if receipt.binding().room != *self.channel {
-            return Err(invalid("prefix receipt room"));
-        }
-        let key = receipt_key(
-            &receipt.head_id(),
-            &receipt.binding().author,
-            receipt.prefix().leaves,
-        );
-        self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
-    }
 }
 
+/// A pending header under one head: kept so only while that head is not in the author's
+/// accepted chain (it may belong to another branch), and by older versions for every head.
 fn pending_header_key(head: &Digest32, seq: u64) -> Digest32 {
     let mut bytes = b"vox/local-pending-header/v1".to_vec();
     bytes.extend_from_slice(head);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    sha256(&bytes)
+}
+/// A pending header kept under a head in the author's accepted chain: a fact about the
+/// author's position, which every later committed head extends, so it is kept once by author
+/// and position and deleted when that position is published (`index_source_head`).
+fn pending_position_key(author: &Digest32, seq: u64) -> Digest32 {
+    let mut bytes = b"vox/local-pending-position/v1".to_vec();
+    bytes.extend_from_slice(author);
     bytes.extend_from_slice(&seq.to_be_bytes());
     sha256(&bytes)
 }
@@ -4324,19 +4304,38 @@ fn check_pending_header(head: &SignedHead, entry: &Entry) -> Result<()> {
 }
 impl Read<'_> {
     /// Authenticated provisional header only; this locator is neither inclusion nor admission.
+    /// Under a head in the author's accepted chain the header kept by position is found
+    /// whichever accepted head it came with; under another head only the one kept under it.
     pub(crate) fn history_pending_header(
         &self,
         head: &Digest32,
         seq: u64,
     ) -> Result<Option<Entry>> {
+        let target = self.history_head(head)?;
+        if let Some(target) = &target {
+            let source = self.source();
+            let roots = self.directory.active.sparse;
+            if source.sparse_head_accepted(self.sek, self.channel, roots, target)? {
+                let key = pending_position_key(&target.binding.author, seq);
+                if let Some(bytes) = self.history_object(ObjectKind::PendingHeader, &key)? {
+                    let entry = Entry::from_wire(&bytes)?;
+                    if entry.skeleton.seq != seq || entry.payload.is_some() {
+                        return Err(invalid("pending header binding"));
+                    }
+                    // Kept under another accepted head: absent under this one when the position
+                    // is past it or its tail epoch differs.
+                    return Ok(check_pending_header(target, &entry)
+                        .is_ok()
+                        .then_some(entry));
+                }
+            }
+        }
         let Some(bytes) =
             self.history_object(ObjectKind::PendingHeader, &pending_header_key(head, seq))?
         else {
             return Ok(None);
         };
-        let target = self
-            .history_head(head)?
-            .ok_or(invalid("pending header head missing"))?;
+        let target = target.ok_or(invalid("pending header head missing"))?;
         let entry = Entry::from_wire(&bytes)?;
         check_pending_header(&target, &entry)?;
         if entry.skeleton.seq != seq || entry.payload.is_some() {
@@ -4371,8 +4370,23 @@ impl Write<'_, '_> {
             return Err(invalid("pending header head binding"));
         }
         check_pending_header(&target, header.entry())?;
+        let (author, seq) = (target.binding.author, header.entry().skeleton.seq);
+        let roots = self.directory.active.sparse;
+        let accepted = source.sparse_head_accepted(self.sek, self.channel, roots, &target)?;
+        if accepted
+            && source
+                .sparse_position_header(self.sek, self.channel, roots, &author, seq)?
+                .is_some_and(|held| held.entry_hash() == header.entry().entry_hash())
+        {
+            // Already published at this position: nothing is pending.
+            return Ok(());
+        }
         self.keep_history_header(header)?;
-        let hash = pending_header_key(head, header.entry().skeleton.seq);
+        let hash = if accepted {
+            pending_position_key(&author, seq)
+        } else {
+            pending_header_key(head, seq)
+        };
         let key = object_key(ObjectKind::PendingHeader, &hash);
         let source = Source::Batch(self.batch);
         if let Some(prior) = source.number(
@@ -4406,5 +4420,29 @@ impl Write<'_, '_> {
             Some(Value::Number(id)),
         )?;
         Ok(())
+    }
+    /// Position `seq` of `author` is published under `head`: its pending header, kept by
+    /// position or under that head, is no longer pending. The header object itself stays.
+    fn retire_pending_header(
+        &mut self,
+        objects: u64,
+        author: &Digest32,
+        seq: u64,
+        head: &Digest32,
+    ) -> Result<u64> {
+        let mut objects = objects;
+        for hash in [
+            pending_position_key(author, seq),
+            pending_header_key(head, seq),
+        ] {
+            let key = object_key(ObjectKind::PendingHeader, &hash);
+            if Source::Batch(self.batch)
+                .number(self.sek, self.channel, objects, &key)?
+                .is_some()
+            {
+                objects = self.change_value(objects, key, None)?;
+            }
+        }
+        Ok(objects)
     }
 }

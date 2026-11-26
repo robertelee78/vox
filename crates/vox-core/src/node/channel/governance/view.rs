@@ -1016,7 +1016,9 @@ impl<'a> View<'a> {
 
     /// Strict causal containment of the cut readmission. A body still unindexed here (a fresh
     /// arrival) is decided only by its own author chain while that chain has no known fork, or
-    /// positively by a signed parent that already contains the cut; otherwise it waits.
+    /// positively by a control's receipt-checked signed parent that already contains the cut;
+    /// otherwise it waits. An ordinary Content entry's `seen` are unchecked ordering hints
+    /// (ADR-053 M0) and never count here, whatever they name.
     fn contains_cut(
         &self,
         entry: &Entry,
@@ -1035,7 +1037,7 @@ impl<'a> View<'a> {
         let Some(v2) = entry.skeleton.v2.as_ref() else {
             return Ok(None);
         };
-        for parent in &v2.seen {
+        for parent in super::sparse::checked_seen(v2) {
             if parent.hash == cut.hash
                 || (unforked && parent.author == cut.author && parent.seq > cut.seq)
                 || self.facts.causal_contains(&parent.hash, cut)? == Some(true)

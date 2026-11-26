@@ -33,7 +33,7 @@ pub(super) enum IngressProgress {
 }
 
 pub(super) struct IngressWait {
-    instance: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    instance: Option<std::sync::Weak<crate::node::channel::RoomLock>>,
     attachment: u64,
     reason: IngressReason,
 }
@@ -49,6 +49,9 @@ impl Drop for IngressWait {
 pub(super) struct Bookkeeping {
     room: Digest32,
     result: Arc<std::sync::Mutex<Option<bool>>>,
+    /// Whether its completion changes what the node publishes: a Session admission does; an
+    /// attention write changes only the attention ledger, which no view shows.
+    publishes: bool,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -106,10 +109,12 @@ impl Node {
             .is_some_and(|pending| pending.room == *room)
     }
 
+    /// Whether the pending bookkeeping completed with something to publish.
     pub(super) fn complete_session_bookkeeping(&mut self) -> bool {
         let Some(pending) = &self.pending_session_bookkeeping else {
             return false;
         };
+        let publishes = pending.publishes;
         let saved = pending
             .result
             .lock()
@@ -120,7 +125,7 @@ impl Node {
             if ingress {
                 self.ingress_scan_wake();
             }
-            true
+            publishes
         } else {
             false
         }
@@ -270,6 +275,7 @@ impl Node {
         self.pending_session_bookkeeping = Some(Bookkeeping {
             room,
             result,
+            publishes: true,
             _task: task,
         });
     }
@@ -328,30 +334,49 @@ impl Node {
             } else {
                 authority.try_acquire_publication().ok().flatten()
             };
-            let mut channel = channel.lock_owned().await;
+            let room = Arc::clone(&channel);
+            let held = channel.lock_owned().await;
             let saved = tokio::task::spawn_blocking(move || {
+                // Both are held until the write below is done: the node stays unlocked and the
+                // Computer publication (a pause's write) waits for it, as it did for the room.
                 let _secret = secret;
-                if *attachment.borrow() != epoch {
-                    return Err("the node changed; attention was not saved".into());
-                }
-                if by != owner && !channel.is_member(&by) {
-                    return Err("attention requires current room membership".into());
-                }
-                if (page && !authority.current()) || (!page && publication.is_none()) {
-                    return Err("attention waits for current computer trust".into());
-                }
-                if !page {
-                    if let Some(expected) = expected_instance {
-                        if channel
-                            .history_instance(&store)
-                            .map_err(|error| error.to_string())?
-                            != expected
-                        {
-                            return Err("the selected room changed; refresh and retry".into());
+                let publication = publication;
+                let decided = {
+                    // The room is held only to decide; it is released before the write.
+                    let mut channel = held;
+                    if *attachment.borrow() != epoch {
+                        return Err("the node changed; attention was not saved".into());
+                    }
+                    if by != owner && !channel.is_member(&by) {
+                        return Err("attention requires current room membership".into());
+                    }
+                    if (page && !authority.current()) || (!page && publication.is_none()) {
+                        return Err("attention waits for current computer trust".into());
+                    }
+                    if !page {
+                        if let Some(expected) = expected_instance {
+                            if channel
+                                .history_instance(&store)
+                                .map_err(|error| error.to_string())?
+                                != expected
+                            {
+                                return Err("the selected room changed; refresh and retry".into());
+                            }
                         }
                     }
-                }
-                let saved = channel.attention(&store, owner, expected_instance, operation, clock());
+                    channel.attention(&store, owner, expected_instance, operation, clock())
+                };
+                let saved = decided.and_then(|decided| match decided {
+                    crate::node::channel::Attention::Answer(reply) => Ok(reply),
+                    crate::node::channel::Attention::Write(write) => {
+                        write.run(&store).map_err(|error| {
+                            if !matches!(error, Error::Profile(_)) {
+                                room.blocking_lock().poison(&error);
+                            }
+                            error.to_string()
+                        })
+                    }
+                });
                 if page && !authority.current() {
                     Err("attention waits for current computer trust".into())
                 } else {
@@ -374,6 +399,7 @@ impl Node {
             self.pending_session_bookkeeping = Some(Bookkeeping {
                 room,
                 result,
+                publishes: false,
                 _task: task,
             });
         }

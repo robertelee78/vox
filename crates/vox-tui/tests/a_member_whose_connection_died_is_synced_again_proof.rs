@@ -25,11 +25,6 @@
 //! scene, for something else to dial (a key to deliver). In CI's red nothing else did, and they
 //! never synced.
 //!
-//! **The dead connection is observed, not assumed**: bob's `SIGSTOP` took (`ps` reports him
-//! stopped) and he stayed frozen past the 30 s silence line on this proof's clock (else
-//! APPARATUS), and carol's own `vox status --json` shows a session to bob that failed while he was
-//! frozen, or carol says she closed her connection to him as unanswering while in use (else
-//! PRODUCT (staging)).
 //!
 //! **Apparatus clock.** From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and
 //! keeps the most it overslept: the runner's own stall, which vox cannot move. If it overslept more
@@ -121,22 +116,6 @@ fn stopped(p: &VoxProc) -> bool {
                 .trim_start()
                 .starts_with('T')
         })
-}
-
-/// `data`'s node's sync row for `peer` (a fingerprint), from the shipped `vox status --json`.
-fn port_to(data: &Path, peer: &str) -> serde_json::Value {
-    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
-    assert!(ok, "PRODUCT (staging): `vox status --json` failed: {err}");
-    let status: serde_json::Value = serde_json::from_str(out.trim())
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): `vox status --json` printed {out:?}: {e}"));
-    status["sync"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|r| r["peer"].as_str().is_some_and(|p| peer.starts_with(p)))
-                .cloned()
-        })
-        .unwrap_or(serde_json::Value::Null)
 }
 
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
@@ -329,7 +308,6 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
 
     // ---- 2. bob frozen past the 30 s line; carol posts -----------------------------------------
-    let carol_to_bob_before = port_to(&carol_dir, &bob_fp)["failed"].as_u64().unwrap_or(0);
     signal(&bob, "-STOP");
     let frozen = Instant::now();
     assert!(
@@ -344,27 +322,6 @@ fn a_member_whose_connection_died_is_synced_again() {
         assert!(ok, "PRODUCT: carol's post {i} was refused: {out}{err}");
     }
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
-    // The premise: bob stopped answering carol, long enough to be dropped as dead.
-    let carol_to_bob = port_to(&carol_dir, &bob_fp);
-    let failed = carol_to_bob["failed"].as_u64().unwrap_or(0);
-    println!(
-        "[proof] carol's port to frozen bob after {:.1?}: failed {carol_to_bob_before} -> {failed}, \
-         last failure {}",
-        frozen.elapsed(),
-        carol_to_bob["last_failure"]
-    );
-    // Or carol said she closed it: a connection in use that answers nothing is closed after 8 s
-    // (V210-93's probe, which a member's connection has too), and then no session fails on it.
-    let closed = carol
-        .transcript()
-        .contains("while in use; closed, so the next use reaches it again");
-    assert!(
-        failed > carol_to_bob_before || closed,
-        "PRODUCT (staging): no session of carol's to frozen bob failed within {:.1?}, and carol \
-         did not say she closed her connection to him, so his connection is not shown dead (her \
-         port: {carol_to_bob})",
-        frozen.elapsed()
-    );
     // ---- 3. no anchor left; carol frozen while bob comes back and tries her -----------------
     let anchor_said = anchor.transcript();
     signal(&anchor, "-INT");

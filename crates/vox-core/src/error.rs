@@ -471,9 +471,10 @@ pub enum Error {
     #[error("a member accepted the passphrase but could not admit this identity")]
     JoinNotAdmitted,
 
-    /// Every one of the responder's join slots was held, so it refused before the exchange began
-    /// (V210-92). The passphrase was never checked.
-    #[error("a member is busy answering other joins")]
+    /// The member was busy and took no step for this joiner: every one of its join slots was held,
+    /// so it refused before the exchange began (V210-92), or it was saving the room for longer
+    /// than a join's offer waits, after the passphrase was accepted. Says nothing about the joiner.
+    #[error("a member is busy answering other joins or saving the room")]
     JoinResponderBusy,
 
     /// The member that answered said the room has ended (V030-08): it takes nobody in. The

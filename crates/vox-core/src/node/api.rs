@@ -705,6 +705,10 @@ pub struct ChannelDetail {
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
+    /// The other members a post of which is held here and not shown because the render gate
+    /// holds it back, each with the current fact that does (`status::NOT_SHOWN_NO_GRANT`,
+    /// `status::NOT_SHOWN_NO_KEY`), in fingerprint order.
+    pub not_shown: Vec<(Digest32, &'static str)>,
     /// Who trusts each member here (ADR-028 K-7): `(member, the other members that consent to it
     /// reading them)`, in fingerprint order, a member no one trusts left out. `consenting` is this
     /// identity's own entry.
@@ -1009,6 +1013,12 @@ pub enum HistoryDemandPhase {
     /// Another bounded operation owns the available reservation.
     Busy,
 }
+
+/// Largest wire-byte count accepted in a saved history-demand status.
+pub(crate) const MAX_HISTORY_STATUS_WIRE_BYTES: usize = crate::log::entry::MAX_PAYLOAD_LEN
+    + crate::log::entry::MAX_AUTHENTICATOR_LEN
+    + 4096
+    + 512 * 1024;
 
 /// Redaction-safe, bounded progress returned to the CLI and app.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1605,8 +1615,14 @@ pub enum Fault {
     SessionCleanupBusy,
     /// The hosted daemon's reliable Session cleanup handler has gone away.
     SessionCleanupUnavailable,
-    /// Rejoining must keep the last copy of a signed departure until a member acknowledges it.
+    /// Rejoining must keep the last copy of a signed departure until a member acknowledges it;
+    /// no member of the room was reachable while the join waited.
     DepartureNotHeard,
+    /// The same, while a member of the room was connected and did not acknowledge it.
+    DepartureNotAcknowledged,
+    /// A rejoin was accepted, but this node's own signed history in the room conflicts with what
+    /// a member holds, so it cannot be recovered and this node cannot write there.
+    RejoinedOwnHistoryFrozen,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1654,9 +1670,9 @@ pub enum Fault {
     /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
     /// was reported: the member had been reached, and had waited.
     SolveTooSlow,
-    /// Every member that answered was already answering as many joins as it takes at once
-    /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
-    /// was never checked.
+    /// Every member that answered was busy: already answering as many joins as it takes at once
+    /// (V210-92), or saving the room for longer than a join's offer waits. **Not
+    /// [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this says nothing about it.
     MembersBusy,
     /// A member answered and checked the passphrase, and the room already holds as many members as
     /// a room can, so it could not admit the joiner. **Not [`Fault::Refused`]**, which reads as a
@@ -1885,6 +1901,12 @@ impl Fault {
             Fault::DepartureNotHeard => {
                 "no member of this room has acknowledged this node's signed departure; the left copy was kept and this join made no change\n       try joining again when a member of the room is reachable"
             }
+            Fault::DepartureNotAcknowledged => {
+                "a member of this room is connected but has not acknowledged this node's signed departure; the left copy was kept and this join made no change\n       try joining again; `vox status` names that member and its last sync failure, if any"
+            }
+            Fault::RejoinedOwnHistoryFrozen => {
+                "the room was joined again, but this node's own signed history in it conflicts with what a member holds, so it cannot be recovered and this node writes nothing there\n       `vox status --node <name>` says `conflicting signed own history; writes remain frozen` for this room"
+            }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
@@ -1921,7 +1943,7 @@ impl Fault {
                 "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
             }
             Fault::MembersBusy => {
-                "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
+                "a member answered, but it is busy answering other joins or saving the room, so it did not take you in\n       this is not a verdict on your passphrase\n       try the join again shortly"
             }
             Fault::RoomFull => {
                 "the room is full, so you were not admitted\n       your passphrase was accepted; the room takes no more members"
@@ -2129,6 +2151,8 @@ fault_names!(
     SessionCleanupBusy,
     SessionCleanupUnavailable,
     DepartureNotHeard,
+    DepartureNotAcknowledged,
+    RejoinedOwnHistoryFrozen,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,
@@ -2206,6 +2230,11 @@ pub enum Outcome {
     /// A Session entry was appended (ADR-029 SC-1): its entry hash, which a later entry's `re`
     /// names.
     Appended(Digest32),
+    /// A rejoin was accepted and this node is a member again, but the join's patience
+    /// (`BOARD_PATIENCE`) passed while its own history in the room was still being recovered from
+    /// the members that hold it: it reads now and posts once that has finished
+    /// ([`Outcome::RECOVERING`]).
+    JoinedRecovering,
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -2232,12 +2261,23 @@ impl Fault {
 }
 
 impl Outcome {
+    /// What a person is told after "joined" when the join answered [`Outcome::JoinedRecovering`],
+    /// one line, indented by the caller as the join's other lines are.
+    pub const RECOVERING: &'static str = "this node's own history recovery in this room is \
+        pending: it reads the room now and cannot post here until recovery completes; recovery \
+        needs members that hold the history and may remain pending (`vox status` reports its \
+        current state)";
+
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
         matches!(
             self,
-            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_)
+            Outcome::Done
+                | Outcome::Bound(_)
+                | Outcome::OwnRetention { .. }
+                | Outcome::Appended(_)
+                | Outcome::JoinedRecovering
         )
     }
 }
@@ -2254,6 +2294,7 @@ impl std::fmt::Display for Outcome {
                 f,
                 "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
             ),
+            Outcome::JoinedRecovering => f.write_str(Outcome::RECOVERING),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }

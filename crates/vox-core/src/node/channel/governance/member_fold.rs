@@ -1168,6 +1168,14 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
     Ok(())
 }
 
+/// Whether `target` has an accepted removal row (`View::removal_row`): only then does a reader
+/// of an eligibility decision about it wait for that decision (`View::never_removed`).
+fn removed_once(writer: &Write<'_, '_>, target: &Digest32) -> Result<bool> {
+    Ok(writer
+        .at_or_after(Table::MemberRemovals, hash_key(target))?
+        .is_some_and(|(key, _)| key[..32] == target[..]))
+}
+
 /// Advance at most one causal eligibility decision step. Source replay has a
 /// fixed receipt tail; later appends are independently queued at frontier completion.
 /// Every entry decided as its author's content is added to `decided` with its decision, so the
@@ -1280,11 +1288,40 @@ pub(super) fn advance_eligibility(
                 stage = 1;
                 past = PastMembership::for_content(hash, floor.recipient);
             } else {
+                // A retained legacy private record catalogued under this entry's hash
+                // (`facts::Write::private_record`): `permitted_to` reads its content decision, and
+                // waits for it only while its author was once removed
+                // (`View::content_eligibility`). That wait ends here: permission news. The
+                // catalog, not this entry's payload, says so: a migrated record's public payload
+                // is pruned (`PendingUpgrade::migrate_row_prepared`), and only catalogued
+                // records are ever walked by a teller.
+                if removed_once(writer, &entry.skeleton.author_id)?
+                    && writer.private_record(&hash)?
+                {
+                    writer.private_permission_news()?;
+                }
                 writer.finish_eligibility(&hash, log)?;
                 writer.clear_cursor(Cursor::Eligibility)?;
                 return Ok(true);
             }
         } else {
+            // A Session floor: `permitted_to`'s floor authorization reads both its decisions
+            // (`View::floor_recipient_eligibility`), and waits for them only while its author or
+            // its recipient was once removed. That wait ends here: permission news.
+            let entry = writer.entry(log)?;
+            let recipient = entry
+                .payload
+                .as_deref()
+                .and_then(super::super::session_floor::Floor::read)
+                .map(|floor| floor.recipient);
+            let awaited = removed_once(writer, &entry.skeleton.author_id)?
+                || match recipient {
+                    Some(recipient) => removed_once(writer, &recipient)?,
+                    None => false,
+                };
+            if awaited {
+                writer.private_permission_news()?;
+            }
             writer.finish_eligibility(&hash, log)?;
             writer.clear_cursor(Cursor::Eligibility)?;
             return Ok(true);

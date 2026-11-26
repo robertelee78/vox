@@ -1621,9 +1621,10 @@ pub struct RoomReadArgs {
     /// `vox.room.row/1`.
     #[arg(long, requires = "json", conflicts_with = "late")]
     pub notices: bool,
-    /// Print every entry this node holds for the room in the room's order, one per
-    /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
-    /// and the one that must be identical on every node.
+    /// Print every entry this node holds for the room in display order, one per line as
+    /// `<entry-hash> <display-ms>` — readable or not. The sequence every member's view is a
+    /// part of; members agree on it except for an entry signed more than ten minutes ahead of
+    /// when one of them first saw it.
     #[arg(long, hide = true, conflicts_with_all = ["since", "limit", "json"])]
     pub hashes: bool,
     /// Print only the messages marked late: they arrived after rows below them had already

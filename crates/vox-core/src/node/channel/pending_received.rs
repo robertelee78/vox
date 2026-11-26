@@ -10,6 +10,8 @@ use crate::log::history::SignedEntryKind;
 use crate::node::store::{Batch, ReceivedFlow};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// `Effect` is the common per-received-entry work; boxing its entry would allocate per entry.
+#[allow(clippy::large_enum_variant)]
 enum Work {
     Immediate(HistoryEffectProgress),
     Finished {
@@ -44,7 +46,6 @@ pub(crate) struct PendingReceived {
     content: Option<PreparedContent>,
     presence: Option<governance::Presence>,
     late: bool,
-    private: Vec<(Digest32, Digest32, u64)>,
     refill_recipient: bool,
     /// A body-less signed message's "not received yet" row: `(created, expires, removal
     /// generation)` decided at preparation (ADR-008 LS-33).
@@ -61,8 +62,6 @@ pub(crate) struct CompletedReceived {
     consent: bool,
     governance_changed: bool,
     contiguous: Option<(Digest32, entry_store::sparse::ContiguousAdvance)>,
-    private: Vec<Digest32>,
-    available: Option<Digest32>,
     poisoned: bool,
 }
 
@@ -137,15 +136,6 @@ impl ChannelState {
                 let Some((head, control)) =
                     input.history_validated_header(&coordinate.author, coordinate.seq)?
                 else {
-                    // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): an
-                    // absent control of the entry's own author (its withheld termination) is
-                    // passed over.
-                    if coordinate.author == header.skeleton.author_id
-                        && super::governance::termination_admitted()
-                    {
-                        cursor.next += 1;
-                        continue;
-                    }
                     return Err(Error::MalformedAtRest("validated history control vanished"));
                 };
                 if control.entry_hash() != coordinate.hash {
@@ -393,11 +383,6 @@ impl ChannelState {
             content: None,
             presence: author.and_then(|author| self.presence.get(&author).copied()),
             late,
-            private: if semantic {
-                self.snapshot_private_generations()
-            } else {
-                Vec::new()
-            },
             refill_recipient: false,
             owed: None,
             maintenance_now: crate::time::Ms(self.now_hint),
@@ -418,8 +403,6 @@ impl ChannelState {
             consent,
             governance_changed,
             contiguous,
-            private,
-            available,
             poisoned,
         } = completed;
         let PendingReceived {
@@ -434,7 +417,6 @@ impl ChannelState {
         if self.channel_id != room || self.epoch != epoch {
             return result.map(|progress| (cursor, progress));
         }
-        let was_member = effect.is_some_and(|(author, ..)| self.is_member(&author));
         #[cfg(feature = "test-knobs")]
         let content_outcome = match &work {
             Work::Effect { entry, .. }
@@ -475,13 +457,9 @@ impl ChannelState {
                             .entry(author)
                             .and_modify(|held| *held = (*held).max(seq))
                             .or_insert(seq);
-                        if !was_member && self.is_member(&author) {
-                            self.key_member_became_current(author);
-                        }
                         self.key_packages.published(self.next_log_id);
                     }
                     if kind == SignedEntryKind::KeyPackage && body {
-                        self.note_key_body_acquired();
                         let recipient = match &work {
                             Work::Effect { entry, .. } => key_package_for(entry, &self.me()),
                             _ => refill_recipient,
@@ -491,20 +469,12 @@ impl ChannelState {
                             self.key_packages.note(author, log)?;
                         }
                     }
-                    self.note_role_progress(author, 0);
                 }
-                self.install_private_generations(&private);
                 if matches!(&work, Work::Effect { .. } | Work::Refill { .. }) {
                     self.gen.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(author) = available {
-                    self.note_available(store, author)?;
-                }
                 if let Some((author, progress)) = contiguous {
                     self.note_contiguous_advance(author, progress)?;
-                }
-                if matches!(&work, Work::Effect { .. }) && effect.is_some() {
-                    self.note_history_available();
                 }
                 Ok(())
             })();
@@ -562,8 +532,7 @@ impl PendingReceived {
         let mut consent = false;
         let mut governance_changed = false;
         let mut contiguous = None;
-        let mut private = Vec::new();
-        let mut available = None;
+        let mut newly_available = false;
         let mut poisoned = false;
         let weak = self.sek.clone();
         let result = received.scope(|| {
@@ -674,7 +643,7 @@ impl PendingReceived {
                     if kind != SignedEntryKind::KeyPackage
                         || Some(need.head) != head
                         || need.seq != entry.skeleton.seq
-                        || need.target.author != author
+                        || need.author != author
                         || need.hash != hash
                     {
                         return Err(Error::MalformedBundle("key body refill owner differs"));
@@ -703,7 +672,7 @@ impl PendingReceived {
                         batch.ruled();
                     }
                     let mut index = self.index.write(&mut batch, sek, &self.room)?;
-                    let newly_available = index.refill_available(entry, log)?;
+                    newly_available = index.refill_available(entry, log)?;
                     index.put_committed(entry, log)?;
                     if kind == SignedEntryKind::KeyPackage {
                         index.finish_history_obligation(&entry_store::sparse::Obligation {
@@ -716,9 +685,6 @@ impl PendingReceived {
                         })?;
                     }
                     index.seal()?;
-                    if newly_available {
-                        available = Some(author);
-                    }
                 } else {
                     if publish_before_effect {
                         let mut index = self.index.write(&mut batch, sek, &self.room)?;
@@ -830,29 +796,6 @@ impl PendingReceived {
                 }
                 if !is_refill || settled && kind == SignedEntryKind::Content {
                     projection.queue_receivers_with(&mut batch, sek)?;
-                    for (hash, author, generation) in &self.private {
-                        if self
-                            .index
-                            .in_batch(&batch, sek, &self.room)?
-                            .log_id(hash)?
-                            .is_some()
-                        {
-                            batch.ruled();
-                            session_projection::private_index::observe_control(
-                                &mut batch,
-                                sek,
-                                &self.room,
-                                author,
-                                session_projection::private_index::Control {
-                                    generation: Some(*generation),
-                                    ..Default::default()
-                                },
-                            )?;
-                            if !is_refill {
-                                private.push(*hash);
-                            }
-                        }
-                    }
                 }
                 let staged_deferred = deferred;
                 let admitted = settled && !(refill_pending || staged_deferred || unavailable);
@@ -933,13 +876,10 @@ impl PendingReceived {
                 let more = progress.as_ref().is_some_and(|progress| progress.more);
                 contiguous = progress.map(|progress| (author, progress));
                 projection.after_commit_with(store, sek)?;
-                if available.is_some()
-                    && !self
-                        .index
+                if newly_available {
+                    self.index
                         .read(store, sek, &self.room)?
-                        .payload_present(&hash)?
-                {
-                    available = None;
+                        .payload_present(&hash)?;
                 }
                 self.cursor.rendered |= !projection.rows.is_empty();
                 Ok(if unavailable {
@@ -974,8 +914,6 @@ impl PendingReceived {
             consent,
             governance_changed,
             contiguous,
-            private,
-            available,
             poisoned,
         }
     }

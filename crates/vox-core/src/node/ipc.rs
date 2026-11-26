@@ -247,6 +247,8 @@ const T_ROOM_NOT_REMEMBERED: u64 = 2081;
 /// `NodeEvent::RetentionAboveRoom` (V030-32): a node file value above the room's, ignored.
 const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
+/// [`Frame::JoinedRecovering`].
+const T_JOINED_RECOVERING: u64 = 11650010;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_HISTORY_DEMAND_REQ: u64 = 94101;
@@ -748,14 +750,16 @@ pub enum Request {
         /// Cap on rows returned; 0 uses the server's row and byte page bounds.
         limit: u64,
     },
-    /// Every entry the node holds for a room, in the room's one order (ADR-023
-    /// decision 1): the sequence the timeline is a subsequence of.
+    /// Every entry the node holds for a room, in display order: each entry's display key is
+    /// fixed when its header is first published here and never moves. The timeline is a
+    /// subsequence of it.
     Order {
         /// The room.
         channel_id: Digest32,
-        /// Exclusive canonical key from the previous page.
+        /// Exclusive display key from the previous page.
         after: Option<(u64, Digest32)>,
-        /// The previous page's ordering revision; a change requires an explicit restart.
+        /// The previous page's token: it changes only when the saved room is replaced, or
+        /// when the answering Vox keys its order differently; a change requires a restart.
         revision: Option<u64>,
     },
     /// The members of a room.
@@ -1306,7 +1310,8 @@ pub enum Request {
         channel_id: Digest32,
     },
     /// The token a read spanning requests compares, as [`Frame::RoomDisplayRevision`]: it
-    /// moves when the order of rows already read changed, not when a message arrives.
+    /// moves only when the open or saved room was replaced. An arrival, a body filled in or a
+    /// row taken away does not move it: no admission reorders rows already read.
     RoomReadRevision {
         /// The selected node's room.
         channel_id: Digest32,
@@ -3457,6 +3462,9 @@ pub enum Frame {
     },
     /// A request succeeded and carries nothing further.
     Ok,
+    /// A join succeeded, and this node's own history in the room is still being recovered
+    /// ([`crate::node::api::Outcome::JoinedRecovering`]).
+    JoinedRecovering,
     /// A request failed. The reason is for a person to read, not to branch on.
     Error {
         /// Why it failed.
@@ -3865,6 +3873,9 @@ impl Frame {
             }
             Frame::Ok => {
                 e.array(1).uint(T_OK);
+            }
+            Frame::JoinedRecovering => {
+                e.array(1).uint(T_JOINED_RECOVERING);
             }
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
@@ -4726,6 +4737,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             })
         }
         (T_OK, 1) => return Ok(Frame::Ok),
+        (T_JOINED_RECOVERING, 1) => return Ok(Frame::JoinedRecovering),
         (T_ERROR, 2) => {
             return Ok(Frame::Error {
                 reason: d
@@ -4925,7 +4937,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let status: crate::node::api::HistoryDemandStatus = serde_json::from_str(text)
                 .map_err(|_| Error::MalformedIpc("history demand status"))?;
             if status.headers > 128
-                || status.wire_bytes > crate::log::sync::LEGACY_QUANTUM_BYTES
+                || status.wire_bytes > crate::node::api::MAX_HISTORY_STATUS_WIRE_BYTES
                 || status.detail.len() > 512
             {
                 return Err(Error::MalformedIpc("history demand status limits"));
@@ -9473,6 +9485,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                crate::node::api::Outcome::JoinedRecovering => Frame::JoinedRecovering,
                 // The outcome is named, not reduced to "it failed". `Unreachable` and a
                 // refused passphrase call for completely different responses from whoever
                 // is holding the link, and this is the only place that knows which it was.

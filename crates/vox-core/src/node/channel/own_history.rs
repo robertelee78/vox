@@ -525,14 +525,6 @@ impl PendingOwnRecovery {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct OwnRecoveryPage {
-    pub head: Digest32,
-    pub lo: u64,
-    pub hi: u64,
-    pub donor_through: u64,
-}
-
 /// One bounded step toward certifying the actual content in the retained signed prefix.
 /// Debts are parked until the exact body, key or authority changes; they are not a timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,8 +709,13 @@ impl ChannelState {
                 extent(held)
             };
         }
+        // A publication in progress is waited for (the join's proposal asks again once it ends),
+        // never reported as this node being behind what a member holds: nothing was compared
+        // yet, and the history in question is the joiner's, not this node's.
         if read.publication_busy() {
-            return Err(Error::OwnHistoryBehind);
+            return Err(Error::Profile(
+                "room publication is busy; retry this operation",
+            ));
         }
         let settled = read
             .history_settled_tip(&author)?
@@ -1065,8 +1062,12 @@ impl ChannelState {
             return Ok(Some(Recovery::Fork));
         }
         let read = self.history_read(store)?;
+        // A publication in progress is waited for (its callers re-run after it), never
+        // reported as this node being behind what a member holds: nothing was compared yet.
         if read.publication_busy() {
-            return Err(Error::OwnHistoryBehind);
+            return Err(Error::Profile(
+                "room publication is busy; retry this operation",
+            ));
         }
         let own = self.me();
         let held = self.dag.verified_head(&own);
@@ -1217,136 +1218,16 @@ impl ChannelState {
         }
     }
 
-    /// Ask trusted admitted peers for a signed head when an extent still needs coverage.
-    pub(crate) fn unknown_own_recovery_probe(&self, store: &Store, peer: &Digest32) -> bool {
-        self.own_behind
-            && self.is_member(peer)
-            && (matches!(self.own_recovery, Recovery::UnknownBehind)
-                || unknown_higher(store, &self.sek, &self.channel_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|extent| match &self.own_recovery {
-                        Recovery::Head(head) => head.root.leaves < extent.skeleton.seq,
-                        _ => false,
-                    }))
-    }
-
-    /// Derive one exact local verification root at ordinary foreground admission. No scalar
-    /// inbox insertion is required, and a donor's role receipt cannot suppress local proof debt.
-    /// A durable exact metadata refusal remains parked until its real authority/incarnation
-    /// changes. Old whole-head refusals still suppress ordinary/body inventory; they cannot
-    /// assert that this new exact metadata-verification operation was ever attempted.
-    pub(crate) fn own_recovery_discovery_hint(
-        &self,
-        store: &Store,
-        peer: &Digest32,
-        authorization: Digest32,
-    ) -> Result<Option<(Digest32, Digest32, u64)>> {
-        if !self.own_behind || !self.is_member(peer) || self.dag.is_frozen(&self.me()) {
-            return Ok(None);
-        }
-        let Recovery::Head(head) = &self.own_recovery else {
-            return Ok(None);
-        };
-        self.checked_own_head(head)?;
-        let read = self.history_read(store)?;
-        if read
-            .sparse_author(&self.me(), LogScope::Public)?
-            .is_some_and(|state| state.observed_conflict.is_some())
-            || read.history_head_accepted(&head.id(), head.binding)?
-        {
-            return Ok(None);
-        }
-        if let Some((refused, grant, peer_life, author_life)) =
-            read.history_declined_metadata(peer, &self.me())?
-        {
-            if refused == head.id()
-                && grant == authorization
-                && self.history_inventory_incarnation(peer) == Some(peer_life)
-                && self.history_author_inventory_incarnation(&self.me()) == Some(author_life)
-            {
-                return Ok(None);
-            }
-        }
-        Ok(Some((self.me(), head.id(), head.root.leaves)))
-    }
-
-    pub(crate) fn own_recovery_page(
-        &self,
-        store: &Store,
-        peer: &Digest32,
-        body_debt: Option<(Digest32, u64, Digest32)>,
-    ) -> Result<Option<OwnRecoveryPage>> {
-        if !self.own_behind || self.dag.is_frozen(&self.me()) {
-            return Ok(None);
-        }
-        let Recovery::Head(head) = &self.own_recovery else {
-            return Ok(None);
-        };
-        self.checked_own_head(head)?;
-        match self.own_recovery_evidence(store)? {
-            Some(Recovery::Head(current)) if current.id() == head.id() => {}
-            _ => return Ok(None),
-        }
-        let read = self.history_read(store)?;
-        if read.publication_busy() || !read.history_head_accepted(&head.id(), head.binding)? {
-            return Ok(None);
-        }
-        let held = read
-            .history_held_through(&self.me())
-            .map_or(0, |(seq, _)| seq);
-        // The admitting witness is the authenticated source of the join proposal. Its
-        // signed-head offer is a reason to try, not proof that it still has every body.
-        // A failed page remains recovery debt and never advances the held prefix.
-        let donor_through = self
-            .held_through(peer)
-            .unwrap_or(0)
-            .max(match &self.own_admission {
-                Admission::Witnessed(witness) if witness.witness_id == *peer => head.root.leaves,
-                _ => 0,
-            });
-        if !self.is_member(peer) {
-            return Ok(None);
-        }
-        if let Some((target, seq, entry_hash)) = body_debt {
-            if target == head.id() && seq <= head.root.leaves && donor_through >= seq {
-                if let Some((_, header)) = read.history_validated_header(&self.me(), seq)? {
-                    if header.entry_hash() == entry_hash
-                        && read
-                            .history_entry(&entry_hash)?
-                            .is_none_or(|entry| entry.payload.is_none())
-                    {
-                        return Ok(Some(OwnRecoveryPage {
-                            head: target,
-                            lo: seq,
-                            hi: seq,
-                            donor_through,
-                        }));
-                    }
-                }
-            }
-        }
-        if held >= head.root.leaves || donor_through <= held {
-            return Ok(None);
-        }
-        let lo = held.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
-        // A Page serves its highest position first. Own recovery must settle the next
-        // contiguous entry before later sender generations: otherwise an unreadable later
-        // body can park the whole page before the readability audit reaches its key debt.
-        Ok(Some(OwnRecoveryPage {
-            head: head.id(),
-            lo,
-            hi: lo,
-            donor_through,
-        }))
-    }
-
     /// This path is exclusively an original author's authenticated recovery response, not a
     /// trust grant from its transport peer. The ordinary inbound-SKDM trust gate is unchanged.
+    ///
+    /// A release is a fact about one key (author, epoch, chain, iteration), not about a head:
+    /// it is accepted while recovery stands at an accepted, current target, whichever target
+    /// the request named when it was asked (per-head audit item 22). The release itself is
+    /// verified under this node's own admitted root by the native installation below.
     pub(crate) fn accept_own_recovery_release(
         &mut self,
         store: &Store,
-        target: Digest32,
         release: &crate::group::skdm::Skdm,
         now: crate::time::Ms,
     ) -> Result<super::AcceptedSkdm> {
@@ -1354,15 +1235,23 @@ impl ChannelState {
             || release.body.author_id != self.me()
             || release.body.channel_id != self.channel_id
             || release.body.epoch > self.epoch
+            || !self.recovery_standing(store, &self.me())?
         {
             return Err(Error::OwnHistoryBehind);
         }
-        if !matches!(&self.own_recovery, Recovery::Head(head) if head.id() == target) {
+        let Recovery::Head(target) = &self.own_recovery else {
             return Err(Error::OwnHistoryBehind);
-        }
+        };
+        let (target, binding) = (target.id(), target.binding);
         match self.own_recovery_evidence(store)? {
             Some(Recovery::Head(current)) if current.id() == target => {}
             _ => return Err(Error::OwnHistoryBehind),
+        }
+        if !self
+            .history_read(store)?
+            .history_head_accepted(&target, binding)?
+        {
+            return Err(Error::OwnHistoryBehind);
         }
         self.accept_skdm_mode(store, release, now, true)
     }

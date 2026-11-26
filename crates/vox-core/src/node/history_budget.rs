@@ -12,102 +12,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::Notify;
 
 use crate::hash::Digest32;
-use crate::node::ports::PhysicalSlot;
 
 const MIB: usize = 1024 * 1024;
 /// Archive rounds the daemon may run together. Exported so shipped-binary proofs derive their
 /// hosted-node pressure from the same admission rule instead of copying a count.
 pub const ARCHIVE_JOBS: usize = 2;
 const FOREGROUND_JOBS: usize = 64;
-#[cfg(feature = "test-knobs")]
-/// Proof-only foreground capacity override; absent from a production build.
-pub const TEST_FOREGROUND_JOBS_ENV: &str = "VOX_TEST_FOREGROUND_JOBS";
-#[cfg(feature = "test-knobs")]
-/// Proof-only independent small-Control capacity; absent from a production build.
-pub const TEST_CONTROL_JOBS_ENV: &str = "VOX_TEST_CONTROL_JOBS";
-#[cfg(feature = "test-knobs")]
-/// Proof-only file whose presence holds an admitted Live job; absent from production.
-pub const TEST_HOLD_LIVE_JOB_ENV: &str = "VOX_TEST_HOLD_LIVE_JOB_FILE";
-#[cfg(feature = "test-knobs")]
-/// Proof-only file whose presence holds an admitted Control job; absent from production.
-pub const TEST_HOLD_CONTROL_JOB_ENV: &str = "VOX_TEST_HOLD_CONTROL_JOB_FILE";
-#[cfg(feature = "test-knobs")]
-/// Proof-only file whose presence holds an admitted Archive job; absent from production.
-pub const TEST_HOLD_ARCHIVE_JOB_ENV: &str = "VOX_TEST_HOLD_ARCHIVE_JOB_FILE";
-#[cfg(feature = "test-knobs")]
-/// Proof-only file whose presence holds the pool at its source-defined floor. This stages the
-/// otherwise impossible retained-continuation path without copying a capacity count.
-pub const TEST_FLOW_STATE_FLOOR_ENV: &str = "VOX_TEST_FLOW_STATE_FLOOR_FILE";
-/// Historical fixed capacity used only to stage the old full-pool failure in optional proofs.
-/// Production capacity is exactly the running slots times active-or-retiring identities.
-pub const FLOW_STATE_CAPACITY: usize = 16;
-/// The running bounded-sync slots one hosted node owns. This is the source of truth for both
-/// the controller's array and the daemon pool's per-node capacity (ADR-038 FX-35).
-pub const BOUNDED_SYNC_RUNNING_SLOTS: usize = 2;
-/// One running bounded-sync quantum's product contract; proofs wait on this source-owned edge,
-/// never a copied timeout.
-pub const BOUNDED_ROUND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const FLOW_STATE_BYTES: usize = 128 * 1024;
 const CONTROL_TURNS_BEFORE_LIVE: usize = 3;
-const LIVE_GRANTS: usize = 64;
-const LIVE_GRANT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
-const LIVE_GRANT_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
-
-fn flow_state_limit(hosted: usize) -> usize {
-    #[cfg(feature = "test-knobs")]
-    if std::env::var_os(TEST_FLOW_STATE_FLOOR_ENV)
-        .is_some_and(|path| std::path::Path::new(&path).exists())
-    {
-        return FLOW_STATE_CAPACITY;
-    }
-    BOUNDED_SYNC_RUNNING_SLOTS * hosted
-}
-
-#[cfg(feature = "test-knobs")]
-fn foreground_jobs() -> usize {
-    std::env::var(TEST_FOREGROUND_JOBS_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(FOREGROUND_JOBS)
-}
-
-#[cfg(feature = "test-knobs")]
-fn control_jobs() -> usize {
-    std::env::var(TEST_CONTROL_JOBS_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(FOREGROUND_JOBS)
-}
-
-#[cfg(not(feature = "test-knobs"))]
-const fn foreground_jobs() -> usize {
-    FOREGROUND_JOBS
-}
-
-/// Exact body selected within a bounded newest window. A later tip cannot widen it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LiveRequest {
-    pub(crate) room: Digest32,
-    pub(crate) peer: Digest32,
-    pub(crate) epoch: u64,
-    pub(crate) request: [u8; 16],
-    pub(crate) head: Digest32,
-    pub(crate) seq: u64,
-    pub(crate) entry: Digest32,
-    pub(crate) length: u64,
-}
-
-type LiveKey = (Digest32, Digest32, Digest32, [u8; 16]);
-
-struct LiveGrant {
-    request: LiveRequest,
-    persisted: u64,
-    pending: Option<u64>,
-    expires: std::time::Instant,
-    idle: std::time::Instant,
-}
 
 /// Independent reservations prevent archive work from consuming live/control capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,10 +69,7 @@ struct State {
     foreground: usize,
     foreground_control_turns: usize,
     next_ticket: u64,
-    live_grants: BTreeMap<LiveKey, LiveGrant>,
     foreground_jobs: usize,
-    #[cfg(feature = "test-knobs")]
-    control_jobs: usize,
 }
 
 impl Default for State {
@@ -172,10 +81,7 @@ impl Default for State {
             foreground: 0,
             foreground_control_turns: 0,
             next_ticket: 0,
-            live_grants: Default::default(),
-            foreground_jobs: foreground_jobs(),
-            #[cfg(feature = "test-knobs")]
-            control_jobs: control_jobs(),
+            foreground_jobs: FOREGROUND_JOBS,
         }
     }
 }
@@ -201,15 +107,7 @@ impl State {
             Lane::Archive => {
                 self.archive_nodes.len() < ARCHIVE_JOBS && !self.archive_nodes.contains(&node)
             }
-            Lane::Control => {
-                // Foreground1 must not also starve the small Control workers needed
-                // to reach that foreground gate. A separate proof may explicitly hold Control1.
-                #[cfg(feature = "test-knobs")]
-                let limit = self.control_jobs;
-                #[cfg(not(feature = "test-knobs"))]
-                let limit = FOREGROUND_JOBS;
-                self.control < limit
-            }
+            Lane::Control => self.control < FOREGROUND_JOBS,
             Lane::LargeControl => {
                 self.foreground < self.foreground_jobs
                     && (self.queues[Lane::Live.index()].is_empty()
@@ -301,8 +199,6 @@ pub struct Budget {
     changed: [Arc<Notify>; 4],
     bytes_changed: [Arc<Notify>; 2],
     control_bytes: AtomicUsize,
-    /// The daemon's flow-state pool, one record under one lock (ADR-038 FX-35).
-    pool: Mutex<Pool>,
     /// Owed retirement ownership belongs to the daemon, not one actor incarnation. An actor
     /// panic therefore cannot lose a Flow or its visible failure, and a replacement resumes the
     /// same exact request.
@@ -370,14 +266,6 @@ impl Budget {
     pub fn try_start(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Job> {
         self.enqueue(node, lane).try_admit()
     }
-
-    /// Whether a fresh Control owner would pass the fair daemon gate now. This observation
-    /// grants nothing: the caller uses it only to name the first refusal before a locally busy
-    /// lane, and [`Ticket::try_admit`] remains the sole authority that creates a worker.
-    pub(crate) fn fresh_control_would_admit(&self, node: Digest32) -> bool {
-        let state = self.state();
-        state.queues[Lane::Control.index()].is_empty() && state.available(node, Lane::Control)
-    }
 }
 
 /// A bounded fair queue position, cancelled on drop unless it has become a worker.
@@ -404,18 +292,6 @@ impl Ticket {
             Box::pin(Arc::clone(&self.budget.changed[self.lane.index()]).notified_owned());
         wake.as_mut().enable();
         wake
-    }
-
-    /// Observe whether this exact retained owner is the currently admissible fair-queue head.
-    /// The observation consumes neither the ticket nor capacity; a later `try_admit` rechecks
-    /// under the same state lock before it grants the worker.
-    pub(crate) fn would_admit(&self) -> bool {
-        self.queued
-            && self
-                .budget
-                .state()
-                .ticket_position(self.node, self.lane, self.ticket)
-                .is_some()
     }
 
     pub(crate) fn try_admit(&mut self) -> Option<Job> {
@@ -449,22 +325,11 @@ impl Ticket {
         if notify_next {
             self.budget.notify_lane(self.lane);
         }
-        let flow_owner = self
-            .budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .active
-            .get(&self.node)
-            .copied();
         Some(Job(Arc::new(Worker {
             budget: Arc::clone(&self.budget),
             node: self.node,
             lane: self.lane,
             bytes: AtomicUsize::new(0),
-            flow_owner,
-            #[cfg(feature = "test-knobs")]
-            proof_round: Mutex::new(None),
         })))
     }
 }
@@ -484,64 +349,6 @@ struct Worker {
     node: Digest32,
     lane: Lane,
     bytes: AtomicUsize,
-    /// Registration generation that admitted this actor's work. A retired actor's running
-    /// charge and a replacement actor with the same fingerprint therefore retain distinct pool
-    /// capacity until the old round really returns it.
-    flow_owner: Option<u64>,
-    #[cfg(feature = "test-knobs")]
-    proof_round: Mutex<Option<Arc<ProofRound>>>,
-}
-
-#[cfg(feature = "test-knobs")]
-struct ProofRound {
-    room: Digest32,
-    peer: Digest32,
-    request: [u8; 16],
-    instance: [u8; 16],
-    token: u64,
-}
-
-/// Non-owning apparatus annotation, bounded by the actual exclusive worker future.
-#[cfg(feature = "test-knobs")]
-pub(crate) struct ProofRoundGuard {
-    worker: std::sync::Weak<Worker>,
-    round: Arc<ProofRound>,
-}
-
-#[cfg(feature = "test-knobs")]
-impl Drop for ProofRoundGuard {
-    fn drop(&mut self) {
-        if let Some(worker) = self.worker.upgrade() {
-            let mut current = worker
-                .proof_round
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if current
-                .as_ref()
-                .is_some_and(|round| Arc::ptr_eq(round, &self.round))
-            {
-                *current = None;
-            }
-        }
-    }
-}
-
-#[cfg(feature = "test-knobs")]
-struct ProofWaitWitness {
-    path: std::path::PathBuf,
-    fault: std::path::PathBuf,
-}
-
-#[cfg(feature = "test-knobs")]
-impl Drop for ProofWaitWitness {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("APPARATUS: foreground queue witness could not be removed: {error}");
-                let _ = std::fs::write(&self.fault, error.to_string());
-            }
-        }
-    }
 }
 
 impl Worker {
@@ -605,10 +412,6 @@ fn byte_wake(budget: &Budget, lane: Lane) -> ByteWake {
 }
 
 impl BytePressure {
-    pub(crate) fn lane(&self) -> Lane {
-        self.lane
-    }
-
     pub(crate) async fn released(self) {
         // Archive bytes belong to one worker, not a shared pool. After that worker exits,
         // the ordinary archive admission gate supplies a fresh worker with the validated cap.
@@ -713,439 +516,6 @@ impl Job {
             .ok_or_else(|| crate::error::Error::HistoryCapacity(Box::new(pressure)))
     }
 
-    pub(crate) fn flow_owner(&self) -> Option<u64> {
-        self.0.flow_owner
-    }
-
-    /// Record one exact retained Flow after the impossible pool/source-slot refusal. Enrollment
-    /// carries the refusing reservation's release-edge identity, so an intervening charge release
-    /// or returned release promise can grant it while closing the check/enroll race.
-    pub(crate) fn flow_wait_ticket(
-        &self,
-        port: (Digest32, Digest32, PhysicalSlot),
-        request: [u8; 16],
-        instance: [u8; 16],
-        token: u64,
-        refused_at: &FlowReleaseEdge,
-    ) -> Result<FlowReleaseTicket, FlowWaitError> {
-        let (room, peer, slot) = port;
-        let owner = self.0.flow_owner.ok_or(FlowWaitError::OwnerMissing)?;
-        let budget = Arc::clone(&self.0.budget);
-        let mut pool = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if !pool.owners.contains_key(&owner) {
-            return Err(FlowWaitError::OwnerMissing);
-        }
-        // Never recycle a low numeric order while an older continuation can still exist. At
-        // exhaustion the operator sees the exact invariant failure instead of new work jumping
-        // ahead of retained old work.
-        let id = pool
-            .next_continuation
-            .checked_add(1)
-            .ok_or(FlowWaitError::OrderExhausted)?;
-        pool.next_continuation = id;
-        let Some(owner_state) = pool.owners.get_mut(&owner) else {
-            return Err(FlowWaitError::OwnerMissing);
-        };
-        owner_state.continuations.insert(
-            id,
-            FlowContinuation {
-                id,
-                room,
-                peer,
-                slot,
-                request,
-                instance,
-                token,
-                granted: false,
-            },
-        );
-        // Enrollment itself is not a wake. It dispatches only when a charge or release promise
-        // was returned after the refusing snapshot, closing the check/enroll race without
-        // letting registration, resizing or a tick stand in for the release edge.
-        if !Arc::ptr_eq(&pool.release_edge, &refused_at.0) {
-            pool.handoff_continuations();
-        }
-        drop(pool);
-        Ok(FlowReleaseTicket { budget, owner, id })
-    }
-
-    /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
-    pub(crate) fn bytes_wake(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let index = usize::from(matches!(self.0.lane, Lane::LargeControl | Lane::Live));
-        let mut wake = Box::pin(Arc::clone(&self.0.budget.bytes_changed[index]).notified_owned());
-        wake.as_mut().enable();
-        wake
-    }
-
-    /// Observe one real Control round without retaining its worker or changing admission.
-    /// Only the isolated FG1 proof and its existing Live hold path enable this annotation.
-    #[cfg(feature = "test-knobs")]
-    pub(crate) fn round_for_proof(
-        &self,
-        room: Digest32,
-        peer: Digest32,
-        request: [u8; 16],
-        instance: [u8; 16],
-        token: u64,
-    ) -> Option<ProofRoundGuard> {
-        let foreground_one = self.0.budget.state().foreground_jobs == 1;
-        if self.0.lane != Lane::Control
-            || self.0.flow_owner.is_none()
-            || !foreground_one
-            || !std::env::var_os(TEST_HOLD_LIVE_JOB_ENV)
-                .is_some_and(|path| std::path::Path::new(&path).exists())
-        {
-            return None;
-        }
-        let round = Arc::new(ProofRound {
-            room,
-            peer,
-            request,
-            instance,
-            token,
-        });
-        *self
-            .0
-            .proof_round
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&round));
-        Some(ProofRoundGuard {
-            worker: Arc::downgrade(&self.0),
-            round,
-        })
-    }
-
-    // Called only after a real failed try_admit and subscribed wake, outside every Budget lock.
-    #[cfg(feature = "test-knobs")]
-    fn foreground_wait_for_proof(&self, ticket: &Ticket) -> Option<ProofWaitWitness> {
-        let round = self
-            .0
-            .proof_round
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()?;
-        let actor = self.0.flow_owner?;
-        let base = std::path::PathBuf::from(std::env::var_os(TEST_HOLD_LIVE_JOB_ENV)?);
-        if !base.exists() {
-            return None;
-        }
-        let parent = Arc::as_ptr(&self.0) as usize;
-        let path = std::path::PathBuf::from(format!(
-            "{}.foreground-wait.{actor}.{parent}.{}",
-            base.display(),
-            ticket.ticket
-        ));
-        let hex = |bytes: &[u8]| {
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        let witness = serde_json::json!({
-            "schema": "vox.proof.foreground-wait/1", "actor": actor,
-            "node": crate::node::link::b32_encode(&self.0.node),
-            "room": crate::node::link::b32_encode(&round.room),
-            "peer": crate::node::link::b32_encode(&round.peer),
-            "request": hex(&round.request), "instance": hex(&round.instance),
-            "token": round.token, "parent_job": parent, "ticket": ticket.ticket,
-            "lane": "large_control",
-        });
-        let temporary = std::path::PathBuf::from(format!(
-            "{}.foreground-publishing.{actor}.{parent}.{}",
-            base.display(),
-            ticket.ticket
-        ));
-        let fault = std::path::PathBuf::from(format!("{}.foreground-fault", base.display()));
-        if let Err(error) = std::fs::write(&temporary, witness.to_string())
-            .and_then(|()| std::fs::rename(&temporary, &path))
-        {
-            eprintln!("APPARATUS: foreground queue witness could not be published: {error}");
-            let _ = std::fs::remove_file(&temporary);
-            let _ = std::fs::write(&fault, error.to_string());
-            return None;
-        }
-        Some(ProofWaitWitness { path, fault })
-    }
-
-    /// Proof-only: keep one admitted Control, Live or Archive job until apparatus removes its lane's
-    /// named file. The caller invokes this only after it exclusively owns the charged Flow.
-    /// A `<hold>.entered.<actor>.<job>` file containing the node, room and peer is the apparatus
-    /// edge which proves that exact ownership; observing admission/status before this edge is
-    /// insufficient because the controller can still adopt a Flow whose worker has not locked
-    /// it. Production builds contain neither variable, marker nor pause.
-    #[cfg(feature = "test-knobs")]
-    pub(crate) async fn hold_for_proof(&self, room: Digest32, peer: Digest32) {
-        let variable = match self.0.lane {
-            Lane::Archive => TEST_HOLD_ARCHIVE_JOB_ENV,
-            Lane::Control => TEST_HOLD_CONTROL_JOB_ENV,
-            Lane::Live => TEST_HOLD_LIVE_JOB_ENV,
-            Lane::LargeControl => return,
-        };
-        let Some(path) = std::env::var_os(variable) else {
-            return;
-        };
-        if !std::path::Path::new(&path).exists() {
-            return;
-        }
-        // An optional canonical room selector scopes only this proof barrier. All legacy
-        // contents, including an empty file, retain the existing all-room hold behavior.
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(selected) = contents
-                .strip_prefix("room=")
-                .and_then(|selected| selected.strip_suffix('\n'))
-            {
-                if let Ok(selected_room) =
-                    crate::node::link::b32_decode(selected, "proof hold room")
-                {
-                    if crate::node::link::b32_encode(&selected_room) == selected
-                        && selected_room != room
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-        let Some(owner) = self.0.flow_owner else {
-            return;
-        };
-        let job = Arc::as_ptr(&self.0) as usize;
-        let entered = std::path::PathBuf::from(format!(
-            "{}.entered.{owner}.{job}",
-            std::path::Path::new(&path).display()
-        ));
-        let identity = format!(
-            "{}\nroom={}\npeer={}\n",
-            crate::node::link::b32_encode(&self.0.node),
-            crate::node::link::b32_encode(&room),
-            crate::node::link::b32_encode(&peer),
-        );
-        if std::fs::write(&entered, identity.as_bytes()).is_err() {
-            return;
-        }
-        while std::path::Path::new(&path).exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let _ = std::fs::remove_file(entered);
-    }
-
-    #[cfg(not(feature = "test-knobs"))]
-    pub(crate) async fn hold_for_proof(&self, _room: Digest32, _peer: Digest32) {}
-
-    /// Reserve flow state for a port's round (ADR-038 FX-35), the Control bytes it costs already
-    /// reserved by the caller (the control budget's refusal is its own gate, never the pool's).
-    /// The charge is the round's: it is recorded as running in the same step, under the one
-    /// lock, and is given back when the charge drops. `NodeBusy` when this fingerprint's current
-    /// and retiring generations already hold the requested physical position or both running slots.
-    /// `PoolFull` when every pool position is occupied; the bytes go back on either refusal.
-    pub(crate) fn reserve_flow_state(
-        &self,
-        port: (Digest32, Digest32, PhysicalSlot),
-        request: [u8; 16],
-        instance: [u8; 16],
-        bytes: BufferCharge,
-        waiter: Option<&mut FlowReleaseTicket>,
-    ) -> FlowStateTry {
-        let (room, peer, slot) = port;
-        let budget = Arc::clone(&self.0.budget);
-        let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(owner) = self.0.flow_owner else {
-            return FlowStateTry::OwnerMissing;
-        };
-        let key = FlowStateOwner {
-            actor: owner,
-            node: self.0.node,
-            room,
-            peer,
-            slot,
-            request,
-            instance,
-        };
-        let Some(node) = p.owners.get(&owner).map(|owner| owner.node) else {
-            return FlowStateTry::OwnerMissing;
-        };
-        let granted = waiter
-            .as_ref()
-            .is_some_and(|waiter| waiter.take_grant_locked(&mut p, owner, port, request, instance));
-        // Actor replacement does not create a second pair of bounded slots for one hosted
-        // fingerprint. Retiring and current generations share the same source-owned slot count;
-        // the old charge's exact Drop wakes the replacement without a tick or elapsed escape.
-        let node_in_use: usize = p
-            .owners
-            .values()
-            .filter(|pool_owner| pool_owner.node == node)
-            .map(|pool_owner| pool_owner.charges)
-            .sum();
-        let promised_for_node = p
-            .owners
-            .values()
-            .filter(|owner| owner.node == node)
-            .flat_map(|owner| owner.continuations.values())
-            .filter(|continuation| continuation.granted)
-            .count();
-        if !granted && p.slot_occupied(node, slot) {
-            return FlowStateTry::NodeBusy(FlowReleaseEdge(Arc::clone(&p.release_edge)));
-        }
-        if !granted && node_in_use + promised_for_node >= BOUNDED_SYNC_RUNNING_SLOTS {
-            return FlowStateTry::NodeBusy(FlowReleaseEdge(Arc::clone(&p.release_edge)));
-        }
-        let promised = p
-            .owners
-            .values()
-            .flat_map(|owner| owner.continuations.values())
-            .filter(|continuation| continuation.granted)
-            .count();
-        let occupied = p.in_use + promised;
-        if !granted && occupied > p.limit {
-            return FlowStateTry::PoolOvercommitted(FlowReleaseEdge(Arc::clone(&p.release_edge)));
-        }
-        if !granted && occupied == p.limit {
-            return FlowStateTry::PoolFull(FlowReleaseEdge(Arc::clone(&p.release_edge)));
-        }
-        let Some(pool_owner) = p.owners.get_mut(&owner) else {
-            return FlowStateTry::OwnerMissing;
-        };
-        pool_owner.charges += 1;
-        p.in_use += 1;
-        *p.running.entry(key).or_insert(0) += 1;
-        drop(p);
-        FlowStateTry::Reserved(FlowStateCharge {
-            budget,
-            key,
-            owner,
-            charge: Some(bytes),
-        })
-    }
-
-    /// Start only within a currently eligible bounded newest window. Later quanta may finish
-    /// that exact body at the last durable ACK even after the window ages out. If a volatile
-    /// grant expired or the server restarted, a saved offset may resume only if the exact
-    /// body still passes the newest-window predicate; no grant authorizes an older archive.
-    pub(crate) fn live_entry(
-        &self,
-        request: LiveRequest,
-        offset: u64,
-        in_live_window: bool,
-    ) -> crate::error::Result<bool> {
-        use crate::error::Error;
-        if self.0.lane != Lane::Live {
-            return Err(Error::MalformedBundle(
-                "live request in another reservation",
-            ));
-        }
-        let key = (self.0.node, request.room, request.peer, request.request);
-        let now = std::time::Instant::now();
-        let mut state = self.0.budget.state();
-        state
-            .live_grants
-            .retain(|_, grant| now < grant.expires && now < grant.idle);
-        if let Some(grant) = state.live_grants.get_mut(&key) {
-            if grant.request != request
-                || (grant.persisted != offset && grant.pending != Some(offset))
-            {
-                return Err(Error::MalformedBundle(
-                    "live continuation changes authorized body",
-                ));
-            }
-            // The receiver may have persisted the outstanding chunk before its ACK was
-            // lost with the stream. It may resume only at that sent boundary or replay it.
-            if offset > grant.persisted {
-                grant.idle = now + LIVE_GRANT_IDLE;
-            }
-            grant.persisted = offset;
-            grant.pending = None;
-            return Ok(true);
-        }
-        if !in_live_window || offset > request.length {
-            return Err(Error::MalformedBundle(
-                "live request is outside the bounded newest window",
-            ));
-        }
-        if state.live_grants.len() >= LIVE_GRANTS {
-            return Ok(false);
-        }
-        state.live_grants.insert(
-            key,
-            LiveGrant {
-                request,
-                persisted: offset,
-                pending: None,
-                expires: now + LIVE_GRANT_LIFETIME,
-                idle: now + LIVE_GRANT_IDLE,
-            },
-        );
-        Ok(true)
-    }
-
-    /// Reserve the sole outgoing chunk boundary before I/O, so cancellation after a write
-    /// cannot strand a receiver whose durable ACK did not reach this process.
-    pub(crate) fn live_sent(
-        &self,
-        request: LiveRequest,
-        offset: u64,
-        next: u64,
-    ) -> crate::error::Result<()> {
-        use crate::error::Error;
-        let key = (self.0.node, request.room, request.peer, request.request);
-        let now = std::time::Instant::now();
-        let mut state = self.0.budget.state();
-        let grant = state
-            .live_grants
-            .get_mut(&key)
-            .ok_or(Error::MalformedBundle("live grant expired"))?;
-        if grant.request != request
-            || now >= grant.expires
-            || now >= grant.idle
-            || offset != grant.persisted
-            || grant.pending.is_some()
-            || next <= offset
-            || next > request.length
-            || next - offset > crate::log::history::MAX_CHUNK_BYTES as u64
-        {
-            return Err(Error::MalformedBundle(
-                "live outgoing chunk changed or expired",
-            ));
-        }
-        grant.pending = Some(next);
-        Ok(())
-    }
-
-    /// Called only after the response ledger accepted the exact outstanding chunk's ACK.
-    pub(crate) fn live_ack(&self, request: LiveRequest, next: u64) -> crate::error::Result<()> {
-        use crate::error::Error;
-        let key = (self.0.node, request.room, request.peer, request.request);
-        let now = std::time::Instant::now();
-        let mut state = self.0.budget.state();
-        let grant = state
-            .live_grants
-            .get_mut(&key)
-            .ok_or(Error::MalformedBundle("live grant expired"))?;
-        if grant.request != request
-            || now >= grant.expires
-            || now >= grant.idle
-            || grant.pending != Some(next)
-        {
-            return Err(Error::MalformedBundle("live grant ACK changed or expired"));
-        }
-        grant.persisted = next;
-        grant.pending = None;
-        grant.idle = now + LIVE_GRANT_IDLE;
-        Ok(())
-    }
-
-    pub(crate) fn finish_live(&self, request: LiveRequest) {
-        let key = (self.0.node, request.room, request.peer, request.request);
-        let mut state = self.0.budget.state();
-        if state
-            .live_grants
-            .get(&key)
-            .is_some_and(|grant| grant.request == request)
-        {
-            state.live_grants.remove(&key);
-        }
-    }
-
     /// A control work envelope larger than one MiB uses the foreground reservation, preserving
     /// the small control pool for fixed wire metadata and staging state. This admits a separately
     /// accounted worker; it never widens a charge on the existing worker. The caller drops it
@@ -1153,10 +523,6 @@ impl Job {
     pub(crate) async fn record_job(&self, envelope: usize) -> Option<Self> {
         if self.0.lane == Lane::Control && envelope > MIB {
             let mut ticket = self.0.budget.enqueue(self.0.node, Lane::LargeControl);
-            #[cfg(feature = "test-knobs")]
-            let mut proof_attempted = false;
-            #[cfg(feature = "test-knobs")]
-            let mut _proof_wait = None;
             loop {
                 // Subscribe first: a release between the failed admission and the await cannot
                 // be lost. The retained ticket keeps its fair position; no periodic retry is
@@ -1164,11 +530,6 @@ impl Job {
                 let wake = ticket.wake();
                 if let Some(job) = ticket.try_admit() {
                     return Some(job);
-                }
-                #[cfg(feature = "test-knobs")]
-                if !proof_attempted {
-                    proof_attempted = true;
-                    _proof_wait = self.foreground_wait_for_proof(&ticket);
                 }
                 wake.await;
             }
@@ -1359,383 +720,6 @@ impl Drop for OutputCharge {
     }
 }
 
-/// The daemon's flow-state pool (ADR-038 FX-35), one record under one lock, so that what
-/// `vox status --json` shows of it is one coordinated view: how many flow states it allows;
-/// which running rounds hold one (actor, node, room, peer); and the current actor's count per
-/// hosted node (one member per hosted node, 0 until it holds one). Retiring generations remain
-/// visible separately. The limit is exactly two per active-or-retiring hosted identity;
-/// it bounds only running rounds. A parked continuation holds no pool slot.
-struct Pool {
-    limit: usize,
-    in_use: usize,
-    /// Exact running owners, including their physical positions across actor generations.
-    running: BTreeMap<FlowStateOwner, usize>,
-    next_owner: u64,
-    /// The current actor generation for each hosted fingerprint.
-    active: BTreeMap<Digest32, u64>,
-    /// Active and retiring actor generations. A replacement with the same fingerprint gets its
-    /// own owner for exact attribution, but both generations count as one hosted node. Impossible
-    /// continuations remain actor-owned here, never in a daemon-wide wait queue.
-    owners: BTreeMap<u64, PoolOwner>,
-    next_continuation: u64,
-    /// Identity of the most recent charge release or returned release promise.
-    release_edge: Arc<()>,
-}
-
-struct FlowContinuation {
-    id: u64,
-    room: Digest32,
-    peer: Digest32,
-    slot: PhysicalSlot,
-    request: [u8; 16],
-    instance: [u8; 16],
-    token: u64,
-    granted: bool,
-}
-
-struct PoolOwner {
-    node: Digest32,
-    registered: bool,
-    charges: usize,
-    /// Exact Flows remain in this actor generation's controller. These records only bind their
-    /// monotonic release order and causal actor handoff; they are not a daemon-wide work queue.
-    continuations: BTreeMap<u64, FlowContinuation>,
-    release: tokio::sync::mpsc::UnboundedSender<FlowRelease>,
-}
-
-/// A charge release synchronously puts this exact retained continuation on its owning actor's
-/// runnable queue. The actor processes this queue before reporting status, so a shipped snapshot
-/// cannot mistake a pending handoff for a wedge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FlowRelease {
-    pub(crate) order: u64,
-    pub(crate) token: u64,
-    pub(crate) room: Digest32,
-    pub(crate) peer: Digest32,
-    pub(crate) slot: PhysicalSlot,
-}
-
-/// Exact running-round ownership published in the same pool snapshot as its charge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FlowStateOwner {
-    pub(crate) actor: u64,
-    pub(crate) node: Digest32,
-    pub(crate) room: Digest32,
-    pub(crate) peer: Digest32,
-    pub(crate) slot: PhysicalSlot,
-    pub(crate) request: [u8; 16],
-    pub(crate) instance: [u8; 16],
-}
-
-impl Default for Pool {
-    fn default() -> Self {
-        Self {
-            limit: 0,
-            in_use: 0,
-            running: BTreeMap::new(),
-            next_owner: 0,
-            active: BTreeMap::new(),
-            owners: BTreeMap::new(),
-            next_continuation: 0,
-            release_edge: Arc::new(()),
-        }
-    }
-}
-
-impl Pool {
-    /// Active registrations and a retired generation whose round is still returning both count
-    /// as hosted until that exact charge is gone. Distinct generations of one fingerprint never
-    /// widen its two legal running slots or its contribution to the daemon limit.
-    fn resize(&mut self) {
-        let hosted = self
-            .owners
-            .values()
-            .map(|owner| owner.node)
-            .collect::<BTreeSet<_>>()
-            .len();
-        self.limit = flow_state_limit(hosted);
-    }
-    /// Running charges and granted continuations share the same physical position.
-    fn slot_occupied(&self, node: Digest32, slot: PhysicalSlot) -> bool {
-        self.running
-            .keys()
-            .any(|owner| owner.node == node && owner.slot == slot)
-            || self
-                .owners
-                .values()
-                .filter(|owner| owner.node == node)
-                .any(|owner| {
-                    owner
-                        .continuations
-                        .values()
-                        .any(|continuation| continuation.granted && continuation.slot == slot)
-                })
-    }
-
-    /// Select the earliest actor-owned continuation which can use a daemon charge and one of its
-    /// node's two source-owned running slots. A successful synchronous send is a promise counted
-    /// ahead of new contenders until consumed or cancelled. The pool scans the continuations of
-    /// its already-registered actor generations; it owns no daemon-wide work queue.
-    fn handoff_continuations(&mut self) {
-        loop {
-            let promised = self
-                .owners
-                .values()
-                .flat_map(|owner| owner.continuations.values())
-                .filter(|continuation| continuation.granted)
-                .count();
-            if self.in_use + promised >= self.limit {
-                return;
-            }
-            let candidate = self
-                .owners
-                .iter()
-                .filter(|(_, owner)| owner.registered)
-                .flat_map(|(generation, owner)| {
-                    owner
-                        .continuations
-                        .values()
-                        .filter(|continuation| !continuation.granted)
-                        .map(move |continuation| {
-                            (*generation, owner.node, continuation.slot, continuation.id)
-                        })
-                })
-                .filter(|(_, node, slot, _)| {
-                    let in_use: usize = self
-                        .owners
-                        .values()
-                        .filter(|owner| owner.node == *node)
-                        .map(|owner| owner.charges)
-                        .sum();
-                    let promised = self
-                        .owners
-                        .values()
-                        .filter(|owner| owner.node == *node)
-                        .flat_map(|owner| owner.continuations.values())
-                        .filter(|continuation| continuation.granted)
-                        .count();
-                    in_use + promised < BOUNDED_SYNC_RUNNING_SLOTS
-                        && !self.slot_occupied(*node, *slot)
-                })
-                .min_by_key(|(_, _, _, order)| *order);
-            let Some((generation, _, _, order)) = candidate else {
-                return;
-            };
-            let sent = {
-                let Some(owner) = self.owners.get_mut(&generation) else {
-                    continue;
-                };
-                let Some(continuation) = owner.continuations.get_mut(&order) else {
-                    continue;
-                };
-                continuation.granted = true;
-                owner
-                    .release
-                    .send(FlowRelease {
-                        order,
-                        token: continuation.token,
-                        room: continuation.room,
-                        peer: continuation.peer,
-                        slot: continuation.slot,
-                    })
-                    .is_ok()
-            };
-            if !sent {
-                if let Some(owner) = self.owners.get_mut(&generation) {
-                    owner.continuations.remove(&order);
-                }
-            }
-        }
-    }
-}
-
-/// Exact ownership of an impossible flow-state admission wait. It retains no worker, bytes,
-/// outbound slot or flow-state charge. Dropping it removes ineligible work immediately and, when
-/// it owned a release-edge grant, passes that grant to the next earliest eligible continuation.
-pub(crate) struct FlowReleaseTicket {
-    budget: Arc<Budget>,
-    owner: u64,
-    id: u64,
-}
-
-/// Why an exact retained continuation could not acquire monotonic release-edge ownership.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FlowWaitError {
-    /// Its admitted worker no longer belongs to a registered or retiring actor generation.
-    OwnerMissing,
-    /// The process-lifetime monotonic identity space is exhausted; identities never wrap.
-    OrderExhausted,
-}
-
-/// Snapshot of the last charge release or returned promise when a reservation was refused.
-/// A later enrollment may dispatch only if pointer identity proves such an edge intervened.
-#[derive(Clone)]
-pub(crate) struct FlowReleaseEdge(Arc<()>);
-
-impl FlowReleaseTicket {
-    fn take_grant_locked(
-        &self,
-        pool: &mut Pool,
-        owner: u64,
-        port: (Digest32, Digest32, PhysicalSlot),
-        request: [u8; 16],
-        instance: [u8; 16],
-    ) -> bool {
-        let (room, peer, slot) = port;
-        let Some(owner_state) = pool.owners.get_mut(&owner) else {
-            return false;
-        };
-        let Some(continuation) = owner_state.continuations.get(&self.id) else {
-            return false;
-        };
-        if self.owner != owner
-            || !continuation.granted
-            || continuation.room != room
-            || continuation.peer != peer
-            || continuation.slot != slot
-            || continuation.request != request
-            || continuation.instance != instance
-        {
-            return false;
-        }
-        owner_state.continuations.remove(&self.id);
-        true
-    }
-
-    pub(crate) fn granted(&self) -> bool {
-        self.budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .owners
-            .get(&self.owner)
-            .and_then(|owner| owner.continuations.get(&self.id))
-            .is_some_and(|continuation| continuation.granted)
-    }
-
-    pub(crate) fn sequence(&self) -> u64 {
-        self.id
-    }
-}
-
-impl Drop for FlowReleaseTicket {
-    fn drop(&mut self) {
-        let mut pool = self
-            .budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let returned_grant = pool
-            .owners
-            .get_mut(&self.owner)
-            .and_then(|owner| owner.continuations.remove(&self.id))
-            .is_some_and(|continuation| continuation.granted);
-        if pool.owners.get(&self.owner).is_some_and(|owner| {
-            !owner.registered && owner.charges == 0 && owner.continuations.is_empty()
-        }) {
-            pool.owners.remove(&self.owner);
-            pool.resize();
-        }
-        // Cancelling ungranted work creates no release edge. A granted ticket, however, returns
-        // the exact earlier release promise, which remains causal when passed to the next owner.
-        if returned_grant {
-            pool.release_edge = Arc::new(());
-            pool.handoff_continuations();
-        }
-    }
-}
-
-/// One hosted node's ownership of its daemon flow-state capacity. Kept in the node actor, so
-/// unwinding an actor panic requests the same unregister as a graceful lock. If a worker charge
-/// outlives the actor, the pool defers removal until that charge's `Drop`.
-pub(crate) struct FlowPoolRegistration {
-    budget: Arc<Budget>,
-    node: Digest32,
-    owner: u64,
-}
-
-impl Drop for FlowPoolRegistration {
-    fn drop(&mut self) {
-        let mut p = self
-            .budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if p.active.get(&self.node) == Some(&self.owner) {
-            p.active.remove(&self.node);
-        }
-        if let Some(owner) = p.owners.get_mut(&self.owner) {
-            owner.registered = false;
-        }
-        if p.owners
-            .get(&self.owner)
-            .is_some_and(|owner| owner.charges == 0 && owner.continuations.is_empty())
-        {
-            p.owners.remove(&self.owner);
-        }
-        p.resize();
-    }
-}
-
-/// What a port's reservation of flow state came to (ADR-038 FX-35).
-pub(crate) enum FlowStateTry {
-    /// The round holds its flow state.
-    Reserved(FlowStateCharge),
-    /// Every dynamically sized position is occupied by a running charge or an earlier
-    /// release-edge promise. This is an invariant failure: the exact parked continuation waits
-    /// for the causally matching charge release without retaining a worker or flow-state slot.
-    PoolFull(FlowReleaseEdge),
-    /// Accounting already exceeds the current limit. This is not falsely called PoolFull,
-    /// whose displayed contract is exact equality.
-    PoolOvercommitted(FlowReleaseEdge),
-    /// The requested physical position or both bounded running slots of this fingerprint belong
-    /// to its current or retiring actor generation, including release-edge promises.
-    NodeBusy(FlowReleaseEdge),
-    /// The admitted worker no longer belongs to a pool actor generation. Pool occupancy says
-    /// nothing about this lifecycle invariant failure.
-    OwnerMissing,
-}
-
-/// One running round's flow state, inseparable from its real Control byte charge. The Flow
-/// stores it after its state fields so allocations die before capacity is returned; the bytes
-/// go back first, then the pool is told.
-pub(crate) struct FlowStateCharge {
-    budget: Arc<Budget>,
-    key: FlowStateOwner,
-    owner: u64,
-    charge: Option<BufferCharge>,
-}
-impl Drop for FlowStateCharge {
-    fn drop(&mut self) {
-        drop(self.charge.take());
-        let mut p = self
-            .budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        p.in_use = p.in_use.saturating_sub(1);
-        if let Some(count) = p.running.get_mut(&self.key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                p.running.remove(&self.key);
-            }
-        }
-        if let Some(owner) = p.owners.get_mut(&self.owner) {
-            owner.charges = owner.charges.saturating_sub(1);
-        }
-        if p.owners.get(&self.owner).is_some_and(|owner| {
-            !owner.registered && owner.charges == 0 && owner.continuations.is_empty()
-        }) {
-            p.owners.remove(&self.owner);
-        }
-        p.resize();
-        // A physical charge release creates a new grant edge. Registration and pool resizing
-        // update accounting but dispatch no work.
-        p.release_edge = Arc::new(());
-        p.handoff_continuations();
-    }
-}
-
 /// The budget's lanes as they stand, for `vox status --json` (`lanes.budget`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetSnapshot {
@@ -1751,92 +735,13 @@ pub struct BudgetSnapshot {
     pub foreground_jobs: usize,
     /// Tickets waiting per lane, in `Lane::index` order: archive, control, large control, live.
     pub queued: [usize; 4],
-    /// Flow states held now, each by one running round (ADR-038 FX-35).
-    pub flow_state_in_use: usize,
-    /// Release-edge grants not consumed by their owning actors yet.
-    pub flow_state_promised: usize,
-    /// Running charges plus release-edge grants: capacity unavailable to a new contender.
-    pub flow_state_occupied: usize,
-    /// The running flow states the daemon allows at once.
-    pub flow_state_limit: usize,
-    /// Charges by hosted node: one member per fingerprint across its active and retiring actor
-    /// generations. The member values sum exactly to `flow_state_in_use`.
-    pub flow_state_by_node: Vec<(Digest32, usize)>,
-    /// Running charges plus release-edge grants per hosted node.
-    pub flow_state_occupied_by_node: Vec<(Digest32, usize)>,
-    /// Every active or retiring actor generation and its exact charge count.
-    pub flow_state_actors: Vec<(u64, Digest32, bool, usize)>,
-    /// Nodes whose actor registration ended while a running charge was still returning.
-    pub flow_state_retiring_nodes: Vec<Digest32>,
-    /// The running rounds holding a flow state (node, room, peer), from the same view.
-    pub flow_state_running: Vec<FlowStateOwner>,
-    /// Exact retained impossible-path continuations in monotonic enrollment order.
-    pub flow_state_waiting: Vec<FlowContinuationSnapshot>,
 }
 
-/// Monotonic order, actor, node, room, peer, request, incarnation, release grant and slot index.
-pub type FlowContinuationSnapshot = (
-    u64,
-    u64,
-    Digest32,
-    Digest32,
-    Digest32,
-    [u8; 16],
-    [u8; 16],
-    bool,
-    usize,
-);
-
 impl Budget {
-    /// A hosted node lists itself in the flow-state pool when it starts networking, at 0 until
-    /// it holds one (`by_node` has one member per hosted node, ADR-038 FX-35).
-    pub(crate) fn register_node(
-        self: &Arc<Self>,
-        node: Digest32,
-        release: tokio::sync::mpsc::UnboundedSender<FlowRelease>,
-    ) -> FlowPoolRegistration {
-        let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut owner = p.next_owner.wrapping_add(1);
-        while p.owners.contains_key(&owner) {
-            owner = owner.wrapping_add(1);
-        }
-        p.next_owner = owner;
-        if let Some(replaced_owner) = p.active.insert(node, owner) {
-            if let Some(replaced) = p.owners.get_mut(&replaced_owner) {
-                replaced.registered = false;
-            }
-            // The replacement owns new work for this fingerprint. An old generation may keep
-            // an already-running charge until its task returns. Its continuations cease to be
-            // eligible at replacement, but remain until their actor-owned tickets drop: that
-            // returns an existing grant causally instead of letting registration create a wake.
-        }
-        p.owners.insert(
-            owner,
-            PoolOwner {
-                node,
-                registered: true,
-                charges: 0,
-                continuations: BTreeMap::new(),
-                release,
-            },
-        );
-        p.owners.retain(|_, owner| {
-            owner.registered || owner.charges > 0 || !owner.continuations.is_empty()
-        });
-        p.resize();
-        drop(p);
-        FlowPoolRegistration {
-            budget: Arc::clone(self),
-            node,
-            owner,
-        }
-    }
-
     /// The lanes as they stand now.
     #[must_use]
     pub fn snapshot(&self) -> BudgetSnapshot {
         let state = self.state();
-        let p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
         BudgetSnapshot {
             archive_nodes: state.archive_nodes.iter().copied().collect(),
             archive_jobs: ARCHIVE_JOBS,
@@ -1849,84 +754,6 @@ impl Budget {
                 state.queues[2].len(),
                 state.queues[3].len(),
             ],
-            // One locked view of the pool: the running rounds and their count per node, as
-            // they stand together.
-            flow_state_in_use: p.in_use,
-            flow_state_promised: p
-                .owners
-                .values()
-                .flat_map(|owner| owner.continuations.values())
-                .filter(|continuation| continuation.granted)
-                .count(),
-            flow_state_occupied: p.in_use
-                + p.owners
-                    .values()
-                    .flat_map(|owner| owner.continuations.values())
-                    .filter(|continuation| continuation.granted)
-                    .count(),
-            flow_state_limit: p.limit,
-            flow_state_by_node: {
-                let mut by_node = BTreeMap::new();
-                for owner in p.owners.values() {
-                    *by_node.entry(owner.node).or_insert(0) += owner.charges;
-                }
-                by_node.into_iter().collect()
-            },
-            flow_state_occupied_by_node: {
-                let mut by_node = BTreeMap::new();
-                for owner in p.owners.values() {
-                    *by_node.entry(owner.node).or_insert(0) += owner.charges
-                        + owner
-                            .continuations
-                            .values()
-                            .filter(|continuation| continuation.granted)
-                            .count();
-                }
-                by_node.into_iter().collect()
-            },
-            flow_state_actors: p
-                .owners
-                .iter()
-                .map(|(generation, owner)| {
-                    (*generation, owner.node, owner.registered, owner.charges)
-                })
-                .collect(),
-            flow_state_retiring_nodes: p
-                .owners
-                .values()
-                .filter(|owner| !owner.registered)
-                .map(|owner| owner.node)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            flow_state_running: p
-                .running
-                .iter()
-                .flat_map(|(owner, count)| std::iter::repeat_n(*owner, *count))
-                .collect(),
-            flow_state_waiting: {
-                let mut waiting = p
-                    .owners
-                    .iter()
-                    .flat_map(|(generation, owner)| {
-                        owner.continuations.values().map(|continuation| {
-                            (
-                                continuation.id,
-                                *generation,
-                                owner.node,
-                                continuation.room,
-                                continuation.peer,
-                                continuation.request,
-                                continuation.instance,
-                                continuation.granted,
-                                continuation.slot.index(),
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                waiting.sort_by_key(|continuation| continuation.0);
-                waiting
-            },
         }
     }
 }

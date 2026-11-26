@@ -268,9 +268,14 @@ network change under `network_changed`.
 
 A room's or member's `last sync` is when a sync last saved room history this node did not hold
 before: an entry, a header or body, a signed head, a proof or a room context. It does not say that
-a message arrived. A room reads `not receiving` when a connected member has stayed at least 20 live
+a message arrived. In a room of the current history format the member is the one whose connection
+brought it: an answer its loop got that saved any of these, or an entry from that answer the room
+then admitted. A room reads `not receiving` when a connected member has stayed at least 20 live
 entries behind for over 60 seconds with no progress seen between status samples; the line under
-`UNHEALTHY` names the member and how many of its live entries are missing now.
+`UNHEALTHY` names the member and how many of its live entries are missing now. Behind is the
+newest position of its own feed the member told this node on its current connection, less what
+this node holds of that feed (the size committed here, less the positions still owed below it);
+progress is an entry of that feed admitted here, not a newer head of it.
 
 Status remains available when another node's saved anchor inventory cannot be read. Its JSON
 `anchors` is the complete machine inventory; `node_anchors` retains a Ready node's own dial
@@ -305,12 +310,36 @@ message counts or proof that a peer has admitted every author.
 Quiet rooms still send scheduled head checks and transport keepalives: zero record counts do not
 mean zero network bytes.
 
-An ongoing `sync-failing` problem must clear after a successful current bounded or legacy
-completion. Historical `last_failure` values and cumulative failure counts remain diagnostic
-history, not current-health verdicts. `last_failure_stands` says whether the last failure is
-still that peer's latest outcome; it turns false once a later round with the peer, in either
-direction, ends without error (its `completed` or `partial` count grows). Plain status names a
-peer's last failure only while it stands.
+The other numbers of a `sync` row count rounds, for that room and peer. `completed` is the rounds
+that ended without error: those this node asked (`fetched_completed`) and the peer's requests it
+answered other than a loop's Have, Range, fork proof or head by id (`served_completed`); `empty` is
+those of them that saved, or served, nothing new (`fetched_empty`, `served_empty`), and `why` says
+what each completed round ran for. Each exchange of a connection's loop is one of this node's
+rounds: a Range the peer answered (`why: hint`; `empty` when it saved nothing new) or a Have the
+peer took (`why: announce`, always `empty`). A Have or Range the peer's loop asks of this node is
+the peer's exchange and counts in none of these; what this node sent for it is in
+`history_served`. `failed` counts rounds that failed and each refused or failed exchange of a
+loop. `partial` counts requests counted with `served_completed` that this node answered without
+error but short of what was asked. `running` lists the answers this node is giving the peer now
+(`"dir": "in"`), each Have or Range of the peer's loop included, never this node's own loop.
+`lanes.bounded.running` lists each room's local admission (`"admission": true`); `retiring`,
+`cleanup` and `cleanup_errors` list admission work whose saved state is still being cleaned up,
+and the error that stopped it. No loop is listed there.
+
+An ongoing `sync-failing` problem clears once an exchange of this node's loop with that peer, or a
+request of the peer counted in `served_completed`, ends without error. Historical `last_failure`
+values and cumulative failure counts remain diagnostic history, not current-health verdicts.
+`last_failure_stands` says whether the last failure is still that peer's latest outcome; it turns
+false once a later round with the peer, in either direction, ends without error (its `completed`
+or `partial` count grows). Plain status names a peer's last failure only while it stands. An
+exchange of a connection's loop that the peer refuses, or that fails here, adds one `failed` and
+makes that error's sentence the peer's last failure. The connection then sends that peer nothing
+for the room until there is news: the peer's next Have, a new connection, or a change of this
+node's own standing in the room. It is never backed off and it does not raise `sync-failing`. A
+refusal because the peer does not know this node yet is the introduction at work: it becomes the
+last failure without adding to `failed`, and the next exchange with the peer that ends without
+error (a Range answered, a Have taken) ends it. A reply that fails its check closes the
+connection.
 
 Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
 the problem.

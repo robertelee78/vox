@@ -44,6 +44,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The thread's receiver input as it was, put back when dropped.
+pub(crate) struct Withheld(Option<SelectedReceiverInput>);
+
+impl Drop for Withheld {
+    fn drop(&mut self) {
+        SELECTED_RECEIVER_INPUT.with(|input| input.replace(self.0.take()));
+    }
+}
+
 impl SelectedReceiverInput {
     pub(crate) fn new(
         select: impl Fn((Digest32, u64)) -> Result<Option<Zeroizing<Vec<u8>>>> + Send + Sync + 'static,
@@ -58,15 +67,17 @@ impl SelectedReceiverInput {
     }
 
     pub(crate) fn scope<T>(&self, body: impl FnOnce() -> T) -> T {
-        struct Restore(Option<SelectedReceiverInput>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                SELECTED_RECEIVER_INPUT.with(|input| input.replace(self.0.take()));
-            }
-        }
         let _restore =
-            Restore(SELECTED_RECEIVER_INPUT.with(|input| input.replace(Some(self.clone()))));
+            Withheld(SELECTED_RECEIVER_INPUT.with(|input| input.replace(Some(self.clone()))));
         body()
+    }
+
+    /// This thread's scoped input, withheld while its native write holds the room's lock again
+    /// (`history_stream::source::OwnedRoom`): the input locks the room itself, so a step under
+    /// that lock which asked it would wait on its own thread for ever. Asked meanwhile, it
+    /// answers as outside any write. Put back when the returned value is dropped.
+    pub(crate) fn withhold() -> Withheld {
+        Withheld(SELECTED_RECEIVER_INPUT.with(|input| input.replace(None)))
     }
 
     pub(crate) fn selected(slot: (Digest32, u64)) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -327,12 +338,9 @@ impl SemanticProjection {
                 }
                 Err(error) => return Err(error),
             };
-            // `VOX_TEST_MP10_RENDER_EVERY_BODY` (boundary 2 off) reaches this render gate only,
-            // never a "not received yet" row.
             let decided =
                 channel.body_render_decision(&view, generation, entry, channel.now_hint, || {
-                    Ok(governance::render_every_body()
-                        || self.already_readable(channel, store, &hash)?)
+                    self.already_readable(channel, store, &hash)
                 })?;
             drop(view);
             let Some(eligible) = decided else {
@@ -456,12 +464,16 @@ impl SemanticProjection {
                     .get(&slot)
                     .filter(|chain| chain.epoch() == message.header.epoch)
             });
+            // No receiver of this own generation here (a node recovering its own history, or
+            // one that never held it): the entry is published as any unreadable entry is,
+            // whether or not the own-history fence is already up. The fence's readability audit
+            // (`own_history.rs`) then names the missing key (`OwnReadability::KeyDebt`) and the
+            // loops ask it (OwnRelease); recovery completes only once it opens. Answering
+            // `Unavailable` here instead kept the entry unpublished, so the audit never reached
+            // it to name the key, and the entry was fetched again and again for a body that
+            // could not change.
             let Some(chain) = chain else {
-                return Ok(if channel.own_behind {
-                    PreparedOutcome::Unavailable
-                } else {
-                    PreparedOutcome::Applied
-                });
+                return Ok(PreparedOutcome::Applied);
             };
             return Ok(match chain.decrypt_retained(&message) {
                 Ok(plaintext) => PreparedOutcome::opened(Zeroizing::new(plaintext), false),
@@ -536,8 +548,12 @@ impl SemanticProjection {
             PreparedOutcome::Applied => return Ok(ProjectionOutcome::Applied),
             PreparedOutcome::Unavailable => return Ok(ProjectionOutcome::Unavailable),
             PreparedOutcome::Deferred => {
+                // The walk comes back to this row, not to the author's first position: a row
+                // deferred while admission runs (one per admitted post of a returning reader)
+                // sent the walk back to 1 each time, so posts admitted before their key, which
+                // only the walk shows, waited behind the author's whole history again and again.
                 let mut index = self.entries.write(batch, sek, &self.room)?;
-                index.queue_backfill(author, Some(1))?;
+                index.lower_backfill(author, entry.skeleton.seq)?;
                 index.seal()?;
                 return Ok(ProjectionOutcome::Deferred);
             }
@@ -964,6 +980,6 @@ impl SemanticProjection {
         for row in self.rows {
             channel.note_rendered(store, &row.entry_hash)?;
         }
-        channel.settle_display_order(store)
+        Ok(())
     }
 }

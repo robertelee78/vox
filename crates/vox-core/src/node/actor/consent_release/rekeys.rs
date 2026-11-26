@@ -10,10 +10,6 @@ pub(in crate::node::actor) enum RekeyAfter {
         next: Box<Continuation>,
         reply: Reply,
     },
-    Packages {
-        next: package_save::Redelivery,
-        reply: Reply,
-    },
 }
 struct Selection {
     room: Digest32,
@@ -848,18 +844,6 @@ impl Node {
                     self.fail_owned_consent(room, error, *next, reply).await;
                 }
             },
-            RekeyAfter::Packages { next, reply } => {
-                let outcome = result
-                    .as_ref()
-                    .map(|_| Outcome::Done)
-                    .unwrap_or_else(|error| Outcome::Failed(fault_of(error)));
-                self.resume_package_redelivery(next, result.map(|_| ()))
-                    .await;
-                if let Some(reply) = reply {
-                    let _ = reply.send(outcome);
-                }
-                self.post_save_wake.notify_one();
-            }
         }
     }
 
@@ -869,14 +853,6 @@ impl Node {
             RekeyAfter::Consent { next, reply } => {
                 self.reject_owned_consent(target.pass.room, error, *next, reply)
             }
-            RekeyAfter::Packages { next, reply } => {
-                let fault = fault_of(&error);
-                self.reject_package_redelivery(next);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Failed(fault));
-                }
-                self.post_save_wake.notify_one();
-            }
         }
     }
 }
@@ -885,10 +861,5 @@ pub(super) fn retire(target: Target, error: Error) {
     match target.pass.after {
         RekeyAfter::Automatic | RekeyAfter::Settlement { .. } => {}
         RekeyAfter::Consent { next, reply } => super::retire_detached(Err(error), *next, reply),
-        RekeyAfter::Packages { reply, .. } => {
-            if let Some(reply) = reply {
-                let _ = reply.send(Outcome::Failed(fault_of(&error)));
-            }
-        }
     }
 }

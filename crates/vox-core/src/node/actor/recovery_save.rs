@@ -30,7 +30,6 @@ impl Work {
 
 #[derive(Clone, Copy)]
 enum Stage {
-    Offer,
     Settle,
     CatchUp,
     Presence,
@@ -46,10 +45,6 @@ enum After {
     Producer,
     Governance(governance_save::Retained),
 }
-struct Offer {
-    hint: Option<(Digest32, Digest32, u64)>,
-    targets: Vec<Digest32>,
-}
 pub(super) struct Continuation {
     instance: SharedChannel,
     attachment: u64,
@@ -58,7 +53,6 @@ pub(super) struct Continuation {
     stage: Stage,
     settle: bool,
     recover: bool,
-    offer: Option<Offer>,
     back: bool,
     changed: bool,
     completed: bool,
@@ -81,10 +75,9 @@ impl Continuation {
             attachment,
             lifetime,
             after,
-            stage: if settle { Stage::Offer } else { Stage::Fence },
+            stage: if settle { Stage::Settle } else { Stage::Fence },
             settle,
             recover,
-            offer: None,
             back: false,
             changed: false,
             completed: false,
@@ -117,14 +110,12 @@ impl Node {
         self.begin_owned_recovery(room).await;
     }
     pub(super) async fn begin_owned_recovery(&mut self, room: Digest32) {
-        self.try_install_own_key(room);
         self.begin_recovery_chain(room, false, true).await;
     }
     pub(super) async fn settle_room(&mut self, room: &Digest32) {
         self.begin_recovery_chain(*room, true, false).await;
     }
     pub(super) async fn begin_owned_settlement_recovery(&mut self, room: Digest32) {
-        self.try_install_own_key(room);
         self.begin_recovery_chain(room, true, true).await;
     }
     async fn begin_recovery_chain(&mut self, room: Digest32, settle: bool, recover: bool) {
@@ -158,9 +149,7 @@ impl Node {
                 let Some(profile) = self.profile.as_ref() else {
                     return;
                 };
-                channel.settlement_work_pending(profile.store(), continuation.now, || {
-                    self.recovery_offer_peers(room)
-                })
+                channel.settlement_work_pending(profile.store(), continuation.now)
             };
             match pending {
                 Ok(true) => {}
@@ -194,27 +183,6 @@ impl Node {
         self.continue_recovery_stage(room, continuation, reply)
             .await;
     }
-    fn recovery_offer_peers(
-        &self,
-        room: Digest32,
-    ) -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)> {
-        self.connected_peers()
-            .into_iter()
-            .map(|peer| {
-                let parked = self
-                    .ports
-                    .get(&(room, peer))
-                    .and_then(|port| port.own_receipt_lower)
-                    .zip(
-                        self.net
-                            .as_ref()
-                            .and_then(|net| net.manager().existing(&peer)),
-                    )
-                    .map(|(probe, connection)| (connection.serial(), probe));
-                (peer, parked)
-            })
-            .collect()
-    }
 
     async fn continue_recovery_stage(
         &mut self,
@@ -223,7 +191,6 @@ impl Node {
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
         let step = match continuation.stage {
-            Stage::Offer => Step::Offer(self.recovery_offer_peers(room)),
             Stage::Settle => Step::Settle,
             Stage::CatchUp => Step::CatchUp,
             Stage::Presence => Step::Presence,
@@ -385,10 +352,6 @@ impl Node {
             }
         };
         let next = match (continuation.stage, saved) {
-            (Stage::Offer, Saved::Offered { hint, targets }) => {
-                continuation.offer = Some(Offer { hint, targets });
-                Stage::Settle
-            }
             (
                 Stage::Settle,
                 Saved::Settlement {
@@ -398,6 +361,11 @@ impl Node {
                 },
             ) => {
                 continuation.back |= sparse && changed;
+                // The room is settled now: what waited for that (`IngressReason::Room`, refused
+                // `RoomNotSynced`) goes on from this commit.
+                if changed {
+                    self.ingress_room_progress(room, session_save::IngressProgress::Room);
+                }
                 if !eligible {
                     self.finish_settlement_offer(room, &mut continuation);
                     Stage::Fence
@@ -422,6 +390,15 @@ impl Node {
                 return;
             }
             (Stage::Fence, Saved::Fence(changed)) => {
+                if changed {
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.store().touch_history(
+                            room,
+                            profile.fingerprint(),
+                            std::collections::BTreeSet::new(),
+                        );
+                    }
+                }
                 continuation.changed |= changed;
                 Stage::Receiver
             }
@@ -440,6 +417,11 @@ impl Node {
             (Stage::Ranges, Saved::Ranges) => Stage::Complete,
             (Stage::Complete, Saved::Recovered(completed)) => {
                 continuation.completed |= completed;
+                // Own history recovered (and the room settled, when this rotation also settled
+                // it): what waited for either (`OwnHistoryBehind`, `RoomNotSynced`) goes on.
+                if completed {
+                    self.ingress_room_progress(room, session_save::IngressProgress::Room);
+                }
                 Stage::Inspect
             }
             (Stage::Inspect, Saved::Inspected(key)) => {
@@ -469,9 +451,6 @@ impl Node {
         if continuation.back {
             self.note_local_governance_append(&room);
             continuation.back = false;
-        }
-        if let Some(offer) = continuation.offer.take() {
-            self.offer_own_head(&room, offer.hint, offer.targets);
         }
         if continuation.recover {
             continuation.now = self.now_ms();
@@ -517,80 +496,40 @@ impl Node {
         if audit == OwnReadability::Runnable {
             self.governance_work.wake_room(room);
         }
-        if let OwnReadability::EffectReady {
-            target,
-            seq,
-            entry_hash,
-        } = audit
-        {
-            let same = self.own_readable_effects.get(&room).is_some_and(|ready| {
-                ready.target == target
-                    && ready.seq == seq
-                    && ready.entry_hash == entry_hash
-                    && ready
-                        .instance
-                        .upgrade()
-                        .is_some_and(|held| Arc::ptr_eq(&held, shared))
-            });
-            if !same {
-                self.own_readable_effects.insert(
-                    room,
-                    ReadableOwnEffect {
-                        instance: Arc::downgrade(shared),
-                        target,
-                        seq,
-                        entry_hash,
-                        woken: BTreeSet::new(),
-                    },
-                );
-            }
-            self.retry_readable_own_effect(room);
-        }
-        if let OwnReadability::KeyDebt {
-            target,
-            epoch,
-            chain,
-            iteration,
-            ..
-        } = audit
-        {
-            self.start_own_key_request(room, target, epoch, chain, iteration);
-        }
+        // A missing own body (BodyDebt) or a readable own body whose effect has not settled
+        // (EffectReady) is not a walked position: the connections' loops owe it, the room's
+        // admission settles it, and each admission wakes these stages again (`actor.rs`,
+        // after `room_advanced`).
+        // An own sender key the audit lacks is the loops' debt (OwnRelease, `pull::own_release`):
+        // asked of a peer whose own-release section says it can release it. Any other audit
+        // result clears it: the next contiguous position comes first.
+        let key_debt = match audit {
+            OwnReadability::KeyDebt {
+                epoch,
+                chain,
+                iteration,
+                ..
+            } => Some(crate::node::history_stream::pull::OwnKeyDebt {
+                epoch,
+                chain,
+                iteration,
+            }),
+            _ => None,
+        };
+        self.history_frontier.owe_own_key(room, key_debt);
         if continuation.receiver_changed {
             self.governance_work.wake_room(room);
         }
         if continuation.completed {
             self.note_local_governance_append(&room);
         }
-        let debt = match audit {
-            OwnReadability::BodyDebt {
-                target,
-                seq,
-                entry_hash,
-            } => Some((target, seq, entry_hash)),
-            _ => None,
-        };
-        let debt_changed = match debt {
-            Some(debt) => self.own_recovery_body_debts.insert(room, debt) != Some(debt),
-            None => self.own_recovery_body_debts.remove(&room).is_some(),
-        };
-        let progress = match key {
-            Some(key) => self.own_recovery_rooms.insert(room, key) != Some(key),
+        match key {
+            Some(key) => {
+                self.own_recovery_rooms.insert(room, key);
+            }
             None => {
                 self.own_recovery_rooms.remove(&room);
-                false
             }
-        };
-        if continuation.completed || key.is_none() {
-            self.own_readable_effects.remove(&room);
-        }
-        if progress || debt_changed {
-            for ((r, _), port) in &mut self.ports {
-                if *r == room {
-                    port.own_recovery_checked = false;
-                }
-            }
-            self.sched_rooms.insert(room);
         }
         if continuation.changed || continuation.completed {
             let note = if continuation.completed {

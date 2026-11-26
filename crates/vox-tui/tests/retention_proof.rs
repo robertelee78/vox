@@ -183,15 +183,6 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
         )
         .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
-        // Off unless the act creates the file: then this node serves redundantly expanded
-        // control proofs, as a hostile relay may (`proof_rows::fetch`).
-        .env(
-            "VOX_TEST_REDUNDANT_CONTROL_FILE",
-            dir.join("redundant-control"),
-        )
-        // Off unless the act creates the file: then this node is a hostile asker
-        // (`proof_rows::hostile_member`).
-        .env("VOX_TEST_CYCLE_TARGETS_FILE", dir.join("cycle-targets"))
         .envs(
             std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
                 .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
@@ -2564,46 +2555,6 @@ mod proof_rows {
         );
         count
     }
-    fn evict_nonprefix_ranges(dir: &Path, room: &Digest32) {
-        let profile = profile(dir);
-        let sek = sek(&profile, room);
-        let directory = decoded(profile.store(), &sek, room, 0);
-        let mut pages = Vec::new();
-        let mut ranges = Vec::new();
-        tree(
-            profile.store(),
-            &sek,
-            room,
-            number(&roots(&directory)[5]),
-            &mut pages,
-            &mut ranges,
-        );
-        let before = ranges.len();
-        // Prefix ranges are acceptance witnesses and stay. Only redundant non-prefix serving
-        // subtrees are evicted, so a cache miss must use committed source-header reconstruction.
-        ranges.retain(|row| {
-            let key = bytes(&array(row)[0]);
-            u64::from_be_bytes(key[32..40].try_into().unwrap()) == 1
-        });
-        assert!(
-            before > ranges.len(),
-            "APPARATUS: non-prefix ranges existed"
-        );
-        eprintln!(
-            "EVICTED {} redundant non-prefix ranges",
-            before - ranges.len()
-        );
-        replace_tree(
-            profile.store(),
-            &sek,
-            room,
-            5,
-            directory,
-            &pages,
-            ranges,
-            Vec::new(),
-        );
-    }
     fn all_texts(dir: &Path, room: &str) -> Vec<String> {
         let mut before: Option<String> = None;
         let mut texts = Vec::new();
@@ -2713,284 +2664,6 @@ mod proof_rows {
         let id = full_room(&a, &room);
         (tmp, a, b, ad, bd, room, id)
     }
-    // The control proofs the hostile author served (`<a>/redundant-control.served`, one
-    // `<head hex> <lo> <hi>` per proof) that the stopped receiver holds as its own coverage
-    // (key (head, lo), value hi): the receiver verified and accepted each of these.
-    fn redundant_held(author: &Path, receiver: &Path, room: &Digest32) -> (usize, usize) {
-        let served =
-            std::fs::read_to_string(author.join("redundant-control.served")).unwrap_or_default();
-        let copy = tempfile::tempdir().unwrap();
-        copy_tree(receiver, copy.path());
-        let profile = profile(copy.path());
-        let sek = sek(&profile, room);
-        let directory = decoded(profile.store(), &sek, room, 0);
-        let mut intervals = Vec::new();
-        tree(
-            profile.store(),
-            &sek,
-            room,
-            number(&roots(&directory)[3]),
-            &mut Vec::new(),
-            &mut intervals,
-        );
-        let held: std::collections::BTreeMap<Vec<u8>, u64> = intervals
-            .iter()
-            .map(|row| {
-                let row = array(row);
-                (bytes(&row[0])[..40].to_vec(), number(&array(&row[1])[1]))
-            })
-            .collect();
-        let mut accepted = 0;
-        let mut count = 0;
-        for line in served.lines() {
-            let mut fields = line.split(' ');
-            let (Some(head), Some(lo), Some(hi), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
-            else {
-                panic!("APPARATUS: redundant control marker line {line:?}");
-            };
-            let mut key: Vec<u8> = (0..head.len())
-                .step_by(2)
-                .map(|at| u8::from_str_radix(&head[at..at + 2], 16).unwrap())
-                .collect();
-            assert_eq!(key.len(), 32, "APPARATUS: redundant control marker head");
-            key.extend_from_slice(&lo.parse::<u64>().unwrap().to_be_bytes());
-            let hi = hi.parse::<u64>().unwrap();
-            count += 1;
-            if held.get(&key).is_some_and(|held| *held >= hi) {
-                accepted += 1;
-            }
-        }
-        (count, accepted)
-    }
-    // A third member whose every head-bound request is hostile (ADR-053 P guards): it trusts and
-    // is trusted by both, joins the room through the author and runs with
-    // `VOX_TEST_CYCLE_TARGETS_FILE` on, so each of its asks names an unsigned target it does not
-    // hold: a forged root of its own head's size, a size past any holder, smaller sizes with
-    // forged roots, and a request it abandons once sent.
-    fn hostile_member(a: &Path, b: &Path, room: &str) -> (PathBuf, Daemon) {
-        let c = a.parent().expect("APPARATUS: scratch root").join("c");
-        std::fs::create_dir_all(c.join("cfg")).expect("APPARATUS: a profile directory");
-        let fingerprint = |dir: &Path| {
-            let (ok, out, err) = vox(dir, &["id"], None);
-            assert!(ok, "PRODUCT (staging): vox id: {err}");
-            out.trim().to_owned()
-        };
-        let (fa, fb, fc) = (fingerprint(a), fingerprint(b), fingerprint(&c));
-        // Each profile names each peer once: a and b already call each other "peer".
-        for (dir, peer, name) in [
-            (c.as_path(), &fa, "author"),
-            (c.as_path(), &fb, "receiver"),
-            (a, &fc, "hostile"),
-            (b, &fc, "hostile"),
-        ] {
-            let (ok, _, err) = attach::Root::at(dir, IDENTITY).ensure("default", || {
-                vox(dir, &["trust", "add", peer, "--name", name], None)
-            });
-            assert!(ok, "PRODUCT (staging): vox trust add: {err}");
-        }
-        std::fs::write(c.join("cycle-targets"), b"hostile asker").unwrap();
-        let cd = daemon(&c, "c", &format!("{IDENTITY}\n"));
-        attached(&c, "c");
-        let (ok, link, err) = vox(a, &["room", "link", room], None);
-        assert!(ok, "PRODUCT (staging): vox room link: {err}");
-        let (ok, _, err) = vox(
-            &c,
-            &["room", "join", "--passphrase-file", "-", link.trim()],
-            Some(&format!("{ROOMPASS}\n")),
-        );
-        assert!(ok, "PRODUCT (staging): the hostile member joins: {err}");
-        (c, cd)
-    }
-    // The hostile member's own count of what it asked, per variant (its test-knobs lines).
-    fn hostile_sent(c: &Path) -> std::collections::BTreeMap<String, usize> {
-        let mut sent = std::collections::BTreeMap::new();
-        for line in std::fs::read_to_string(c.join("daemon-c.err"))
-            .unwrap_or_default()
-            .lines()
-        {
-            if let Some(rest) = line.split("hostile target sent variant=").nth(1) {
-                let variant = rest.split_whitespace().next().unwrap_or_default();
-                *sent.entry(variant.to_owned()).or_default() += 1;
-            }
-        }
-        sent
-    }
-    /// Stop as APPARATUS (the `test_knobs::require` convention) unless the `vox` under test
-    /// reads every staging knob the store act sets, the mutant it was asked for, and prints the
-    /// hostile member's line it counts.
-    fn require_store_knobs() {
-        #[cfg(feature = "test-knobs")]
-        {
-            let mut knobs = vec![
-                "VOX_TEST_CYCLE_TARGETS_FILE",
-                "hostile target sent variant=",
-                "VOX_TEST_REDUNDANT_CONTROL_FILE",
-                "VOX_TEST_HOLD_VERIFIED_FETCH",
-            ];
-            if std::env::var_os("VOX_MUTANT_PREFIX_PERSIST").is_some() {
-                knobs.push("VOX_MUTANT_PREFIX_PERSIST");
-            }
-            super::test_knobs::require(&knobs);
-        }
-        #[cfg(not(feature = "test-knobs"))]
-        panic!(
-            "CANNOT MEASURE (precondition unmet): the store act stages a hostile member and a \
-             hostile relay with test-only knobs; run it with `--features vox-tui/test-knobs`"
-        );
-    }
-    pub(super) fn fetch() {
-        require_store_knobs();
-        let (_tmp, a, b, ad, bd, room, id) = fresh();
-        let (c, _cd) = hostile_member(&a, &b, &room);
-        // A hostile server: from here on the author serves every control proof with each
-        // subtree without controls inside the asked interval expanded once more. Such a proof
-        // verifies; the serving walk never visits those halves, so no row may keep them.
-        std::fs::write(a.join("redundant-control"), b"expand zero-control subtrees").unwrap();
-        for i in 0..100 {
-            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
-            if i % 10 == 9 {
-                await_count(&b, &room, i + 1);
-            }
-        }
-        let alisten = listening(&a);
-        let blisten = listening(&b);
-        drop(ad);
-        drop(bd);
-        let (served, accepted) = redundant_held(&a, &b, &id);
-        eprintln!(
-            "REDUNDANT control proofs: the author served {served}; the receiver holds \
-             {accepted} of them as verified coverage"
-        );
-        assert!(
-            served > 0,
-            "APPARATUS: the author served no redundantly expanded control proof"
-        );
-        assert!(
-            accepted > 0,
-            "PRODUCT: the receiver holds none of the {served} redundantly expanded control \
-             proofs it was served as coverage"
-        );
-        receipt_rows(&a, &id);
-        receipt_rows(&b, &id);
-        let ad = daemon_on(&a, "a-post", &format!("{IDENTITY}\n"), &alisten);
-        attached(&a, "a-post");
-        for i in 100..140 {
-            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
-        }
-        drop(ad);
-        evict_nonprefix_ranges(&a, &id);
-        let ad = daemon_on(&a, "a-restart", &format!("{IDENTITY}\n"), &alisten);
-        attached(&a, "a-restart");
-        for attempt in 0..2 {
-            let hold = b.join(format!("fetch-{attempt}.hold"));
-            std::fs::write(&hold, b"abandon verified fetch before bodies").unwrap();
-            let bd = held_daemon(
-                &b,
-                &format!("b-abandon-{attempt}"),
-                &blisten,
-                "VOX_TEST_HOLD_VERIFIED_FETCH",
-                &hold,
-            );
-            assert!(
-                within(120, || hold.with_extension("verified").exists()),
-                "APPARATUS: no completed fetch proof was available to abandon"
-            );
-            let held = count(&all_texts(&b, &room), "PROOF-CACHE-");
-            assert!(
-                held < 140,
-                "APPARATUS: fetch abandonment was staged after all message bodies arrived"
-            );
-            eprintln!("ABANDONED verified fetch: receiver shows {held}/140 message bodies");
-            drop(bd);
-            std::fs::remove_file(hold).unwrap();
-            receipt_rows(&b, &id);
-        }
-        let bd = daemon_on(&b, "b-restart", &format!("{IDENTITY}\n"), &blisten);
-        attached(&b, "b-restart");
-        await_count(&b, &room, 140);
-        all_messages(&a, &room, 140);
-        all_messages(&b, &room, 140);
-        drop(ad);
-        drop(bd);
-        let held = (receipt_rows(&a, &id), receipt_rows(&b, &id));
-        // Context rows are owned by verification, never by serving (ADR-053 P rule 6): repeated
-        // exchanges, with the hostile member asking throughout, add none.
-        let contexts = |dir: &Path| counts(dir, &id).get(&0).copied().unwrap_or(0);
-        let held_contexts = (contexts(&a), contexts(&b));
-        // The same exchange again and again: both restart, the receiver asks its author for
-        // the newest history once more and both page everything back. Rows stay as they were.
-        for again in 0..2 {
-            let ad = daemon_on(
-                &a,
-                &format!("a-again-{again}"),
-                &format!("{IDENTITY}\n"),
-                &alisten,
-            );
-            let bd = daemon_on(
-                &b,
-                &format!("b-again-{again}"),
-                &format!("{IDENTITY}\n"),
-                &blisten,
-            );
-            attached(&a, &format!("a-again-{again}"));
-            attached(&b, &format!("b-again-{again}"));
-            let (ok, _, err) = vox(&b, &["room", "read", &room, "--history", "newest"], None);
-            assert!(ok, "PRODUCT: repeated history request: {err}");
-            let phase = std::cell::RefCell::new(String::new());
-            assert!(
-                within(120, || {
-                    let (_, said, _) = vox(
-                        &b,
-                        &["room", "read", &room, "--json", "--history", "status"],
-                        None,
-                    );
-                    let ended = serde_json::from_str::<serde_json::Value>(&said)
-                        .ok()
-                        .and_then(|v| v["status"]["phase"].as_str().map(str::to_owned))
-                        // `more` is the answer of a bounded scan that ended cached.
-                        .is_some_and(|phase| {
-                            ["complete", "unavailable", "paused", "cached", "more"]
-                                .contains(&&*phase)
-                        });
-                    *phase.borrow_mut() = said;
-                    ended
-                }),
-                "APPARATUS: the repeated history request never answered: {}",
-                phase.borrow()
-            );
-            all_messages(&b, &room, 140);
-            all_messages(&a, &room, 140);
-            drop(ad);
-            drop(bd);
-            let again_rows = (receipt_rows(&a, &id), receipt_rows(&b, &id));
-            assert_eq!(
-                again_rows, held,
-                "PRODUCT: restarting and repeating the exchange moved the ProofRange rows \
-                 (author, receiver) from {held:?} to {again_rows:?}"
-            );
-            let again_contexts = (contexts(&a), contexts(&b));
-            assert_eq!(
-                again_contexts, held_contexts,
-                "PRODUCT: restarting and repeating the exchange, with a hostile member asking, \
-                 moved the context rows (author, receiver) from {held_contexts:?} to \
-                 {again_contexts:?}"
-            );
-            eprintln!(
-                "REPEATED exchange {again}: ProofRange rows (author, receiver) {again_rows:?}; \
-                 context rows {again_contexts:?}; hostile asks so far {:?}",
-                hostile_sent(&c)
-            );
-        }
-        let sent = hostile_sent(&c);
-        assert!(
-            ["0", "1", "2", "3"]
-                .iter()
-                .all(|variant| sent.get(*variant).is_some_and(|n| *n > 0)),
-            "APPARATUS: the hostile member did not ask every hostile variant: {sent:?}"
-        );
-        eprintln!("HOSTILE asker: {sent:?} head-bound asks, all with targets it does not hold");
-    }
     pub(super) fn cleanup() {
         let (_tmp, a, b, ad, bd, room, id) = fresh();
         for i in 0..80 {
@@ -3066,13 +2739,6 @@ mod proof_rows {
         drop(bd);
         receipt_rows(&a, &id);
     }
-}
-
-#[cfg(feature = "optional-proofs")]
-#[test]
-#[ignore = "real pair, changing signed heads, store inspection and restart paging"]
-fn fetching_keeps_serving_proofs_out_of_the_store() {
-    proof_rows::fetch();
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -4351,10 +4017,6 @@ fn a_failed_small_row_move_keeps_the_room_readable_and_retries() {
     assert_small_rows_share(&small_row_paths(&root).store_file());
 }
 
-#[cfg(feature = "optional-proofs")]
-#[path = "../../vox-core/tests/support/raw_sync.rs"]
-mod private_raw_sync;
-
 /// The store measurement is of rows actually written by the binary, not a codec
 /// benchmark. The same bodies must still be read through the CLI after restarting.
 #[cfg(feature = "optional-proofs")]
@@ -4801,28 +4463,6 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
                     let mut send = send;
                     write_frame(&mut send, &e.finish()).await.unwrap();
                     send.finish().unwrap();
-                } else {
-                    // The room's existing public sync continues independently.
-                    tokio::spawn(async move {
-                        let Ok((_room, _epoch)) =
-                            vox_core::node::syncstream::read_sync_request(&mut recv).await
-                        else {
-                            return;
-                        };
-                        let transport = vox_core::node::syncstream::accept_sync(
-                            tokio::runtime::Handle::current(),
-                            send,
-                            recv,
-                        );
-                        let _ = tokio::task::spawn_blocking(move || {
-                            private_raw_sync::session(
-                                transport,
-                                &private_raw_sync::Ask::Everything,
-                                None,
-                            )
-                        })
-                        .await;
-                    });
                 }
             }
         });

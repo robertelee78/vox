@@ -677,12 +677,6 @@ impl ReceivedFlow {
     pub(crate) fn debt(&self, store: &Store) -> Result<Option<ReceivedDebt>> {
         store.received_debt(self)
     }
-
-    /// Whether both handles name the same creating flow. Room equality is deliberately not
-    /// enough: concurrent lanes in one room own independent durability debts.
-    pub(crate) fn same_owner(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owner, &other.owner)
-    }
 }
 
 thread_local! {
@@ -727,6 +721,26 @@ pub struct Store {
     profile_owner: Option<Arc<ProfileOwner>>,
     /// Its give-back passes, shared with its reads (RG-13).
     give_back: Arc<GiveBack>,
+    /// Per room: what committed batches changed of its history since the room last took it,
+    /// for the room's in-memory record of what it holds (`channel::held_history`).
+    history_touched: Mutex<BTreeMap<Digest32, HistoryTouched>>,
+}
+
+/// What committed batches changed of one room's history: every author whose heads, coverage or
+/// positions changed, with those positions; or, after a rebuilt index, everything.
+#[derive(Debug, Default)]
+pub(crate) struct HistoryTouched {
+    pub(crate) all: bool,
+    pub(crate) authors: BTreeMap<Digest32, BTreeSet<u64>>,
+}
+
+impl HistoryTouched {
+    fn merge(&mut self, other: Self) {
+        self.all |= other.all;
+        for (author, positions) in other.authors {
+            self.authors.entry(author).or_default().extend(positions);
+        }
+    }
 }
 
 /// How the store's file is open.
@@ -792,6 +806,27 @@ fn open_error(path: &Path, e: redb::DatabaseError) -> Error {
 }
 
 impl Store {
+    /// What committed batches changed of `room`'s history since the last take.
+    pub(crate) fn take_history_touched(&self, room: &Digest32) -> HistoryTouched {
+        let mut touched = self
+            .history_touched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        touched.remove(room).unwrap_or_default()
+    }
+
+    /// Positions a reader found changed without a batch of its own (a body's lifetime ended).
+    pub(crate) fn touch_history(&self, room: Digest32, author: Digest32, positions: BTreeSet<u64>) {
+        let mut touched = self
+            .history_touched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        touched.entry(room).or_default().merge(HistoryTouched {
+            all: false,
+            authors: BTreeMap::from([(author, positions)]),
+        });
+    }
+
     /// Open (creating if absent) the store at `path` **writable**, set the file to `0600`, and
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
@@ -809,6 +844,7 @@ impl Store {
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
             give_back: Arc::default(),
+            history_touched: Mutex::default(),
         };
         store.init_schema()?;
         Ok(store)
@@ -840,6 +876,7 @@ impl Store {
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
             give_back: Arc::default(),
+            history_touched: Mutex::default(),
         };
         if store.schema_is_current()? {
             Ok(store)
@@ -1592,6 +1629,7 @@ impl Store {
             received_flow: None,
             received_authors: BTreeSet::new(),
             small_schema_checked: false,
+            history_touched: BTreeMap::new(),
             epochs,
         })
     }
@@ -1617,6 +1655,7 @@ impl Store {
             received_flow: Some(flow.clone()),
             received_authors: BTreeSet::new(),
             small_schema_checked: false,
+            history_touched: BTreeMap::new(),
             epochs,
         })
     }
@@ -2385,6 +2424,8 @@ pub struct Batch<'a> {
     class: Class,
     received_flow: Option<ReceivedFlow>,
     received_authors: BTreeSet<Digest32>,
+    /// What this batch changed of each room's history, installed in the store at commit.
+    history_touched: BTreeMap<Digest32, HistoryTouched>,
     small_schema_checked: bool,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
@@ -2417,6 +2458,24 @@ impl Batch<'_> {
         }
         self.small_schema_checked = true;
         Ok(())
+    }
+
+    /// This batch changed `author`'s history in `room`: its heads or coverage, and position
+    /// `seq` when given. Installed in the store at commit; a dropped batch changed nothing.
+    pub(crate) fn touch_history(&mut self, room: &Digest32, author: Digest32, seq: Option<u64>) {
+        let positions = self
+            .history_touched
+            .entry(*room)
+            .or_default()
+            .authors
+            .entry(author)
+            .or_default();
+        positions.extend(seq);
+    }
+
+    /// This batch rebuilt `room`'s whole index.
+    pub(crate) fn touch_history_all(&mut self, room: &Digest32) {
+        self.history_touched.entry(*room).or_default().all = true;
     }
 
     /// Associate an author's visible semantic state with this exact received transaction.
@@ -2697,10 +2756,11 @@ impl Batch<'_> {
     pub fn commit(self) -> Result<()> {
         let Self {
             mut txn,
-            store: _store,
+            store,
             class,
             received_flow,
             received_authors,
+            history_touched,
             small_schema_checked: _,
             mut epochs,
         } = self;
@@ -2724,6 +2784,15 @@ impl Batch<'_> {
                 detail: "store transaction identity exhausted".into(),
             })?;
         txn.commit().map_err(storage("commit"))?;
+        if !history_touched.is_empty() {
+            let mut sink = store
+                .history_touched
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (room, touched) in history_touched {
+                sink.entry(room).or_default().merge(touched);
+            }
+        }
         epochs.next_transaction = transaction;
         if flushed {
             Store::settle_durable_through(&mut epochs, transaction);

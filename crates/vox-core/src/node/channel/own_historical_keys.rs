@@ -19,10 +19,23 @@ pub(super) struct Retirement {
     pub(super) retention: (u64, u64),
     pub(super) entry_generation: u64,
     pub(super) wake_at: Option<u64>,
+    /// Per stored key, the own position through which the scan found nothing that keeps it.
+    /// Each position it passed is passed for good while the epoch and the retention policy
+    /// stand: another epoch or kind, a body expired under both policies, or a held body of
+    /// another chain. So a new pass (a commit, an own post, a wake) resumes each key here;
+    /// only `reset` clears it.
+    pub(super) checked: std::collections::BTreeMap<[u8; 64], u64>,
 }
 
 impl Retirement {
+    /// Everything again from position 1: the epoch or the retention policy changed.
     pub(super) fn reset(&mut self) {
+        self.new_pass();
+        self.checked.clear();
+    }
+
+    /// Every key again, each from where it was checked through.
+    pub(super) fn new_pass(&mut self) {
         self.after = None;
         self.current = None;
         self.complete = false;

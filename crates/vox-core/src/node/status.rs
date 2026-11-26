@@ -14,7 +14,8 @@
 //!
 //! - a room with other members and no new sync entries in [`STALE_SYNC_MS`] while nobody is connected;
 //! - a connected member missing at least twenty live entries with no observed walk progress
-//!   for [`NOT_RECEIVING_AFTER`] milliseconds. A re-selected window is not receipt progress.
+//!   for [`NOT_RECEIVING_AFTER`] milliseconds. A newer head of the member's feed is not receipt
+//!   progress; an entry of it admitted here is.
 //! - a **trusted** member of an open room this node was connected to and no longer is;
 //! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_MS`], while
 //!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
@@ -35,12 +36,9 @@
 //!
 //! ## ADR-025 S0b's sync counters
 //!
-//! Beside the report, `vox status --json` carries v0.2.10's **simple sync counters** (the
-//! decider's decision 3, 2026-09-26): a `"sync"` row per `(room, peer)` — sessions opened,
-//! admitted, refused busy, completed, partial, failed, stale, skipped at the cap, queued, and the
-//! backoff a port is in — and a `"reach"` row per peer, counting reachability ladders and outbound
-//! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
-//! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
+//! Beside the report, `vox status --json` carries a `"sync"` row per `(room, peer)` with
+//! completed and partial exchanges, failures, and bounded-serving observations, and a `"reach"`
+//! row per peer counting reachability ladders and outbound circuits (V210-53).
 //!
 //! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
 //! opened, and when it was opened and last moved a byte.
@@ -126,9 +124,11 @@ impl StatusBook {
             verified,
             since: None,
         });
+        // Progress is a position of the feed admitted here: the committed size less what is
+        // still owed grew. A newer head committed alone grows both and is not a receipt.
         let walked = match (wait.window, member.live_window) {
-            (Some((old_through, old_remaining)), Some((through, remaining))) => {
-                through == old_through && remaining < old_remaining
+            (Some((old_through, old_owed)), Some((through, owed))) => {
+                through.saturating_sub(owed) > old_through.saturating_sub(old_owed)
             }
             (_, None) => verified > wait.verified,
             _ => false,
@@ -176,14 +176,27 @@ pub struct MemberStatus {
     pub holds_through: Option<u64>,
     /// Authenticated header position only; it may have no showable message body.
     pub verified_through: Option<u64>,
-    /// Selected live-window upper bound and positions still to walk; none before selection.
+    /// The member's feed as the published record of what this node holds has it: its committed
+    /// size here and the positions still owed below it (from the floor, less the runs admission
+    /// completed at either end); none before a head of it is committed here.
     pub live_window: Option<(u64, u64)>,
     /// Time observed >=20 live entries behind without walking an entry, milliseconds.
     pub receipt_wait_ms: Option<u64>,
     /// Whether this member is still owed, or is actively being sent, any generation of this
     /// node's sender key in this room.
     pub key_delivery_pending: bool,
+    /// Why a post of it held here is not shown, while one is: the current fact of the render
+    /// gate that holds it back ([`NOT_SHOWN_NO_GRANT`], [`NOT_SHOWN_NO_KEY`]).
+    pub not_shown: Option<&'static str>,
 }
+
+/// A post of the member is held here and not shown, and no grant of it to this node is in force
+/// in the room's log as folded here.
+pub const NOT_SHOWN_NO_GRANT: &str =
+    "some of its posts held here are not shown: no current grant from this member is recorded here";
+/// A post of the member is held here and not shown, and no sender key of it is held here.
+pub const NOT_SHOWN_NO_KEY: &str =
+    "some of its posts held here are not shown: no sender key from this member is held here";
 
 impl MemberStatus {
     /// A connected member has >=20 missing live entries and no observed walk for 60 seconds.
@@ -650,7 +663,7 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"missing_live_entries\":{},\"receipt_wait_ms\":{},\"key_delivery_pending\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"missing_live_entries\":{},\"receipt_wait_ms\":{},\"key_delivery_pending\":{},\"not_shown\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -665,7 +678,8 @@ impl StatusReport {
                     opt(m.verified_through),
                     m.missing_live_entries(),
                     opt(m.receipt_wait_ms),
-                    m.key_delivery_pending
+                    m.key_delivery_pending,
+                    m.not_shown.map_or_else(|| "null".to_owned(), q)
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
@@ -1242,52 +1256,19 @@ pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
 
 // ---- ADR-025 S0b: sync and reach counters ----------------------------------
 
-/// The kinds of backoff a port can be in (ADR-025 D5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackoffKind {
-    /// A transport or stream-open failure.
-    Unreachable,
-    /// The peer refused with `SessionBusy` (only past its inbound limit), or has not yet admitted
-    /// this just-joined member.
-    Busy,
-    /// A session that left requested positions unfilled and made no progress, or a protocol
-    /// violation.
-    NoProgress,
-    /// The peer refuses by policy: another epoch, not a member, the room not held.
-    Policy,
-}
-
-impl BackoffKind {
-    /// The name `vox status --json` prints.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Unreachable => "unreachable",
-            Self::Busy => "busy",
-            Self::NoProgress => "no_progress",
-            Self::Policy => "policy",
-        }
-    }
-}
-
 /// Why a sync round ran (ADR-038 FX-15, #996): the need `vox status` names for each completed
 /// round of a lane, so a round with no need a person can read is seen as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundReason {
-    /// This node offered its own head to the peer for acknowledgement (the settlement tick).
-    Offer,
     /// A head the peer told this node of, and this node fetched: its inventory, or a third
-    /// party's head it named; the follow-ups such a fetch needs count here too.
+    /// party's head it named; the follow-ups such a fetch needs count here too. In a room of the
+    /// current history format every Range a connection's loop asked of the peer's Have is one.
     Hint,
-    /// This node appended in the room and owed the peer the announcement (ADR-037 R7).
+    /// This node appended in the room and owed the peer the announcement (ADR-037 R7). In a room
+    /// of the current history format, every Have a connection's loop told the peer is one.
     Announce,
-    /// The periodic request (ADR-025 D7), with nothing else pending on the port.
-    Periodic,
     /// A reader's history page this node asked the peer for (`vox room read --history older`).
     Page,
-    /// Another request raised on the port: the join, a new connection, the room's generation
-    /// advancing, `vox room sync`, a continuation re-raised.
-    Request,
     /// A request the peer made that this node answered: the peer's round, not this node's.
     Served,
 }
@@ -1297,12 +1278,9 @@ impl RoundReason {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::Offer => "offer",
             Self::Hint => "hint",
             Self::Announce => "announce",
-            Self::Periodic => "periodic",
             Self::Page => "page",
-            Self::Request => "request",
             Self::Served => "served",
         }
     }
@@ -1312,18 +1290,12 @@ impl RoundReason {
 /// `completed`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoundReasons {
-    /// Own-head offers.
-    pub offer: u64,
     /// The peer's hints.
     pub hint: u64,
     /// Own appends announced.
     pub announce: u64,
-    /// Periodic requests.
-    pub periodic: u64,
     /// A reader's pages.
     pub page: u64,
-    /// Other requests.
-    pub request: u64,
     /// The peer's requests this node answered.
     pub served: u64,
 }
@@ -1332,12 +1304,9 @@ impl RoundReasons {
     /// Count one completed round that ran for `reason`.
     pub fn count(&mut self, reason: RoundReason) {
         let slot = match reason {
-            RoundReason::Offer => &mut self.offer,
             RoundReason::Hint => &mut self.hint,
             RoundReason::Announce => &mut self.announce,
-            RoundReason::Periodic => &mut self.periodic,
             RoundReason::Page => &mut self.page,
-            RoundReason::Request => &mut self.request,
             RoundReason::Served => &mut self.served,
         };
         *slot = slot.saturating_add(1);
@@ -1347,67 +1316,19 @@ impl RoundReasons {
     #[must_use]
     pub fn json(&self) -> String {
         format!(
-            "{{\"offer\":{},\"hint\":{},\"announce\":{},\"periodic\":{},\"page\":{},\
-             \"request\":{},\"served\":{}}}",
-            self.offer,
-            self.hint,
-            self.announce,
-            self.periodic,
-            self.page,
-            self.request,
-            self.served
+            "{{\"hint\":{},\"announce\":{},\"page\":{},\"served\":{}}}",
+            self.hint, self.announce, self.page, self.served
         )
     }
-}
-
-/// One `(room, peer)`'s counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HistoryRefusalStatus {
-    pub(crate) peer: Digest32,
-    pub(crate) author: Digest32,
-    pub(crate) head: Digest32,
-    pub(crate) request: [u8; 16],
-    pub(crate) captured_generation: Digest32,
-    pub(crate) current_generation: Digest32,
-    pub(crate) remembered: bool,
-}
-
-fn request_text(request: &[u8; 16]) -> String {
-    let mut text = String::with_capacity(request.len() * 2);
-    for byte in request {
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
-
-fn history_refusal_json(refusal: Option<&HistoryRefusalStatus>) -> String {
-    refusal.map_or_else(
-        || "null".to_owned(),
-        |refusal| {
-            format!(
-                "{{\"peer\":\"{}\",\"author\":\"{}\",\"head\":\"{}\",\"request\":\"{}\",\"captured_generation\":\"{}\",\"current_generation\":\"{}\",\"remembered\":{}}}",
-                b32_encode(&refusal.peer),
-                b32_encode(&refusal.author),
-                b32_encode(&refusal.head),
-                request_text(&refusal.request),
-                b32_encode(&refusal.captured_generation),
-                b32_encode(&refusal.current_generation),
-                refusal.remembered,
-            )
-        },
-    )
 }
 
 /// One `(room, peer)`'s counters and exact current diagnostic facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortCounters {
-    /// Outbound sessions this node opened.
-    pub opened: u64,
-    /// Inbound sessions this node admitted.
-    pub admitted: u64,
     /// Inbound sessions this node refused with `SessionBusy`.
     pub busy_refused: u64,
-    /// Sessions (either direction) that completed with every requested entry received.
+    /// Rounds that ended with every requested entry received: those this node asked (see
+    /// `fetched_completed`) and the old flows' rounds it answered (see `served_completed`).
     pub completed: u64,
     /// Why each of them ran (ADR-038 FX-15, #996): one count per `completed`.
     pub reasons: RoundReasons,
@@ -1415,38 +1336,34 @@ pub struct PortCounters {
     /// fetched no head, header, context, proof, body or hint it lacked, or a round it served
     /// whose inventory exchange added no hint and that asked for no object (ADR-038 FX-29). In
     /// a quiet room every round is one; a lane whose `completed` climbs faster than its
-    /// `empty` is pulling or serving something.
+    /// `empty` is pulling or serving something. Every Have a loop told is one.
     pub empty: u64,
-    /// Completed outbound bounded-history rounds on which this node was the requester.
+    /// Completed rounds this node asked of the peer: the old flows' outbound rounds, and each
+    /// exchange of the connection's loop (a Range answered, a Have taken).
     pub fetched_completed: u64,
-    /// Completed outbound bounded-history rounds that fetched nothing.
+    /// Of `fetched_completed`, those that saved nothing this node did not hold.
     pub fetched_empty: u64,
-    /// Completed inbound bounded-history rounds on which this node was the server.
+    /// Completed rounds of the old flows on which the peer asked and this node answered. A
+    /// loop's Have or Range this node answers is the peer's exchange, not a round here.
     pub served_completed: u64,
     /// Completed inbound bounded-history rounds that served nothing and accepted no new hint.
     pub served_empty: u64,
-    /// Worker turns that committed or accepted at least one history item this node did not
-    /// already hold. Counted at the commit edge even if the enclosing attempt is later stale,
-    /// cancelled, superseded or failed, so zero means no durable fetched-side work occurred.
+    /// Worker turns, and loop exchanges, that committed or accepted at least one history item
+    /// this node did not already hold. Counted at the commit edge even if the enclosing attempt
+    /// is later stale, cancelled, superseded or failed, so zero means no durable fetched-side
+    /// work occurred.
     pub history_fetched: u64,
-    /// Bounded-history rounds in which this node actually sent at least one history object or
-    /// newly accepted a peer inventory hint, including a round that later ended partial, failed,
-    /// or stale.
+    /// Requests of the peer, a loop's Range included, in which this node actually sent at
+    /// least one history object or newly accepted a peer inventory hint, including a round
+    /// that later ended partial, failed, or stale.
     pub history_served: u64,
     /// New exact advertised-head decisions durably remembered after this peer could not serve
     /// an unavailable newest body. Repeating an unchanged standing refusal does not increment it.
     pub history_declined: u64,
-    /// Scalar history hints this lane accepted as newly eligible work.
-    pub history_offered: u64,
-    /// Exact durable refusal relationships invalidated by changed relevant inventory.
-    pub history_rearmed: u64,
-    /// Exact last transaction fenced because its flow carried an older authorization.
-    pub(crate) history_refusal_stale: Option<HistoryRefusalStatus>,
-    /// Exact last refusal transaction accepted under its captured authorization.
-    pub(crate) history_refusal_saved: Option<HistoryRefusalStatus>,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
-    /// Sessions that failed.
+    /// Rounds that failed: this node's or the old flows' rounds it answered, and each end of a
+    /// connection's loop with an error.
     pub failed: u64,
     /// The last failure's reason, kept after rounds complete again as diagnostic history
     /// (`vox status --json` `last_failure`). Set through [`PortCounters::note_failure`].
@@ -1459,15 +1376,6 @@ pub struct PortCounters {
     pub failing_since: Option<std::time::Instant>,
     /// Consecutive sessions that failed in either direction.
     pub consecutive_failures: u32,
-    /// Results that arrived for an attempt already retired (ADR-025 D1a).
-    pub stale: u64,
-    /// Entries this peer served that were refused rather than held (V210-74): without their
-    /// payload, past a position not held, or signed but unclassifiable.
-    pub refused: u64,
-    /// Sessions that were due but skipped because every outbound slot was taken.
-    pub skipped_at_cap: u64,
-    /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
-    pub queued: u64,
     /// Actual record frames received in complete board replies; unchanged replies add zero.
     pub board_records_received: u64,
     /// Received by anchor reads, rather than member-sync setup.
@@ -1480,8 +1388,6 @@ pub struct PortCounters {
     pub board_records_offered: u64,
     /// Board offers that failed or were cancelled before completion.
     pub board_offer_failures: u64,
-    /// The backoff the port is in now, and its consecutive failures.
-    pub backoff: Option<(BackoffKind, u32)>,
     /// The sessions running on the port now, by token: which end opened each, the step it is at,
     /// since when, and when it started (V210-110). A session that never ends was otherwise only a counter that did
     /// not move; with this, `vox status` says which session is stuck, and at which step.
@@ -1500,9 +1406,20 @@ impl PortCounters {
     pub(crate) fn note_failure(&mut self, why: String) {
         self.last_failure = Some(why);
         self.last_failure_at = self.answered();
-        #[cfg(feature = "test-knobs")]
-        if failure_outlives_answers_mutant() {
-            self.last_failure_at = u64::MAX;
+    }
+
+    /// A round this node asked of the peer ended without error: a port round of the old flows,
+    /// or an exchange of a connection's loop (its Range answered, or its Have taken). `brought`:
+    /// it saved history this node did not hold before; one that did not is `empty`.
+    pub(crate) fn note_fetched(&mut self, reason: RoundReason, brought: bool) {
+        self.completed += 1;
+        self.consecutive_failures = 0;
+        self.failing_since = None;
+        self.reasons.count(reason);
+        self.fetched_completed += 1;
+        if !brought {
+            self.empty += 1;
+            self.fetched_empty += 1;
         }
     }
 
@@ -1513,24 +1430,6 @@ impl PortCounters {
     pub fn last_failure_stands(&self) -> bool {
         self.last_failure.is_some() && self.answered() <= self.last_failure_at
     }
-}
-
-/// `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`: a failure is stored ahead of every later round count, so
-/// a round that ends without error leaves it standing. Says so once on stderr when the daemon
-/// first reads it.
-#[cfg(feature = "test-knobs")]
-fn failure_outlives_answers_mutant() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var_os("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").is_some();
-        if on {
-            eprintln!(
-                "vox: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged: a round that ends without \
-                 error leaves the last failure standing"
-            );
-        }
-        on
-    });
-    *ON
 }
 
 /// The step a sync session is at (V210-110).
@@ -1821,8 +1720,10 @@ impl SyncBook {
         self.connections = Some(std::sync::Arc::downgrade(manager));
     }
 
-    /// Peers that have failed every sync for 30 seconds, in the person's status report.
-    /// A successful inbound or outbound session clears this condition immediately.
+    /// Peers this node has failed to reach for 30 seconds (two or more failed reaches in a
+    /// row, `NetEvent::ReachFailed`), in the person's status report. Nothing is retried on a
+    /// timer for sync: the room syncs with the peer again over the next connection to it, and
+    /// a round that ends without error clears this condition at once.
     pub fn failing_peers(book: &SharedSyncBook) -> Vec<Unhealthy> {
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
         b.ports
@@ -1834,7 +1735,7 @@ impl SyncBook {
                 Some(Unhealthy {
                     key: format!("sync-failing:{}:{}", b32_encode(room), b32_encode(peer)),
                     message: format!(
-                        "room {}: peer {} sync failing: {}; retrying with backoff",
+                        "room {}: peer {} sync failing: {}; it syncs again over the next connection to it",
                         short(room),
                         short(peer),
                         c.last_failure
@@ -1973,21 +1874,17 @@ impl SyncBook {
             }
             let _ = write!(
                 s,
-                "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
+                "{{\"room\":\"{}\",\"peer\":\"{}\",\"busy_refused\":{},\
                  \"completed\":{},\"reasons\":{},\"empty\":{},\"fetched_completed\":{},\"fetched_empty\":{},\
                  \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
-                 \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
-                 \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
+                 \"history_declined\":{},\
                  \"partial\":{},\"failed\":{},\"last_failure\":{},\"last_failure_stands\":{},\
-                 \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\
                  \"board_records_received\":{},\"board_anchor_records_received\":{},\
                  \"board_sync_records_received\":{},\"board_sync_owner_waits\":{},\
-                 \"board_records_offered\":{},\"board_offer_failures\":{},\"backoff\":{},\
+                 \"board_records_offered\":{},\"board_offer_failures\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
                 b32_encode(peer),
-                c.opened,
-                c.admitted,
                 c.busy_refused,
                 c.completed,
                 c.reasons.json(),
@@ -1999,30 +1896,18 @@ impl SyncBook {
                 c.history_fetched,
                 c.history_served,
                 c.history_declined,
-                c.history_offered,
-                c.history_rearmed,
-                history_refusal_json(c.history_refusal_stale.as_ref()),
-                history_refusal_json(c.history_refusal_saved.as_ref()),
                 c.partial,
                 c.failed,
                 c.last_failure
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), q),
                 c.last_failure_stands(),
-                c.stale,
-                c.refused,
-                c.skipped_at_cap,
-                c.queued,
                 c.board_records_received,
                 c.board_anchor_records_received,
                 c.board_sync_records_received,
                 c.board_sync_owner_waits,
                 c.board_records_offered,
                 c.board_offer_failures,
-                c.backoff.map_or_else(
-                    || "null".to_owned(),
-                    |(k, n)| format!("{{\"kind\":\"{}\",\"failures\":{n}}}", k.name())
-                ),
                 c.running
                     .values()
                     .map(|(outbound, step, since, started)| format!(

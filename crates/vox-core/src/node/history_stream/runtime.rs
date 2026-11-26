@@ -1,62 +1,25 @@
-//! One bounded outgoing work slice. The actor owns scheduling; this state contains only
-//! bounded cursors and the three existing staging capabilities, never a retained entry body.
+//! Local bounded admission slices and their durable retirement.
 
 use super::source::{Lookup, Source};
-use super::{
-    EntryPhase, LocalNeed, LocalProof, LocalStep, Preamble, Purpose, Query, Receiver, RequestId,
-    Staging, Status,
-};
+use super::{EntryPhase, LocalNeed, LocalProof, LocalStep, Query, Receiver, RequestId};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::channel::entry_store::sparse::LiveWindow;
-use crate::node::channel::{ChannelState, HistoryAdmissionRoom};
 use crate::node::history_budget::Job;
-use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
-use crate::node::ports::OutboundService;
+use crate::node::history_demand::{self as demand, Context};
 use crate::node::store::{ReceivedFlow, Store};
-use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 const MAX_TASKS: usize = 128;
+/// A local edge an admission flow waits for.
+type Wake = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 enum Operation {
-    LiveWindow {
-        author: Digest32,
-        head: Digest32,
-    },
-    LiveAdvance {
-        author: Digest32,
-        target: Digest32,
-        window: LiveWindow,
-        retry: bool,
-    },
-    LiveRetry {
-        author: Digest32,
-        window: LiveWindow,
-    },
-    Tail {
-        head: Digest32,
-        seq: u64,
-    },
-    Wire(Query),
-    /// A refused local allocation may follow a durable body append/checkpoint. Rebind from
-    /// the exact saved staging cursor before another network request, rather than replaying
-    /// an old offset or forgetting a complete body's remaining semantic application.
-    ResumeWire(Query),
     LocalProof(Query),
     Local(LocalStep),
-    Reclaim(Purpose),
-    ReclaimUnavailable,
-    ReclaimKeyUnavailable,
-    FinishArchive,
     Governance,
-}
-enum StageStart {
-    Ready,
-    Waiting,
-    Reclaimed,
 }
 
 /// How long one turn keeps running local slices before it yields to the actor.
@@ -66,9 +29,6 @@ const LOCAL_SLICES_PER_TURN: u32 = 64;
 /// Fold steps an entry slice may take in one turn before it waits for the actor's fold hook
 /// (ADR-037 R11): a hold on the fold cycled the need 32 times a turn, 77 turns a second.
 const GOVERNANCE_STEPS_PER_TURN: u8 = 4;
-/// The body bytes one explicit history quantum fetches at most; past it the request pauses and
-/// `vox room read --history resume` asks for the rest.
-const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
 
 pub(crate) enum RetirementStep {
     Done,
@@ -92,182 +52,7 @@ impl RetirementWait {
 #[derive(Clone)]
 struct Task {
     request: RequestId,
-    purpose: Purpose,
     operation: Operation,
-}
-
-/// One inventory exchange prepended to an already-retained foreground flow. It is deliberately
-/// outside `tasks`/`replay`: announcing an own append must not need a thirteenth retained Flow or
-/// a spare dependency-stack position, and it must not replace the hint/required owner already in
-/// this Flow.
-struct Announcement {
-    request: RequestId,
-    prior_request: RequestId,
-    task: Option<Task>,
-    through: u64,
-    brought: bool,
-    complete: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct AnnouncementReceipt {
-    pub(crate) through: u64,
-    pub(crate) brought: bool,
-}
-
-/// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
-/// across quanta; another deferred flow may advance metadata but cannot reset that body. Each
-/// slot's release wakes the flows waiting for it (`released`), so a flow that found its slot
-/// held by a sibling waits for that exact edge rather than retrying at a Busy cadence.
-///
-/// A flow that is not running holds no slot whose body still waits on a peer, unless its last
-/// turn moved that body's bytes on the port it runs on next
-/// ([`Flow::release_waiting_body_slots`]). Its durable partial body stays in the node's one
-/// staging record; the next claimant ends it through `ensure_stage`'s existing cancel/reclaim.
-#[derive(Default)]
-pub(crate) struct BodySlots {
-    owners: StdMutex<[Option<RequestId>; 3]>,
-    wakes: [Arc<tokio::sync::Notify>; 3],
-}
-impl BodySlots {
-    fn claim(&self, purpose: Purpose, request: RequestId, key_body: bool) -> bool {
-        let Some(index) = body_slot(purpose, key_body) else {
-            return true;
-        };
-        let mut slots = self
-            .owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slots[index].is_some_and(|owner| owner != request) {
-            return false;
-        }
-        slots[index] = Some(request);
-        true
-    }
-    fn release(&self, purpose: Purpose, request: RequestId, key_body: bool) {
-        let Some(index) = body_slot(purpose, key_body) else {
-            return;
-        };
-        let mut slots = self
-            .owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slots[index] == Some(request) {
-            slots[index] = None;
-            drop(slots);
-            self.wakes[index].notify_waiters();
-        }
-    }
-    /// The holder of slot `purpose` renews its request: same ownership, no release edge.
-    fn rename(&self, purpose: Purpose, old: RequestId, new: RequestId, key_body: bool) {
-        let Some(index) = body_slot(purpose, key_body) else {
-            return;
-        };
-        let mut slots = self
-            .owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slots[index] == Some(old) {
-            slots[index] = Some(new);
-        }
-    }
-    /// The next release of slot `index`. Subscribe before checking the slot, so a release
-    /// between the failed claim and the wait is not lost.
-    fn released(&self, index: usize) -> std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>> {
-        let mut wake = Box::pin(Arc::clone(&self.wakes[index]).notified_owned());
-        wake.as_mut().enable();
-        wake
-    }
-}
-/// `VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT`: a flow that stops while its body waits on a peer
-/// keeps that body slot, as before. Says so once on stderr when it first keeps one.
-#[cfg(feature = "test-knobs")]
-fn parked_flow_keeps_body_slot_mutant() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT").is_some()
-    });
-    static SAID: std::sync::Once = std::sync::Once::new();
-    if *ON {
-        SAID.call_once(|| {
-            eprintln!(
-                "vox: VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT engaged: a stopped flow kept the \
-                 body slot of a body waiting on a peer"
-            );
-        });
-    }
-    *ON
-}
-#[cfg(not(feature = "test-knobs"))]
-const fn parked_flow_keeps_body_slot_mutant() -> bool {
-    false
-}
-/// `VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY`: when staging fails after `ensure_stage` renewed the
-/// body's request, the popped task and its retry owner keep the old request, as before. Says so
-/// once on stderr when it first does.
-#[cfg(feature = "test-knobs")]
-fn renewal_kept_from_retry_mutant(failed: bool) -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY").is_some()
-    });
-    static SAID: std::sync::Once = std::sync::Once::new();
-    if *ON && failed {
-        SAID.call_once(|| {
-            eprintln!(
-                "vox: VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY engaged: a staging error kept the renewed \
-                 request from the retry owner"
-            );
-        });
-    }
-    *ON && failed
-}
-#[cfg(not(feature = "test-knobs"))]
-const fn renewal_kept_from_retry_mutant(_failed: bool) -> bool {
-    false
-}
-fn body_slot(purpose: Purpose, key_body: bool) -> Option<usize> {
-    if key_body && purpose == Purpose::Control {
-        return Some(2);
-    }
-    match purpose {
-        Purpose::Live => Some(0),
-        Purpose::Control => Some(1),
-        Purpose::History => None,
-    }
-}
-
-/// Only persisted cursor/body progress counts; activating a request or serial changes do not.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OwnRecoveryCheckpoint {
-    remaining: usize,
-    next: u64,
-    body: Option<(u64, u64)>,
-}
-impl OwnRecoveryCheckpoint {
-    pub(crate) fn of(state: &demand::State) -> Self {
-        Self {
-            remaining: state.remaining,
-            next: state
-                .cursor
-                .as_ref()
-                .map_or(state.bounds.hi, |cursor| cursor.next_seq),
-            body: state.body.as_ref().map(|body| (body.seq, body.offset)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct UnavailableResponse {
-    pub(crate) author: Option<Digest32>,
-    pub(crate) head: Digest32,
-    pub(crate) lo: u64,
-    pub(crate) hi: u64,
-    pub(crate) reason: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyBodyUnavailable {
-    Body,
-    Evidence,
 }
 
 pub(crate) struct Flow {
@@ -277,76 +62,7 @@ pub(crate) struct Flow {
     pub(crate) epoch: u64,
     pub(crate) instance: [u8; 16],
     pub(crate) generation: Digest32,
-    pub(crate) shared: Arc<Mutex<ChannelState>>,
-    pub(crate) service: OutboundService,
-    pub(crate) archive: bool,
-    pub(crate) automatic_own_recovery: bool,
-    pub(crate) own_recovery_cleanup: bool,
-    pub(crate) own_recovery_trigger: Option<Digest32>,
-    pub(crate) own_recovery_page: Option<(Digest32, u64)>,
-    pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
-    pub(crate) own_recovery_progress: bool,
-    pub(crate) inventory: bool,
-    pub(crate) availability_captured: Option<crate::node::channel::availability::Token>,
-    pub(crate) availability_connection: u64,
-    pub(crate) availability_ack: Option<crate::node::channel::availability::Token>,
-    /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
-    /// the round reads the peer's board whatever kind of flow this is, until the bundle is
-    /// held. Set by the actor at each start from the fact `vox status` reports as `key_waits`.
-    pub(crate) wants_board: bool,
-    /// This node's own board records for the room (bundle, then address record), put on the
-    /// peer's board the first time a connection is used for the room (ledger 91). Set by the
-    /// actor at each start.
-    pub(crate) introduction: Arc<[Vec<u8>]>,
-    departure_probe: bool,
-    pub(crate) archive_request: Option<RequestId>,
-    /// Exact required control root removed from the actor queue when this foreground flow was
-    /// built. An authorization retirement must return this owner just as it returns a hint.
-    pub(crate) required_root: Option<(Digest32, u64)>,
-    /// Exact retained request whose prerequisite this Public control root satisfies.
-    pub(crate) required_owner_request: Option<RequestId>,
-    pub(crate) key_body_root: Option<super::KeyBodyNeed>,
-    pub(crate) key_body_token: Option<Arc<()>>,
-    pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
-    pub(crate) unavailable_response: Option<UnavailableResponse>,
-    pub(crate) archive_selected_author: Option<(Digest32, Digest32)>,
-    pub(crate) key_availability_token: Option<Arc<()>>,
-    pub(crate) key_availability_result: super::KeyAvailabilityResult,
-    key_body_checked: bool,
-    pub(crate) hint: Option<super::HeadHint>,
-    pub(crate) hint_owner: Option<u64>,
-    pub(crate) transient_refused: bool,
-    /// Local refusal bookkeeping yielded without parking or losing the selected operation.
-    pub(crate) refusal_retry: Option<super::hints::RefusalRetry>,
-    /// Canonical local recovery proof root, not a consumed advisory inbox item.
-    pub(crate) local_own_verification: bool,
-    pub(crate) local_own_discovery: bool,
-    /// A newly constructed inventory took precedence over an already eligible local probe.
-    /// Its real completion owns exactly one subsequent port request.
-    pub(crate) local_own_after_inventory: bool,
-    /// MP-9: the one comparison request this flow's inventory asked of the peer. Unavailable,
-    /// it records nothing and fails nothing: the next inventory may ask again.
-    inventory_ask: Option<Query>,
-    discovery_reply: Option<(
-        super::HeadHint,
-        u64,
-        Option<crate::node::channel::availability::Token>,
-    )>,
-    /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
-    /// temporarily routed over its author's port.
-    pub(crate) hint_peer: Digest32,
-    /// Exact signed head selected for this hinted flow, not the inventory claim.
-    pub(crate) authenticated_head: Option<super::HeadHint>,
-    /// A Control Head response from this peer's semantically complete role cut.
-    pub(crate) departure_receipt: Option<super::HeadHint>,
-    /// How far the peer said, in this round, it holds this node's own feed: its answer to
-    /// the own-author head probe, or its inventory naming an own head this node accepted
-    /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
-    /// head to a peer that holds it (ADR-038 FX-15).
-    pub(crate) mine_held: Option<u64>,
-    /// Why this flow's rounds run (ADR-038 FX-15, #996), set when the actor selects it and
-    /// kept across its slices; counted on the lane when a round completes.
-    pub(crate) reason: crate::node::status::RoundReason,
+    pub(crate) shared: Arc<crate::node::channel::RoomLock>,
     pub(crate) waiting: bool,
     pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
     pub(crate) slot_wait:
@@ -354,83 +70,24 @@ pub(crate) struct Flow {
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
-    /// An exchange of this flow fetched an object it saved or a body chunk it did not hold.
-    /// An inventory hint alone is not receipt: a completed flow that brought nothing is an
-    /// `empty` round in `vox status --json` (ADR-038 FX-29).
-    pub(crate) brought: bool,
+    /// A control-effects step made an author's Session controls current (`LocalResult::
+    /// controls_ready`): its admission task raises permission news for the room's tellers.
+    pub(crate) controls_ready: bool,
     /// Set at the durable/user-visible work edge and drained by the actor before it classifies
     /// the worker result. This survives any later cancellation, error or supersession.
     pub(crate) work_committed: Arc<std::sync::atomic::AtomicBool>,
     /// Changed, signature-verified own observation committed by the physical receiver.
     pub(crate) own_head_observed: Arc<std::sync::atomic::AtomicBool>,
-    /// Exact connection which returned unavailable for this startup metadata probe.
-    pub(crate) discovery_unavailable:
-        Option<(u64, Option<crate::node::channel::availability::Token>)>,
-    pub(crate) discovery_incarnations: Option<(u64, u64)>,
-    pub(crate) receipt_lower: Option<(u64, (u64, u64))>,
-    /// Exact unavailable advertised heads declined during this retained flow. The actor reports
-    /// the outcome through the lane in `vox status --json`.
-    pub(crate) declined: u64,
-    /// Newly eligible scalar hints and durable refusal relationships invalidated this turn.
-    /// The actor publishes them even if the enclosing attempt is later retired or stale.
-    pub(crate) offered: u64,
-    pub(crate) rearmed: u64,
-    /// Exact refusal transaction outcomes are published even when the enclosing flow is retired.
-    pub(crate) refusal_stale: Option<crate::node::status::HistoryRefusalStatus>,
-    pub(crate) refusal_saved: Option<crate::node::status::HistoryRefusalStatus>,
-    pub(crate) admitted_authors: usize,
-    pub(crate) external: Option<(Digest32, u64)>,
-    pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
-    /// A healthy advertising peer did not retain the exact current wire dependency. The actor
-    /// moves this same flow to the named author's port; no second root or volatile copy exists.
-    pub(crate) reroute: Option<Digest32>,
-    /// Original peer while the next exact wire dependency runs against its author.
-    pub(crate) route_origin: Option<Digest32>,
-    /// Fetch progress accumulated on the advertising source's lane before a dependency is routed
-    /// to its author. The routed lane gets a fresh directional account; returning restores only
-    /// the origin's progress, so one fetched object cannot make both lanes non-empty.
-    pub(crate) route_origin_brought: bool,
-    /// The routed wire response completed and the retained continuation must return to origin.
-    pub(crate) route_complete: bool,
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
     /// the controller re-arms its exact scalar hint under the new generation.
     pub(crate) authorization_changed: bool,
     /// Durability debt created by this flow alone. It follows every receiver handoff and is
     /// detached whenever the flow returns to the actor.
     received: ReceivedFlow,
-    /// A refusal reached the peer successfully but could not be recorded in the local store.
-    /// The actor re-arms the exact owner without charging this failure to the peer.
-    pub(crate) local_retry: Option<String>,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
     replay: Option<Task>,
-    announcement: Option<Announcement>,
-    /// The returned error came from the prefix itself, not an ordinary task that ran while a
-    /// prefix was pending behind a publication owner.
-    announcement_error: bool,
-    /// True only while the worker owns the scalar prefix task. A supervisor-observed panic can
-    /// therefore reconstruct that task without guessing from a merely pending announcement.
-    announcement_active: bool,
-    /// A post arriving while the announcement exchange is in flight must not make announcements
-    /// starve the retained root. One actual ordinary worker quantum runs before another prefix.
-    ordinary_turn_due: bool,
-    /// This turn returned one of the two retryable coded peer refusals after restoring its exact
-    /// ordinary continuation. The announcement scalar is deliberately separate provenance.
-    peer_busy_retry: bool,
-    /// The peer answered an exchange of this turn: `exchange` returned its coded status. Only
-    /// that ends the port's transport failure streak; a local-only turn proves nothing about
-    /// the peer.
-    peer_answered: bool,
-    slots: Arc<BodySlots>,
-    owners: [Option<RequestId>; 3],
-    /// A durable body chunk moved in this flow's last turn: the waiting slice is
-    /// progress, not a busy wait, and its port must not grow a Busy backoff.
-    pub(crate) body_progress: bool,
-    /// When this flow was built: only `VOX_MUTANT_FETCH_DISCARD` reads it, to put back the cut
-    /// one second after it.
-    #[cfg(feature = "test-knobs")]
-    pub(crate) since: std::time::Instant,
     /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
@@ -443,14 +100,12 @@ pub(crate) struct Flow {
     /// port cadence.
     publication_owner_wait: Option<RequestId>,
     governance_cycles: u8,
-    last_head: Option<super::HeadHint>,
     /// Immutable identity of this cleanup obligation. `request` changes as continuations are
     /// derived; retirement ownership must not.
     retirement_request: RequestId,
     request: RequestId,
     /// A popped task remains owned even while an archive keeps `request` at its demand root.
     selected_request: Option<RequestId>,
-    retirement_root_cleaned: bool,
     cleanup_store: Arc<Store>,
     failed_settlement: Option<crate::node::store::ReceivedSettlement>,
     cleanup_budget: Arc<crate::node::history_budget::Budget>,
@@ -458,25 +113,21 @@ pub(crate) struct Flow {
     cleanup_after: Option<[u8; 64]>,
     live_context: Option<Arc<Context>>,
     control_context: Arc<Context>,
-    live: Option<Staging>,
-    control: Option<Staging>,
-    history: Option<Staging>,
-    /// Body bytes this explicit history quantum has fetched so far (ADR-036: one bounded ask).
-    archive_wire_bytes: u64,
-    archive_next: Option<u64>,
-    pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
-    live_unavailable: Option<(Digest32, u64)>,
-    // One hinted flow either advances the main window or retries missing newest positions.
-    // A peer's BodyNotHeld never rewinds the main cursor or suppresses another peer's retry.
-    live_visited: bool,
-    // Exact head whose independent control closure is already retained by this flow. A later
-    // authenticated successor schedules its own closure without mutating the in-flight work.
-    control_head: Option<Digest32>,
-    // Declared last: actual state/capabilities die before the shared admission is returned.
-    // `None` while the flow is parked (ADR-038 FX-35): a flow that is not running holds no
-    // daemon-wide flow state; [`Flow::resume`] reserves it again before a round.
-    state_charge: Option<crate::node::history_budget::FlowStateCharge>,
+    /// An admission flow (design simple-sync §3): the node's frontier, whose room ready set it
+    /// takes its roots from one at a time. Such a flow fetches nothing: a need ends its root.
+    frontier: Option<Arc<super::pull::Frontier>>,
+    /// An admission flow's room record: read before each local step, so a need for a newer
+    /// head of an author names the committed head that step could have seen (`resolve_need`).
+    record: Option<Arc<crate::node::channel::RoomSnapshotCell>>,
+    /// An admission flow's current root, the checked entry the delivering connection holds in
+    /// memory, and whether it is settled (`settle_root`).
+    admit_root: Option<(super::pull::Ready, bool)>,
+    /// The root this admission held unsettled when it failed (`fail`): owned here, neither
+    /// waiting for a head nor fetched again, until the failed flow's retirement ends, then given
+    /// back to the room's ready set (`Drop`). The room's admission meanwhile waits for its
+    /// recovery edge (`actor/admission.rs` `start_admissions`).
+    failed: Option<super::pull::Ready>,
 }
 // The retained-flow permit includes the exact Vec allocation, the scalar replay root,
 // and conservative room for the one-object receiver handoff and small staging handles.
@@ -485,61 +136,8 @@ const _: () = assert!(
     std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>() + 4096
         <= crate::node::history_budget::FLOW_STATE_BYTES
 );
-/// What [`Flow::resume`] came to (ADR-038 FX-35).
-pub(crate) enum Resumed {
-    /// The round holds its flow state.
-    Held,
-    /// Every pool position is occupied by a running charge or earlier release-edge promise. The
-    /// exact flow remains parked until a charge release wakes it.
-    PoolFull(crate::node::history_budget::FlowReleaseEdge),
-    /// Pool accounting already exceeds its limit; exact equality is reserved for `PoolFull`.
-    PoolOvercommitted(crate::node::history_budget::FlowReleaseEdge),
-    /// The current and retiring actor generations already occupy this fingerprint's two shared
-    /// running slots. Exact charge release, not a tick, wakes the retained round.
-    NodeBusy(crate::node::history_budget::FlowReleaseEdge),
-    /// The admitted worker's actor generation no longer owns pool capacity.
-    OwnerMissing,
-}
 
 impl Flow {
-    pub(crate) fn initialized_authorization(&self) -> Option<Digest32> {
-        self.initialized.then_some(self.generation)
-    }
-    pub(crate) fn local_own_root(&self) -> bool {
-        self.local_own_verification || self.local_own_discovery
-    }
-    pub(crate) fn completed_support_discovery(&self) -> Option<u64> {
-        self.discovery_reply
-            .filter(|(head, _, _)| {
-                self.local_own_discovery && Some(*head) == self.authenticated_head
-            })
-            .map(|(_, connection, _)| connection)
-    }
-    pub(crate) fn completed_support_availability(
-        &self,
-    ) -> Option<crate::node::channel::availability::Token> {
-        self.discovery_reply
-            .filter(|(head, _, _)| {
-                self.local_own_discovery && Some(*head) == self.authenticated_head
-            })
-            .and_then(|(_, _, availability)| availability)
-    }
-    pub(crate) fn root_name(&self) -> &'static str {
-        if self.announcement_pending() && self.announcement_can_run() {
-            "inventory"
-        } else if self.archive {
-            "archive"
-        } else if self.hint.is_some() {
-            "hint"
-        } else if self.departure_probe {
-            "departure"
-        } else if self.inventory {
-            "inventory"
-        } else {
-            "required"
-        }
-    }
-
     pub(crate) fn retirement_request(&self) -> RequestId {
         self.retirement_request
     }
@@ -548,133 +146,50 @@ impl Flow {
         self.actor_incarnation
     }
 
+    /// The room's one local admission, taking its ready entries in frontier order.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn foreground(
+    pub(crate) fn admit(
         room: Digest32,
-        peer: Digest32,
         node: Digest32,
         epoch: u64,
-        shared: Arc<Mutex<ChannelState>>,
+        shared: Arc<crate::node::channel::RoomLock>,
         live: Arc<Context>,
         control: Arc<Context>,
-        hint: Option<super::HeadHint>,
-        local_own_verification: bool,
-        local_own_discovery: bool,
-        departure_probe: bool,
-        required: Option<(Digest32, u64)>,
-        slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
         cleanup_budget: Arc<crate::node::history_budget::Budget>,
         actor_incarnation: Option<u64>,
+        frontier: Arc<super::pull::Frontier>,
+        record: Arc<crate::node::channel::RoomSnapshotCell>,
     ) -> Result<Self> {
-        if (local_own_verification || local_own_discovery)
-            && (hint.is_none_or(|hint| hint.author != node)
-                || departure_probe
-                || required.is_some())
-        {
-            return Err(Error::Profile(
-                "own verification root is not an exact local head",
-            ));
-        }
         let request = request_id()?;
-        let mut flow = Self {
+        Ok(Self {
             room,
-            peer,
+            peer: node,
             node,
             epoch,
             instance: [0; 16],
             generation: [0; 32],
             shared,
-            service: OutboundService::Public,
-            archive: false,
-            automatic_own_recovery: false,
-            own_recovery_cleanup: false,
-            own_recovery_trigger: None,
-            own_recovery_page: None,
-            own_recovery_checkpoint: None,
-            own_recovery_progress: false,
-            inventory: hint.is_none() && required.is_none(),
-            wants_board: false,
-            introduction: Arc::from([]),
-            departure_probe,
-            archive_request: None,
-            required_root: required,
-            required_owner_request: None,
-            key_body_root: None,
-            key_body_token: None,
-            key_body_unavailable: None,
-            unavailable_response: None,
-            archive_selected_author: None,
-            key_availability_token: None,
-            key_availability_result: None,
-            key_body_checked: false,
-            state_charge: None,
-            hint,
-            hint_owner: None,
-            transient_refused: false,
-            refusal_retry: None,
-            local_own_verification,
-            local_own_discovery,
-            local_own_after_inventory: false,
-            inventory_ask: None,
-            availability_captured: None,
-            availability_connection: 0,
-            availability_ack: None,
-            discovery_reply: None,
-            hint_peer: peer,
-            authenticated_head: None,
-            departure_receipt: None,
-            mine_held: None,
-            reason: crate::node::status::RoundReason::Request,
             waiting: false,
             byte_pressure: None,
             slot_wait: None,
             published: false,
             rendered: false,
             governance: false,
-            brought: false,
+            controls_ready: false,
             work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            discovery_unavailable: None,
-            discovery_incarnations: None,
-            receipt_lower: None,
-            declined: 0,
-            offered: 0,
-            rearmed: 0,
-            refusal_stale: None,
-            refusal_saved: None,
-            admitted_authors: 0,
-            external: None,
-            archive_status: None,
-            reroute: None,
-            route_origin: None,
-            route_origin_brought: false,
-            route_complete: false,
             authorization_changed: false,
             received: ReceivedFlow::new(room),
-            local_retry: None,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
-            announcement: None,
-            announcement_error: false,
-            announcement_active: false,
-            ordinary_turn_due: false,
-            peer_busy_retry: false,
-            peer_answered: false,
-            slots,
-            owners: [None, None, None],
-            body_progress: false,
-            #[cfg(feature = "test-knobs")]
-            since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
             publication_owner_wait: None,
             governance_cycles: 0,
-            last_head: None,
             retirement_request: request,
             request,
             selected_request: None,
-            retirement_root_cleaned: false,
             cleanup_store,
             failed_settlement: None,
             cleanup_budget,
@@ -682,361 +197,205 @@ impl Flow {
             cleanup_after: None,
             live_context: Some(live),
             control_context: control,
-            live: None,
-            control: None,
-            history: None,
-            archive_wire_bytes: 0,
-            archive_next: None,
-            request_fence: None,
             initialized: false,
-            live_unavailable: None,
-            live_visited: false,
-            control_head: None,
-        };
-        if let Some((head, seq)) = required {
-            flow.push(Task {
-                request,
-                purpose: Purpose::Control,
-                operation: Operation::Local(LocalStep::Entry {
-                    request,
-                    head,
-                    seq,
-                    body: false,
-                    role_header: false,
-                    phase: EntryPhase::Start,
-                }),
-            })?;
-        } else if let Some(hint) = flow.hint {
-            if !departure_probe {
-                flow.push(Task {
-                    request,
-                    purpose: Purpose::Control,
-                    operation: Operation::LiveWindow {
-                        author: hint.author,
-                        head: hint.head,
-                    },
-                })?;
-            }
-            flow.push(Task {
-                request,
-                purpose: if local_own_discovery {
-                    Purpose::Live
-                } else {
-                    Purpose::Control
-                },
-                // Ordinary inventory hints ask which head the peer currently serves. A
-                // recovery root already names a locally verified signed Head: asking Head
-                // here could retarget it to a lower reply forever. Start its existing exact
-                // header/inclusion/consistency promotion path instead; no body is requested.
-                operation: Operation::Wire(if local_own_verification {
-                    if hint.size == 0 {
-                        Query::Proof {
-                            head: hint.head,
-                            kind: super::ProofKind::Consistency,
-                            from: 0,
-                            to: 0,
-                        }
-                    } else {
-                        Query::Header {
-                            head: hint.head,
-                            seq: hint.size,
-                        }
-                    }
-                } else {
-                    Query::Head(hint.author)
-                }),
-            })?;
-        } else {
-            flow.push(Task {
-                request,
-                purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Inventory),
-            })?;
-        }
-        Ok(flow)
-    }
-    /// Ask an authenticated member for this author's head without inventing an inventory hint.
-    /// The returned signed head is verified normally; absence never clears recovery debt.
-    pub(crate) fn probe_unknown_own(mut self) -> Result<Self> {
-        if self.hint.is_some() || self.required_root.is_some() || self.departure_probe {
-            return Err(Error::Profile("unknown own-head probe has another root"));
-        }
-        self.tasks.clear();
-        self.inventory = false;
-        self.local_own_discovery = true;
-        self.push(Task {
-            request: self.request,
-            purpose: Purpose::Live,
-            operation: Operation::Wire(Query::Head(self.node)),
-        })?;
-        Ok(self)
+            frontier: Some(frontier),
+            record: Some(record),
+            admit_root: None,
+            failed: None,
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn archive(
-        room: Digest32,
-        peer: Digest32,
-        node: Digest32,
-        epoch: u64,
-        instance: [u8; 16],
-        generation: Digest32,
-        shared: Arc<Mutex<ChannelState>>,
-        control: Arc<Context>,
-        staging: Staging,
-        query: Query,
-        request: RequestId,
-        fence: Arc<Fence>,
-        slots: Arc<BodySlots>,
-        cleanup_store: Arc<Store>,
-        cleanup_budget: Arc<crate::node::history_budget::Budget>,
-        actor_incarnation: Option<u64>,
-    ) -> Self {
-        Self {
-            room,
-            peer,
-            node,
-            epoch,
-            instance,
-            generation,
-            shared,
-            service: OutboundService::Archive,
-            archive: true,
-            automatic_own_recovery: false,
-            own_recovery_cleanup: false,
-            own_recovery_trigger: None,
-            own_recovery_page: None,
-            own_recovery_checkpoint: None,
-            own_recovery_progress: false,
-            inventory: false,
-            wants_board: false,
-            introduction: Arc::from([]),
-            departure_probe: false,
-            archive_request: Some(request),
-            required_root: None,
-            required_owner_request: None,
-            key_body_root: None,
-            key_body_token: None,
-            key_body_unavailable: None,
-            unavailable_response: None,
-            archive_selected_author: None,
-            key_availability_token: None,
-            key_availability_result: None,
-            key_body_checked: false,
-            state_charge: None,
-            hint: None,
-            hint_owner: None,
-            transient_refused: false,
-            refusal_retry: None,
-            local_own_verification: false,
-            local_own_discovery: false,
-            local_own_after_inventory: false,
-            inventory_ask: None,
-            availability_captured: None,
-            availability_connection: 0,
-            availability_ack: None,
-            discovery_reply: None,
-            hint_peer: peer,
-            authenticated_head: None,
-            departure_receipt: None,
-            mine_held: None,
-            reason: crate::node::status::RoundReason::Page,
-            waiting: false,
-            byte_pressure: None,
-            slot_wait: None,
-            published: false,
-            rendered: false,
-            governance: false,
-            brought: false,
-            work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            discovery_unavailable: None,
-            discovery_incarnations: None,
-            receipt_lower: None,
-            declined: 0,
-            offered: 0,
-            rearmed: 0,
-            refusal_stale: None,
-            refusal_saved: None,
-            admitted_authors: 0,
-            external: None,
-            archive_status: None,
-            reroute: None,
-            route_origin: None,
-            route_origin_brought: false,
-            route_complete: false,
-            authorization_changed: false,
-            received: ReceivedFlow::new(room),
-            local_retry: None,
-            slots,
-            owners: [None, None, None],
-            body_progress: false,
-            #[cfg(feature = "test-knobs")]
-            since: std::time::Instant::now(),
-            governance_wait: false,
-            publication_wait: false,
-            publication_owner_wait: None,
-            governance_cycles: 0,
-            last_head: None,
-            retirement_request: request,
+    /// An admission's next root, once the previous one's work has left the stack: the previous
+    /// root, if neither published nor dropped for a need, is owed again; the next is ONE entry
+    /// of the room's ready set (`Frontier::take`): urgent (a control, or a position an
+    /// admission waiter waits for) and ordinary alternating when both are ready, each class
+    /// taking one entry of each author that has one, in rotation, before a second of any (an
+    /// author's urgent entries oldest first; its ordinary ones newest and oldest in turn,
+    /// `pull::ReadySet`). No batch and no order by id; controls do not drain ahead of posts: an
+    /// ordinary author's next entry waits for at most one root of each other ordinary author
+    /// and one urgent root before each (journey-6, y1: the author whose id sorted first kept
+    /// every newly ready batch ahead of the roots not tried yet; why-j16: a newcomer's grant
+    /// queued behind every member's posts).
+    fn next_admission_root(&mut self) -> Result<()> {
+        let Some(frontier) = self.frontier.clone() else {
+            return Ok(());
+        };
+        self.settle_root(None, None, None);
+        let Some(ready) = frontier.take(self.room) else {
+            self.admit_root = None;
+            return Ok(());
+        };
+        let (head, seq) = (ready.head, ready.entry.skeleton.seq);
+        let body = ready.entry.payload.is_some();
+        self.admit_root = Some((ready, false));
+        let request = request_id()?;
+        self.push(Task {
             request,
-            selected_request: None,
-            retirement_root_cleaned: false,
-            cleanup_store,
-            failed_settlement: None,
-            cleanup_budget,
-            actor_incarnation,
-            cleanup_after: None,
-            tasks: {
-                let mut tasks = Vec::with_capacity(MAX_TASKS);
-                tasks.push(Task {
-                    request,
-                    purpose: Purpose::History,
-                    // A resumed archive Entry may have a durably complete body but no room
-                    // effect yet. Re-enter its local admission instead of asking the donor
-                    // for an empty suffix and parking an unchanged request.
-                    operation: match query {
-                        // A resumed durable page can have delivered its last body before
-                        // its terminal checkpoint. Finish locally; no zero-entry wire page.
-                        Query::Page { entries: 0, .. } => Operation::FinishArchive,
-                        query @ Query::Entry { .. } => Operation::ResumeWire(query),
-                        query => Operation::Wire(query),
-                    },
-                });
-                tasks
-            },
-            replay: None,
-            announcement: None,
-            announcement_error: false,
-            announcement_active: false,
-            ordinary_turn_due: false,
-            peer_busy_retry: false,
-            peer_answered: false,
-            live_context: None,
-            control_context: control,
-            live: None,
-            control: None,
-            history: Some(staging),
-            archive_wire_bytes: 0,
-            archive_next: None,
-            request_fence: Some(fence),
-            initialized: true,
-            live_unavailable: None,
-            live_visited: false,
-            control_head: None,
-        }
-    }
-    /// Own one recipient body without consuming the peer's public hint.
-    pub(crate) fn with_key_body(
-        mut self,
-        need: super::KeyBodyNeed,
-        instance: [u8; 16],
-        context: Arc<Context>,
-        token: Arc<()>,
-    ) -> Self {
-        self.service = OutboundService::Private;
-        self.tasks.clear();
-        self.tasks.push(Task {
-            request: self.request,
-            purpose: Purpose::Control,
             operation: Operation::Local(LocalStep::Entry {
-                request: self.request,
-                head: need.head,
-                seq: need.seq,
-                body: true,
+                request,
+                head,
+                seq,
+                body,
                 role_header: false,
                 phase: EntryPhase::Start,
             }),
-        });
-        self.inventory = false;
-        self.initialized = true;
-        self.instance = instance;
-        self.generation = need.authorization;
-        self.key_body_root = Some(need);
-        self.key_body_token = Some(token);
-        self.control_context = context;
-        self
+        })
     }
 
-    /// An exact receiver-owned cursor asks for one provider catalog page.
-    pub(crate) fn with_key_availability(mut self, after: Option<u64>, token: Arc<()>) -> Self {
-        self.service = OutboundService::Private;
-        self.tasks.clear();
-        self.tasks.push(Task {
-            request: self.request,
-            purpose: Purpose::Control,
-            operation: Operation::Wire(Query::KeyAvailability { after }),
-        });
-        self.inventory = false;
-        self.key_availability_token = Some(token);
-        self
+    /// An admission's current root ends, if not settled yet: as published when `published`
+    /// names its author and position, under whatever head (the entries waiting for that
+    /// position go to the ready set); with `need`, dropped for it, waiting for position `at`
+    /// when the need is the entry of a position not admitted here yet, and owed again when it is
+    /// met; with neither, owed again. A publication of any other position (a nested dependency)
+    /// releases that position's waiters at once.
+    fn settle_root(
+        &mut self,
+        published: Option<(Digest32, u64)>,
+        need: Option<(
+            super::pull::Need,
+            Option<Arc<crate::log::history::SignedHead>>,
+        )>,
+        at: Option<(Digest32, u64)>,
+    ) {
+        let Some(frontier) = self.frontier.clone() else {
+            return;
+        };
+        let root = self.admit_root.as_mut().filter(|(_, settled)| !settled);
+        let position = root
+            .as_ref()
+            .map(|(ready, _)| (ready.entry.skeleton.author_id, ready.entry.skeleton.seq));
+        if let Some((author, seq)) = published.filter(|p| Some(*p) != position) {
+            frontier.published(self.room, author, seq);
+            return;
+        }
+        let Some((ready, settled)) = root else {
+            return;
+        };
+        let (author, seq) = (ready.entry.skeleton.author_id, ready.entry.skeleton.seq);
+        *settled = true;
+        if published.is_some() {
+            frontier.published(self.room, author, seq);
+            return;
+        }
+        let kept = need.as_ref().map(|_| (self.peer, ready.clone()));
+        frontier.settled(self.room, author, seq, need, kept, at);
     }
 
+    /// The frontier's need for a wire dependency of an admission flow's `step`, with what it
+    /// names read once, here, so that no loop reads it again. Every need is keyed by the author
+    /// and position it is about (`pull::Need`), never by the head the step found it missing
+    /// under; the head the step named is kept beside it only as a fallback to ask under.
+    ///
+    /// - A header, an inclusion proof or an entry: the receipt of that position.
+    /// - A control proof: the author's control coverage through its end.
+    /// - A consistency proof from `from` under this node's committed head of the author (an
+    ///   entry's or a parent's own prefix [1, from]: `from` is at most that head's size, and at
+    ///   its size the prefix is that very head): the receipt of position `from`, which any
+    ///   committed head of the author proves. Nothing newer is missing (a departure naming
+    ///   another author's last entry waited for a head of carol past 7 while carol's history was
+    ///   7 on every node: fjw8).
+    /// - A consistency proof under another head (a promotion from this node's committed head):
+    ///   below the committed size, the receipt of position `from`, as above; at or above it, a
+    ///   newer committed head of the author, met by ANY being reached (the step that asked it
+    ///   then compares with that head).
+    /// - A newer head of an author: a committed head past the author's committed size in the
+    ///   room's record read BEFORE the step that found it missing (`before`). Read after the
+    ///   step, a head committed meanwhile (by a connection's answer) would be the anchor, and the
+    ///   need, already met by that head, would wait for one beyond it that may never come (r18:
+    ///   gyde62/9 waited for a head of r3dtvp past 12, committed 1 ms after the validator
+    ///   looked; nine entries waited for gyde62/9 and no loop asked). Read before, the anchor is
+    ///   at most what the step saw: a head committed meanwhile meets the need at the next plan
+    ///   and the step runs again with it.
+    fn resolve_need(
+        read: &crate::node::channel::entry_store::Read<'_>,
+        before: Option<&crate::node::channel::RoomSnapshot>,
+        step: Option<&LocalStep>,
+        query: Option<&Query>,
+    ) -> Result<
+        Option<(
+            super::pull::Need,
+            Option<Arc<crate::log::history::SignedHead>>,
+        )>,
+    > {
+        use super::pull::Need;
+        let (head, seq, controls) = match query {
+            Some(Query::Head(author)) => {
+                let size = before
+                    .and_then(crate::node::channel::RoomSnapshot::history)
+                    .and_then(|history| history.author(author))
+                    .map_or(
+                        0,
+                        crate::node::channel::held_history::HeldAuthor::committed_size,
+                    );
+                return Ok(Some((
+                    Need::Head {
+                        author: *author,
+                        size,
+                    },
+                    None,
+                )));
+            }
+            Some(Query::Proof {
+                head,
+                kind: super::ProofKind::Control,
+                from,
+                to,
+            }) => (*head, *to, Some(*from)),
+            Some(
+                Query::Proof {
+                    head, from: seq, ..
+                }
+                | Query::Header { head, seq }
+                | Query::Entry { head, seq, .. },
+            ) => (*head, *seq, None),
+            _ => match step {
+                Some(LocalStep::Entry { head, seq, .. }) => (*head, *seq, None),
+                _ => return Ok(None),
+            },
+        };
+        let Some(signed) = read.history_head(&head)? else {
+            return Ok(None);
+        };
+        let author = signed.binding.author;
+        let need = match (query, controls) {
+            (_, Some(lo)) => Need::Controls {
+                author,
+                lo,
+                hi: seq,
+            },
+            (
+                Some(Query::Proof {
+                    kind: super::ProofKind::Consistency,
+                    ..
+                }),
+                None,
+            ) => {
+                let committed = read
+                    .sparse_author(&author, signed.binding.scope)?
+                    .and_then(|state| state.committed);
+                if committed == Some(head) {
+                    Need::Position { author, seq }
+                } else {
+                    let size = match committed {
+                        Some(id) => read.history_head(&id)?.map_or(0, |head| head.root.leaves),
+                        None => 0,
+                    };
+                    if seq >= size {
+                        return Ok(Some((Need::Head { author, size }, None)));
+                    }
+                    Need::Position { author, seq }
+                }
+            }
+            _ => Need::Position { author, seq },
+        };
+        Ok(Some((need, Some(Arc::new(signed)))))
+    }
     fn push(&mut self, task: Task) -> Result<()> {
         if self.tasks.len() >= MAX_TASKS {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
         }
         self.tasks.push(task);
         Ok(())
-    }
-    /// Serve one exact prerequisite without waiting for this retained Public root to end.
-    /// Do not cover a retained body owner: it must reclaim the shared slot before
-    /// another request on this stack can fetch a Control body.
-    pub(crate) fn prepend_required(
-        &mut self,
-        head: Digest32,
-        seq: u64,
-        owner: RequestId,
-    ) -> Result<bool> {
-        if self.service != OutboundService::Public
-            || self.archive
-            || self.automatic_own_recovery
-            || self.own_recovery_cleanup
-            || self.key_body_root.is_some()
-            || self.local_own_root()
-            || self.departure_probe
-            || self.route_origin.is_some()
-            || self.required_root.is_some()
-            || self.required_owner_request.is_some()
-            || self.authorization_changed
-            || self.publication_wait
-            || self.byte_pressure.is_some()
-            || self.owners.iter().any(Option::is_some)
-            // A partial kept without its slot (`release_waiting_body_slots`) is still this
-            // stack's body owner.
-            || self.live.is_some()
-            || self.control.is_some()
-            || self.tasks.len() >= MAX_TASKS
-            || self.tasks.iter().chain(self.replay.iter()).any(|task| {
-                matches!(
-                    task.operation,
-                    Operation::Local(LocalStep::Entry {
-                        phase: EntryPhase::Prepare(_)
-                            | EntryPhase::Commit(_)
-                            | EntryPhase::Cleanup(_),
-                        ..
-                    })
-                )
-            })
-        {
-            return Ok(false);
-        }
-        let request = request_id()?;
-        self.push(Task {
-            request,
-            purpose: Purpose::Control,
-            operation: Operation::Local(LocalStep::Entry {
-                request,
-                head,
-                seq,
-                body: false,
-                role_header: false,
-                phase: EntryPhase::Start,
-            }),
-        })?;
-        self.required_root = Some((head, seq));
-        self.required_owner_request = Some(owner);
-        self.waiting = false;
-        Ok(true)
     }
 
     /// Move this Flow's exact durable publication owner to the top of its bounded LIFO stack.
@@ -1074,444 +433,48 @@ impl Flow {
                 .as_ref()
                 .is_some_and(|task| task.request == request)
     }
-    /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
-    /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
-    fn push_control_closure(&mut self, task: &Task, window: LiveWindow) -> Result<()> {
-        if window.through == 0 || self.control_head == Some(window.head) {
-            return Ok(());
-        }
-        if self.tasks.len() > MAX_TASKS.saturating_sub(2) {
-            return Err(Error::SizeLimitExceeded("history dependency stack"));
-        }
-        self.tasks.push(Task {
-            operation: Operation::Local(LocalStep::Control {
-                head: window.head,
-                through: window.through,
-                effects: true,
-            }),
-            ..task.clone()
-        });
-        self.tasks.push(Task {
-            operation: Operation::Local(LocalStep::Control {
-                head: window.head,
-                through: window.through,
-                effects: false,
-            }),
-            ..task.clone()
-        });
-        self.control_head = Some(window.head);
-        Ok(())
-    }
-    /// Park (ADR-038 FX-35): a flow that is ready but not running, deferred, retiring or
-    /// awaiting cleanup holds none of the daemon's flow-state pool. Measured before this: four
-    /// hosted nodes' parked hinted flows held all sixteen, and the inventory round that would
-    /// have let them resume could never be started.
-    pub(crate) fn park(&mut self) {
-        self.state_charge = None;
-    }
-
-    /// The Control bytes one flow state costs, reserved on this flow's own control job before
-    /// the pool is asked (ADR-038 FX-35): `None` is the control budget's refusal, never the
-    /// pool's, and the caller names it so.
-    pub(crate) fn reserve_state_bytes(
-        &self,
-        job: &Job,
-    ) -> Option<crate::node::history_budget::BufferCharge> {
-        job.reserve(crate::node::history_budget::FLOW_STATE_BYTES)
-    }
-
-    pub(crate) fn state_bytes_wake(
-        job: &Job,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        job.bytes_wake()
-    }
-
-    /// Reserve the flow state as the round begins, its bytes already held: the last gate before
-    /// running, so a held charge always belongs to a running round. [`Resumed::NodeBusy`] when
-    /// this fingerprint's current and retiring generations already hold its source-owned slots;
-    /// [`Resumed::PoolFull`] when every pool position is occupied by a charge or release-edge
-    /// promise. A flow already holding its state keeps it, and the bytes go back.
-    pub(crate) fn resume(
-        &mut self,
-        job: &Job,
-        bytes: crate::node::history_budget::BufferCharge,
-        waiter: Option<&mut crate::node::history_budget::FlowReleaseTicket>,
-    ) -> Resumed {
-        if self.state_charge.is_some() {
-            return Resumed::Held;
-        }
-        match job.reserve_flow_state(
-            (self.room, self.peer, self.service.slot()),
-            self.retirement_request,
-            self.instance,
-            bytes,
-            waiter,
-        ) {
-            crate::node::history_budget::FlowStateTry::Reserved(charge) => {
-                self.state_charge = Some(charge);
-                Resumed::Held
-            }
-            crate::node::history_budget::FlowStateTry::PoolFull(edge) => Resumed::PoolFull(edge),
-            crate::node::history_budget::FlowStateTry::PoolOvercommitted(edge) => {
-                Resumed::PoolOvercommitted(edge)
-            }
-            crate::node::history_budget::FlowStateTry::NodeBusy(edge) => Resumed::NodeBusy(edge),
-            crate::node::history_budget::FlowStateTry::OwnerMissing => Resumed::OwnerMissing,
-        }
-    }
-
-    /// Whether this round begins by exchanging boards with the peer: a fresh inventory flow's
-    /// first round, or any round while a key to the peer waits on its bundle (ADR-038 FX-35):
-    /// the bundle a key delivery opens its session against travels only on that exchange.
-    pub(crate) fn needs_board(&self) -> bool {
-        (self.inventory && !self.initialized) || self.wants_board
-    }
-
-    pub(crate) fn secret_work(&self) -> Arc<tokio::sync::OwnedRwLockReadGuard<()>> {
-        self.control_context.secret_work()
-    }
-    /// The author of a retained signed head, for the record of a peer that could not fill a
-    /// body under it; `None` when the head is not retained or the room is busy, and then no
-    /// record is made (the next period asks once more).
-    async fn head_author(
-        &self,
-        source: &super::source::Source,
-        job: &Job,
-        head: Digest32,
-    ) -> Result<Option<Digest32>> {
-        let found = source
-            .read(
-                job,
-                std::mem::size_of::<Option<Digest32>>(),
-                move |room, store| {
-                    Ok(Some(
-                        room.history_read(store)?
-                            .history_head(&head)?
-                            .map(|signed| signed.binding.author),
-                    ))
-                },
-            )
-            .await?;
-        Ok(match found {
-            Lookup::Found(found) => found.value,
-            Lookup::Busy | Lookup::Missing => None,
-        })
-    }
-    async fn decline(
-        &mut self,
-        source: &super::source::Source,
-        job: &Job,
-        inbox: &super::hints::HintInbox,
-        author: Digest32,
-        head: Digest32,
-    ) -> Result<bool> {
-        self.decline_exact(source, job, inbox, author, head).await
-    }
-    async fn transient_decline(
-        &mut self,
-        source: &super::source::Source,
-        job: &Job,
-        inbox: &super::hints::HintInbox,
-        inbox_generation: u64,
-        author: Digest32,
-        head: Digest32,
-    ) -> Result<bool> {
-        #[cfg(feature = "test-knobs")]
-        let mutant = std::env::var_os("VOX_TEST_DURABLE_TRANSIENT_DECLINE").is_some();
-        #[cfg(not(feature = "test-knobs"))]
-        let mutant = false;
-        if mutant {
-            if !self.decline(source, job, inbox, author, head).await? {
-                return Ok(false);
-            }
-        } else {
-            let Some(scope) = source
-                .transient_scope(job, self.room, author, self.availability_connection)
-                .await?
-            else {
-                self.refusal_retry = Some(super::hints::RefusalRetry::Busy);
-                return Ok(false);
-            };
-            if let super::hints::RefusalDisposition::Retry(retry) = inbox.transient_decline(
-                job,
-                inbox_generation,
-                (self.room, source.peer),
-                (author, head),
-                scope,
-                self.availability_captured,
-            )? {
-                self.refusal_retry = Some(retry);
-                return Ok(false);
-            }
-            if let Some(hint) = self.hint.filter(|hint| {
-                self.required_root.is_none()
-                    && self.hint_peer == source.peer
-                    && (hint.author != author || hint.head != head)
-            }) {
-                let Some(hint_scope) = source
-                    .transient_scope(job, self.room, hint.author, self.availability_connection)
-                    .await?
-                else {
-                    self.refusal_retry = Some(super::hints::RefusalRetry::Busy);
-                    return Ok(false);
-                };
-                if let super::hints::RefusalDisposition::Retry(retry) = inbox.transient_decline(
-                    job,
-                    inbox_generation,
-                    (self.room, source.peer),
-                    (hint.author, hint.head),
-                    hint_scope,
-                    self.availability_captured,
-                )? {
-                    self.refusal_retry = Some(retry);
-                    return Ok(false);
-                }
-            }
-            self.transient_refused = true;
-            self.declined = self.declined.saturating_add(1);
-        }
-        #[cfg(feature = "test-knobs")]
-        eprintln!(
-            "history transient decline mode={} peer={} author={} head={} connection={}",
-            if mutant { "durable" } else { "connection" },
-            crate::node::link::b32_encode(&source.peer),
-            crate::node::link::b32_encode(&author),
-            crate::node::link::b32_encode(&head),
-            self.availability_connection
-        );
-        #[cfg(feature = "test-knobs")]
-        if let Some(path) = std::env::var_os("VOX_TEST_TRANSIENT_DECLINE_MARKER") {
-            let mode = if mutant { "durable" } else { "connection" };
-            let _ = std::fs::write(
-                path,
-                format!(
-                    "{} {} {mode}",
-                    crate::node::link::b32_encode(&author),
-                    crate::node::link::b32_encode(&source.peer)
-                ),
-            );
-        }
-        Ok(true)
-    }
-    async fn decline_exact(
-        &mut self,
-        source: &super::source::Source,
-        job: &Job,
-        inbox: &super::hints::HintInbox,
-        author: Digest32,
-        head: Digest32,
-    ) -> Result<bool> {
-        if self.local_own_discovery {
-            // Startup metadata discovery is scoped to the selected connection, not the old
-            // durable receipt/proof operation. Actor retains its unavailable disposition on
-            // that Port; a genuine reconnect can obtain newly available signed metadata.
-            return Ok(true);
-        }
-        // A metadata root is a separate operation from the old ambiguous body/inventory
-        // decision. Retain one exact disposition for its whole immutable verification chain.
-        let (author, head) = if self.local_own_root() {
-            let hint = self
-                .hint
-                .ok_or(Error::Profile("own metadata refusal root missing"))?;
-            (hint.author, hint.head)
-        } else {
-            (author, head)
+    /// When authorization changed: the root this admission has not settled goes back to the
+    /// room's ready set with the entry it holds, still in admission, and the room's fresh
+    /// admission takes it under the new authorization; nothing is dropped or fetched again.
+    pub(crate) fn give_back_admission(&mut self) {
+        let Some(frontier) = self.frontier.clone() else {
+            return;
         };
-        let remembered = match source
-            .remember_decline(job, author, head, self.request, self.local_own_root())
-            .await
-        {
-            Ok(super::source::DeclineResult::Stored {
-                remembered,
-                captured,
-                current,
-            }) => {
-                self.refusal_saved = Some(crate::node::status::HistoryRefusalStatus {
-                    peer: source.peer,
-                    author,
-                    head,
-                    request: self.request,
-                    captured_generation: captured,
-                    current_generation: current,
-                    remembered,
-                });
-                remembered
-            }
-            Ok(super::source::DeclineResult::AuthorizationChanged { captured, current }) => {
-                self.refusal_stale = Some(crate::node::status::HistoryRefusalStatus {
-                    peer: source.peer,
-                    author,
-                    head,
-                    request: self.request,
-                    captured_generation: captured,
-                    current_generation: current,
-                    remembered: false,
-                });
-                self.authorization_changed = true;
-                self.waiting = true;
-                return Ok(false);
-            }
-            Err(error) => {
-                self.local_retry = Some(format!(
-                    "local history refusal was not durably recorded: {error}"
-                ));
-                self.waiting = true;
-                return Ok(false);
-            }
-        };
-        if self.hint_peer == source.peer
-            && self
-                .hint
-                .is_some_and(|hint| hint.author == author && hint.head == head)
-        {
-            if let Some(owner) = self.hint_owner {
-                inbox.finish_owned(self.room, self.hint_peer, owner, false);
-            }
+        if let Some((ready, false)) = self.admit_root.take() {
+            frontier.give_back(self.room, ready);
         }
-        self.declined = self.declined.saturating_add(u64::from(remembered));
-        Ok(true)
-    }
-    pub(crate) fn done(&self) -> bool {
-        self.tasks.is_empty() && self.replay.is_none() && self.announcement.is_none()
     }
 
-    /// Whether an ordinary operation, rather than the separate announcement prefix, remains
-    /// owned by this Flow. A peer-Busy settlement may retain the Flow only when the exact popped
-    /// operation was restored here; an announcement alone is not provenance for retrying it.
-    #[must_use]
-    pub(crate) fn ordinary_pending(&self) -> bool {
-        !self.tasks.is_empty() || self.replay.is_some()
-    }
-
-    /// Consume the proof that this returned peer-Busy result still owns its exact ordinary task.
-    /// A pending announcement alone can never satisfy this predicate.
-    pub(crate) fn take_peer_busy_retry(&mut self) -> bool {
-        std::mem::take(&mut self.peer_busy_retry) && self.ordinary_pending()
-    }
-
-    /// Whether the peer answered an exchange of the turn that just returned.
-    pub(crate) fn peer_answered(&self) -> bool {
-        self.peer_answered
-    }
-
-    /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
-    /// remains this same scalar; it never consumes, rebuilds or retires the ordinary root.
-    pub(crate) fn arm_announcement(&mut self, through: u64) -> Result<()> {
-        if self.service != OutboundService::Public || self.inventory {
-            return Err(Error::Profile(
-                "history announcement prefix requires a retained Public root",
-            ));
-        }
-        if self.announcement.is_some() {
-            return Ok(());
-        }
-        let request = request_id()?;
-        self.announcement = Some(Announcement {
-            request,
-            prior_request: self.request,
-            task: Some(Task {
-                request,
-                purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Inventory),
-            }),
-            through,
-            brought: false,
-            complete: false,
-        });
-        Ok(())
-    }
-
-    #[must_use]
-    pub(crate) fn announcement_pending(&self) -> bool {
-        self.announcement
+    /// A failed admission (any error its task ends with, except its own cancellation): the root
+    /// it held unsettled stays in admission inside this flow (`failed`), and the flow stops
+    /// before it is retired. Every failure, before initialization, in any phase or between
+    /// roots, ends here and nowhere else; the room's admission then waits for its recovery
+    /// edge (`pull::Frontier::failed_admission_news`).
+    pub(crate) fn fail(&mut self) {
+        if self
+            .admit_root
             .as_ref()
-            .is_some_and(|announcement| !announcement.complete)
-    }
-
-    #[must_use]
-    pub(crate) fn announcement_can_run(&self) -> bool {
-        self.service == OutboundService::Public
-            && !self.inventory
-            && !self.publication_wait
-            && self.active_publication_owner().is_none()
-    }
-
-    #[must_use]
-    pub(crate) fn announcement_failed(&self) -> bool {
-        self.announcement_error || self.announcement_active
-    }
-
-    pub(crate) fn retain_failed_announcement(&mut self) -> Result<()> {
-        if self.service != OutboundService::Public {
-            return Err(Error::Profile("history announcement owner is not Public"));
+            .is_some_and(|(_, settled)| !settled)
+        {
+            self.failed = self.admit_root.take().map(|(ready, _)| ready);
         }
-        let Some(announcement) = self.announcement.as_mut() else {
-            return Err(Error::Profile("history announcement owner missing"));
-        };
-        if !announcement.complete && announcement.task.is_none() {
-            announcement.task = Some(Task {
-                request: announcement.request,
-                purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Inventory),
-            });
-        }
-        self.request = announcement.prior_request;
-        self.announcement_error = false;
-        self.announcement_active = false;
-        self.peer_busy_retry = false;
-        Ok(())
+        self.park();
     }
 
-    #[must_use]
-    pub(crate) fn ordinary_turn_due(&self) -> bool {
-        self.ordinary_turn_due
+    /// Stop a failed admission before its flow is retired.
+    pub(crate) fn park(&mut self) {
+        self.cancel();
+        self.byte_pressure = None;
+        self.slot_wait = None;
     }
 
-    pub(crate) fn take_announcement_receipt(&mut self) -> Option<AnnouncementReceipt> {
-        if self.service != OutboundService::Public {
-            return None;
-        }
-        let announcement = self
-            .announcement
-            .take_if(|announcement| announcement.complete)?;
-        self.ordinary_turn_due = true;
-        Some(AnnouncementReceipt {
-            through: announcement.through,
-            brought: announcement.brought,
-        })
-    }
-
-    fn restore_announcement_task(&mut self, task: Task) -> Result<()> {
-        if self.service != OutboundService::Public {
-            return Err(Error::Profile("history announcement owner is not Public"));
-        }
-        let Some(announcement) = self.announcement.as_mut() else {
-            return Err(Error::Profile("history announcement owner missing"));
-        };
-        if announcement.complete || announcement.task.is_some() {
-            return Err(Error::Profile("history announcement task already retained"));
-        }
-        announcement.task = Some(task);
-        Ok(())
-    }
-    /// Whether the next task is a local slice, with no wire exchange, so this turn may run it.
-    fn next_slice_is_local(&self) -> bool {
-        let next = self.tasks.last().or(self.replay.as_ref());
-        matches!(
-            next.map(|task| &task.operation),
-            Some(
-                Operation::Local(_)
-                    | Operation::LiveWindow { .. }
-                    | Operation::LiveAdvance { .. }
-                    | Operation::LiveRetry { .. }
-                    | Operation::Tail { .. }
-                    | Operation::Reclaim(_)
-                    | Operation::ReclaimUnavailable
-                    | Operation::ReclaimKeyUnavailable
-                    | Operation::FinishArchive
-                    | Operation::Governance
-            )
-        )
+    pub(crate) fn done(&self) -> bool {
+        self.tasks.is_empty()
+            && self.replay.is_none()
+            && self
+                .frontier
+                .as_ref()
+                .is_none_or(|frontier| !frontier.has_ready(self.room))
     }
 
     /// The exact request whose sparse publication is between Begin and Cleanup in the next
@@ -1522,147 +485,26 @@ impl Flow {
         match &next.operation {
             Operation::Local(LocalStep::Entry {
                 request,
-                phase: EntryPhase::Prepare(_) | EntryPhase::Commit(_) | EntryPhase::Cleanup(_),
+                phase: EntryPhase::Publish(_) | EntryPhase::Cleanup(_),
                 ..
             }) => Some(*request),
             _ => None,
         }
     }
-    /// Only the controller retirement owner may execute a recovered deletion capability.
-    pub(crate) fn mark_own_recovery_cleanup(&mut self) {
-        self.own_recovery_cleanup = true;
-        self.initialized = true;
-        self.tasks.clear();
-    }
 
-    pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
-        use crate::node::history_budget::Lane;
-        match self
-            .tasks
-            .last()
-            .or(self.replay.as_ref())
-            .map(|task| (&task.operation, task.purpose))
-        {
-            Some((
-                Operation::Wire(Query::Entry { .. } | Query::Page { .. })
-                | Operation::ResumeWire(Query::Entry { .. } | Query::Page { .. }),
-                Purpose::History,
-            )) => Lane::Archive,
-            Some((_, Purpose::Live)) => Lane::Live,
-            _ => Lane::Control,
-        }
-    }
     pub(crate) fn cancellation_handles(&self) -> Vec<demand::Cancellation> {
-        let mut handles = Vec::with_capacity(3);
+        let mut handles = Vec::with_capacity(2);
         if let Some(context) = &self.live_context {
             handles.push(context.cancellation());
         }
         handles.push(self.control_context.cancellation());
-        if let Some(staging) = &self.history {
-            handles.push(staging.context.cancellation());
-        }
         handles
     }
     pub(crate) fn cancel(&self) {
-        for (index, owner) in self.owners.iter().enumerate() {
-            // The key slot remains owned until physical retirement or the Flow is dropped.
-            if index == 2 {
-                continue;
-            }
-            if let Some(request) = owner {
-                self.slots.release(
-                    if index == 0 {
-                        Purpose::Live
-                    } else {
-                        Purpose::Control
-                    },
-                    *request,
-                    index == 2,
-                );
-            }
+        if let Some(context) = &self.live_context {
+            context.cancellation().cancel();
         }
-
-        for cancellation in self.cancellation_handles() {
-            cancellation.cancel();
-        }
-    }
-    /// Give back the live and control body slots whose body still waits on wire bytes (its exact
-    /// Entry ask is retained on this stack). The partial body stays in the node's one durable
-    /// staging record: the flow's next `ensure_stage` claims the slot again and resumes at the
-    /// saved offset, or, when another claimant ended that partial meanwhile, fetches that one
-    /// body again under a fresh request. A complete body is not given back: its local
-    /// continuation needs no peer. The key slot keeps its retirement rule (`cancel`).
-    pub(crate) fn release_waiting_body_slots(&mut self) {
-        for (index, purpose) in [(0, Purpose::Live), (1, Purpose::Control)] {
-            let Some(owner) = self.owners[index] else {
-                continue;
-            };
-            let waits = self.tasks.iter().chain(self.replay.iter()).any(|task| {
-                task.request == owner
-                    && task.purpose == purpose
-                    && matches!(
-                        task.operation,
-                        Operation::Wire(Query::Entry { .. })
-                            | Operation::ResumeWire(Query::Entry { .. })
-                    )
-            });
-            if !waits || parked_flow_keeps_body_slot_mutant() {
-                continue;
-            }
-            self.owners[index] = None;
-            self.slots.release(purpose, owner, false);
-        }
-    }
-    /// A fresh request for one body whose staging activation another claimant ended while this
-    /// flow held no slot: the retained Entry ask and its local Entry owner move to it together,
-    /// so the new activation passes `history_demand`'s fresh-request guard and the owner's
-    /// staged admission matches it. Other tasks of the old request keep it.
-    fn renew_body_request(&mut self, old: RequestId, purpose: Purpose) -> Result<RequestId> {
-        let fresh = request_id()?;
-        for task in self.tasks.iter_mut().chain(self.replay.iter_mut()) {
-            if task.request != old || task.purpose != purpose {
-                continue;
-            }
-            match &mut task.operation {
-                Operation::Wire(Query::Entry { .. })
-                | Operation::ResumeWire(Query::Entry { .. }) => {
-                    task.request = fresh;
-                }
-                Operation::Local(LocalStep::Entry { request, .. }) if *request == old => {
-                    *request = fresh;
-                    task.request = fresh;
-                }
-                _ => {}
-            }
-        }
-        if self.request == old {
-            self.request = fresh;
-        }
-        if self.selected_request == Some(old) {
-            self.selected_request = Some(fresh);
-        }
-        Ok(fresh)
-    }
-    /// Test-only: the kind of the ask on top of this flow's stack (the one a reroute moves).
-    #[cfg(feature = "test-knobs")]
-    pub(crate) fn retained_ask(&self) -> &'static str {
-        match self.tasks.last().map(|task| &task.operation) {
-            Some(Operation::Wire(query) | Operation::ResumeWire(query)) => match query {
-                Query::Entry { .. } => "entry",
-                Query::Page { .. } => "page",
-                Query::KeyBody { .. } => "key-body",
-                Query::Header { .. } => "header",
-                Query::Proof { .. } => "proof",
-                Query::Head(_) => "head",
-                Query::Context(_) => "context",
-                Query::Inventory => "inventory",
-                Query::KeyAvailability { .. } => "key-availability",
-                Query::Fork(_) => "fork",
-                Query::HeadById(_) => "head-by-id",
-            },
-            Some(_) => "local",
-            None => "none",
-        }
+        self.control_context.cancellation().cancel();
     }
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
@@ -1717,66 +559,20 @@ impl Flow {
             self.cancel();
             return Ok(RetirementStep::Done);
         }
-        // A published current body queues only local exact-request reclamation. If its peer
-        // departs before the next network turn, finish that bounded cleanup here; membership is
-        // never restored and no archive, wire request or new effect is run.
-        let reclaim_live = self.tasks.iter().any(|task| {
-            matches!(
-                task.operation,
-                Operation::Reclaim(Purpose::Live) | Operation::ReclaimUnavailable
-            )
-        });
-        let reclaim_control = self.tasks.iter().any(|task| {
-            matches!(
-                task.operation,
-                Operation::Reclaim(Purpose::Control) | Operation::ReclaimKeyUnavailable
-            )
-        });
-        // A stale foreground capability cannot resume even when its peer reconnects. Retire
-        // its exact partial body before lending the fixed slot to another flow. Explicit
-        // archive staging remains owned by its saved Pause/Resume controller.
-        let stale_foreground = self.authorization_changed && self.archive_request.is_none();
-        let staging = if (reclaim_live || stale_foreground) && self.live.is_some() {
-            self.live.clone().map(|stage| (Purpose::Live, stage))
-        } else if (reclaim_control || stale_foreground) && self.control.is_some() {
-            self.control.clone().map(|stage| (Purpose::Control, stage))
-        } else if self.automatic_own_recovery {
-            self.history.clone().map(|stage| (Purpose::History, stage))
-        } else {
-            None
-        };
+        self.cancel();
         // A parked flow owns no worker. Retirement admits one independent large-control job for
         // this bounded local slice and gives it back before the flow is retained again.
         let cleanup_job = self
             .cleanup_budget
             .admit_job(self.node, crate::node::history_budget::Lane::LargeControl)
             .await;
-        // No worker owns this Flow while it is retiring. Retain its already-fenced local
-        // capability only through the exact queued reclamation above, then cancel it before
-        // any general publication/verifier cleanup. Nothing here opens a stream or schedules
-        // another turn.
-        if staging.is_none() {
-            self.cancel();
-        }
-        // Cleanup uses the independently admitted foreground-control envelope above; no parked
-        // flow retains a Control worker merely so it can eventually retire.
         const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
-        let envelope = if staging.is_some() {
-            demand::AdmissionCharge::total(CLEANUP_ENVELOPE)?
-        } else {
-            CLEANUP_ENVELOPE
-        };
-        let mut charge = match cleanup_job.reserve_or_pressure(envelope) {
+        let charge = match cleanup_job.reserve_or_pressure(CLEANUP_ENVELOPE) {
             Ok(charge) => charge,
             Err(Error::HistoryCapacity(pressure)) => {
                 return Ok(RetirementStep::Wait(RetirementWait::Bytes(*pressure)));
             }
             Err(error) => return Err(error),
-        };
-        let admission = if staging.is_some() {
-            Some(demand::AdmissionCharge::split_from(&mut charge)?)
-        } else {
-            None
         };
         let room = self.shared.clone();
         let store = self.cleanup_store.clone();
@@ -1787,7 +583,6 @@ impl Flow {
         let committed = Arc::clone(&self.work_committed);
         enum Slice {
             Gone,
-            Staging(Purpose, bool),
             Source(bool, Option<[u8; 64]>),
             Publication(
                 Option<RequestId>,
@@ -1807,25 +602,6 @@ impl Flow {
                 Err(error) => return Err(error),
                 Ok(current) if current != instance => return Ok(Slice::Gone),
                 Ok(_) => {}
-            }
-            if let Some((purpose, staging)) = staging {
-                // Same room->Active lock order as semantic completion. Observer cancellation
-                // remains set: this route can only delete the captured abandoned staging.
-                let mut active = staging
-                    .active
-                    .lock()
-                    .map_err(|_| Error::Profile("history activation lock failed"))?;
-                let admission = admission
-                    .as_ref()
-                    .ok_or(Error::Profile("history retirement admission missing"))?;
-                // This deletion touches only the exact request's staging namespace and Active
-                // serial, never the room projection. Context retains its existing secret lease.
-                // Preserve room->Active acquisition order, then release the room before writer
-                // acquisition; no room reacquisition occurs while Active is held.
-                drop(channel);
-                let done =
-                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
-                return Ok(Slice::Staging(purpose, done));
             }
             let wake = channel.history_publication_wake();
             let publication_owner = channel.history_publication_request(&store)?;
@@ -1869,7 +645,7 @@ impl Flow {
                 if published.is_err() {
                     pin.retain_saved_read();
                 }
-                published.and_then(|()| channel.history_write_released(&store))
+                published
             } else {
                 Ok(())
             };
@@ -1884,25 +660,6 @@ impl Flow {
             Slice::Gone => {
                 self.cancel();
                 return Ok(RetirementStep::Done);
-            }
-            Slice::Staging(purpose, done) => {
-                if done {
-                    if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
-                        if let Some(request) = self.owners[index].take() {
-                            self.slots
-                                .release(purpose, request, self.key_body_root.is_some());
-                        }
-                    }
-                    match purpose {
-                        Purpose::Live => self.live = None,
-                        Purpose::Control => self.control = None,
-                        // Automatic own recovery owns a real History staging slot too.
-                        // Drop it only after exact-request retirement finished; the next
-                        // slice can then clean this Flow's source/verifier owners.
-                        Purpose::History => self.history = None,
-                    }
-                }
-                return Ok(RetirementStep::Progress);
             }
             Slice::Source(done, next) => (done, next),
             Slice::Publication(owner, wake) => {
@@ -1939,9 +696,6 @@ impl Flow {
         // replay root already hold every suspended continuation; the current scalar covers the
         // operation that was popped when an error interrupted it.
         self.cleanup_after = None;
-        if self.archive && request == self.retirement_request {
-            self.retirement_root_cleaned = true;
-        }
         if self.selected_request == Some(request) {
             self.selected_request = None;
         }
@@ -1958,10 +712,7 @@ impl Flow {
             .last()
             .map(|task| task.request)
             .or_else(|| self.replay.as_ref().map(|task| task.request))
-            .or(self.selected_request)
-            .or_else(|| {
-                (self.archive && !self.retirement_root_cleaned).then_some(self.retirement_request)
-            });
+            .or(self.selected_request);
         if let Some(next) = next {
             self.request = next;
             Ok(RetirementStep::Progress)
@@ -2008,21 +759,13 @@ impl Flow {
         })
     }
 
-    fn stage(&self, purpose: Purpose) -> Option<Staging> {
-        match purpose {
-            Purpose::Live => self.live.clone(),
-            Purpose::Control => self.control.clone(),
-            Purpose::History => self.history.clone(),
-        }
-    }
     fn receiver(
         &self,
         store: Arc<Store>,
-        purpose: Purpose,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
     ) -> Receiver {
-        Receiver::new(
+        let receiver = Receiver::new(
             self.shared.clone(),
             store,
             self.peer,
@@ -2030,15 +773,21 @@ impl Flow {
             self.generation,
             self.node,
             self.received.clone(),
-            self.stage(purpose),
-            purpose == Purpose::History,
-            self.key_body_root,
+            None,
+            false,
+            // The admission's root carries the live package body debt an explicit Body
+            // answer fills (`pull::Ready::key_body`): its typed refill checks it again.
+            self.admit_root.as_ref().and_then(|(held, _)| held.key_body),
             fence,
             deadline,
             Arc::clone(&self.work_committed),
             Arc::clone(&self.own_head_observed),
             self.retirement_request,
-        )
+        );
+        match &self.admit_root {
+            Some((held, _)) => receiver.with_held(held.clone()),
+            None => receiver,
+        }
     }
 
     async fn settle_received(&self, store: Arc<Store>) -> Result<()> {
@@ -2057,15 +806,6 @@ impl Flow {
             .await
             .map_err(|_| Error::Unreachable("history received flush worker stopped"))?
     }
-    fn binding(&self) -> Binding {
-        Binding {
-            room: self.room,
-            instance: self.instance,
-            epoch: self.epoch,
-            audience: self.node,
-            grant: self.generation,
-        }
-    }
 
     /// Local slices back to back, or one response quantum (ADR-037 R11). The caller retains its
     /// worker/port slot through this return, including every spawned blocking worker, even after
@@ -2074,43 +814,21 @@ impl Flow {
     pub(crate) async fn turn(
         &mut self,
         store: Arc<Store>,
-        conn: &VoxConnection,
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
-        inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
         self.waiting = false;
         self.byte_pressure = None;
-        self.body_progress = false;
         self.governance_wait = false;
         self.governance_cycles = 0;
-        self.external = None;
-        self.announcement_error = false;
-        self.announcement_active = false;
-        self.peer_busy_retry = false;
-        self.peer_answered = false;
-        // Local slices run back to back inside one turn; a slice that needs the wire, waits,
-        // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
-        // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
-        // 128-position live window drained at three positions a second (40 s), and a creator
-        // serving three joiners at once read their first posts after 30 s (#934).
+        // Local slices run back to back until a wait, completion, error, or fairness budget.
         let mut quantum_started = tokio::time::Instant::now();
         let mut slices = 0u32;
         let mut result = loop {
             let result = self
-                .turn_inner(
-                    store.clone(),
-                    conn,
-                    job,
-                    fence.clone(),
-                    deadline,
-                    inbox,
-                    inbox_generation,
-                    now,
-                )
+                .turn_inner(store.clone(), job, fence.clone(), deadline, now)
                 .await;
             let result = match result {
                 Err(Error::HistoryCapacity(pressure)) => {
@@ -2127,18 +845,11 @@ impl Flow {
             let publication_active = self.active_publication_owner().is_some();
             if result.is_err()
                 || self.waiting
-                || self.external.is_some()
-                // The actor owns the separate announcement receipt/accounting boundary. Do not
-                // let an ordinary local phase run behind it in this worker return.
-                || self
-                    .announcement
-                    .as_ref()
-                    .is_some_and(|announcement| announcement.complete)
+                || self.done()
                 || (!publication_active
                     && (slices >= LOCAL_SLICES_PER_TURN
                         || quantum_started.elapsed() >= LOCAL_TURN_BUDGET
                         || tokio::time::Instant::now() >= deadline))
-                || !self.next_slice_is_local()
             {
                 break result;
             }
@@ -2154,18 +865,7 @@ impl Flow {
                 quantum_started = tokio::time::Instant::now();
             }
         };
-        if result.as_ref().is_err_and(|error| {
-            matches!(
-                error,
-                Error::Profile(
-                    "history authorization changed"
-                        | "history authorization changed before publication"
-                        | "history authorization changed before refusal"
-                        | "live window authorization changed"
-                        | "live retry authorization changed"
-                ) | Error::StreamRefused(super::AUTHORIZATION_CHANGED)
-            )
-        }) {
+        if result.as_ref().is_err_and(authorization_changed) {
             self.authorization_changed = true;
             result = Ok(());
         }
@@ -2178,37 +878,57 @@ impl Flow {
         // retirement, which retries this same debt instead of lending it to a later transaction.
         if result.is_err() || self.authorization_changed || self.done() {
             let settlement = self.settle_received(store).await;
-            if settlement.is_err() {
-                // A stale actor callback must not publish a saved archive completion whose
-                // received bytes did not cross their durable boundary.
-                self.archive_status = None;
-            }
             if result.is_ok() {
                 settlement?;
             }
         }
-        // The one place a flow stops running. Unless this turn moved body bytes and the flow
-        // runs next on this same port, its next turn waits on a peer (a Busy answer, a refusal,
-        // a move to another member's port or back to its origin, a failed exchange) or on local
-        // work; no other body of this daemon may wait behind that. A close of the peer's
-        // connection while the flow is parked gives the slots back too (the actor).
-        if result.is_err() || !self.body_progress || self.reroute.is_some() || self.route_complete {
-            self.release_waiting_body_slots();
-        }
         result
     }
 
-    // One bounded turn uses the same stream, job, hint inbox and deadline throughout.
+    /// An admission flow that stopped short of done waits for exactly the local edge its stop
+    /// named, then runs again (design simple-sync §3): a body slot's or a publication's release,
+    /// a byte release, or the room's publication or save when another owns it. A spent slice
+    /// budget or a governance fold still folding waits for nothing: the next turn continues it.
+    /// Returns what it waited on, for diagnostics.
+    pub(crate) async fn admission_wait(
+        &mut self,
+        store: &Store,
+        fence: &Fence,
+    ) -> Result<&'static str> {
+        let (what, wake): (&'static str, Option<Wake>) = if let Some(wake) = self.slot_wait.take() {
+            ("slot", Some(wake))
+        } else if let Some(pressure) = self.byte_pressure.take() {
+            ("bytes", Some(Box::pin(pressure.released())))
+        } else if self.waiting && self.active_publication_owner().is_none() {
+            let room = self.shared.lock().await;
+            if room.post_pending() {
+                ("post_pending", Some(room.history_publication_wake()))
+            } else if room.history_publication_busy(store)? {
+                ("publication_busy", Some(room.history_publication_wake()))
+            } else {
+                ("none", None)
+            }
+        } else {
+            ("none", None)
+        };
+        if let Some(wake) = wake {
+            tokio::select! {
+                biased;
+                () = fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                () = wake => {}
+            }
+        }
+        Ok(what)
+    }
+
+    // One bounded turn uses the same stream, job and deadline throughout.
     #[allow(clippy::too_many_arguments)]
     async fn turn_inner(
         &mut self,
         store: Arc<Store>,
-        conn: &VoxConnection,
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
-        inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
         let source = Source::new(
@@ -2268,192 +988,78 @@ impl Flow {
                 }
             }
         }
-        if let Some(need) = self.key_body_root.filter(|_| !self.key_body_checked) {
-            let found = source
-                .read(job, 64 * 1024, move |room, store| {
-                    let read = room.history_read(store)?;
-                    if read.publication_busy() {
-                        return Ok(Some((true, true, room.history_publication_request(store)?)));
-                    }
-                    Ok(Some((
-                        read.history_key_body_owed(need, room.me())?,
-                        false,
-                        None,
-                    )))
-                })
-                .await?;
-            let Lookup::Found(owed) = found else {
-                self.waiting = true;
-                return Ok(());
-            };
-            let (owed, busy, owner) = owed.value;
-            if busy {
-                self.publication_owner_wait = owner;
-                self.publication_wait = true;
-                self.waiting = true;
-                return Ok(());
-            }
-            if !owed {
-                self.tasks.clear();
-                self.replay = None;
-                return Ok(());
-            }
-            self.key_body_checked = true;
-        }
         if self.tasks.is_empty() {
             if let Some(root) = self.replay.take() {
                 self.tasks.push(root);
+            } else {
+                self.next_admission_root()?;
             }
         }
-        // A publication Begin..Cleanup owner is correctness-critical and remains ahead of the
-        // announcement prefix. Once no exact publication phase is active, the scalar inventory
-        // task gets one response quantum ahead of the ordinary retained stack.
-        let announcement_task = if self.service == OutboundService::Public
-            && self.active_publication_owner().is_none()
-        {
-            self.announcement
-                .as_mut()
-                .and_then(|announcement| announcement.task.take())
-        } else {
-            None
-        };
-        let (task, announcement_task) = if let Some(task) = announcement_task {
-            self.announcement_active = true;
-            (task, true)
-        } else if let Some(task) = self.tasks.pop() {
-            // Initialization, publication-owner lookup and worker admission do not spend the
-            // fairness quantum. Only selecting an actual ordinary task does.
-            self.ordinary_turn_due = false;
-            (task, false)
-        } else {
+        let Some(task) = self.tasks.pop() else {
             return Ok(());
         };
         self.selected_request = Some(task.request);
-        // Non-archive work follows its selected operation; an archive keeps its demand root.
-        // `selected_request` separately retains the popped owner through errors and panic.
-        if !self.archive {
-            self.request = task.request;
-        }
-        let original_task = task.clone();
-        let mut retry_task = Some(Task {
-            operation: match &task.operation {
-                Operation::Wire(query) => Operation::ResumeWire(query.clone()),
-                operation => operation.clone(),
-            },
-            ..task.clone()
-        });
-        // Prefix work has its own empty/nonempty account. Preserve progress already made by the
-        // ordinary root, then restore it after the inventory exchange.
-        let ordinary_brought = announcement_task.then(|| std::mem::take(&mut self.brought));
-        let ordinary_request = announcement_task.then(|| {
-            self.announcement
-                .as_ref()
-                .map_or(self.retirement_request, |announcement| {
-                    announcement.prior_request
-                })
-        });
+        self.request = task.request;
+        let mut retry_task = Some(task.clone());
         let result = self
             .execute_task(
                 task,
                 source,
                 store,
-                conn,
                 job,
                 fence,
                 deadline,
-                inbox,
-                inbox_generation,
                 now,
-                announcement_task,
                 &mut retry_task,
             )
             .await;
-        if let Some(request) = ordinary_request {
-            self.request = request;
-        }
-        let announcement_brought = announcement_task.then(|| {
-            let brought = self.brought;
-            self.brought = ordinary_brought.unwrap_or(false);
-            brought
-        });
-        if self.refusal_retry.is_some() {
-            // The response was real, but its refusal is obsolete or local bookkeeping is
-            // busy. Restore this exact popped query before returning ownership to the actor.
-            if let Some(task) = retry_task {
-                if announcement_task {
-                    self.restore_announcement_task(task)?;
-                } else {
-                    self.push(task)?;
-                }
-            }
-            self.discovery_unavailable = None;
-            if let Some(brought) = announcement_brought {
-                if let Some(announcement) = self.announcement.as_mut() {
-                    announcement.brought |= brought;
-                }
-            }
-            self.announcement_active = false;
-            self.selected_request = None;
-            return Ok(());
-        }
         let result = match result {
             Err(Error::HistoryCapacity(pressure)) => {
                 if let Some(task) = retry_task {
-                    if announcement_task {
-                        self.restore_announcement_task(task)?;
-                    } else {
-                        self.push(task)?;
-                    }
+                    self.push(task)?;
                 }
                 self.byte_pressure = Some(*pressure);
                 self.waiting = true;
-                self.announcement_active = false;
-                if let Some(brought) = announcement_brought {
-                    if let Some(announcement) = self.announcement.as_mut() {
-                        announcement.brought |= brought;
-                    }
-                }
                 Ok(())
             }
-            Err(error) if announcement_task => {
-                // A new stream retries the inventory prefix. The ordinary stack and every local
-                // continuation remain exactly where they were when this prefix began.
-                self.restore_announcement_task(original_task)?;
-                if let Some(brought) = announcement_brought {
-                    if let Some(announcement) = self.announcement.as_mut() {
-                        announcement.brought |= brought;
-                    }
-                }
-                self.announcement_error = true;
-                self.announcement_active = false;
-                Err(error)
-            }
-            Err(
-                error @ Error::PeerRefused(
-                    crate::wire::WireError::SessionBusy | crate::wire::WireError::NotYetMember,
-                ),
-            ) => {
-                // These are the two coded, transient peer refusals paced as Busy by the port.
-                // Restore the exact popped operation before returning it to the actor: a Wire
-                // operation resumes from durable staging/cursor state, never from offset zero.
-                // If a helper consumed the retry owner, do not fabricate a replacement.
-                if let Some(task) = retry_task {
-                    self.push(task)?;
-                    self.peer_busy_retry = true;
-                }
-                Err(error)
-            }
-            Ok(()) if announcement_task => {
-                let Some(announcement) = self.announcement.as_mut() else {
-                    return Err(Error::Profile("history announcement owner missing"));
-                };
-                announcement.brought |= announcement_brought.unwrap_or(false);
-                if announcement.task.is_none() {
-                    announcement.complete = true;
-                }
-                self.announcement_active = false;
+            // What the validator refuses in an admission root's evidence (`MalformedBundle`), or
+            // a fork it records (`MalformedGovernance`), is about its author's own history: it
+            // fails that root alone, and the room's admission goes on with its next root
+            // (journey-6, y1: one entry the validator refused ended the room's whole admission
+            // and 28 roots were fetched again). The root is not fetched again: it was fetched
+            // and verified, so it stays held, waiting for the one thing that can change such a
+            // refusal, a newer committed head of its author (its next positions, their
+            // controls, its promotion), and is tried again then (r24: a failure settled as owed
+            // again was asked again at once, answered, failed again: 1,830 asks).
+            Err(Error::MalformedBundle(_) | Error::MalformedGovernance(_))
+                if self
+                    .admit_root
+                    .as_ref()
+                    .is_some_and(|(_, settled)| !settled) =>
+            {
+                self.tasks.clear();
+                self.replay = None;
+                let record = self.record.as_ref().and_then(|cell| cell.current());
+                let wait = self.admit_root.as_ref().map(|(ready, _)| {
+                    let author = ready.entry.skeleton.author_id;
+                    let size = record
+                        .as_deref()
+                        .and_then(crate::node::channel::RoomSnapshot::history)
+                        .and_then(|history| history.author(&author))
+                        .map_or(
+                            0,
+                            crate::node::channel::held_history::HeldAuthor::committed_size,
+                        );
+                    (super::pull::Need::Head { author, size }, None)
+                });
+                self.settle_root(None, wait, None);
                 Ok(())
             }
+            // Any other failure is this node's, not the root's: a store fault, a local
+            // precondition or race, the dependency stack's bound. It ends the room's admission
+            // as a failed flow (`Flow::fail`), whose retirement owns its publication and
+            // cleanup (`actor/admission.rs`). A changed authorization renews the admission
+            // instead (`turn`).
             result => result,
         };
         if result.is_ok() {
@@ -2467,1500 +1073,42 @@ impl Flow {
     #[allow(clippy::too_many_arguments)]
     async fn execute_task(
         &mut self,
-        mut task: Task,
+        task: Task,
         source: Source,
         store: Arc<Store>,
-        conn: &VoxConnection,
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
-        inbox_generation: u64,
         now: u64,
-        announcement_task: bool,
         retry_task: &mut Option<Task>,
     ) -> Result<()> {
-        let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
-        let resuming_wire = matches!(task.operation, Operation::ResumeWire(_));
+        let receiver = self.receiver(store, fence, deadline);
         match task.operation.clone() {
-            Operation::LiveWindow { author, head } => {
-                if author == self.node {
-                    // This node's own log needs no window: every position is held, and a
-                    // peer holding more of it is the own-history conflict the detector stops
-                    // the node on (ADR-037 R5), not something to fetch. The authenticated head
-                    // still settles the join. Measured before this: a creator walked her own
-                    // 10-entry log through a joiner's port for 8 s, 103 rounds, while two
-                    // other joiners' first posts waited behind it.
-                    let found = source
-                        .read(job, 256, move |channel, store| {
-                            let input = channel.history_read(store)?;
-                            Ok(input
-                                .history_head(&head)?
-                                .filter(|signed| signed.binding.author == author)
-                                .map(|signed| signed.root.leaves))
-                        })
-                        .await?;
-                    match found {
-                        Lookup::Found(found) => {
-                            self.authenticated_head = Some(super::HeadHint {
-                                author,
-                                head,
-                                size: found.value,
-                            });
-                        }
-                        Lookup::Busy => {
-                            self.push(task)?;
-                            self.waiting = true;
-                        }
-                        Lookup::Missing => {}
-                    }
-                    return Ok(());
-                }
-                let instance = self.instance;
-                let generation = self.generation;
-                let node = self.node;
-                let room = self.room;
-                let epoch = self.epoch;
-                let committed = Arc::clone(&self.work_committed);
-                enum Selection<P> {
-                    Held(LiveWindow, u64),
-                    Write(P, u64, Option<LiveWindow>),
-                }
-                let found = source
-                    .write_owned(
-                        job,
-                        (256, 4 * 1024 * 1024, false),
-                        move |channel, store| {
-                            if channel.history_instance(store)? != instance
-                                || super::authorization_generation(
-                                    store, node, room, instance, epoch,
-                                )? != generation
-                            {
-                                return Err(Error::Profile("live window authorization changed"));
-                            }
-                            let input = channel.history_read(store)?;
-                            let target = input
-                                .history_head(&head)?
-                                .ok_or(Error::MalformedAtRest("live window head missing"))?;
-                            if target.binding.author != author
-                                || target.binding.scope != crate::log::history::LogScope::Public
-                            {
-                                return Err(Error::MalformedAtRest(
-                                    "live window head binding differs",
-                                ));
-                            }
-                            let state = input
-                                .sparse_author(&author, crate::log::history::LogScope::Public)?
-                                .ok_or(Error::MalformedAtRest("live window author missing"))?;
-                            if state.observed_conflict.is_some() {
-                                return Err(Error::MalformedBundle(
-                                    "live window author has conflicting heads",
-                                ));
-                            }
-                            // A head no newer than the window's top resumes it. A newer head
-                            // selects a new window when this operation runs, even over an
-                            // unfinished one, and the selector keeps the unfinished positions
-                            // inside the new window, walked newest first after the fresh ones;
-                            // the walk then jumps the run it had already passed and resumes
-                            // the old remainder where it stopped (`LiveResume`). A flow already
-                            // fetching is not cut for the newer head (ADR-052 RG-6): it finishes
-                            // its position, then ends at that boundary so the next flow selects
-                            // the newer head. Measured before the newer head selected at all: a
-                            // joiner read the creator's next post only when his drain of her
-                            // 150-post window ended, 51–59 s on.
-                            if let Some(window) = state.live {
-                                if window.through >= target.root.leaves {
-                                    return Ok(Selection::Held(window, target.root.leaves));
-                                }
-                            }
-                            let through = target.root.leaves;
-                            drop(input);
-                            let pending = channel
-                                .prepare_history_admission(store, Some((node, generation)))?;
-                            Ok(Selection::Write(pending, through, state.live))
-                        },
-                        move |selection, store| match selection {
-                            Selection::Held(window, through) => Ok((window, through, None)),
-                            Selection::Write(pending, through, old) => pending.with(|channel| {
-                                channel
-                                    .history_write_tracked(store, &committed, |index| {
-                                        index.select_history_live_window(&author, head)
-                                    })
-                                    .map(|window| (window, through, Some(old)))
-                            }),
-                        },
-                        move |channel, _, (window, through, selected)| {
-                            if let Some(old) = selected {
-                                let prior = channel.live_resume.get(&author).copied();
-                                let resume = old.filter(|old| !old.complete()).and_then(|old| {
-                                    crate::node::channel::entry_store::sparse::LiveResume::select(
-                                        old, prior, window,
-                                    )
-                                });
-                                #[cfg(feature = "test-knobs")]
-                                eprintln!(
-                                    "live window selected author={} from={} through={} \
-                                     resume={:?}",
-                                    crate::node::link::b32_encode(&author),
-                                    window.from,
-                                    window.through,
-                                    resume.map(|resume| (resume.at, resume.to))
-                                );
-                                match resume {
-                                    Some(resume) => channel.live_resume.insert(author, resume),
-                                    None => channel.live_resume.remove(&author),
-                                };
-                            }
-                            Ok((window, through))
-                        },
-                    )
-                    .await?;
-                let found = match found {
-                    Lookup::Found(found) => found,
-                    Lookup::Missing => {
-                        self.publication_wait = true;
-                        self.publication_owner_wait = None;
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                    Lookup::Busy => {
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                };
-                let (window, target_through) = found.value;
-                // Report the exact authenticated Head(author) response that selected this
-                // operation, not a newer locally retained window that may supersede it. Join
-                // settlement must never turn an older peer echo into acknowledgement of the
-                // current own head.
-                self.authenticated_head = Some(super::HeadHint {
-                    author,
-                    head,
-                    size: target_through,
-                });
-                // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): the head's
-                // control closure goes below its ordinary-body work instead of above it, so a
-                // body is fetched and validated while a control under the head is withheld.
-                if crate::node::channel::governance::termination_admitted() {
-                    self.push_control_closure(&task, window)?;
-                }
-                if !window.complete() {
-                    self.live_visited = true;
-                    // Each staged body needs a fresh demand ID, even though its enclosing
-                    // live window is unchanged. The previous position has released both
-                    // body slots and finished its verifier work before this operation runs.
-                    let request = request_id()?;
-                    self.request = request;
-                    self.push(Task {
-                        request,
-                        operation: Operation::LiveAdvance {
-                            author,
-                            target: head,
-                            window,
-                            retry: false,
-                        },
-                        ..task.clone()
-                    })?;
-                    self.push(Task {
-                        request,
-                        operation: Operation::Tail {
-                            head: window.head,
-                            seq: window.next,
-                        },
-                        ..task.clone()
-                    })?;
-                } else {
-                    if !self.live_visited {
-                        self.live_visited = true;
-                        // This is a peer-local retry pass over only the authenticated peer's
-                        // newest window. It changes neither the durable main cursor nor the
-                        // missing-position fact until normal body admission fills that fact.
-                        // Retain it below the exact-head control work on this LIFO stack: omitted
-                        // ordinary bodies are best-effort live recovery and cannot delay Session
-                        // authorization. Any addressed key-package in the same window is a
-                        // control dependency and is fetched by that work before the retry begins.
-                        self.push(Task {
-                            operation: Operation::LiveRetry {
-                                author,
-                                window: LiveWindow {
-                                    head,
-                                    from: target_through
-                                        .saturating_sub(
-                                            crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
-                                        )
-                                        .max(1),
-                                    next: target_through,
-                                    through: target_through,
-                                },
-                            },
-                            ..task.clone()
-                        })?;
-                    }
-                }
-                // Head commitment independently authorizes bounded control closure. Run it above
-                // the ordinary-body work just retained on this LIFO stack, so governance,
-                // Session floors/support and addressed key delivery do not wait for 128 unrelated
-                // Content bodies. Collapsed proof ranges fetch none of those omitted bodies.
-                self.push_control_closure(&task, window)?;
-            }
-            Operation::LiveRetry { author, window } => {
-                if window.complete() {
-                    return Ok(());
-                }
-                let instance = self.instance;
-                let generation = self.generation;
-                let node = self.node;
-                let room = self.room;
-                let epoch = self.epoch;
-                let found = source
-                    .read(job, 128, move |channel, store| {
-                        if channel.history_instance(store)? != instance
-                            || super::authorization_generation(store, node, room, instance, epoch)?
-                                != generation
-                        {
-                            return Err(Error::Profile("live retry authorization changed"));
-                        }
-                        let input = channel.history_read(store)?;
-                        if input.publication_busy() {
-                            return Ok(None);
-                        }
-                        Ok(Some(input.missing_contains(&author, window.next)?))
-                    })
-                    .await?;
-                let found = match found {
-                    Lookup::Found(found) => found,
-                    Lookup::Missing => {
-                        self.publication_wait = true;
-                        self.publication_owner_wait = None;
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                    Lookup::Busy => {
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                };
-                if found.value {
-                    let request = request_id()?;
-                    self.request = request;
-                    self.push(Task {
-                        request,
-                        operation: Operation::LiveAdvance {
-                            author,
-                            target: window.head,
-                            window,
-                            retry: true,
-                        },
-                        ..task.clone()
-                    })?;
-                    self.push(Task {
-                        request,
-                        operation: Operation::Tail {
-                            head: window.head,
-                            seq: window.next,
-                        },
-                        ..task
-                    })?;
-                } else {
-                    self.push(Task {
-                        operation: Operation::LiveRetry {
-                            author,
-                            window: LiveWindow {
-                                next: window.next - 1,
-                                ..window
-                            },
-                        },
-                        ..task
-                    })?;
-                }
-            }
-            Operation::LiveAdvance {
-                author,
-                target,
-                window,
-                retry,
-            } => {
-                // A compacted root still owns its entry. Proof completion alone must not
-                // move the window past a body whose admission has not finished.
-                if let Some(root) = self.replay.take() {
-                    self.push(task)?;
-                    self.push(root)?;
-                    return Ok(());
-                }
-                // Proof-only pacing/hold/fail after visible progress, outside room/store locks.
-                #[cfg(feature = "test-knobs")]
-                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LIVE_WINDOW_FILE") {
-                    let path = std::path::PathBuf::from(path);
-                    let remaining = window.next.saturating_add(1).saturating_sub(window.from);
-                    if let Ok(spec) = std::fs::read_to_string(&path) {
-                        if let Some(mode) = spec
-                            .trim()
-                            .strip_prefix(&format!("{} ", crate::node::link::b32_encode(&author)))
-                        {
-                            let pause = mode
-                                .strip_prefix("pause-ms=")
-                                .and_then(|ms| ms.parse::<u64>().ok());
-                            if pause.is_some()
-                                || mode == "hold"
-                                || mode == "fail"
-                                || mode.parse::<u64>().ok() == Some(remaining)
-                            {
-                                std::fs::write(
-                                    path.with_extension("entered"),
-                                    format!("through={} remaining={remaining}\n", window.through),
-                                )
-                                .map_err(|_| Error::Profile("proof live-window marker failed"))?;
-                                if let Some(ms) = pause {
-                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                                } else if mode == "fail" {
-                                    // Fail the author's own pull before this position, as when
-                                    // the peer answers that the selected body is unavailable:
-                                    // the flow ends mid-walk and the next one re-selects.
-                                    if self.peer == author {
-                                        return Err(Error::Unreachable(
-                                            "selected current body is unavailable or cancelled",
-                                        ));
-                                    }
-                                    return Ok(());
-                                } else if path.exists() {
-                                    // Hold the author's own pull. Other providers can finish
-                                    // their other-author tasks, but cannot advance this window.
-                                    if self.peer == author {
-                                        self.push(task)?;
-                                        self.waiting = true;
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-                let instance = self.instance;
-                let generation = self.generation;
-                let node = self.node;
-                let room = self.room;
-                let epoch = self.epoch;
-                let unavailable = self.live_unavailable == Some((window.head, window.next));
-                let committed = Arc::clone(&self.work_committed);
-                let advanced = source
-                    .write_owned(
-                        job,
-                        (128, 4 * 1024 * 1024, false),
-                        move |channel, store| {
-                            if channel.history_instance(store)? != instance
-                                || super::authorization_generation(
-                                    store, node, room, instance, epoch,
-                                )? != generation
-                            {
-                                return Err(Error::Profile("live window authorization changed"));
-                            }
-                            let input = channel.history_read(store)?;
-                            let Some(header) =
-                                input.history_position_header(&author, window.next)?
-                            else {
-                                return Err(Error::MalformedAtRest(
-                                    "live window position was not published",
-                                ));
-                            };
-                            let hash = header.entry_hash();
-                            let content = header.skeleton.v2.as_ref().is_some_and(|v| {
-                                v.kind == crate::log::history::SignedEntryKind::Content
-                            });
-                            let missing = unavailable
-                                && content
-                                && input.missing_contains(&author, window.next)?;
-                            let finished = input.history_effect_finished(&hash)?;
-                            let body = !content
-                                || input.retention(&hash)?.is_some()
-                                || channel
-                                    .body_expired(header.skeleton.claimed_ms, crate::time::Ms(now));
-                            if !(missing || finished && body) {
-                                return Err(Error::MalformedAtRest(
-                                    "live window position is not complete or explicitly missing",
-                                ));
-                            }
-                            if retry {
-                                return Ok(None);
-                            }
-                            drop(input);
-                            // Past the run this walk passed before a newer head came, at once.
-                            let to = channel
-                                .live_resume
-                                .get(&author)
-                                .filter(|resume| {
-                                    resume.head == window.head
-                                        && resume.at == window.next
-                                        && !live_resume_off_mutant()
-                                })
-                                .map_or(window.next - 1, |resume| resume.to);
-                            channel
-                                .prepare_history_admission(store, Some((node, generation)))
-                                .map(|pending| Some((pending, to)))
-                        },
-                        move |pending, store| match pending {
-                            None => Ok((true, None)),
-                            Some((pending, to)) => pending.with(|channel| {
-                                channel
-                                    .history_write_tracked(store, &committed, |index| {
-                                        index.advance_history_live_window(&author, window, to)
-                                    })
-                                    .map(|advanced| (advanced, Some(to)))
-                            }),
-                        },
-                        move |channel, _, (advanced, to)| {
-                            if let (true, Some(to)) = (advanced, to) {
-                                if to + 1 < window.next {
-                                    channel.live_resume.remove(&author);
-                                }
-                                #[cfg(feature = "test-knobs")]
-                                eprintln!(
-                                    "live window passed author={} through={} at={} to={to}",
-                                    crate::node::link::b32_encode(&author),
-                                    window.through,
-                                    window.next
-                                );
-                            }
-                            Ok(advanced)
-                        },
-                    )
-                    .await?;
-                match advanced {
-                    Lookup::Found(_) => {}
-                    Lookup::Missing => {
-                        self.publication_wait = true;
-                        self.publication_owner_wait = None;
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                    Lookup::Busy => {
-                        self.push(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                }
-                self.live_unavailable = None;
-                // Position boundary (ADR-052 RG-6): this position is complete. When the same
-                // author's newer head waits in the inbox, end the walk here instead of taking
-                // the next position under the old head. The flow finishes, its hint is retired
-                // as superseded, and the next flow takes the newer head. That flow's selection
-                // keeps this window's start, so the fresh positions come first and the rest of
-                // this window follows. Nothing in flight is cancelled, and every head gets at
-                // least the one position just completed. Measured without this: a reader back
-                // 8,000 entries walked all 128 positions under its first head while the
-                // author's next entry, which the room needed before it could show any of them,
-                // waited. It showed nothing for about nine seconds.
-                if !retry
-                    && !boundary_reselect_off_mutant()
-                    && self.hint.is_some_and(|hint| {
-                        hint.author == author
-                            && inbox.newer_pending(self.room, self.hint_peer, author, hint.size)
-                    })
-                {
-                    return Ok(());
-                }
-                self.push(Task {
-                    operation: if retry {
-                        Operation::LiveRetry {
-                            author,
-                            window: LiveWindow {
-                                next: window.next - 1,
-                                ..window
-                            },
-                        }
-                    } else {
-                        Operation::LiveWindow {
-                            author,
-                            head: target,
-                        }
-                    },
-                    ..task
-                })?;
-            }
-            Operation::Tail { head, seq } => {
-                let found = source
-                    .read(job, 128, move |room, store| {
-                        let input = room.history_read(store)?;
-                        let Some(signed) = input.history_head(&head)? else {
-                            return Ok(None);
-                        };
-                        let entry = input
-                            .history_position_header(&signed.binding.author, seq)?
-                            .or(input.history_pending_header(&head, seq)?);
-                        let Some(entry) = entry else {
-                            return Ok(None);
-                        };
-                        let Some(v2) = entry.skeleton.v2.as_ref() else {
-                            return Ok(None);
-                        };
-                        let content = v2.kind == crate::log::history::SignedEntryKind::Content;
-                        let expired = content
-                            && room.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(now));
-                        let held = input.history_effect_finished(&entry.entry_hash())?
-                            && (!content
-                                || input.retention(&entry.entry_hash())?.is_some()
-                                || expired);
-                        Ok(Some((content, held, expired)))
-                    })
-                    .await?;
-                match found {
-                    Lookup::Found(value) => {
-                        let (content, held, expired) = value.value;
-                        if held {
-                            return Ok(());
-                        }
-                        self.push(Task {
-                            request: task.request,
-                            purpose: if content {
-                                Purpose::Live
-                            } else {
-                                Purpose::Control
-                            },
-                            operation: Operation::Local(LocalStep::Entry {
-                                request: task.request,
-                                head,
-                                seq,
-                                body: content && !expired,
-                                role_header: false,
-                                phase: EntryPhase::Start,
-                            }),
-                        })?;
-                    }
-                    Lookup::Missing => {
-                        self.push(task.clone())?;
-                        self.push(Task {
-                            request: task.request,
-                            purpose: Purpose::Control,
-                            operation: Operation::Wire(Query::Header { head, seq }),
-                        })?;
-                    }
-                    Lookup::Busy => {
-                        self.push(task)?;
-                        self.waiting = true;
-                    }
-                }
-            }
-            Operation::Wire(mut query) | Operation::ResumeWire(mut query) => {
-                let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
-                if resuming_wire && body {
-                    // A flow that gave its slot back while parked may find its partial ended by
-                    // another claimant; `ensure_stage` below starts that body again.
-                    let ended = match self.stage(task.purpose) {
-                        Some(staging)
-                            if body_slot(task.purpose, self.key_body_root.is_some())
-                                .is_some_and(|index| self.owners[index].is_none()) =>
-                        {
-                            let snapshot = inspect(&staging.context, job).await?;
-                            let active = staging
-                                .active
-                                .lock()
-                                .map_err(|_| Error::Profile("history activation lock failed"))?;
-                            snapshot.is_none_or(|snapshot| !active.matches(snapshot.state()))
-                        }
-                        _ => false,
-                    };
-                    if let Some(staging) = self.stage(task.purpose).filter(|_| !ended) {
-                        let snapshot = inspect(&staging.context, job)
-                            .await?
-                            .ok_or(Error::Profile("history retry state missing"))?;
-                        let active = staging
-                            .active
-                            .lock()
-                            .map_err(|_| Error::Profile("history activation lock failed"))?;
-                        let state = snapshot.state();
-                        // Public archive and own-recovery History activations have a
-                        // donor-independent audience. Live/Control remains node-bound,
-                        // including those dependencies within an archive flow.
-                        let expected_binding = Binding {
-                            audience: if task.purpose == Purpose::History
-                                && (self.archive || self.automatic_own_recovery)
-                            {
-                                [0; 32]
-                            } else {
-                                self.node
-                            },
-                            ..self.binding()
-                        };
-                        if !active.matches(state)
-                            || active.request() != task.request
-                            || active.binding() != expected_binding
-                        {
-                            return Err(Error::Profile("history retry activation changed"));
-                        }
-                        if let Some(saved) = &state.body {
-                            let exact = match query {
-                                Query::Entry { head, seq, .. } => {
-                                    head == state.bounds.head && seq == saved.seq
-                                }
-                                Query::Page { head, lo, hi, .. } => {
-                                    head == state.bounds.head && saved.seq >= lo && saved.seq <= hi
-                                }
-                                _ => false,
-                            };
-                            if !exact {
-                                return Err(Error::Profile(
-                                    "history retry body differs from request",
-                                ));
-                            }
-                            if saved.offset == saved.length {
-                                // Bytes alone establish no room effect. Resume the normal opaque
-                                // inclusion/control/authority checks under the original request.
-                                if task.purpose == Purpose::History {
-                                    self.archive_next = saved
-                                        .seq
-                                        .checked_sub(1)
-                                        .filter(|next| *next >= state.bounds.lo);
-                                    self.archive_wire_bytes =
-                                        self.archive_wire_bytes.saturating_add(saved.length);
-                                    self.push(Task {
-                                        operation: Operation::Local(LocalStep::Entry {
-                                            request: task.request,
-                                            head: state.bounds.head,
-                                            seq: saved.seq,
-                                            body: true,
-                                            role_header: false,
-                                            phase: EntryPhase::Start,
-                                        }),
-                                        ..task.clone()
-                                    })?;
-                                } else {
-                                    // Current body requests are dependencies of an already
-                                    // retained Local phase. As with normal body_ready delivery,
-                                    // resume that exact owner instead of adding a second Start.
-                                    // A nested dependency may live on tasks while an older,
-                                    // different root occupies the scalar replay slot.
-                                    let owns_body = |pending: &Task| {
-                                        pending.request == task.request
-                                            && pending.purpose == task.purpose
-                                            && matches!(pending.operation,
-                                                Operation::Local(LocalStep::Entry { request, head, seq, body: true, role_header: false, .. })
-                                                if request == task.request
-                                                    && head == state.bounds.head
-                                                    && seq == saved.seq)
-                                    };
-                                    if !self.tasks.iter().any(owns_body)
-                                        && !self.replay.as_ref().is_some_and(owns_body)
-                                    {
-                                        return Err(Error::Profile(
-                                            "completed current body has no retained local owner",
-                                        ));
-                                    }
-                                }
-                                return Ok(());
-                            }
-                            query = Query::Entry {
-                                head: state.bounds.head,
-                                seq: saved.seq,
-                                offset: saved.offset,
-                            };
-                        }
-                    }
-                }
-                if task.purpose == Purpose::History
-                    && body
-                    && self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES
-                {
-                    self.finish_archive_owned(job, &task, retry_task).await?;
-                    self.tasks.clear();
-                    return Ok(());
-                }
-                if let Query::Entry { head, seq, .. } = query {
-                    if task.purpose != Purpose::History {
-                        let mut request = task.request;
-                        let start = self
-                            .ensure_stage(task.purpose, &mut request, head, seq, job)
-                            .await;
-                        // `ensure_stage` renews the body's request in one in-memory step (the
-                        // slot, its owner, the retained Entry ask and its local owner) before
-                        // any fallible staging step. The popped task and its retry owner take
-                        // that identity before an error propagates: byte pressure and the Busy
-                        // refusals restore `retry_task`, and a retry under the old request
-                        // would wait on the slot its own renewed identity holds.
-                        if request != task.request
-                            && !renewal_kept_from_retry_mutant(start.is_err())
-                        {
-                            if let Some(retry) = retry_task
-                                .as_mut()
-                                .filter(|retry| retry.request == task.request)
-                            {
-                                retry.request = request;
-                            }
-                            task.request = request;
-                        }
-                        let start = start?;
-                        match start {
-                            StageStart::Ready => {}
-                            StageStart::Waiting => {
-                                self.push(task)?;
-                                self.waiting = true;
-                                return Ok(());
-                            }
-                            StageStart::Reclaimed => {
-                                // One bounded committed cleanup slice moved the retained
-                                // owner forward. Yield to the actor, then continue immediately.
-                                self.push(task)?;
-                                return Ok(());
-                            }
-                        }
-                        let staging = self
-                            .stage(task.purpose)
-                            .ok_or(Error::Profile("current history staging missing"))?;
-                        let snapshot = inspect(&staging.context, job).await?;
-                        let snapshot =
-                            snapshot.ok_or(Error::Profile("current history operation missing"))?;
-                        let offset = snapshot.state().body.as_ref().map_or(0, |body| body.offset);
-                        query = Query::Entry { head, seq, offset };
-                    }
-                }
-                if let (Some(need), Query::Entry { head, seq, offset }) =
-                    (self.key_body_root, &query)
-                {
-                    if *head == need.head && *seq == need.seq {
-                        query = Query::KeyBody {
-                            head: *head,
-                            author: need.target.author,
-                            hash: need.hash,
-                            seq: *seq,
-                            offset: *offset,
-                        };
-                    }
-                }
-                let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
-                let wire_request = if body {
-                    self.stage(task.purpose)
-                        .map(|s| {
-                            s.active
-                                .lock()
-                                .map(|a| a.request())
-                                .map_err(|_| Error::Profile("history activation lock failed"))
-                        })
-                        .transpose()?
-                        .unwrap_or(task.request)
-                } else {
-                    task.request
-                };
-                let exchanged = super::exchange(
-                    &receiver,
-                    conn,
-                    job.clone(),
-                    Preamble {
-                        room: self.room,
-                        epoch: self.epoch,
-                        purpose: task.purpose,
-                        request: wire_request,
-                    },
-                    query.clone(),
-                    fence,
-                    deadline,
-                    &self.introduction,
-                )
-                .await;
-                // A server from v0.4.6 to v0.4.30 refuses a Live body more than 128 positions
-                // below its head with a ProtocolLimits reset, as every server refuses a head the
-                // author has since moved more than 128 past. Neither is this connection's fault.
-                // Failed, the round put the member's port in a backoff of up to 30 s and its
-                // newest messages waited behind it. Instead the head is parked for this
-                // connection and the walk stops here; the position stays owed (and counted in
-                // `vox status`), asked again for a newer head or on another connection.
-                let refused = match (&exchanged, &query) {
-                    (
-                        Err(Error::PeerRefused(crate::wire::WireError::ProtocolLimits)),
-                        Query::Entry { head, seq, .. },
-                    ) if task.purpose == Purpose::Live => {
-                        self.tasks
-                            .iter()
-                            .find_map(|pending| match pending.operation {
-                                Operation::LiveAdvance { author, window, .. }
-                                    if window.head == *head && window.next == *seq =>
-                                {
-                                    Some((author, *head, *seq))
-                                }
-                                _ => None,
-                            })
-                    }
-                    _ => None,
-                };
-                if let Some((author, head, seq)) = refused {
-                    self.peer_answered = true;
-                    if !self
-                        .transient_decline(&source, job, inbox, inbox_generation, author, head)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    let at = |pending: &Task| match pending.operation {
-                        Operation::LiveAdvance { window, .. } => {
-                            window.head == head && window.next == seq
-                        }
-                        Operation::Local(LocalStep::Entry {
-                            head: at,
-                            seq: position,
-                            ..
-                        }) => at == head && position == seq,
-                        _ => false,
-                    };
-                    self.tasks.retain(|pending| !at(pending));
-                    if self.replay.as_ref().is_some_and(at) {
-                        self.replay = None;
-                    }
-                    #[cfg(feature = "test-knobs")]
-                    eprintln!(
-                        "live body refused author={} seq={seq}: kept owed",
-                        crate::node::link::b32_encode(&author)
-                    );
-                    self.push(Task {
-                        operation: Operation::ReclaimUnavailable,
-                        ..task
-                    })?;
-                    return Ok(());
-                }
-                let mut result = exchanged?;
-                self.peer_answered = true;
-                if matches!(
-                    result.status,
-                    Status::BodyNotHeld | Status::EvidenceUnavailable
-                ) {
-                    let reason = if result.status == Status::BodyNotHeld {
-                        "body_not_held"
-                    } else {
-                        "evidence_unavailable"
-                    };
-                    let known_author = |head| {
-                        self.authenticated_head
-                            .filter(|known| known.head == head)
-                            .map(|known| known.author)
-                            .or_else(|| {
-                                self.archive_selected_author
-                                    .filter(|(selected_head, _)| *selected_head == head)
-                                    .map(|(_, author)| author)
-                            })
-                    };
-                    self.unavailable_response = match &query {
-                        Query::Entry { head, seq, .. } => Some(UnavailableResponse {
-                            author: known_author(*head),
-                            head: *head,
-                            lo: *seq,
-                            hi: *seq,
-                            reason,
-                        }),
-                        Query::Page { head, lo, hi, .. } => Some(UnavailableResponse {
-                            author: known_author(*head),
-                            head: *head,
-                            lo: *lo,
-                            hi: *hi,
-                            reason,
-                        }),
-                        Query::KeyBody {
-                            head, author, seq, ..
-                        } => Some(UnavailableResponse {
-                            author: Some(*author),
-                            head: *head,
-                            lo: *seq,
-                            hi: *seq,
-                            reason,
-                        }),
-                        _ => None,
-                    };
-                }
-                if let Some(token) = result.offered_availability {
-                    self.availability_ack = Some(token);
-                }
-                self.body_progress |= result.body_progress;
-                if let Some(inventory) = result.inventory.as_ref() {
-                    source
-                        .offer_key_catalog(job, inventory.key_catalog, conn.serial())
-                        .await?;
-                    let offered = source
-                        .offer_role(
-                            job,
-                            inbox,
-                            inbox_generation,
-                            self.room,
-                            conn.serial(),
-                            inventory.role,
-                        )
-                        .await?;
-                    self.offered = self.offered.saturating_add(offered.added as u64);
-                    if offered.full {
-                        return Err(Error::Unreachable("history role hint capacity busy"));
-                    }
-                    // MP-9: the one listed fork this node has not frozen is asked of this peer.
-                    if let Some(author) = inventory.fork {
-                        self.push(Task {
-                            request: task.request,
-                            purpose: Purpose::Control,
-                            operation: Operation::Wire(Query::Fork(author)),
-                        })?;
-                    }
-                    // MP-9 (rule 6): one unresolved comparison request of this peer.
-                    if let Some(query) = inventory.ask.clone() {
-                        self.inventory_ask = Some(query.clone());
-                        self.push(Task {
-                            request: task.request,
-                            purpose: Purpose::Control,
-                            operation: Operation::Wire(query),
-                        })?;
-                    }
-                }
-                let brought_now = result.brought || result.body_progress;
-                self.brought |= brought_now;
-                if brought_now {
-                    self.work_committed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                if announcement_task {
-                    if result.status == Status::Busy {
-                        self.restore_announcement_task(task)?;
-                        self.waiting = true;
-                        return Ok(());
-                    }
-                    if result.status != Status::Complete
-                        || result.continuation.is_some()
-                        || !result.needs.is_empty()
-                        || !result.verifiers.is_empty()
-                        || result.body_ready.is_some()
-                        || result.role_ready.is_some()
-                        || !result.heads.is_empty()
-                        || result.departure_receipt.is_some()
-                    {
-                        return Err(Error::MalformedBundle(
-                            "history announcement inventory response",
-                        ));
-                    }
-                    let Some(inventory) = result.inventory.take() else {
-                        return Err(Error::MalformedBundle(
-                            "history announcement inventory missing",
-                        ));
-                    };
-                    for page in inventory.hints.chunks(64) {
-                        let offered = source
-                            .offer_inventory(
-                                job,
-                                inbox,
-                                inbox_generation,
-                                self.room,
-                                conn.serial(),
-                                page,
-                            )
-                            .await?;
-                        self.offered = self.offered.saturating_add(offered.added as u64);
-                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
-                        let added = offered.added != 0;
-                        #[cfg(feature = "test-knobs")]
-                        if added {
-                            eprintln!("vox: RG7_HINT_OFFERED announcement count={}", offered.added);
-                        }
-                        if added {
-                            self.work_committed
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
-                    *retry_task = None;
-                    return Ok(());
-                }
-                if self.route_origin.is_some()
-                    && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
-                {
-                    self.route_complete = true;
-                }
-                if self.departure_probe {
-                    // A stale/absent echo is not receipt. Keep the room and retry only this
-                    // bounded head request through the existing port backoff.
-                    if result.status != Status::Complete || result.departure_receipt != self.hint {
-                        return Err(Error::Unreachable(
-                            "peer has not acknowledged the current departure head",
-                        ));
-                    }
-                    self.authenticated_head = result.departure_receipt;
-                    self.departure_receipt = result.departure_receipt;
-                    return Ok(());
-                }
-                // Inventory is a hint. The first signed Head(author) response selects the
-                // newest window before any entry/body work. The durable selector resumes an
-                // unfinished window while live-eligible; aging retires demand, never saved
-                // evidence. No hint retargets an in-progress entry dependency or proof.
-                if let Query::Head(author) = query {
-                    for head in &result.heads {
-                        if head.author == author {
-                            if author == self.node {
-                                if self.local_own_discovery {
-                                    self.discovery_reply =
-                                        Some((*head, conn.serial(), self.availability_captured));
-                                }
-                                if task.purpose == Purpose::Control && !self.local_own_discovery {
-                                    if self.hint.is_some_and(|hint| {
-                                        hint.author == author && hint.size > head.size
-                                    }) {
-                                        self.receipt_lower = result
-                                            .own_head_incarnations
-                                            .map(|incarnations| (conn.serial(), incarnations));
-                                    }
-                                    self.mine_held = Some(
-                                        self.mine_held.map_or(head.size, |m| m.max(head.size)),
-                                    );
-                                }
-                            }
-                            // A repeated signed head remains the peer's exact current answer.
-                            // Busy handling below retains the dependency and applies the named
-                            // port backoff; no count of identical answers may dispose its root.
-                            self.last_head = Some(*head);
-                        }
-                        if head.author == author
-                            && self.hint.is_some_and(|hint| hint.author == author)
-                        {
-                            let receipt = result.departure_receipt == Some(*head);
-                            for pending in &mut self.tasks {
-                                if matches!(pending.operation, Operation::LiveWindow { .. }) {
-                                    pending.operation = Operation::LiveWindow {
-                                        author,
-                                        head: head.head,
-                                    };
-                                }
-                            }
-                            #[cfg(feature = "test-knobs")]
-                            if receipt && task.purpose == Purpose::Live {
-                                if let Some(path) = std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
-                                    .map(std::path::PathBuf::from)
-                                    .filter(|path| path.is_file())
-                                {
-                                    let _ = std::fs::write(path.with_extension("live"), b"live");
-                                }
-                            }
-                            if receipt {
-                                if task.purpose == Purpose::Control
-                                    && result.status == Status::Complete
-                                {
-                                    self.departure_receipt = Some(*head);
-                                }
-                                self.authenticated_head = Some(*head);
-                                // This exact head is already held locally; it needs no
-                                // Header/Proof/Body work on this flow.
-                                self.tasks.retain(|pending| {
-                                    !matches!(pending.operation, Operation::LiveWindow { .. })
-                                });
-                            }
-                        }
-                    }
-                }
-                if matches!(query, Query::KeyAvailability { .. })
-                    && result.status == Status::Complete
-                {
-                    self.key_availability_result = result.key_availability;
-                }
-                if let Some(inventory) = result.inventory {
-                    for page in inventory.hints.chunks(64) {
-                        let offered = source
-                            .offer_inventory(
-                                job,
-                                inbox,
-                                inbox_generation,
-                                self.room,
-                                conn.serial(),
-                                page,
-                            )
-                            .await?;
-                        self.offered = self.offered.saturating_add(offered.added as u64);
-                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
-                        let added = offered.added != 0;
-                        #[cfg(feature = "test-knobs")]
-                        if added {
-                            eprintln!("vox: RG7_HINT_OFFERED ordinary count={}", offered.added);
-                        }
-                        if added {
-                            self.work_committed
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
-                }
-                if matches!(result.status, Status::BodyNotHeld | Status::EvidenceUnavailable)
-                    && self.key_body_root.is_some_and(|debt| {
-                        matches!(query, Query::KeyBody { head, seq, .. } if head == debt.head && seq == debt.seq)
-                    })
-                {
-                    self.key_body_unavailable = Some(if result.status == Status::BodyNotHeld {
-                        KeyBodyUnavailable::Body
-                    } else {
-                        KeyBodyUnavailable::Evidence
-                    });
-                    self.tasks.clear();
-                    self.replay = None;
-                    self.push(Task { operation: Operation::ReclaimKeyUnavailable, ..task })?;
-                    return Ok(());
-                }
-                if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
-                    let Query::Entry { head, seq, .. } = query else {
-                        return Err(Error::MalformedBundle(
-                            "live body refusal has no exact entry",
-                        ));
-                    };
-                    // BodyNotHeld is local availability, not a durable authority refusal.
-                    // Park this head for this connection to avoid the FX-29 re-pull loop;
-                    // authenticated progress or a new connection may offer it again.
-                    let author = self
-                        .tasks
-                        .iter()
-                        .find_map(|pending| match pending.operation {
-                            Operation::LiveAdvance { author, window, .. }
-                                if window.head == head && window.next == seq =>
-                            {
-                                Some(author)
-                            }
-                            _ => None,
-                        });
-                    if let Some(author) = author {
-                        if !self
-                            .transient_decline(&source, job, inbox, inbox_generation, author, head)
-                            .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    if let Some(hint) = self.hint {
-                        if !self
-                            .transient_decline(
-                                &source,
-                                job,
-                                inbox,
-                                inbox_generation,
-                                hint.author,
-                                hint.head,
-                            )
-                            .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    if !self.tasks.iter().any(|pending| matches!(pending.operation,
-                        Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
-                        return Err(Error::MalformedBundle("live body refusal is outside the selected window"));
-                    }
-                    // Keep the authenticated header as a missing position, without applying
-                    // a content effect or treating the peer's refusal as authenticated expiry.
-                    // Busy, cancellation and transport failure never enter this path.
-                    self.live_unavailable = Some((head, seq));
-                    let is_entry = |pending: &Task| {
-                        matches!(pending.operation,
-                        Operation::Local(LocalStep::Entry { head: at, seq: position, .. }) if at == head && position == seq)
-                    };
-                    self.tasks.retain(|pending| !is_entry(pending));
-                    if self.replay.as_ref().is_some_and(is_entry) {
-                        self.replay = None;
-                    }
-                    self.push(Task {
-                        operation: Operation::ReclaimUnavailable,
-                        ..task.clone()
-                    })?;
-                    self.push(Task {
-                        purpose: Purpose::Control,
-                        operation: Operation::Local(LocalStep::Entry {
-                            request: task.request,
-                            head,
-                            seq,
-                            body: false,
-                            role_header: false,
-                            phase: EntryPhase::Start,
-                        }),
-                        ..task
-                    })?;
-                    return Ok(());
-                }
-                if matches!(result.status, Status::BodyNotHeld | Status::Cancelled) {
-                    if self.archive && body {
-                        self.finish_archive_owned(job, &task, retry_task).await?;
-                        self.tasks.clear();
-                        return Ok(());
-                    }
-                    if result.status == Status::BodyNotHeld {
-                        // This source cannot fill the body now. Park the exact head for
-                        // this connection, without asserting a global absence.
-                        if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
-                            let head = *head;
-                            if let Some(author) = self.head_author(&source, job, head).await? {
-                                if !self
-                                    .transient_decline(
-                                        &source,
-                                        job,
-                                        inbox,
-                                        inbox_generation,
-                                        author,
-                                        head,
-                                    )
-                                    .await?
-                                {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                    return Err(Error::Unreachable(
-                        "selected current body is unavailable or cancelled",
-                    ));
-                }
-                #[cfg(feature = "test-knobs")]
-                if result.status == Status::EvidenceUnavailable {
-                    eprintln!("history evidence unavailable query={query:?}");
-                }
-                if result.status == Status::EvidenceUnavailable
-                    && (matches!(query, Query::Fork(_) | Query::HeadById(_))
-                        || self.inventory_ask.as_ref() == Some(&query))
-                {
-                    // A listed proof, or the comparison step an inventory asked, that is not
-                    // served records nothing and fails nothing: the next inventory may ask
-                    // again (MP-9).
-                    return Ok(());
-                }
-                if result.status == Status::EvidenceUnavailable && !self.archive {
-                    if self.local_own_discovery {
-                        self.discovery_unavailable =
-                            Some((conn.serial(), self.availability_captured));
-                    }
-                    if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
-                        && !self.departure_probe
-                        && self.last_head.is_none()
-                        && self.replay.is_none()
-                    {
-                        // Inventory is an unauthoritative scalar hint. A peer that no longer
-                        // holds its initially named head, or has not yet completed our echo,
-                        // retires only this hint. Neither is a transport failure, and backing off
-                        // the healthy room/peer port can strand a later fresh head behind it.
-                        // Third-party heads route to their author below; dependency failures
-                        // after a head was selected remain hard failures.
-                        // Keep the unchanged head parked on this connection; a fresh
-                        // connection or changed advertisement is a new reason to ask.
-                        match (&query, self.hint) {
-                            (Query::Head(author), Some(hint)) if hint.author == *author => {
-                                if !self
-                                    .transient_decline(
-                                        &source,
-                                        job,
-                                        inbox,
-                                        inbox_generation,
-                                        *author,
-                                        hint.head,
-                                    )
-                                    .await?
-                                {
-                                    return Ok(());
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.tasks.clear();
-                        return Ok(());
-                    }
-                    if !self.departure_probe {
-                        let dependency = match query {
-                            Query::Head(author) => self.hint.filter(|hint| hint.author == author),
-                            Query::Header { head, .. }
-                            | Query::Proof { head, .. }
-                            | Query::Entry { head, .. }
-                            | Query::KeyBody { head, .. }
-                            | Query::Page { head, .. } => {
-                                match source
-                                    .read(
-                                        job,
-                                        std::mem::size_of::<Option<Digest32>>(),
-                                        move |room, store| {
-                                            Ok(Some(
-                                                room.history_read(store)?.history_head(&head)?.map(
-                                                    |signed| super::HeadHint {
-                                                        author: signed.binding.author,
-                                                        head,
-                                                        size: signed.root.leaves,
-                                                    },
-                                                ),
-                                            ))
-                                        },
-                                    )
-                                    .await?
-                                {
-                                    Lookup::Found(found) => found.value,
-                                    Lookup::Busy => {
-                                        self.push(task)?;
-                                        self.waiting = true;
-                                        return Ok(());
-                                    }
-                                    Lookup::Missing => None,
-                                }
-                            }
-                            Query::Inventory
-                            | Query::KeyAvailability { .. }
-                            | Query::Context(_)
-                            | Query::Fork(_)
-                            | Query::HeadById(_) => None,
-                        };
-                        // Park this source's exact unavailable dependency, and try the
-                        // author through the existing reroute when it is another peer.
-                        if let Some(dependency) = dependency {
-                            if !self
-                                .transient_decline(
-                                    &source,
-                                    job,
-                                    inbox,
-                                    inbox_generation,
-                                    dependency.author,
-                                    dependency.head,
-                                )
-                                .await?
-                            {
-                                return Ok(());
-                            }
-                        }
-                        if dependency.is_some_and(|head| {
-                            head.author != self.peer && head.author != self.node
-                        }) {
-                            // Keep the exact refused query and its full continuation owned by
-                            // this flow. The actor moves it to the dependency author's port for
-                            // one wire turn, then returns the same flow to this advertising peer.
-                            // No missing evidence is accepted and no whole-head surrogate can
-                            // complete without satisfying this exact query.
-                            self.push(task)?;
-                            self.reroute = dependency.map(|head| head.author);
-                            return Ok(());
-                        }
-                    }
-                    return Err(Error::Unreachable(
-                        "required current evidence is unavailable",
-                    ));
-                }
-                if result.status == Status::Busy {
-                    // Retain the exact query/cursor. Peer Busy keeps its port pacing; a local
-                    // publication instead resumes through its owner or physical release.
-                    let retry = Task {
-                        operation: if body {
-                            Operation::ResumeWire(query)
-                        } else {
-                            task.operation.clone()
-                        },
-                        ..task
-                    };
-                    self.push(retry)?;
-                    *retry_task = None;
-                    self.waiting = true;
-                    if result.local_publication_busy {
-                        let readiness = source.publication_readiness(job).await?;
-                        if let Lookup::Found(readiness) = readiness {
-                            let readiness = readiness.value;
-                            self.publication_owner_wait = None;
-                            if !readiness.busy {
-                                self.waiting = false;
-                            } else if readiness
-                                .owner
-                                .is_some_and(|owner| self.prioritize_publication_owner(owner))
-                            {
-                                self.publication_wait = false;
-                                self.waiting = false;
-                            } else {
-                                self.publication_wait = readiness.owner.is_some();
-                                self.publication_owner_wait = readiness.owner;
-                                self.slot_wait = Some(readiness.wake);
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                if result.status == Status::EvidenceUnavailable {
-                    if self.archive && body {
-                        self.finish_archive_owned(job, &task, retry_task).await?;
-                        self.tasks.clear();
-                    } else {
-                        self.push(task)?;
-                        self.waiting = true;
-                    }
-                    return Ok(());
-                }
-                if self.archive && body {
-                    if let Some((head, seq, _)) = result.role_ready {
-                        self.archive_next = seq
-                            .checked_sub(1)
-                            .filter(|next| matches!(query, Query::Page { lo, .. } if *next >= lo));
-                        self.push(Task {
-                            request: wire_request,
-                            purpose: Purpose::History,
-                            operation: Operation::Local(LocalStep::Entry {
-                                request: wire_request,
-                                head,
-                                seq,
-                                body: false,
-                                role_header: true,
-                                phase: EntryPhase::Start,
-                            }),
-                        })?;
-                    } else if result.body_ready.is_none() {
-                        // The one requested quantum ended. Its exact body/page continuation is
-                        // already durable; only a new explicit Resume may request more bytes.
-                        self.finish_archive_owned(job, &task, retry_task).await?;
-                        self.tasks.clear();
-                        return Ok(());
-                    } else {
-                        let staging = self
-                            .history
-                            .as_ref()
-                            .ok_or(Error::Profile("archive staging missing"))?;
-                        let state = inspect(&staging.context, job)
-                            .await?
-                            .ok_or(Error::Profile("archive state missing"))?;
-                        if let Some(body) = &state.state().body {
-                            self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
-                            self.archive_wire_bytes =
-                                self.archive_wire_bytes.saturating_add(body.length);
-                            self.push(Task {
-                                request: wire_request,
-                                purpose: Purpose::History,
-                                operation: Operation::Local(LocalStep::Entry {
-                                    request: wire_request,
-                                    head: state.state().bounds.head,
-                                    seq: body.seq,
-                                    body: true,
-                                    role_header: false,
-                                    phase: EntryPhase::Start,
-                                }),
-                            })?;
-                        }
-                    }
-                }
-                // No demand helper follows these derived tasks. In particular a role-only
-                // header needs no body inspect after its exact Local continuation was pushed.
-                *retry_task = None;
-                for query in result.needs.into_iter().rev() {
-                    self.push(Task {
-                        request: task.request,
-                        purpose: Purpose::Control,
-                        operation: if matches!(query, Query::Proof { .. }) {
-                            Operation::LocalProof(query)
-                        } else {
-                            Operation::Wire(query)
-                        },
-                    })?;
-                }
-                for binding in result.verifiers.into_iter().rev() {
-                    self.push(Task {
-                        request: binding.request,
-                        purpose: Purpose::Control,
-                        operation: Operation::Local(LocalStep::Verify(binding)),
-                    })?;
-                }
-            }
             Operation::LocalProof(query) => {
+                let before = self.record.as_ref().and_then(|cell| cell.current());
                 match receiver
                     .local_proof(job, task.request, query.clone())
                     .await?
                 {
-                    LocalProof::AlreadyHeld => {}
                     LocalProof::Verified(binding) => self.push(Task {
                         request: binding.request,
-                        purpose: Purpose::Control,
                         operation: Operation::Local(LocalStep::Verify(binding)),
                     })?,
-                    LocalProof::Missing => self.push(Task {
-                        request: task.request,
-                        purpose: Purpose::Control,
-                        operation: Operation::Wire(query),
-                    })?,
+                    LocalProof::Missing => {
+                        // Not provable from this node's own rows: the frontier keeps the need.
+                        let room = Arc::clone(&self.shared).lock_owned().await;
+                        let need = Self::resolve_need(
+                            &room.history_read(&self.cleanup_store)?,
+                            before.as_deref(),
+                            None,
+                            Some(&query),
+                        )?;
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.settle_root(None, need, None);
+                        drop(room);
+                        return Ok(());
+                    }
                     LocalProof::Busy => {
                         self.push(task)?;
                         *retry_task = None;
@@ -3989,28 +1137,98 @@ impl Flow {
                 }
             }
             Operation::Local(step) => {
+                let before = self.record.as_ref().and_then(|cell| cell.current());
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
-                if let Some(debt) = self.key_body_root {
-                    if matches!(step, LocalStep::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
-                        && result.published.is_some_and(|hash| hash != debt.hash)
+                self.controls_ready |= result.controls_ready;
+                if self.frontier.is_some() {
+                    // An admission flow fetches nothing: a dependency on evidence or a body this
+                    // node does not hold ends it, and its entries wait for that need, held by the
+                    // node's frontier, which a connection's loop asks for (design §1).
+                    // A proof is first built from this node's own rows (`LocalProof`, below).
+                    let wire = match &result.need {
+                        Some(LocalNeed::Wire(Query::Proof { .. })) => None,
+                        Some(LocalNeed::Wire(query)) => Some(Some(query.clone())),
+                        Some(LocalNeed::StagedBody | LocalNeed::KeyBodyRetired) => Some(None),
+                        _ => None,
+                    };
+                    if let Some(query) = wire {
+                        // The entry of a position this node has not admitted (a control
+                        // source's entry or body): the root waits for that position's admission.
+                        // It is registered under the room's lock, so the position is either not
+                        // admitted yet (its admission moves the root to the ready set) or
+                        // admitted (then its need is the ordinary one, met at once by the next
+                        // plan). A header, a proof or coverage is waited for as itself.
+                        let room = Arc::clone(&self.shared).lock_owned().await;
+                        let root = self.admit_root.as_ref().map(|(ready, _)| {
+                            (ready.entry.skeleton.author_id, ready.entry.skeleton.seq)
+                        });
+                        let entry = match (&query, &step, &result.need) {
+                            (Some(Query::Entry { head, seq, .. }), _, _)
+                            | (
+                                None,
+                                LocalStep::Entry { head, seq, .. },
+                                Some(LocalNeed::StagedBody),
+                            ) => Some((*head, *seq)),
+                            _ => None,
+                        };
+                        let at = match entry {
+                            Some((head, seq)) => {
+                                let read = room.history_read(&self.cleanup_store)?;
+                                match read.history_head(&head)? {
+                                    Some(target)
+                                        if Some((target.binding.author, seq)) != root
+                                            && read
+                                                .history_position_header(
+                                                    &target.binding.author,
+                                                    seq,
+                                                )?
+                                                .is_none() =>
+                                    {
+                                        Some((target.binding.author, seq))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            None => None,
+                        };
+                        let need = Self::resolve_need(
+                            &room.history_read(&self.cleanup_store)?,
+                            before.as_deref(),
+                            Some(&step),
+                            query.as_ref(),
+                        )?;
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.settle_root(None, need, at);
+                        drop(room);
+                        return Ok(());
+                    }
+                    // Every publication settles by author and position, whatever head its step
+                    // named: the root's own, or a nested dependency's (a control source or a
+                    // checkpoint target), whose waiters it releases at once.
+                    if let (Some(_), LocalStep::Entry { head, seq, .. }) = (result.published, step)
                     {
-                        return Err(Error::MalformedAtRest(
-                            "recipient body completion changed entry",
-                        ));
+                        let author = match self
+                            .admit_root
+                            .as_ref()
+                            .filter(|(ready, _)| ready.head == head)
+                        {
+                            Some((ready, _)) => Some(ready.entry.skeleton.author_id),
+                            None => {
+                                let room = Arc::clone(&self.shared).lock_owned().await;
+                                let read = room.history_read(&self.cleanup_store)?;
+                                read.history_head(&head)?.map(|head| head.binding.author)
+                            }
+                        };
+                        if let Some(author) = author {
+                            self.settle_root(Some((author, seq)), None, None);
+                        }
                     }
                 }
                 // The returned next/need now owns the continuation. Archive finalization
                 // installs its own retry instead of duplicating a next phase pushed below.
                 *retry_task = None;
                 if let Some(next) = result.next {
-                    if matches!(next, LocalStep::Entry { head, seq, phase: EntryPhase::Effect(_), .. }
-                        if self.live_unavailable == Some((head, seq)))
-                    {
-                        // Header publication and its missing-body index are durable. Do not
-                        // manufacture a completed effect for a body this peer did not supply.
-                        self.published = true;
-                        return Ok(());
-                    }
                     let continuation = Task {
                         operation: Operation::Local(next),
                         ..task.clone()
@@ -4022,11 +1240,7 @@ impl Flow {
                             ..
                         } | LocalStep::Control { .. }
                     );
-                    if !self.archive
-                        && self.required_root.is_none()
-                        && result.need.is_some()
-                        && rederive
-                    {
+                    if result.need.is_some() && rederive {
                         // Keep the oldest exact root in the scalar replay slot. Once that slot is
                         // occupied, retain each nested continuation on the existing bounded task
                         // stack: the dependency pushed below executes first, then the exact entry
@@ -4079,67 +1293,30 @@ impl Flow {
                     self.published = true;
                     self.rendered |= result.rendered;
                     self.governance |= result.governance;
-                    if matches!(step, LocalStep::Entry { head, seq, .. }
-                        if self.required_root == Some((head, seq)))
-                    {
-                        self.required_root = None;
-                    }
-                    if self.stage(task.purpose).is_some() {
-                        self.push(Task {
-                            operation: Operation::Reclaim(task.purpose),
-                            ..task.clone()
-                        })?;
-                    }
                 }
                 match result.need {
                     Some(LocalNeed::Wire(query)) => {
-                        let purpose = if matches!(query, Query::Entry { .. }) {
-                            task.purpose
-                        } else {
-                            Purpose::Control
-                        };
                         self.push(Task {
                             request: task.request,
-                            purpose,
-                            operation: if matches!(query, Query::Proof { .. }) {
-                                Operation::LocalProof(query)
-                            } else {
-                                Operation::Wire(query)
-                            },
+                            operation: Operation::LocalProof(query),
                         })?;
                     }
                     Some(LocalNeed::KeyBodyRetired) => {
-                        if self.key_body_root.is_none() {
+                        if self
+                            .admit_root
+                            .as_ref()
+                            .and_then(|(held, _)| held.key_body)
+                            .is_none()
+                        {
                             return Err(Error::MalformedAtRest("retired key body has no owner"));
                         }
                         self.tasks.clear();
                         self.replay = None;
-                        self.push(Task {
-                            operation: Operation::ReclaimKeyUnavailable,
-                            ..task
-                        })?;
                     }
                     Some(LocalNeed::StagedBody) => {
-                        let LocalStep::Entry { head, seq, .. } = step else {
-                            return Err(Error::MalformedAtRest("body dependency has no entry"));
-                        };
-                        if task.purpose == Purpose::History {
-                            self.finish_archive_owned(job, &task, retry_task).await?;
-                            self.tasks.clear();
-                        } else {
-                            self.push(Task {
-                                operation: Operation::Wire(Query::Entry {
-                                    head,
-                                    seq,
-                                    offset: 0,
-                                }),
-                                ..task
-                            })?;
-                        }
-                    }
-                    Some(LocalNeed::Entry { head, seq }) if self.archive => {
-                        self.external = Some((head, seq));
-                        self.waiting = true;
+                        return Err(Error::MalformedAtRest(
+                            "admission body need was not settled",
+                        ));
                     }
                     Some(LocalNeed::Entry { head, seq }) => {
                         // A distinct dependency starts a distinct staging activation. Reusing
@@ -4151,7 +1328,6 @@ impl Flow {
                         self.request = request;
                         self.push(Task {
                             request,
-                            purpose: Purpose::Control,
                             operation: Operation::Local(LocalStep::Entry {
                                 request,
                                 head,
@@ -4169,7 +1345,6 @@ impl Flow {
                     }) => {
                         self.push(Task {
                             request: task.request,
-                            purpose: Purpose::Control,
                             operation: Operation::Local(LocalStep::Control {
                                 head,
                                 through,
@@ -4183,35 +1358,6 @@ impl Flow {
                     })?,
                     None => {}
                 }
-            }
-            Operation::Reclaim(purpose) => {
-                if !self.reclaim_stage(purpose, job, false).await? {
-                    self.push(task)?;
-                } else if self.archive
-                    && self.tasks.is_empty()
-                    && !self.archive_continue(job).await?
-                {
-                    self.finish_archive_owned(job, &task, retry_task).await?;
-                }
-            }
-            Operation::ReclaimKeyUnavailable => {
-                if !self.reclaim_stage(Purpose::Control, job, true).await? {
-                    self.push(task)?;
-                }
-            }
-            Operation::ReclaimUnavailable => {
-                if let Some(root) = self.replay.take() {
-                    self.push(task)?;
-                    self.push(root)?;
-                    return Ok(());
-                }
-                if !self.reclaim_stage(Purpose::Live, job, true).await? {
-                    self.push(task)?;
-                }
-            }
-            Operation::FinishArchive => {
-                self.finish_archive(job).await?;
-                self.tasks.clear();
             }
             Operation::Governance => {
                 let generation = self.generation;
@@ -4231,7 +1377,7 @@ impl Flow {
                             }
                             channel.prepare_history_governance_projection(crate::time::Ms(now))
                         },
-                        |pending, store| Ok(pending.run(store)),
+                        |pending, store, _| Ok(pending.run(store)),
                         |channel, store, completed| {
                             channel.finish_history_governance_projection(store, completed)
                         },
@@ -4262,391 +1408,38 @@ impl Flow {
         }
         Ok(())
     }
-    /// Claim `purpose`'s body slot and stage the body at `head`/`seq`. When another claimant
-    /// ended this flow's partial while the flow held no slot (`release_waiting_body_slots`),
-    /// the body starts again under a fresh request: the slot, its owner, the retained Entry ask
-    /// and its local owner are renamed and the fresh request is written back to `request` in
-    /// one step, which can fail only before it changes anything (`request_id`) and comes before
-    /// any fallible staging step; the caller carries `request` to the popped task and its retry
-    /// owner whether this returns `Ok` or `Err`.
-    async fn ensure_stage(
-        &mut self,
-        purpose: Purpose,
-        request: &mut RequestId,
-        head: Digest32,
-        seq: u64,
-        job: &Job,
-    ) -> Result<StageStart> {
-        let is_key = self.key_body_root.is_some() && purpose == Purpose::Control;
-        // A slot held by a sibling flow of this node is a local wait with an exact release
-        // edge, for every slot, not a Busy wait (measured when it was judged Busy: four readers,
-        // 90 restarts of a reader's flow on the author's port in 60 s, ~100 rows each).
-        let wake = body_slot(purpose, is_key).map(|index| self.slots.released(index));
-        if !self.slots.claim(purpose, *request, is_key) {
-            self.slot_wait = wake.map(|wake| {
-                wake as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
-            });
-            return Ok(StageStart::Waiting);
-        }
-        if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
-            self.owners[index] = Some(*request);
-        }
-        if let Some(staging) = self.stage(purpose) {
-            let snapshot = inspect(&staging.context, job)
-                .await?
-                .ok_or(Error::Profile("current history state missing"))?;
-            let current = staging
-                .active
-                .lock()
-                .map_err(|_| Error::Profile("history activation lock failed"))?
-                .matches(snapshot.state());
-            if current {
-                if snapshot.state().bounds.head == head && snapshot.state().bounds.lo == seq {
-                    return Ok(StageStart::Ready);
-                }
-                return Err(Error::Profile("current body slot belongs to another entry"));
-            }
-            // The slot now held again is this flow's; the record is another claimant's or ended.
-            // That claimant owns its cleanup. This body starts again from its first byte under a
-            // fresh request: the ended one may never be activated again.
-            match purpose {
-                Purpose::Live => self.live = None,
-                Purpose::Control => self.control = None,
-                Purpose::History => {}
-            }
-            let fresh = self.renew_body_request(*request, purpose)?;
-            self.slots.rename(purpose, *request, fresh, is_key);
-            if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
-                self.owners[index] = Some(fresh);
-            }
-            *request = fresh;
-            #[cfg(feature = "test-knobs")]
-            {
-                eprintln!("history body renewed purpose={purpose:?}");
-                // Proof-only: the staging after a renewal answers byte pressure once, while the
-                // file exists, as its first byte reservation (`demand::inspect`) does when the
-                // pool is full.
-                if let Some(path) = std::env::var_os("VOX_TEST_RENEWAL_PRESSURE_FILE") {
-                    if std::fs::remove_file(&path).is_ok() {
-                        eprintln!(
-                            "vox: VOX_TEST_RENEWAL_PRESSURE_FILE answered byte pressure after a \
-                             renewal"
-                        );
-                        return Err(Error::HistoryCapacity(Box::new(job.byte_pressure(1)?)));
-                    }
-                }
-            }
-        }
-        let request = *request;
-        let context = match purpose {
-            Purpose::Live => self
-                .live_context
-                .clone()
-                .ok_or(Error::Profile("live context missing"))?,
-            Purpose::Control => self.control_context.clone(),
-            Purpose::History => return Err(Error::Profile("archive activation missing")),
-        };
-        let binding = self.binding();
-        let job = job.clone();
-        let context_work = context.clone();
-        let active = tokio::task::spawn_blocking(move || {
-            if let Some(previous) = demand::inspect(&context_work, &job)? {
-                let request = previous.state().request;
-                if !matches!(
-                    previous.state().progress(None),
-                    demand::Progress::Complete | demand::Progress::Cancelled
-                ) {
-                    demand::cancel(&context_work, request, &job)?;
-                }
-                if !demand::reclaim(&context_work, request, &job)? {
-                    return Ok(None);
-                }
-            }
-            demand::start(
-                &context_work,
-                request,
-                binding,
-                Bounds {
-                    head,
-                    lo: seq,
-                    hi: seq,
-                    entries: 1,
-                },
-                &job,
-            )
-            .map(Some)
-        })
-        .await
-        .map_err(|_| Error::Profile("current history staging worker stopped"))??;
-        let Some(active) = active else {
-            return Ok(if is_key {
-                StageStart::Reclaimed
-            } else {
-                StageStart::Waiting
-            });
-        };
-        let staging = Staging {
-            context,
-            active: Arc::new(StdMutex::new(active)),
-        };
-        match purpose {
-            Purpose::Live => self.live = Some(staging),
-            Purpose::Control => self.control = Some(staging),
-            Purpose::History => unreachable!(),
-        };
-        Ok(StageStart::Ready)
-    }
-    async fn reclaim_stage(&mut self, purpose: Purpose, job: &Job, retiring: bool) -> Result<bool> {
-        let Some(staging) = self.stage(purpose) else {
-            return Ok(true);
-        };
-        let job = job.clone();
-        let complete = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut active = staging
-                .active
-                .lock()
-                .map_err(|_| Error::Profile("history activation lock failed"))?;
-            if retiring {
-                // The entry/effect is already admitted. End only this exact current staging
-                // request, without consulting a peer grant that may have changed during
-                // departure; cancel creates no network or archive authority.
-                demand::cancel(&staging.context, active.request(), &job)?;
-            }
-            if !demand::reclaim(&staging.context, active.request(), &job)? {
-                return Ok(false);
-            }
-            if !retiring && purpose != Purpose::History {
-                demand::checkpoint(
-                    &staging.context,
-                    &mut active,
-                    demand::Progress::Complete,
-                    None,
-                    &job,
-                )?;
-            }
-            Ok(true)
-        })
-        .await
-        .map_err(|_| Error::Profile("history reclamation worker stopped"))??;
-        if complete {
-            if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
-                if let Some(request) = self.owners[index].take() {
-                    self.slots
-                        .release(purpose, request, self.key_body_root.is_some());
-                }
-            }
-            match purpose {
-                Purpose::Live => self.live = None,
-                Purpose::Control => self.control = None,
-                Purpose::History => {}
-            }
-        }
-        Ok(complete)
-    }
-    /// After a body of an explicit history quantum is applied: the next page of the same bounded
-    /// interval, while entries remain and the quantum's byte budget does. A page response is
-    /// consumed up to its first complete body (one body slot), so one ask fetches its page body
-    /// by body. Returns whether a page was pushed. Measured before this: `vox room read
-    /// --history older` delivered one body and paused, and the newcomer proof's page below the
-    /// live window never arrived.
-    async fn archive_continue(&mut self, job: &Job) -> Result<bool> {
-        let Some(staging) = self.history.clone() else {
-            return Ok(false);
-        };
-        let Some(next) = self.archive_next else {
-            return Ok(false);
-        };
-        if self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES {
-            return Ok(false);
-        }
-        let snapshot = inspect(&staging.context, job)
-            .await?
-            .ok_or(Error::Profile("archive state missing"))?;
-        let state = snapshot.state();
-        if state.body.is_some()
-            || state.reclaiming()
-            || state.remaining == 0
-            || next < state.bounds.lo
-        {
-            return Ok(false);
-        }
-        let request = staging
-            .active
-            .lock()
-            .map(|active| active.request())
-            .map_err(|_| Error::Profile("history activation lock failed"))?;
-        let query = Query::Page {
-            head: state.bounds.head,
-            lo: state.bounds.lo,
-            hi: next,
-            entries: state.remaining,
-            wire_bytes: 1024 * 1024,
-        };
-        self.push(Task {
-            request,
-            purpose: Purpose::History,
-            operation: Operation::Wire(query),
-        })?;
-        Ok(true)
-    }
+}
 
-    async fn finish_archive_owned(
-        &mut self,
-        job: &Job,
-        task: &Task,
-        retry_task: &mut Option<Task>,
-    ) -> Result<()> {
-        *retry_task = Some(Task {
-            operation: Operation::FinishArchive,
-            ..task.clone()
-        });
-        self.finish_archive(job).await
-    }
-
-    async fn finish_archive(&mut self, job: &Job) -> Result<()> {
-        let Some(staging) = self.history.clone() else {
-            return Ok(());
-        };
-        let job = job.clone();
-        let next = self.archive_next;
-        let initial = self.own_recovery_checkpoint;
-        let (status, progressed) = tokio::task::spawn_blocking(
-            move || -> Result<(crate::node::api::HistoryDemandStatus, bool)> {
-                let mut snapshot = demand::inspect(&staging.context, &job)?
-                    .ok_or(Error::Profile("archive state missing"))?;
-                let mut active = staging
-                    .active
-                    .lock()
-                    .map_err(|_| Error::Profile("history activation lock failed"))?;
-                if snapshot.state().request != active.request()
-                    || snapshot.state().binding != active.binding()
-                {
-                    return Err(Error::Profile("archive finalization activation changed"));
-                }
-                // Role-only admission can already have completed this request. A terminal
-                // or deliberately paused activation is a durable result, never permission
-                // to checkpoint again through an invalid live handle.
-                if active.matches(snapshot.state())
-                    && snapshot.state().body.is_none()
-                    && !snapshot.state().reclaiming()
-                    && (next.is_some() || snapshot.state().remaining == 0)
-                {
-                    // This branch ends More/Complete, so it never needs a subsequent
-                    // pause. Prepay only its work and single reload before the commit.
-                    let work = demand::AdmissionCharge::reserve(&job)?;
-                    let reload = demand::AdmissionCharge::reserve(&job)?;
-                    let state = snapshot.state();
-                    let cursor = next
-                        .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
-                        .map(|next| super::Continuation {
-                            query_kind: 4,
-                            head: state.bounds.head,
-                            lo: state.bounds.lo,
-                            hi: state.bounds.hi,
-                            next_seq: next,
-                            entry: None,
-                            offset: 0,
-                            entries_remaining: state.remaining,
-                        });
-                    demand::checkpoint_precharged(
-                        &staging.context,
-                        &mut active,
-                        if cursor.is_some() {
-                            demand::Progress::More
-                        } else {
-                            demand::Progress::Complete
-                        },
-                        cursor.as_ref(),
-                        &work,
-                    )?;
-                    snapshot = demand::inspect_precharged(&staging.context, reload)?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                }
-                if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
-                    let work = demand::AdmissionCharge::reserve(&job)?;
-                    let reload = demand::AdmissionCharge::reserve(&job)?;
-                    // This explicit quantum has ended; no worker will silently retry it.
-                    // Keep its exact body/cursor and make Resume the next action.
-                    demand::pause_precharged(&staging.context, &mut active, &work)?;
-                    snapshot = demand::inspect_precharged(&staging.context, reload)?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                }
-                let progressed =
-                    initial.is_some_and(|old| old != OwnRecoveryCheckpoint::of(snapshot.state()));
-                Ok((
-                    crate::node::actor::saved_history_status(snapshot.state(), None, Some(&active)),
-                    progressed,
-                ))
-            },
-        )
-        .await
-        .map_err(|_| Error::Profile("history status worker stopped"))??;
-        self.archive_status = Some(status);
-        self.own_recovery_progress = progressed;
-        Ok(())
-    }
+/// The errors by which a step finds the room's authorization changed under it: the flow is
+/// renewed under the new one (`turn`), never failed.
+fn authorization_changed(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Profile(
+            "history authorization changed"
+                | "history authorization changed before publication"
+                | "history authorization changed before refusal"
+                | "live window authorization changed"
+                | "live retry authorization changed"
+        ) | Error::StreamRefused(super::AUTHORIZATION_CHANGED)
+    )
 }
 impl Drop for Flow {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(request) = self.owners[2].take() {
-            self.slots.release(Purpose::Control, request, true);
+        // A root this admission failed on goes back to the room's ready set, still in
+        // admission, now that its failed flow's retirement has ended: the room's next
+        // admission takes it, with nothing fetched again, once the failed one's recovery edge
+        // has passed (`start_admissions`). The wake lets a room whose edge passed meanwhile
+        // start. Other entries this flow did not publish stay owed.
+        if let (Some(frontier), Some(ready)) = (self.frontier.clone(), self.failed.take()) {
+            frontier.give_back(self.room, ready);
+            frontier.wake();
         }
+        self.settle_root(None, None, None);
     }
 }
 
-async fn inspect(context: &Arc<Context>, job: &Job) -> Result<Option<demand::Snapshot>> {
-    let context = context.clone();
-    let job = job.clone();
-    tokio::task::spawn_blocking(move || demand::inspect(&context, &job))
-        .await
-        .map_err(|_| Error::Profile("history inspect worker stopped"))?
-}
 fn request_id() -> Result<RequestId> {
     crate::identity::rng::random_array::<16>()
-}
-
-/// `VOX_MUTANT_BOUNDARY_RESELECT_OFF`: a live walk keeps its first head to the end of the
-/// window, as with the cut simply removed, instead of ending at the next position boundary
-/// when the author's newer head waits. Says so once on stderr when the daemon first reads it.
-#[cfg(feature = "test-knobs")]
-fn boundary_reselect_off_mutant() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var_os("VOX_MUTANT_BOUNDARY_RESELECT_OFF").is_some();
-        if on {
-            eprintln!(
-                "vox: VOX_MUTANT_BOUNDARY_RESELECT_OFF engaged: a live walk keeps its first \
-                 head to the window's end"
-            );
-        }
-        on
-    });
-    *ON
-}
-
-#[cfg(not(feature = "test-knobs"))]
-const fn boundary_reselect_off_mutant() -> bool {
-    false
-}
-
-/// `VOX_MUTANT_LIVE_RESUME_OFF`: a live walk never jumps the run it passed before a newer head
-/// came, so it walks back down through it one store write each, as before ledger 66's repair.
-#[cfg(feature = "test-knobs")]
-fn live_resume_off_mutant() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var_os("VOX_MUTANT_LIVE_RESUME_OFF").is_some();
-        if on {
-            eprintln!(
-                "vox: VOX_MUTANT_LIVE_RESUME_OFF engaged: a live walk passes again what it \
-                 already walked"
-            );
-        }
-        on
-    });
-    *ON
-}
-
-#[cfg(not(feature = "test-knobs"))]
-const fn live_resume_off_mutant() -> bool {
-    false
 }

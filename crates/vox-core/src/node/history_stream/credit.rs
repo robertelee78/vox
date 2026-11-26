@@ -35,14 +35,14 @@ impl Response {
                 entries,
                 ..
             } => (wire_bytes, entries),
-            Query::Entry { .. } | Query::KeyBody { .. } | Query::Header { .. } => {
-                (MAX_RESPONSE_BYTES, 1)
-            }
+            Query::Entry { .. } | Query::Header { .. } => (MAX_RESPONSE_BYTES, 1),
+            Query::Range { want, .. } => (MAX_RESPONSE_BYTES, range_headers(want)),
             _ => (MAX_RESPONSE_BYTES, 0),
         };
         let metadata_left = match query {
             Query::Page { entries, .. } => entries,
-            Query::Inventory => 0,
+            // A bundle's objects are bounded by its one wire quantum, not by a count.
+            Query::Range { .. } => MAX_RESPONSE_BYTES,
             _ => 1,
         };
         Ok(Self {
@@ -56,6 +56,10 @@ impl Response {
             done: false,
             inventory_seen: false,
         })
+    }
+
+    pub(super) fn request(&self) -> RequestId {
+        self.request
     }
 
     pub(super) fn remaining_wire(&self) -> usize {
@@ -106,21 +110,28 @@ impl Response {
         if self.done
             || !matches!(
                 self.query,
-                Query::Entry { .. } | Query::KeyBody { .. } | Query::Page { .. }
+                Query::Entry { .. } | Query::Page { .. } | Query::Range { .. }
             )
             || length > MAX_PAYLOAD_BYTES as u64
             || persisted > length
             || self
                 .body
                 .as_ref()
-                .is_some_and(|body| body.pending.is_some() || body.persisted != body.length)
+                .is_some_and(|body| !self.body_settled(body))
         {
             return Err(invalid("history body credit state"));
         }
-        if let Query::Entry { offset, .. } | Query::KeyBody { offset, .. } = self.query {
-            if persisted != offset {
-                return Err(invalid("history body resume offset"));
-            }
+        let resume = match self.query {
+            Query::Entry { offset, .. } => Some(offset),
+            Query::Range {
+                want: super::RangeWant::Body { offset, .. },
+                ..
+            } => Some(offset),
+            Query::Range { .. } => Some(0),
+            _ => None,
+        };
+        if resume.is_some_and(|offset| persisted != offset) {
+            return Err(invalid("history body resume offset"));
         }
         self.body = Some(BodyCredit {
             entry,
@@ -129,6 +140,20 @@ impl Response {
             pending: None,
         });
         Ok(())
+    }
+
+    /// A body may be followed by the next object: it is complete, or (in a Range bundle) none of
+    /// it was sent, which is the holder's answer that it does not serve that body.
+    fn body_settled(&self, body: &BodyCredit) -> bool {
+        body.pending.is_none()
+            && (body.persisted == body.length
+                || (matches!(self.query, Query::Range { .. }) && body.persisted == 0))
+    }
+
+    /// A Range bundle's chunks carry no ACK: the reader holds them in its private assembly, not
+    /// on disk, and the one wire quantum bounds them.
+    fn unacknowledged(&self) -> bool {
+        matches!(self.query, Query::Range { .. })
     }
 
     /// Validate and consume one response frame before handing its bytes to storage or QUIC.
@@ -152,29 +177,15 @@ impl Response {
             return Err(Error::SizeLimitExceeded("history response quantum"));
         }
         match frame {
-            Frame::Have { .. }
-                if matches!(self.query, Query::Inventory) && !self.inventory_seen =>
+            // A Range answer's one correction: the holder's Have pages of the asked author
+            // (the newest and the older body pages over the asked interval), at most
+            // `MAX_CORRECTION_PAGES`, all of one author.
+            Frame::Holding(authors)
+                if matches!(self.query, Query::Range { .. })
+                    && (1..=super::MAX_CORRECTION_PAGES).contains(&authors.len())
+                    && authors.iter().all(|have| have.author == authors[0].author)
+                    && !self.inventory_seen =>
             {
-                self.inventory_seen = true;
-            }
-            Frame::KeyAvailability {
-                request,
-                instance,
-                page,
-            } if *request == self.request
-                && matches!(self.query, Query::KeyAvailability { .. })
-                && !self.inventory_seen =>
-            {
-                if *instance == [0; 16] {
-                    return Err(invalid("key catalog instance is zero"));
-                }
-                if let (Query::KeyAvailability { after: Some(after) }, Some((cursor, _))) =
-                    (&self.query, page)
-                {
-                    if cursor <= after {
-                        return Err(invalid("key availability cursor did not advance"));
-                    }
-                }
                 self.inventory_seen = true;
             }
             Frame::Meta { request, object } if *request == self.request => {
@@ -193,6 +204,15 @@ impl Response {
                 {
                     return Err(invalid("history metadata before persisted chunk"));
                 }
+                if matches!(object, Object::Header(_))
+                    && self.unacknowledged()
+                    && self
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| !self.body_settled(body))
+                {
+                    return Err(invalid("history bundle header inside a partial body"));
+                }
                 if matches!(object, Object::Header(_)) {
                     self.headers_left = self
                         .headers_left
@@ -206,6 +226,7 @@ impl Response {
                 offset,
                 bytes,
             } if *request == self.request => {
+                let unacknowledged = self.unacknowledged();
                 let body = self
                     .body
                     .as_mut()
@@ -222,19 +243,17 @@ impl Response {
                 {
                     return Err(invalid("history chunk credit"));
                 }
-                body.pending = Some(end);
+                if unacknowledged {
+                    body.persisted = end;
+                } else {
+                    body.pending = Some(end);
+                }
             }
             Frame::Done {
                 request,
                 status,
                 continuation,
             } if *request == self.request => {
-                if *status == Status::Complete
-                    && matches!(self.query, Query::Inventory | Query::KeyAvailability { .. })
-                    && !self.inventory_seen
-                {
-                    return Err(invalid("inventory completed without HAVE"));
-                }
                 if self
                     .body
                     .as_ref()
@@ -244,10 +263,13 @@ impl Response {
                     return Err(invalid("history done before persisted chunk"));
                 }
                 if *status == Status::Complete
-                    && self
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| body.persisted != body.length)
+                    && self.body.as_ref().is_some_and(|body| {
+                        if self.unacknowledged() {
+                            !self.body_settled(body)
+                        } else {
+                            body.persisted != body.length
+                        }
+                    })
                 {
                     return Err(invalid("history complete with partial body"));
                 }
@@ -262,66 +284,15 @@ impl Response {
         Ok(())
     }
 
-    /// Validate the exact ACK reserved by `accept` without claiming that its bytes are durable.
-    /// The caller uses this only to admit every mandatory final-chunk operation before append.
-    pub(super) fn pending_ack_completes(
-        &self,
-        request: RequestId,
-        entry: Digest32,
-        next: u64,
-    ) -> Result<bool> {
-        if self.done || request != self.request {
-            return Err(invalid("history ack request"));
-        }
-        let body = self
-            .body
-            .as_ref()
-            .ok_or(invalid("history ack before body"))?;
-        if body.entry != entry {
-            return Err(invalid("history ack entry"));
-        }
-        if body.pending != Some(next) {
-            return Err(invalid("history ack offset/credit"));
-        }
-        Ok(next == body.length)
-    }
-
-    /// Called by the sender for an ACK, or by the receiver only AFTER it durably writes the
-    /// exact next offset. A duplicate acknowledges no new work and never adds byte credit.
-    pub(super) fn acknowledge(
-        &mut self,
-        request: RequestId,
-        entry: Digest32,
-        next: u64,
-    ) -> Result<bool> {
-        if self.done || request != self.request {
-            return Err(invalid("history ack request"));
-        }
-        let body = self
-            .body
-            .as_mut()
-            .ok_or(invalid("history ack before body"))?;
-        if body.entry != entry {
-            return Err(invalid("history ack entry"));
-        }
-        if next == body.persisted {
-            return Ok(false);
-        }
-        if body.pending != Some(next) {
-            return Err(invalid("history ack offset/credit"));
-        }
-        body.persisted = next;
-        body.pending = None;
-        Ok(true)
-    }
-
     fn check_continuation(&self, cursor: &Continuation) -> Result<()> {
         let (kind, head, lo, hi) = match &self.query {
             Query::Proof { head, from, to, .. } => (2, head, *from, *to),
-            Query::Entry { head, seq, .. } | Query::KeyBody { head, seq, .. } => {
-                (3, head, *seq, *seq)
-            }
+            Query::Entry { head, seq, .. } => (3, head, *seq, *seq),
             Query::Page { head, lo, hi, .. } => (4, head, *lo, *hi),
+            Query::Range { head, want, .. } => {
+                let (lo, hi) = want.interval();
+                (5, head, lo, hi)
+            }
             _ => return Err(invalid("history continuation for atomic object")),
         };
         if cursor.query_kind != kind
@@ -338,9 +309,22 @@ impl Response {
             (Some(body), Some(entry)) if entry == body.entry && cursor.offset == body.persisted => {
             }
             (None, None) if cursor.offset == 0 => {}
-            (Some(body), None) if body.persisted == body.length && cursor.offset == 0 => {}
+            (Some(body), None) if self.body_settled(body) && cursor.offset == 0 => {}
             _ => return Err(invalid("history continuation offset")),
         }
         Ok(())
     }
+}
+
+/// Every header a Range answer may carry under its head (server.rs `range`): the receipt of
+/// the head's terminal position, sent first when the asker has not committed that head; the
+/// receipt of `lo - 1` that leads a page; and one per position the want names (a body's own
+/// header; none for a control interval, whose entries travel inside its proofs).
+fn range_headers(want: super::RangeWant) -> usize {
+    let positions = match want {
+        super::RangeWant::Entries { lo, hi } => usize::from(lo > 1) + (hi - lo + 1) as usize,
+        super::RangeWant::Body { .. } => 1,
+        super::RangeWant::Controls { .. } => 0,
+    };
+    1 + positions
 }

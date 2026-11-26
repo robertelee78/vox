@@ -45,8 +45,41 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
         .and_then(|payload| crate::node::keypackage::KeyPackage::from_wire(payload).ok())
         .is_some_and(|package| package.recipient == *recipient)
 }
+/// Shared exact subtype algorithm, also used by the live ChannelState entry_steps_in.
+pub(super) fn entry_steps_in(
+    entries: &entry_store::EntryIndex,
+    transaction: Transaction<'_, '_>,
+    sek: &Sek,
+    room: &Digest32,
+    entry: &Entry,
+) -> Result<bool> {
+    let index = entries.view(transaction, sek, room)?;
+    let hash = entry.entry_hash();
+    Ok(if let Some(tracked) = index.retention(&hash)? {
+        tracked.steps
+    } else if let Some(body) = entry.payload.as_deref() {
+        is_step_body(room, body)
+    } else {
+        let Some(log) = index.log_id(&hash)? else {
+            return Ok(false);
+        };
+        let segment = match transaction {
+            Transaction::Snapshot(snapshot) => {
+                snapshot.get_segment(room, SegmentKind::Index, log)?
+            }
+            Transaction::Batch(batch) => batch.get_segment(room, SegmentKind::Index, log)?,
+        };
+        match segment {
+            Some(segment) => {
+                parse_first_seen(&open_segment(sek, SegmentKind::Index, log, &segment)?)?.1
+            }
+            None => false,
+        }
+    })
+}
 
 mod attention;
+pub(crate) use attention::Attention;
 mod diagnostics;
 pub(crate) mod entry_store;
 pub(crate) mod governance;
@@ -61,8 +94,6 @@ pub(crate) const UNSUPPORTED_ROOM_FORMAT: &str =
 /// it next, by itself, so a refusal for this is a change still being applied.
 pub(crate) const KEYS_ROTATING: &str = "room authorization keys are rotating";
 mod legacy_session;
-mod legacy_session_sender;
-pub(crate) use legacy_session_sender::{CompletedAnnouncement, PendingAnnouncement};
 mod local_history;
 pub(crate) mod pending_cleanup;
 pub(crate) mod pending_governance;
@@ -78,14 +109,16 @@ mod private_session;
 pub(crate) mod semantic_projection;
 pub(crate) use private_session::{pending_control, pending_session, pending_upgrade};
 pub(crate) mod role_owed;
-pub(crate) use private_session::{PrivatePullIntent, SessionAdvance, SessionRefresh};
-pub(crate) mod availability;
+pub(crate) use private_session::{PrivateAsk, SessionAdvance, SessionRefresh};
+pub(crate) mod held_history;
 mod own_historical_keys;
 mod own_history;
 pub(crate) mod own_writer_gate;
 mod proof_range;
+pub(crate) mod room_lock;
+pub(crate) use room_lock::{OwnedRoomGuard, RoomLock};
 pub(crate) mod room_snapshot;
-pub(crate) use room_snapshot::{RoomSnapshot, RoomSnapshotCell, ServedRoom};
+pub(crate) use room_snapshot::{RoomSnapshot, RoomSnapshotCell, ServedRoom, Standing};
 mod receiver_overlay;
 mod receiver_releases;
 pub(crate) use proof_range::{
@@ -97,11 +130,9 @@ mod sparse_history;
 pub(crate) use own_history::confirm_creator_end;
 pub(crate) use own_history::erase_continuity as erase_own_continuity;
 pub(crate) use own_history::OwnReadability;
-pub(crate) use own_history::OwnRecoveryPage;
-pub(crate) use sparse_history::KeyDebtPage;
 pub(crate) use sparse_history::{
-    HistoryAdmission, HistoryAdmissionRoom, HistoryDeclineResult, HistoryEffectCursor,
-    HistoryEffectProgress, HistoryPayload, HistorySourceStart,
+    HistoryAdmission, HistoryAdmissionRoom, HistoryEffectCursor, HistoryEffectProgress,
+    HistoryPayload, HistorySourceStart, PinnedHistory, PublishedHistorySource,
 };
 
 pub use diagnostics::SetAside;
@@ -139,7 +170,6 @@ use crate::log::history::{
     ConsistentPrefix, Descriptor, HistoryStep, LocalAppendBudget, LogScope, SignedHead,
     TreeBinding, WorkBudget,
 };
-use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
 use crate::node::consent_order::Stamp;
@@ -147,8 +177,9 @@ use crate::node::content::{Content, Decoded};
 use crate::node::drive::{drive_channel, DriveState, SessionRow};
 use crate::node::profile::Profile;
 use crate::node::retention::Tracked;
-use crate::node::store::{ReceivedFlow, Store};
+use crate::node::store::Store;
 use crate::suite::{algo, SuiteFloor};
+use crate::wire::WireError;
 
 fn withdrawal_veto_enabled() -> bool {
     #[cfg(feature = "test-knobs")]
@@ -729,121 +760,20 @@ pub fn join_context_from_genesis(
         floor,
     )
 }
-
-/// Map an ADR-008 coded sync failure onto the error taxonomy, keeping the reason
-/// (the ADR's rule is that a failure is never silently downgraded).
-pub(crate) fn sync_failure(
-    code: crate::wire::WireError,
-    peer_refused: Option<crate::wire::WireError>,
-) -> Error {
-    // Its own variant, carrying the coded reason, never `MalformedGovernance` (#202), and naming
-    // which end stopped the session: the peer's refusal, this node's rejection of what it was
-    // sent, or a path that failed under both.
-    use crate::wire::WireError;
-    if peer_refused == Some(code) {
-        Error::SyncRefused(code)
-    } else if code == WireError::TransportFailed {
-        Error::SyncFailed(code)
-    } else {
-        Error::SyncRejected(code)
-    }
-}
-
-/// The channel's [`AuthorResolver`] for ADR-008 sync: the admitted authors' keys,
-/// plus the entry classification the trait's `kind_for` previously had no
-/// discriminator for (it defaulted everything to `Content`, so a governance entry
-/// received via sync got the content fork remedy).
-pub struct ChannelAuthors {
-    authors: BTreeMap<Digest32, CompositePublicKey>,
-}
-
-impl ChannelAuthors {
-    /// A resolver over exactly these authors.
-    #[must_use]
-    pub fn new(authors: BTreeMap<Digest32, CompositePublicKey>) -> Self {
-        Self { authors }
-    }
-}
-
-impl AuthorResolver for ChannelAuthors {
-    fn key_for(&self, author: &Digest32) -> Option<CompositePublicKey> {
-        self.authors.get(author).cloned()
-    }
-
-    fn kind_for(&self, entry: &Entry) -> EntryKind {
-        // A governance payload is a struct-tagged frame, a sender-key message is
-        // domain-prefixed. A payload that is neither, or a pruned one (which cannot
-        // be classified at all), falls back to `Content` — the conservative choice,
-        // since governance entries must retain their payload (ADR-008) and so are
-        // never the pruned case.
-        entry
-            .payload
-            .as_deref()
-            .and_then(|p| classify_payload(p).ok())
-            .unwrap_or(EntryKind::Content)
-    }
-
-    fn unclassifiable(&self, entry: &Entry) -> Option<Error> {
-        let payload = entry.payload.as_deref()?;
-        match classify_payload(payload) {
-            Err(e) => Some(e),
-            Ok(EntryKind::Governance) => GovEntry::body_bound_to(entry).err(),
-            // A checkpoint's claim about its own feed is checked where it is accepted.
-            Ok(EntryKind::Content | EntryKind::Checkpoint) => None,
-        }
-    }
-}
-
-/// What one [`ChannelState::sync_over`] session did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SyncOutcome {
-    /// A missing legacy prefix is recovered only through explicit history demand.
-    pub(crate) legacy_required: Option<crate::log::sync::LegacyGap>,
-    /// An exact explicit legacy interval reached a signed invalid/frozen feed boundary.
-    /// This cancels recovery; it never credits the missing suffix as accepted history.
-    pub(crate) legacy_invalid: bool,
-    pub(crate) legacy_unavailable: bool,
-    /// Received protocol bytes including transport length prefixes.
-    pub(crate) wire_received: usize,
-    /// Next exact legacy position retained by the explicit request, including sealed staging.
-    pub(crate) legacy_next: Option<u64>,
-    /// A signed witness still needs explicit bounded publication/cleanup work.
-    pub(crate) legacy_pending: bool,
-    /// Entries the ADR-008 session applied to the log.
-    pub applied: usize,
-    /// How many of those were governance entries accepted for the sealed projection.
-    pub governance: usize,
-    /// How many of those were decrypted and rendered into the timeline.
-    pub rendered: usize,
-    /// Entries refused rather than held (V210-74): by sync before they were held, or after.
-    pub refused: usize,
-    /// Whether every position this side asked for was filled (ADR-025 D3): `false` for a serve the
-    /// peer bounded, which ends cleanly but leaves the rest owed.
-    pub complete: bool,
-    /// Whether any requested position was newly filled (ADR-025 D3's progress).
-    pub filled_any: bool,
-    /// Entries refused because their author is not admitted here (yet).
-    pub unadmitted: usize,
-    /// Entries refused because their author is frozen.
-    pub frozen: usize,
-    /// Authors the session's setup admitted from the peer's board (ADR-025 D3's progress).
-    pub admitted_authors: usize,
-    /// The room's generation read with this side's `HAVE` (ADR-025 D2).
-    pub gen_have: Option<u64>,
-    /// The room's generation when the session ended.
-    pub gen_end: Option<u64>,
-    /// How far the peer said it holds this identity's feed here: the highest seq its frontier
-    /// named, `0` for none (ADR-028 R-6). `None` when the session never read its frontier.
-    pub mine_held: Option<u64>,
-}
-
-impl SyncOutcome {
-    /// Whether the session made progress (ADR-025 D3): stored an entry, admitted an author, or
-    /// filled a requested position.
-    #[must_use]
-    pub fn progress(&self) -> bool {
-        self.applied > 0 || self.admitted_authors > 0 || self.filled_any
-    }
+/// Retained only by the port scheduler's failure classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionError {
+    /// This side failed it, with this code: a transport failure, or a frame or entry from the peer
+    /// that is not acceptable.
+    Local(WireError),
+    /// The peer refused or reset the stream with this code.
+    Peer(WireError),
+    /// The peer served an entry this side did not ask for, or served one twice (ADR-025 D3). Local
+    /// only: no wire code says it, and the stream is reset with the uninformative one.
+    ProtocolViolation,
+    /// The peer's entries did not all arrive within the drain budget, this many seconds (V210-71).
+    /// What arrived was applied first. Local only: the stream is closed with `TransportFailed`.
+    DrainBudget(u64),
 }
 
 /// Why a sync session did not complete (ADR-025 D5 maps each to a backoff kind).
@@ -851,7 +781,7 @@ impl SyncOutcome {
 pub enum SyncFailure {
     /// The session protocol failed: locally, by the peer's coded refusal, or by a protocol
     /// violation.
-    Session(crate::log::sync::SessionError),
+    Session(SessionError),
     /// The stream could not be opened, or the peer could not be reached.
     Unreachable(String),
     /// The room's persist failed: the room is poisoned until it is reopened.
@@ -862,7 +792,6 @@ pub enum SyncFailure {
 
 impl std::fmt::Display for SyncFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::log::sync::SessionError;
         // Which end stopped the session, as #216 says it: the peer's refusal, this node's
         // rejection of what it was sent, or a path that failed under both.
         match self {
@@ -882,49 +811,6 @@ impl std::fmt::Display for SyncFailure {
             Self::Unreachable(why) | Self::Poisoned(why) => f.write_str(why),
             Self::Panicked => f.write_str("sync failed: the session panicked"),
         }
-    }
-}
-
-/// What one sync session did, and why it stopped if it did not complete. The outcome is filled in
-/// either way: a failure keeps what was persisted before it (ADR-025).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SessionReport {
-    /// What the session did.
-    pub out: SyncOutcome,
-    /// Why it did not complete.
-    pub fail: Option<SyncFailure>,
-}
-
-impl SessionReport {
-    /// A session that failed before it did anything.
-    #[must_use]
-    pub fn failed(fail: SyncFailure) -> Self {
-        Self {
-            out: SyncOutcome::default(),
-            fail: Some(fail),
-        }
-    }
-
-    /// Fill in the room session's part of the outcome.
-    pub(crate) fn from_room(
-        mut out: SyncOutcome,
-        s: crate::log::sync::RoomSession,
-        fatal: Option<Error>,
-    ) -> Self {
-        out.applied = s.applied;
-        out.complete = s.complete;
-        out.filled_any = s.filled_any;
-        out.unadmitted = s.unadmitted;
-        out.frozen = s.frozen;
-        out.refused += s.refused;
-        out.gen_have = s.gen_have;
-        out.gen_end = s.gen_end;
-        out.wire_received = s.wire_received;
-        let fail = match fatal {
-            Some(e) => Some(SyncFailure::Poisoned(e.to_string())),
-            None => s.fail.map(SyncFailure::Session),
-        };
-        Self { out, fail }
     }
 }
 
@@ -985,7 +871,6 @@ pub(crate) struct DisplayStamp {
     rewrite: u64,
     rendered_roots: [u64; 4],
     rendered_count: u64,
-    order_revision: u64,
     body_revision: u64,
     session_revision: u64,
     retention: (u64, u64),
@@ -1031,7 +916,6 @@ impl PartialEq for DisplayStamp {
             && self.rewrite == other.rewrite
             && self.rendered_roots == other.rendered_roots
             && self.rendered_count == other.rendered_count
-            && self.order_revision == other.order_revision
             && self.body_revision == other.body_revision
             && self.session_revision == other.session_revision
             && self.retention == other.retention
@@ -1155,15 +1039,6 @@ pub const READ_BY_SHOWN: usize = 128;
 /// Maximum rows examined by an explicit unread-history query.
 pub const UNREAD_LOOKED: usize = 1_000;
 
-/// How many owed bodies (V030-10) one sync session asks a peer for at most. The rest are asked of
-/// the next session: a peer that stripped a long run is not asked for all of it at once.
-pub const MAX_OWED_ASKED: usize = 256;
-
-/// One entry a sync stored, for [`ChannelState::absorb_arrived`]: `(author, entry hash, body, the
-/// log page it is already stored in)`. The page is set only for a body that arrived for a skeleton
-/// held without one (V030-10).
-type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
-
 /// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_ms`
 /// (`ttl == 0` keeps everything), compared in milliseconds.
 fn expired_at(claimed_ms: u64, now_ms: u64, ttl: u64) -> bool {
@@ -1208,74 +1083,6 @@ struct ReadMarkScan {
     started: ReadMarkEligibility,
 }
 
-/// Memory-only exact capabilities for receive flows whose terminal durability settlement failed.
-/// The Store retains the corresponding pending owner, but deliberately offers no room-only way
-/// to recover it: this registry is what keeps the creating Arc available for a later exact retry.
-#[derive(Default)]
-struct ReceivedRetries(std::sync::Mutex<Vec<ReceivedFlow>>);
-
-impl ReceivedRetries {
-    fn retain(&self, owner: ReceivedFlow) {
-        let mut owners = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !owners.iter().any(|known| known.same_owner(&owner)) {
-            owners.push(owner);
-        }
-    }
-
-    fn remove(&self, owner: &ReceivedFlow) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|known| !known.same_owner(owner));
-    }
-
-    /// Settle this exact flow even if another retry is concurrently draining the registry.
-    fn retry_owner(&self, store: &Store, owner: &ReceivedFlow) -> Result<()> {
-        let result = owner.debt(store).and_then(|debt| {
-            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
-        });
-        match result {
-            Ok(()) => {
-                self.remove(owner);
-                Ok(())
-            }
-            Err(error) => {
-                self.retain(owner.clone());
-                Err(error)
-            }
-        }
-    }
-
-    fn retry(&self, store: &Store) -> Result<()> {
-        let owners = std::mem::take(
-            &mut *self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let mut owners = owners.into_iter();
-        while let Some(owner) = owners.next() {
-            let settled = owner.debt(store).and_then(|debt| {
-                debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
-            });
-            match settled {
-                Ok(()) => self.remove(&owner),
-                Err(error) => {
-                    self.retain(owner);
-                    for owner in owners {
-                        self.retain(owner);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -1311,7 +1118,6 @@ pub struct ChannelState {
     own_heads_verified: std::sync::Mutex<Vec<Digest32>>,
     /// Volatile bounded retirement scan; restart begins a fresh safety audit, not a deletion.
     historical_retirement: own_historical_keys::Retirement,
-    availability: availability::State,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
@@ -1323,11 +1129,7 @@ pub struct ChannelState {
     sparse_contiguous_pending: BTreeSet<Digest32>,
     role_cuts: BTreeMap<Digest32, u64>,
     sparse_contiguous_after: Option<Digest32>,
-    /// Bounded scan for durable key-body refusal cleanup; reset by a committed new owner.
-    key_provider_prune_after: Option<Digest32>,
-    key_provider_prune_pending: bool,
     key_debt_retention_pending: bool,
-    key_provider_prune_wait: Option<sparse_history::KeyProviderPruneWait>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
@@ -1350,20 +1152,11 @@ pub struct ChannelState {
     backfill_after: Option<Digest32>,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
-    /// Own-feed declaration cursor and the capable readers covered by that scan.
-    legacy_announced: Option<legacy_session_sender::Announcements>,
     private_sessions: private_session::PrivateSessions,
     /// How far each other member's node holds this identity's feed here, by its own word in its
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
-    /// Exact owners whose terminal settlement failed. This registry is separate from the room
-    /// mutex so a session can retain its capability after releasing the room, even when another
-    /// lane presently owns that mutex. The next room session retries them before doing work.
-    received_retries: Arc<ReceivedRetries>,
-    /// Last missing-body position examined by `owed_wants`, including ineligible positions.
-    /// The next session resumes after it and wraps, so unavailable bodies cannot starve others.
-    owed_asked_to: Option<(Digest32, u64)>,
     /// The latest time this room was told (milliseconds): what "expired by now" is reckoned against
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
@@ -1371,15 +1164,14 @@ pub struct ChannelState {
     /// Which governance the "not received yet" rows were last decided under (in memory).
     owed_decided: history::OwedDecided,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
-    /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
+    /// An insertion above the tail invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
-    display_order_revision: u64,
     /// Highest shown time in this open incarnation, to notice a backwards wall-clock step.
     display_shown_at: u64,
     /// Changes that cannot extend the previous rendered prefix.
     display_rewrite: u64,
     /// Readable rows removed from the rendered prefix (pruning, retention, missing-position
-    /// cleanup); a late arrival that only reorders the prefix leaves it alone.
+    /// cleanup); an insertion leaves it alone.
     display_removals: u64,
     /// A governance turn took shown rows away or brought retained ones back (ADR-053 MP-11)
     /// since the node last said so: what it says as [`crate::node::api::NodeEvent::Synced`] with
@@ -1498,7 +1290,7 @@ pub struct ChannelState {
     /// served write stands aside while one is registered, so a node that posts back to back
     /// keeps its own turn at the room ahead of the writes its readers queue.
     authored_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    role_owed: std::sync::Arc<role_owed::RoleOwed>,
+    role_owed: std::sync::Arc<role_owed::BoardOwner>,
     pub(crate) own_writer_gate: std::sync::Arc<own_writer_gate::Gate>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
@@ -1515,9 +1307,6 @@ pub struct ChannelState {
     history_read: Option<Arc<history::ReadResource>>,
     /// What answering another member reads instead of this room (see [`RoomSnapshot`]).
     room_snapshot: Arc<RoomSnapshotCell>,
-    /// Each author's in-memory jump over positions its live walk already passed
-    /// ([`entry_store::sparse::LiveResume`]); empty after a restart.
-    pub(crate) live_resume: BTreeMap<Digest32, entry_store::sparse::LiveResume>,
 }
 
 impl Drop for ChannelState {
@@ -2318,16 +2107,12 @@ impl ChannelState {
             own_recovery: own_history::Recovery::UnknownBehind,
             own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
-            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
             role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
-            key_provider_prune_after: None,
-            key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -2340,16 +2125,12 @@ impl ChannelState {
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
-            legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            received_retries: Arc::new(ReceivedRetries::default()),
-            owed_asked_to: None,
             now_hint: now_ms,
             owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
-            display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
@@ -2391,13 +2172,12 @@ impl ChannelState {
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            role_owed: std::sync::Arc::new(role_owed::BoardOwner),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
             room_snapshot: Arc::default(),
-            live_resume: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
@@ -2484,11 +2264,14 @@ impl ChannelState {
             me,
             now,
             paused,
+            &mut |_| {},
         )
     }
 
     /// The post-unlock half of [`Self::open`]. The actor verifies paused legacy ownership before
     /// moving keys to its blocking opener, so restart cannot mistake retained work for an orphan.
+    /// `upgrading` is told each step of the one-time upgrade of a store written before this
+    /// version (`EntryIndex::prepare_owned`).
     #[allow(clippy::too_many_arguments)] // The owned opener keeps key, identity and recovery authority explicit.
     pub(crate) fn open_with_sek_owned(
         store: &Store,
@@ -2499,6 +2282,7 @@ impl ChannelState {
         me: Digest32,
         now: crate::time::Ms,
         paused_legacy_owner: Option<legacy_provisional::LegacyProvisionalOwner>,
+        upgrading: &mut dyn FnMut(&str),
     ) -> Result<Self> {
         let now_ms = now.get();
         let manifest_seg = store
@@ -2545,10 +2329,14 @@ impl ChannelState {
         }
         // Recover unpublished work against the existing sealed roots. Unsupported stores
         // without a compact restart state are refused before cleanup, without rewriting data.
-        let legacy_preparation =
-            entries.prepare_owned(store, &sek, channel_id, epoch, |owner| {
-                Ok(Some(owner) == paused_legacy_owner)
-            })?;
+        let legacy_preparation = entries.prepare_owned(
+            store,
+            &sek,
+            channel_id,
+            epoch,
+            |owner| Ok(Some(owner) == paused_legacy_owner),
+            upgrading,
+        )?;
         let entry_read = entries.read(store, &sek, channel_id)?;
         let restart = entry_read
             .restart_state()
@@ -2612,10 +2400,7 @@ impl ChannelState {
         // Key-packages found on reload are offered again: installing one twice is harmless,
         // and one that arrived just before a crash would otherwise never be installed.
         let mut key_packages = key_package_queue::Queue::new(1);
-        dag.set_order_revision(
-            entry_read.order_revision(),
-            entry_read.order_previous(None)?.map(|(clock, _)| clock),
-        );
+        dag.set_newest_clock(entry_read.order_previous(None)?.map(|(clock, _)| clock));
 
         // Sparse membership follows completed semantic effects, not a contiguous archive
         // prefix. Read at most one persistent, effect-checked tip per admitted author;
@@ -2702,11 +2487,7 @@ impl ChannelState {
             AUTHORS_HARD_LIMIT * 128 + 128,
         )? {
             let old = open_segment(&sek, SegmentKind::KeyMaterial, SEG_OLD_OWN_BEHIND, &segment)?;
-            // Current non-sparse rooms may have a real legacy Session cursor in this slot.
-            // Validate its complete original format and leave it untouched. Sparse rooms never
-            // publish this cursor, so an invalid recovery marker there remains a hard error.
-            if entry_read.sparse_enabled()
-                || legacy_session_sender::Announcements::parse(&old, &me).is_err()
+            // Only sparse rooms reach this migration; slot 18 then holds a recovery marker.
             {
                 let recovery = own_history::Recovery::parse(&old)?;
                 if own_recovery.is_some() {
@@ -2771,8 +2552,6 @@ impl ChannelState {
 
         // The package-only catalog resumes retries without reading unrelated log bodies.
         key_packages.published(next_log_id);
-        let display_order_revision = dag.reorder_generation();
-
         let sender_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SENDER)?
             .ok_or(Error::MalformedAtRest("sender chain missing"))?;
@@ -2965,16 +2744,12 @@ impl ChannelState {
             own_recovery,
             own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
-            availability: availability::State::new()?,
             presence,
             sparse_applied_tips,
             sparse_contiguous_pending,
             role_cuts,
             sparse_contiguous_after: None,
-            key_provider_prune_after: None,
-            key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_provider_prune_wait: None,
             sender,
             next_log_id,
             read_mark_scan: None,
@@ -2985,11 +2760,8 @@ impl ChannelState {
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
-            legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held,
-            received_retries: Arc::new(ReceivedRetries::default()),
-            owed_asked_to: None,
             now_hint: now_ms,
             owed_decided: history::OwedDecided::default(),
             projection_state: match restart.projection.as_deref() {
@@ -2997,7 +2769,6 @@ impl ChannelState {
                 None => history::State::default(),
             },
             display_tail: None,
-            display_order_revision,
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
@@ -3037,13 +2808,12 @@ impl ChannelState {
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            role_owed: std::sync::Arc::new(role_owed::BoardOwner),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
             room_snapshot: Arc::default(),
-            live_resume: BTreeMap::new(),
         };
         room.entries
             .reopen_rendered(store, &room.sek, &room.channel_id)?;
@@ -3470,16 +3240,12 @@ impl ChannelState {
             own_recovery: recovery.unwrap_or(own_history::Recovery::UnknownBehind),
             own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
-            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
             role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
-            key_provider_prune_after: None,
-            key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -3492,16 +3258,12 @@ impl ChannelState {
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
-            legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            received_retries: Arc::new(ReceivedRetries::default()),
-            owed_asked_to: None,
             now_hint: now_ms,
             owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
-            display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
@@ -3542,13 +3304,12 @@ impl ChannelState {
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            role_owed: std::sync::Arc::new(role_owed::BoardOwner),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
             room_snapshot: Arc::default(),
-            live_resume: BTreeMap::new(),
         })
     }
 
@@ -3871,9 +3632,6 @@ impl ChannelState {
             self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
-        }
-        if self.is_member(&fingerprint) {
-            self.key_member_became_current(fingerprint);
         }
         // Capability announcements are live room traffic. A newly admitted member cannot read
         // the announcement that predates its admission, so the next bounded maintenance turn
@@ -4214,17 +3972,10 @@ impl ChannelState {
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
-        let local_applied =
-            self.local_history.as_ref().map(|prepared| {
-                let entry = prepared.header.entry();
-                (
-                    entry.skeleton.author_id,
-                    entry.skeleton.seq,
-                    entry.skeleton.v2.as_ref().is_some_and(|v| {
-                        v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    }),
-                )
-            });
+        let local_applied = self.local_history.as_ref().map(|prepared| {
+            let entry = prepared.header.entry();
+            (entry.skeleton.author_id, entry.skeleton.seq)
+        });
         self.local_history = None;
         self.local_pre_context = None;
         self.local_append_budget = None;
@@ -4232,10 +3983,7 @@ impl ChannelState {
         // The caller committed the local append and all of its effects before entering here.
         // Remote effects advance this cache in `advance_history_effect`; advance the authored
         // path from the exact verified header too, before optional cleanup can return early.
-        if let Some((author, seq, key_package)) = local_applied {
-            if key_package {
-                self.note_key_body_acquired();
-            }
+        if let Some((author, seq)) = local_applied {
             debug_assert_eq!(author, self.me());
             self.sparse_applied_tips
                 .entry(author)
@@ -4259,13 +4007,10 @@ impl ChannelState {
                 batch.commit()?;
                 self.entries.committed();
                 if done {
-                    self.flush_available(store)?;
                     self.history_publication_changed.notify_waiters();
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-                    self.dag.set_order_revision(
-                        read.order_revision(),
-                        read.order_previous(None)?.map(|(clock, _)| clock),
-                    );
+                    self.dag
+                        .set_newest_clock(read.order_previous(None)?.map(|(clock, _)| clock));
                     return Ok(());
                 }
             }
@@ -4274,11 +4019,6 @@ impl ChannelState {
             self.poison(error);
         }
         result
-    }
-
-    fn discard_unverified(&mut self, store: &Store) -> Result<usize> {
-        let mut entries = self.entries.staging(store, &self.sek, &self.channel_id);
-        self.dag.discard_unverified(&mut entries)
     }
 
     fn entry_at(&self, transaction: Transaction<'_, '_>, hash: &Digest32) -> Result<Option<Entry>> {
@@ -4295,12 +4035,6 @@ impl ChannelState {
             &self.entries.read(store, &self.sek, &self.channel_id)?,
             hash,
         )
-    }
-
-    fn log_id_at(&self, transaction: Transaction<'_, '_>, hash: &Digest32) -> Result<Option<u64>> {
-        self.entries
-            .view(transaction, &self.sek, &self.channel_id)?
-            .log_id(hash)
     }
 
     /// Every key-package this node holds in the room's log, with its author, whoever it is
@@ -5806,7 +5540,7 @@ impl ChannelState {
         transaction: Transaction<'_, '_>,
         entry: &Entry,
     ) -> Result<bool> {
-        legacy_session_sender::entry_steps_in(
+        entry_steps_in(
             &self.entries,
             transaction,
             &self.sek,
@@ -5840,145 +5574,12 @@ impl ChannelState {
             && expired_at(claimed_ms, now_ms, self.effective_retention())
     }
 
-    /// Examine at most 64 missing positions per turn, removing settled recovery work in
-    /// the same transaction as its placeholder. The cursor advances over retained positions too.
-    fn forget_settled_owed(&mut self, store: &Store) -> Result<()> {
-        let result = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.derived();
-            let mut writer = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            let (positions, next) =
-                writer.missing_page(self.projection_state.cleanup_cursor, 64)?;
-            let mut changed = false;
-            for (author, seq) in positions {
-                let entry = writer.get(&author, seq)?;
-                let keep = match entry.as_ref() {
-                    Some(e) => {
-                        e.payload.is_none()
-                            && !self.private_contains_in(writer.batch(), &e.entry_hash())?
-                            && !(self.governance_display_current(self.now_hint)
-                                && expired_at(
-                                    e.skeleton.claimed_ms,
-                                    self.now_hint,
-                                    self.entry_retention(Transaction::Batch(writer.batch()), e)?,
-                                ))
-                    }
-                    None => false,
-                };
-                if !keep {
-                    if let Some(entry) = entry {
-                        writer.set_owed(entry.entry_hash(), None)?;
-                    }
-                    changed |= writer.set_missing(&author, seq, false)?;
-                }
-            }
-            if changed {
-                writer.seal()?;
-                batch.commit()?;
-                self.entries.committed();
-                self.remove_display_rows();
-            }
-            self.projection_state.cleanup_cursor = next;
-            Ok(())
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
-        }
-        result
-    }
-
-    /// Ask for at most MAX_OWED_ASKED bodies after examining at most 256 missing positions.
-    /// Advance past every examined position, including frozen, expired and unreachable ones;
-    /// wrap once to the start without revisiting positions from this same call.
-    pub fn owed_wants(
-        &mut self,
-        store: &Store,
-        remote: &[crate::log::sync::FeedFrontier],
-        wants: &[crate::log::sync::WantRange],
-    ) -> Result<Vec<crate::log::sync::WantRange>> {
-        self.forget_settled_owed(store)?;
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let mut out: Vec<crate::log::sync::WantRange> = Vec::new();
-        let mut asked = 0usize;
-        let mut examined = 0usize;
-        let start = self.owed_asked_to;
-        let mut after = start;
-        let mut wrapped = false;
-        'scan: while examined < 256 && asked < MAX_OWED_ASKED {
-            let (positions, next) = entries.missing_page(after, 256 - examined)?;
-            for (author, seq) in positions {
-                if wrapped && start.is_some_and(|start| (author, seq) > start) {
-                    break 'scan;
-                }
-                examined += 1;
-                self.owed_asked_to = Some((author, seq));
-                // Not of a frozen author, nor beyond a refused feed suffix (ADR-025 D3).
-                if self.dag.is_frozen(&author)
-                    || self
-                        .dag
-                        .refused_from(&author)
-                        .is_some_and(|from| seq >= from)
-                    || !remote
-                        .iter()
-                        .any(|f| f.author_id == author && f.max_seq >= seq)
-                    || !wants
-                        .iter()
-                        .filter(|w| w.author_id == author)
-                        .all(|w| seq < w.from_seq)
-                {
-                    continue;
-                }
-                let entry = entries
-                    .get(&author, seq)?
-                    .ok_or(Error::MalformedAtRest("missing-body entry missing"))?;
-                // Cleanup has its own small budget. Recheck every requested position so a
-                // settled position beyond that cleanup page is never asked for again.
-                if entry.payload.is_some()
-                    || self.private_id(store, &entry.entry_hash())?.is_some()
-                    || (self.governance_display_current(self.now_hint)
-                        && expired_at(
-                            entry.skeleton.claimed_ms,
-                            self.now_hint,
-                            self.entry_retention(entries.transaction(), &entry)?,
-                        ))
-                {
-                    continue;
-                }
-                asked += 1;
-                match out.last_mut() {
-                    Some(w) if w.author_id == author && w.to_seq.checked_add(1) == Some(seq) => {
-                        w.to_seq = seq
-                    }
-                    _ => out.push(crate::log::sync::WantRange {
-                        author_id: author,
-                        from_seq: seq,
-                        to_seq: seq,
-                    }),
-                }
-                if asked == MAX_OWED_ASKED {
-                    break 'scan;
-                }
-            }
-            match next {
-                Some(next) => after = Some(next),
-                None if start.is_some() && !wrapped => {
-                    after = None;
-                    wrapped = true;
-                }
-                None => break,
-            }
-        }
-        Ok(out)
-    }
-
     fn invalidate_display(&mut self) {
         self.display_rewrite = self.display_rewrite.wrapping_add(1);
     }
 
     /// [`Self::invalidate_display`] for a change that took readable rows away, which a reader
-    /// folding a fixed arrival range must notice; a reorder is not one.
+    /// folding a fixed arrival range must notice; an insertion is not one.
     fn remove_display_rows(&mut self) {
         self.invalidate_display();
         self.display_removals = self.display_removals.wrapping_add(1);
@@ -6008,7 +5609,6 @@ impl ChannelState {
                 rewrite: self.display_rewrite,
                 rendered_roots: rendered.display_roots(),
                 rendered_count: rendered.count()?,
-                order_revision: self.dag.reorder_generation(),
                 body_revision: self.dag.body_generation(),
                 session_revision: self.legacy_sessions.display_revision(),
                 retention: (self.effective_retention(), self.effective_step_retention()),
@@ -6406,55 +6006,6 @@ impl ChannelState {
         index.seal()
     }
 
-    /// Keep the authenticated carrier's age and public kind when permissions withhold its
-    /// body. This is not a decrypted Session classification or a retained-body record.
-    fn preserve_withheld_body_into(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: &Entry,
-    ) -> Result<()> {
-        let hash = entry.entry_hash();
-        let log = self
-            .log_id_at(Transaction::Batch(batch), &hash)?
-            .ok_or(Error::MalformedAtRest("withheld body has no log page"))?;
-        let saved = batch
-            .get_segment(&self.channel_id, SegmentKind::Index, log)?
-            .map(|segment| {
-                parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &segment)?)
-            })
-            .transpose()?;
-        let tracked = self.retention_get_in(Transaction::Batch(batch), &hash)?;
-        let first_seen = saved
-            .map(|(at, _)| at)
-            .into_iter()
-            .chain(tracked.map(|value| value.first_seen_ms))
-            .min()
-            .unwrap_or(self.now_hint);
-        let steps = entry
-            .payload
-            .as_deref()
-            .is_some_and(|body| is_step_body(&self.channel_id, body))
-            || saved.is_some_and(|(_, steps)| steps)
-            || tracked.is_some_and(|value| value.steps);
-        if saved != Some((first_seen, steps)) {
-            let sealed = seal_segment(
-                &self.sek,
-                SegmentKind::Index,
-                log,
-                &first_seen_bytes(first_seen, steps),
-            )?;
-            batch.put_segment(&self.channel_id, SegmentKind::Index, log, &sealed)?;
-        }
-        if let Some(mut tracked) = tracked {
-            if tracked.first_seen_ms != first_seen || tracked.steps != steps {
-                tracked.first_seen_ms = first_seen;
-                tracked.steps = steps;
-                self.queue_retention(batch, hash, Some(tracked))?;
-            }
-        }
-        Ok(())
-    }
-
     /// Queue a body's age beside its authoritative log row, before the same commit.
     fn track_body_into(
         &mut self,
@@ -6649,703 +6200,12 @@ impl ChannelState {
     pub fn set_aside(&self) -> &SetAside {
         &self.set_aside
     }
-
-    /// The resolver ADR-008 sync needs: this channel's admitted authors and the
-    /// entry classification for `kind_for`.
-    #[must_use]
-    pub fn resolver(&self) -> ChannelAuthors {
-        ChannelAuthors {
-            authors: self.authors.clone(),
-        }
-    }
-
-    /// Run one ADR-008 **frontier sync** session over `transport` against a peer,
-    /// then durably record and render whatever arrived (ADR-016 §"Sync
-    /// scheduling").
-    ///
-    /// Sync is ADR-008's business and applies entries to the log itself; this method
-    /// is the reconciliation the runtime owes afterwards. It snapshots each author's
-    /// head, runs the session, and for every entry that appeared: seals it into a
-    /// `LogDb` segment, queues its bounded governance work, and renders a
-    /// content entry if this node holds the author's sender key **and** the author
-    /// consented to it (ADR-007). An entry that arrives but cannot be persisted
-    /// poisons the channel rather than living only in memory.
-    ///
-    /// **Whatever arrived is reconciled even when the session then fails**, so a
-    /// session that dies part-way still makes durable progress instead of leaving
-    /// entries in the in-memory DAG that the next open would silently drop.
-    ///
-    /// A session hard-fails on the first entry from an author this node has **not
-    /// admitted** (it cannot verify it), so a member must admit the channel's current
-    /// members — whose full composite keys are on the rendezvous board — before
-    /// syncing. That is what makes ADR-016's "`AuthorResolver` built from the genesis,
-    /// admin certificates and the stored records" load-bearing rather than incidental.
-    ///
-    /// The session is synchronous (ADR-008's engine is), so the caller runs it on a
-    /// thread that may block — `tokio::task::spawn_blocking` in the node.
-    pub fn sync_over<T: Transport>(
-        &mut self,
-        store: &Store,
-        transport: &mut T,
-        now: crate::time::Ms,
-    ) -> Result<SyncOutcome> {
-        let now_ms = now.get();
-        let retry = self.received_retries.retry(store);
-        if self.poisoned.get() {
-            // The first persist/absorption failure remains the room's diagnosis. A later retry
-            // failure cannot relabel it, and the exact owner remains in `received_retries`.
-            return Err(self.save_failure());
-        }
-        retry?;
-        // Per-author heads before the session, so the new entries can be found after.
-        let before: BTreeMap<Digest32, u64> = self
-            .authors
-            .keys()
-            .map(|a| (*a, self.dag.feed(a).map_or(0, |f| f.max_seq())))
-            .collect();
-        let resolver = self.resolver();
-        let mut entries = self.entries.staging(store, &self.sek, &self.channel_id);
-        let session = frontier_session_peer(
-            transport,
-            &mut self.dag,
-            &mut entries,
-            &resolver,
-            &self.admission,
-        );
-        if let Err(crate::log::sync::ApplyError::Local(error)) = session {
-            self.mark_poisoned();
-            self.save_error = Some(error.to_string());
-            self.keep_forks(store)?;
-            return Err(error);
-        }
-
-        // Collect what arrived, in per-author sequence order, before touching the
-        // store (the borrow of `self.dag` ends here).
-        let received = ReceivedFlow::new(self.channel_id);
-        let absorbed = received.scope(|| self.absorb_arrived(store, &before, now_ms, &received));
-        // `absorb_arrived` may commit one or more batches before a later batch fails. Settle that
-        // exact flow even on the partial-failure path; otherwise its committed Durability::None
-        // bytes have neither an acknowledgement owner nor a future retry capable of naming them.
-        let mut settled = received.debt(store).and_then(|debt| {
-            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
-        });
-        if settled.is_err() {
-            self.received_retries.retain(received.clone());
-            // Retry this exact owner: another retry may be draining the shared registry.
-            settled = self.received_retries.retry_owner(store, &received);
-        } else {
-            self.received_retries.remove(&received);
-        }
-        let mut out = match absorbed {
-            Ok(out) => {
-                settled?;
-                out
-            }
-            // If both operations failed, return the original absorption error. The settlement
-            // error has retained its exact retry capability above and must not replace the cause
-            // which poisoned the room.
-            Err(error) => return Err(error),
-        };
-        if let Ok(n) = session {
-            out.applied = n;
-        }
-        match session {
-            Ok(_) => Ok(out),
-            Err(crate::log::sync::ApplyError::Wire(code)) => {
-                Err(sync_failure(code, transport.peer_refused()))
-            }
-            Err(crate::log::sync::ApplyError::Local(error)) => Err(error),
-        }
-    }
-
-    /// Each author's head, for [`ChannelState::absorb_arrived`] to find what a sync added.
+    /// Verified author heads used when selecting pending key packages.
     fn heads(&self) -> BTreeMap<Digest32, u64> {
         self.authors
             .keys()
             .map(|a| (*a, self.dag.verified_head(a)))
             .collect()
-    }
-
-    /// Persist, fold and render every entry a sync added past `before`'s heads.
-    ///
-    /// Only up to each author's **verified** head: a run of unsigned skeletons that no signed
-    /// entry has chained to yet (ADR-023 decision 3) waits in the sealed provisional spool.
-    /// It is discarded at session end if no witness comes, never exposed as accepted history.
-    fn absorb_arrived(
-        &mut self,
-        store: &Store,
-        before: &BTreeMap<Digest32, u64>,
-        now_ms: u64,
-        received: &ReceivedFlow,
-    ) -> Result<SyncOutcome> {
-        self.keep_forks(store)?;
-        let result = (|| -> Result<SyncOutcome> {
-            let mut out = SyncOutcome::default();
-            self.now_hint = self.now_hint.max(now_ms);
-            for (author, old_head) in before {
-                let through = self.dag.verified_head(author);
-                let mut from = old_head
-                    .checked_add(1)
-                    .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
-                while from <= through {
-                    // Ordinary signed entries keep their bounded grouped governance fold.
-                    // Their unpublished DAG work is prepared first: one late parent may lift
-                    // arbitrarily many old descendants even when this input batch is tiny.
-                    let first = self
-                        .entries
-                        .read(store, &self.sek, &self.channel_id)?
-                        .get(author, from)?
-                        .ok_or(Error::MalformedAtRest("verified suffix missing"))?;
-                    if first.is_signed() {
-                        let first_log = self.next_log_id;
-                        let mut witness = None;
-                        let mut arrived = Vec::new();
-                        let mut bytes = 0usize;
-                        let mut seq = from;
-                        let mut next = Some(first);
-                        while seq <= through && arrived.len() < 64 {
-                            let entry = match next.take() {
-                                Some(entry) => entry,
-                                None => self
-                                    .entries
-                                    .read(store, &self.sek, &self.channel_id)?
-                                    .get(author, seq)?
-                                    .ok_or(Error::MalformedAtRest("verified suffix missing"))?,
-                            };
-                            if !entry.is_signed() {
-                                break;
-                            }
-                            let size = entry.to_wire().len();
-                            if !arrived.is_empty() && bytes.saturating_add(size) > 1024 * 1024 {
-                                break;
-                            }
-                            let id = self.next_log_id;
-                            self.next_log_id = id
-                                .checked_add(1)
-                                .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-                            witness = Some(entry.clone());
-                            arrived.push((*author, entry.entry_hash(), entry.payload, Some(id)));
-                            bytes = bytes.saturating_add(size);
-                            seq = seq
-                                .checked_add(1)
-                                .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
-                        }
-                        let witness = witness
-                            .ok_or(Error::MalformedAtRest("signed batch witness missing"))?;
-                        self.entries.prepare_publication(
-                            store,
-                            &self.sek,
-                            &self.channel_id,
-                            entry_store::Publication {
-                                witness: &witness,
-                                from,
-                                first_log,
-                                received_ms: now_ms,
-                                bodyless_prefix: false,
-                                origin: self.genesis.body.created_ms,
-                                local_contexts: None,
-                            },
-                        )?;
-                        let count = arrived.len() as u64;
-                        let got =
-                            self.absorb_batch(store, arrived, now_ms, Some(count), received)?;
-                        out.applied += got.applied;
-                        out.rendered += got.rendered;
-                        out.governance += got.governance;
-                        out.refused += got.refused;
-                        from = seq;
-                        continue;
-                    }
-                    // Any signed successor authenticates the preceding bodyless suffix.
-                    // Locate one witness at a time; never collect that suffix in RAM.
-                    let mut seq = from;
-                    let witness = loop {
-                        let entry = self
-                            .entries
-                            .read(store, &self.sek, &self.channel_id)?
-                            .get(author, seq)?
-                            .ok_or(Error::MalformedAtRest("verified suffix missing"))?;
-                        if entry.is_signed() {
-                            break entry;
-                        }
-                        if entry.payload.is_some() || seq >= through {
-                            return Err(Error::MalformedAtRest(
-                                "verified suffix has no signed witness",
-                            ));
-                        }
-                        seq = seq
-                            .checked_add(1)
-                            .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
-                    };
-                    let count = seq - from + 1;
-                    let witness_log = self
-                        .next_log_id
-                        .checked_add(count - 1)
-                        .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-                    let after_log = witness_log
-                        .checked_add(1)
-                        .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-                    self.entries.prepare_publication(
-                        store,
-                        &self.sek,
-                        &self.channel_id,
-                        entry_store::Publication {
-                            witness: &witness,
-                            from,
-                            first_log: self.next_log_id,
-                            received_ms: now_ms,
-                            bodyless_prefix: true,
-                            origin: self.genesis.body.created_ms,
-                            local_contexts: None,
-                        },
-                    )?;
-                    // Reserve all log ids before rendering the witness can allocate a cache id.
-                    self.next_log_id = after_log;
-                    self.projection_state.owed_range(*author, from, seq);
-                    let got = self.absorb_batch(
-                        store,
-                        vec![(
-                            *author,
-                            witness.entry_hash(),
-                            witness.payload,
-                            Some(witness_log),
-                        )],
-                        now_ms,
-                        Some(count),
-                        received,
-                    )?;
-                    out.applied += count as usize;
-                    out.rendered += got.rendered;
-                    out.governance += got.governance;
-                    out.refused += got.refused;
-                    from = seq
-                        .checked_add(1)
-                        .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
-                }
-            }
-            for hash in self.dag.take_filled() {
-                let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-                let Some(entry) = self.dag.get_by_hash(&read, &hash)? else {
-                    continue;
-                };
-                // A new entry covered above was already published and removed from the spool.
-                if !read.staged(&entry.skeleton.author_id, entry.skeleton.seq)? {
-                    continue;
-                }
-                let id = read
-                    .log_id(&hash)?
-                    .ok_or(Error::MalformedAtRest("filled entry has no active log"))?;
-                drop(read);
-                let got = self.absorb_batch(
-                    store,
-                    vec![(entry.skeleton.author_id, hash, entry.payload, Some(id))],
-                    now_ms,
-                    None,
-                    received,
-                )?;
-                out.applied += got.applied;
-                out.rendered += got.rendered;
-                out.governance += got.governance;
-                out.refused += got.refused;
-            }
-            // A repeated authenticated body may contradict a declaration without adding a row.
-            self.reconcile_legacy_sessions(store, now_ms)?;
-            Ok(out)
-        })();
-        if let Err(ref error) = result {
-            self.mark_poisoned();
-            self.save_error = Some(error.to_string());
-        }
-        result
-    }
-
-    /// A bounded signed batch, one signed witness, or one body refill and its effects.
-    /// An arbitrarily long unsigned prefix is written as unpublished chunks beforehand.
-    fn absorb_batch(
-        &mut self,
-        store: &Store,
-        arrived: Vec<Arrived>,
-        now_ms: u64,
-        promotion: Option<u64>,
-        received: &ReceivedFlow,
-    ) -> Result<SyncOutcome> {
-        let received = Some(received);
-        let received_tips = received.map(|flow| {
-            let mut tips = BTreeMap::new();
-            for (author, entry_hash, _, _) in &arrived {
-                tips.insert(*author, (*entry_hash, flow.clone()));
-            }
-            tips
-        });
-        let mut out = SyncOutcome {
-            applied: arrived.len(),
-            ..SyncOutcome::default()
-        };
-        // **One durable commit for the whole batch** (see `render_content_into`).
-        //
-        // Two kinds of failure, kept apart as they were when each entry committed on its own:
-        // - an entry this node refuses (bad governance) is counted and the pass goes on, **without**
-        //   poisoning the room (V210-74): the entries after it are already held, so stopping left
-        //   them in memory and not on disk, and a refusal reported as an error poisoned the room's
-        //   sync. Sync refuses what cannot be classified before it is held, so this is what is left;
-        // - a failed write poisons the room, because memory has advanced past what is on disk.
-        //
-        // Nothing below may write through `store` while `batch` is open: a second write
-        // transaction blocks forever (redb). So a body's first-seen row goes into the batch
-        // (`track_body_into`), and an expired late arrival is pruned only after the commit.
-        let mut rendered_rows: Vec<Rendered> = Vec::new();
-        let mut packages = Vec::new();
-        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
-        let mut chains_advanced = false;
-        let mut batch =
-            match received.map_or_else(|| store.batch(), |flow| store.received_batch(flow)) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.mark_poisoned();
-                    self.save_error = Some(e.to_string());
-                    return Err(e);
-                }
-            };
-        // Received entries with the derived state that admits them (ADR-038 FX-30): committed
-        // without a flush, flushed before this node acknowledges holding them; a key package, a
-        // governance entry or a key written below says `ruled` and the batch is flushed.
-        if received.is_none() {
-            // Without a receive-flow capability, make the accepted entries durable here.
-            batch.ruled();
-        }
-        if let Some(tips) = received_tips.as_ref() {
-            for author in tips.keys() {
-                batch.note_received_author(*author)?;
-            }
-        }
-        let mut promoted_role_cut = None;
-        if promotion.is_some() {
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            promoted_role_cut = index.promotion_role_cut();
-            index.publish_promotion()?;
-            index.seal()?;
-        }
-        let mut write_failed: Option<Error> = None;
-        // Log rows queued into `batch`: what the generation advances by once it commits (ADR-025
-        // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
-        // stores nothing, one after it still stores the row.
-        let mut logged: u64 = promotion.unwrap_or(0);
-        for (author, entry_hash, _, refill) in arrived {
-            let step =
-                (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
-                    // A refusal, not a write failure: `Ok(Err(..))`.
-                    macro_rules! refuse {
-                        ($e:expr) => {
-                            match $e {
-                                Ok(v) => v,
-                                Err(e) => return Ok(Err(e)),
-                            }
-                        };
-                    }
-                    let mut held = self
-                        .dag
-                        .get_by_hash(
-                            &self.entries.in_batch(&batch, &self.sek, &self.channel_id)?,
-                            &entry_hash,
-                        )?
-                        .ok_or(Error::MalformedAtRest("synced entry vanished"))?;
-                    let seq = held.skeleton.seq;
-                    // Written before the entry is classified, exactly as each entry was when it
-                    // committed on its own: a refusal below still leaves its log row stored. A body
-                    // that arrived for a held skeleton rewrites that skeleton's page.
-                    let id = match refill {
-                        Some(id) => id,
-                        None => {
-                            let id = self.next_log_id;
-                            self.next_log_id = id.saturating_add(1);
-                            id
-                        }
-                    };
-                    if promotion.is_none() {
-                        let mut index =
-                            self.entries
-                                .write(&mut batch, &self.sek, &self.channel_id)?;
-                        index.put_committed(&held, id)?;
-                        index.remove_staged(&author, seq)?;
-                        index.seal()?;
-                    }
-                    session_projection::private_index::observe_public(
-                        &mut batch,
-                        &self.sek,
-                        &self.channel_id,
-                        &held,
-                        self.epoch,
-                    )?;
-                    if promotion.is_none() {
-                        logged += 1;
-                    }
-                    self.observe_governance_into(store, &mut batch, &held, id)?;
-                    let key = refuse!(self.authors.get(&author).cloned().ok_or(
-                        Error::MalformedGovernance("synced entry from an unadmitted author")
-                    ));
-
-                    // Save subtype evidence before withholding the body, beside the
-                    // source locator in this same publication transaction.
-                    self.filter_received_session_body_into(&mut batch, &mut held)?;
-                    let Some(payload) = held.payload.as_deref() else {
-                        // A skeleton: stored, never rendered. Its body is owed unless it has
-                        // expired here (V030-10).
-                        // Promotion already inserted the missing position atomically.
-                        let missing = self
-                            .entries
-                            .write(&mut batch, &self.sek, &self.channel_id)?
-                            .missing_contains(&author, seq)?;
-                        let visibility = if missing {
-                            self.owed_visibility(&batch, &held)?
-                        } else {
-                            None
-                        };
-                        let mut writer =
-                            self.entries
-                                .write(&mut batch, &self.sek, &self.channel_id)?;
-                        writer.set_owed(entry_hash, visibility)?;
-                        writer.seal()?;
-                        return Ok(Ok(Vec::new()));
-                    };
-                    let wire_kind = refuse!(classify_payload(payload));
-                    let gov = match wire_kind {
-                        EntryKind::Governance | EntryKind::Content
-                            if wire_kind == EntryKind::Governance
-                                || crate::governance::step_policy::is_step_policy(payload) =>
-                        {
-                            let entry = held.clone();
-                            Some(refuse!(GovEntry::from_verified_log_entry(
-                                &entry,
-                                &key,
-                                &self.channel_id,
-                                Default::default(),
-                            )))
-                        }
-                        // A checkpoint is stored and read by the DAG; there is nothing to render.
-                        EntryKind::Checkpoint => return Ok(Ok(Vec::new())),
-                        EntryKind::Content | EntryKind::Governance => None,
-                    };
-                    if gov.is_some() {
-                        batch.ruled();
-                        // Every newly authenticated governance row is causal index work, even
-                        // when its single-writer semantic effect is superseded. The projection
-                        // observer separately declines to revise/invalidate/backfill for that
-                        // no-op, while this one wake settles its durable frontier obligation.
-                        out.governance += 1;
-                        return Ok(Ok(Vec::new()));
-                    }
-                    let mut rows = Vec::new();
-                    // A key-package is queued for the actor to install, never rendered or aged as
-                    // a message.
-                    if crate::node::keypackage::KeyPackage::is_key_package(payload) {
-                        batch.ruled();
-                        if key_package_for(&held, &self.me()) {
-                            packages.push((author, id));
-                        }
-                        return Ok(Ok(rows));
-                    }
-                    self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
-                    let before_expired = expired.len();
-                    let projection = self.render_content_into(
-                        &mut batch,
-                        author,
-                        entry_hash,
-                        payload,
-                        None,
-                        now_ms,
-                        false,
-                        &mut expired,
-                    )?;
-                    chains_advanced |= matches!(&projection, ContentProjection::Visible(_))
-                        || expired.len() > before_expired;
-                    rows.extend(projection.into_row());
-                    Ok(Ok(rows))
-                })();
-            match step {
-                Ok(Ok(rows)) => rendered_rows.extend(rows),
-                Ok(Err(_refusal)) => out.refused += 1,
-                Err(e) => {
-                    write_failed = Some(e);
-                    break;
-                }
-            }
-        }
-        let committed = match write_failed {
-            Some(e) => Err(e),
-            None => (|| -> Result<()> {
-                self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
-                if chains_advanced || self.chains_advanced {
-                    self.queue_receivers(&mut batch)?;
-                }
-                self.queue_private_generations(&mut batch)?;
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.note_projection(self.projection_state.to_bytes())?;
-                index.seal()?;
-                batch.commit()
-            })(),
-        };
-        if let Err(e) = committed {
-            self.mark_poisoned();
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        self.entries.committed();
-        if let Some((author, seq)) = promoted_role_cut {
-            self.role_cuts.insert(author, seq);
-            self.note_role_progress(author, seq);
-        }
-        self.legacy_sessions.committed();
-        self.key_packages.published(self.next_log_id);
-        for (author, log_id) in packages {
-            if let Err(error) = self.key_packages.note(author, log_id) {
-                self.poison(&error);
-                return Err(error);
-            }
-        }
-        self.private_controls_committed(store)?;
-        self.chains_advanced = false;
-        // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
-        // and ADR-025 credits the peer from it, so it must count exactly the rows now durable —
-        // none when the write failed (the room is poisoned above), and a refused pass's rows too.
-        self.gen
-            .fetch_add(logged, std::sync::atomic::Ordering::Relaxed);
-        if promotion.is_some() {
-            self.finish_entry_publication(store)?;
-        }
-        out.rendered += rendered_rows.len();
-        self.place_committed(store, rendered_rows, &expired)?;
-        // An entry that arrived may be a parent others named before it: rows move.
-        self.settle_display_order(store)?;
-        // Reconciliation done; only now surface a session failure, with its coded
-        // reason preserved (ADR-008 never downgrades a failure silently).
-        Ok(out)
-    }
-
-    /// Reconcile the room with a peer over `transport`, holding `shared`'s lock only inside each
-    /// protocol step — never across a send or a receive. See [`crate::log::sync::SessionRoom`].
-    /// Every step fails once `fence` is retired (ADR-025 D1a).
-    ///
-    /// Never fails as a whole: the report says what was persisted and why the session stopped, if
-    /// it did — the room poisoned, a persist that failed, or the session's own failure.
-    pub fn sync_over_room<T: Transport>(
-        shared: &tokio::sync::Mutex<Self>,
-        store: &Store,
-        peer: Digest32,
-        transport: &mut T,
-        now: crate::time::Ms,
-        fence: &crate::transport::stream_transport::Fence,
-        on_stored: &dyn Fn(),
-    ) -> SessionReport {
-        let now_ms = now.get();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let (epoch, channel_id, received_retries, poisoned, keys_open) = loop {
-            if fence.is_retired() || std::time::Instant::now() >= deadline {
-                return SessionReport::failed(SyncFailure::Session(
-                    crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
-                ));
-            }
-            if let Ok(ch) = shared.try_lock() {
-                break (
-                    ch.epoch,
-                    ch.channel_id,
-                    Arc::clone(&ch.received_retries),
-                    ch.poisoned.get().then(|| ch.save_failure().to_string()),
-                    ch.sek.key_bytes().is_ok(),
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        };
-        let retry = received_retries.retry(store);
-        if let Some(error) = poisoned {
-            return SessionReport::failed(SyncFailure::Poisoned(error));
-        }
-        if let Err(error) = retry {
-            return SessionReport::failed(SyncFailure::Poisoned(error.to_string()));
-        }
-        if !keys_open {
-            return SessionReport::failed(SyncFailure::Session(
-                crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
-            ));
-        }
-        let room = ChannelSessionRoom {
-            shared,
-            store,
-            peer,
-            now_ms,
-            epoch,
-            fence,
-            on_stored,
-            received: ReceivedFlow::new(channel_id),
-            received_retries,
-            observe_tip: std::cell::Cell::new(None),
-            deadline,
-            out: std::cell::RefCell::new(SyncOutcome::default()),
-            fatal: std::cell::RefCell::new(None),
-        };
-        let session = room
-            .received
-            .scope(|| crate::log::sync::frontier_session_room(transport, &room));
-        // Whatever arrived without a signature and was never chained to a signed entry is not
-        // authentic; it was never persisted, and it is taken back here on every path out of the
-        // session (ADR-023 decision 3).
-        {
-            // Cancellation does not skip detaching volatile provisional heads. Wait only
-            // for this bounded local cleanup; lock_now still wipes keys immediately.
-            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let guard = loop {
-                if let Ok(ch) = shared.try_lock() {
-                    break Some(ch);
-                }
-                if std::time::Instant::now() >= cleanup_deadline {
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            };
-            if let Some(mut ch) = guard.filter(|ch| ch.sek.key_bytes().is_ok()) {
-                let cleanup = room.received.scope(|| {
-                    match ch.legacy_provisional_state(store) {
-                        // A current session may finish between explicit recovery's lock
-                        // slices. It never owns that attached suffix or its durable spool.
-                        Ok(Some(_)) => Ok(0),
-                        Ok(None) => ch.discard_unverified(store),
-                        Err(error) => Err(error),
-                    }
-                });
-                match cleanup {
-                    Ok(_) => {}
-                    Err(error) => {
-                        ch.poison(&error);
-                        room.remember_fatal(error);
-                    }
-                }
-            }
-        }
-        let debt = match room.received.debt(store) {
-            Ok(debt) => debt,
-            Err(error) => {
-                room.received_retries.retain(room.received.clone());
-                room.remember_fatal(error);
-                None
-            }
-        };
-        if let Some(debt) = debt {
-            if store.flush_received_through(debt).is_err() {
-                room.received_retries.retain(room.received.clone());
-                if let Err(error) = room.received_retries.retry_owner(store, &room.received) {
-                    room.remember_fatal(error);
-                }
-            } else {
-                room.received_retries.remove(&room.received);
-            }
-        } else if room.fatal.borrow().is_none() {
-            room.received_retries.remove(&room.received);
-        }
-        let fatal = room.fatal.take();
-        SessionReport::from_room(room.out.into_inner(), session, fatal)
     }
 
     fn accept_skdm_mode(
@@ -7439,7 +6299,6 @@ impl ChannelState {
             }
             (chain, true)
         };
-        let mut release_retained = false;
         let saved = (|| -> Result<bool> {
             let mut batch = store.batch()?;
             if own_recovery && changed {
@@ -7511,7 +6370,6 @@ impl ChannelState {
                 writer.seal()?;
             }
             batch.commit()?;
-            release_retained = matches!(retained, receiver_releases::Remember::Retained);
             Ok(true)
         })();
         match saved {
@@ -7524,9 +6382,6 @@ impl ChannelState {
                 self.poison(&error);
                 return Err(error);
             }
-        }
-        if release_retained {
-            self.note_available(store, author)?;
         }
         if !changed {
             return Ok(AcceptedSkdm {
@@ -7748,25 +6603,6 @@ impl ChannelState {
             self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Offer `target` again **every** generation it is entitled to, if it is consented to here
-    /// (V210-118): the live one, and each retired one from where its entitlement began, as
-    /// history. `target` may have refused them while its owner did not trust this identity, or
-    /// dropped them when its owner stopped trusting it; a key it has just handed over says it may
-    /// take ours now. Only the live generation was offered again, so the posts sealed under a
-    /// generation retired in between stayed unreadable to it for good, although it was entitled
-    /// to them. Sending a generation it already holds is harmless: [`Self::accept_skdm`] keeps the
-    /// one it has.
-    pub fn reoffer(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        if !self.has_consented(store, target)? {
-            return Ok(());
-        }
-        self.owe_entitled_history(store, target)?;
-        if self.delivered.remove(target).is_some() {
-            self.persist_delivered(store)?;
         }
         Ok(())
     }
@@ -8140,6 +6976,25 @@ impl ChannelState {
         }
     }
 
+    /// Whether a sender key this node holds opens `author`'s post sealed under `header`: the one
+    /// predicate deciding both whether the post becomes a row here (`render_content_into`) and
+    /// whether a person's older-history request counts it as unreadable here
+    /// (`history_older_page`), so the two never disagree. A post it does not open is never
+    /// said to predate this node's trust: nothing signed this node holds marks where an
+    /// author's grant to it begins (the grant entry is written after the trust decision's mark,
+    /// and is written again after the author's consent reset), and a key it lacks may still come.
+    pub(crate) fn key_opens(
+        &self,
+        author: &Digest32,
+        header: &crate::group::message::MessageHeader,
+    ) -> bool {
+        self.receivers
+            .get(&(*author, header.chain_id))
+            .is_some_and(|chain| {
+                chain.epoch() == header.epoch && header.iteration >= chain.history_iteration()
+            })
+    }
+
     /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`.
     /// `Visible` carries the row the caller places after commit; `Applied` records an intentional
     /// non-row; `Deferred` preserves an explicit demand until transient projection state advances.
@@ -8194,11 +7049,7 @@ impl ChannelState {
             // body, whichever peer relayed it. Already rendered or cached plaintext stays.
             let fetched;
             let held = match pending_sparse_entry {
-                _ if governance::render_every_body()
-                    || !self.recipient_removal_row_in(batch, &me)? =>
-                {
-                    None
-                }
+                _ if !self.recipient_removal_row_in(batch, &me)? => None,
                 Some(entry) => Some(entry),
                 None => {
                     fetched = self.dag.get_by_hash(
@@ -8280,11 +7131,19 @@ impl ChannelState {
         } else {
             None
         };
-        let chain = historical_own.as_mut().or_else(|| {
-            self.receivers
-                .get_mut(&slot)
-                .filter(|chain| chain.epoch() == msg.header.epoch)
-        });
+        // One predicate decides whether a key held here opens another author's post, for its
+        // row here and for a person's older-history request alike (`Self::key_opens`).
+        let chain = if own {
+            historical_own.as_mut().or_else(|| {
+                self.receivers
+                    .get_mut(&slot)
+                    .filter(|chain| chain.epoch() == msg.header.epoch)
+            })
+        } else if self.key_opens(&author, &msg.header) {
+            self.receivers.get_mut(&slot)
+        } else {
+            None
+        };
         let Some(chain) = chain else {
             if author == me && self.own_behind {
                 // Retaining ciphertext is not readable recovery. A generation minted after
@@ -8537,7 +7396,6 @@ impl ChannelState {
     /// retained, and late flags are derived by RenderView from ranked suffix metadata.
     fn note_rendered(&mut self, store: &Store, hash: &Digest32) -> Result<()> {
         let result = (|| -> Result<()> {
-            self.settle_display_order(store)?;
             let rendered = self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)?;
@@ -8564,35 +7422,11 @@ impl ChannelState {
         result
     }
 
-    /// Canonical moves are already reflected in the sealed render tree. Refresh just the
-    /// tail watermark and invalidate any notice scan that depended on the old prefix.
-    fn settle_display_order(&mut self, store: &Store) -> Result<()> {
-        let result = (|| -> Result<()> {
-            if self.poisoned.get() {
-                return Err(self.save_failure());
-            }
-            let generation = self.dag.reorder_generation();
-            if generation != self.display_order_revision {
-                self.display_tail = self
-                    .entries
-                    .render_view(store, &self.sek, &self.channel_id)?
-                    .step(None, true, None, true)?
-                    .map(|(key, _)| key);
-                self.display_order_revision = generation;
-                self.invalidate_display();
-            }
-            Ok(())
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
-        }
-        result
-    }
-
-    /// Whether `a` happened before `b` in this room: `a` is a causal ancestor of `b`
+    /// Whether `a` happened before `b` in this room's hint graph: `a` is an ancestor of `b`
     /// through `b`'s author's feed and the `seen` edges this node holds
-    /// ([`Dag::happened_before`]). `false` means concurrent or not yet known to be
-    /// ordered. The seam claims are to be built on (PRD-001 R17).
+    /// ([`Dag::happened_before`]). Display ordering only, never an authority, membership,
+    /// cut, key, private-access or required-ancestor predicate (ADR-053 M0). `false` means
+    /// concurrent or not yet known to be ordered.
     pub fn happened_before(&self, store: &Store, a: &Digest32, b: &Digest32) -> Result<bool> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -8604,28 +7438,8 @@ impl ChannelState {
         )
     }
 
-    /// Every entry this node holds for the room — readable or not, body pruned or not —
-    /// in the room's one order (PRD-001 R13). The timeline is this sequence restricted
-    /// to the rows this node can render.
-    pub fn causal_order(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if self.poisoned.get() {
-            return Err(self.save_failure());
-        }
-        self.dag
-            .causal_order(&self.entries.read(store, &self.sek, &self.channel_id)?)
-    }
-
-    /// [`ChannelState::causal_order`] with each entry's clock. Transitional view consumer;
-    /// bounded query callers use [`Self::order_view`] instead of collecting history.
-    pub fn order_keys(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
-        if self.poisoned.get() {
-            return Err(self.save_failure());
-        }
-        self.dag
-            .order_keys(&self.entries.read(store, &self.sek, &self.channel_id)?)
-    }
-
-    /// Pin published DAG roots for a bounded query. Drop the view before a client/network wait.
+    /// Pin published display roots for a bounded query. Drop the view before a client/network
+    /// wait. Its keys are the fixed display keys, never the causal clock.
     pub fn order_view(&self, store: &Store) -> Result<OrderView<'_>> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -8733,8 +7547,6 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.finish_entry_publication(store)?;
-        // It may be a parent rows already shown named before it arrived.
-        self.settle_display_order(store)?;
         if kind == EntryKind::Checkpoint {
             return Ok(Accepted::Checkpoint);
         }
@@ -8778,15 +7590,20 @@ impl ChannelState {
         self.with_consent_facts(|facts| facts.can_read(me, author))
     }
 
-    /// **The time to stamp a new post with**: the clock, or just past the latest post this node
-    /// holds in the room if that is later (V210-168); and the authors of the held posts it is
-    /// *not* stamped after.
+    /// **The time to stamp a new post with**: the clock, or just past the latest signed time of
+    /// any entry this node has published in the room if that is later (V210-168); and the
+    /// authors of the shown posts it is *not* stamped after.
     ///
-    /// Posts are ordered by their stamps (the claim fold sorts on them), and each author's clock
-    /// is its own. Without this, a node whose clock is behind could post *after* it held another
-    /// member's post, and its post still sorted first: a member that had agreed another's claim
-    /// came first then claimed the same item and won it, so two agents were told "you hold it".
-    /// With it, a post made after another one was held sorts after it.
+    /// Posts are ordered by their stamps (the claim fold sorts on them, and a row's display time
+    /// is its stamp unless it was stamped more than ten minutes past its first sight, or names in
+    /// `seen` a row this node had already published with a later display time), and each
+    /// author's clock is its own. Without this, a node whose clock is behind could post *after*
+    /// it held another member's post, and its post still sorted first: a member that had agreed
+    /// another's claim came first then claimed the same item and won it, so two agents were told
+    /// "you hold it"; and a reply could sort above what it answers. With it, a post made after
+    /// another one was held sorts after it. "Held" is every published entry, not only the rows
+    /// shown: its own earlier posts, every entry a post names as seen or in its context, a reply
+    /// target, a "not received yet" header, a control entry or a post this node cannot read.
     ///
     /// A post stamped more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of this clock does not move it:
     /// one member's wrong clock must not carry every later post in the room into the future. Such
@@ -8839,46 +7656,34 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Read the existing sparse live-window basis alongside the contiguous prefix. Positions
-    /// still to walk are those between the window's start and its cursor, less a run the walk
-    /// will jump because it already passed it.
+    /// Each member's walk as the published record of what this node holds has it: the head it
+    /// walks under and how many positions it still owes, from its floor to that head less the
+    /// positions admission completed at either end.
     pub(crate) fn feed_coverage(
         &self,
-        store: &Store,
         members: &[Digest32],
-    ) -> Result<Vec<crate::node::api::FeedCoverage>> {
-        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+    ) -> Vec<crate::node::api::FeedCoverage> {
+        let snapshot = self.room_snapshot.current();
+        let history = snapshot.as_ref().and_then(|snapshot| snapshot.history());
         let me = self.me();
-        let mut coverage = Vec::with_capacity(members.len());
-        for member in members {
-            let verified = self.dag.verified_head(member);
-            let live = if *member == me {
-                None
-            } else {
-                read.sparse_author(member, crate::log::history::LogScope::Public)?
-                    .and_then(|state| state.live)
-            };
-            let live_window = live.map(|window| {
-                (
-                    window.through,
-                    if window.complete() {
-                        0
-                    } else {
-                        window.next - window.from + 1
-                            - self
-                                .live_resume
-                                .get(member)
-                                .map_or(0, |resume| resume.passes(window))
-                    },
-                )
-            });
-            coverage.push(crate::node::api::FeedCoverage {
-                member: *member,
-                verified_through: (verified != 0).then_some(verified),
-                live_window,
-            });
-        }
-        Ok(coverage)
+        members
+            .iter()
+            .map(|member| {
+                let verified = self.dag.verified_head(member);
+                let live_window = history
+                    .and_then(|history| history.author(member))
+                    .filter(|row| *member != me && row.committed_size() > 0)
+                    .map(|row| {
+                        let owed = row.window().map_or(0, |(from, to)| to - from + 1);
+                        (row.committed_size(), owed)
+                    });
+                crate::node::api::FeedCoverage {
+                    member: *member,
+                    verified_through: (verified != 0).then_some(verified),
+                    live_window,
+                }
+            })
+            .collect()
     }
 
     /// Latest message this node can show for each member. Authenticated headers and
@@ -9334,21 +8139,6 @@ impl ChannelState {
             .collect()
     }
 
-    fn key_member_became_current(&self, who: Digest32) {
-        if who == self.me() {
-            for peer in self
-                .authors
-                .keys()
-                .copied()
-                .filter(|peer| *peer != who && self.is_member(peer))
-            {
-                self.role_owed.mark_key_dirty(peer);
-            }
-        } else {
-            self.role_owed.mark_key_dirty(who);
-        }
-    }
-
     /// Write that this identity has left the room (`here` = false) or is back in it, unless its
     /// feed already says so (V210-164). Returns whether an entry was written.
     pub fn say_presence(
@@ -9476,7 +8266,7 @@ impl ChannelState {
         // An admin certificate never carries delegate, so another admin cannot extend it.
         #[cfg(feature = "mutant-sender")]
         let entitled = signer.fingerprint() == self.genesis.creator_pubkey().fingerprint()
-            || crate::log::sync::mutant::admins_unentitled();
+            || crate::log::mutant::admins_unentitled();
         #[cfg(not(feature = "mutant-sender"))]
         let entitled = signer.fingerprint() == self.genesis.creator_pubkey().fingerprint();
         if !entitled {
@@ -9607,7 +8397,6 @@ impl ChannelState {
     /// App-lock this channel: wipe the SEK now. The state should be dropped
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
-        self.key_provider_prune_wait = None;
         if let Some(resource) = &self.history_read {
             resource.revoke();
         }
@@ -9647,467 +8436,5 @@ impl ChannelState {
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
         self.passphrase.is_some()
-    }
-}
-
-/// A channel as a [`crate::log::sync::SessionRoom`]: each step locks the room, does its work, and
-/// lets go. See [`ChannelState::sync_over_room`].
-struct ChannelSessionRoom<'a> {
-    peer: Digest32,
-    shared: &'a tokio::sync::Mutex<ChannelState>,
-    store: &'a Store,
-    now_ms: u64,
-    /// The epoch the session began at; a room that has moved on refuses what was staged for it.
-    epoch: u64,
-    /// Retired sessions stop at their next step (ADR-025 D1a).
-    fence: &'a crate::transport::stream_transport::Fence,
-    /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
-    on_stored: &'a dyn Fn(),
-    received: ReceivedFlow,
-    received_retries: Arc<ReceivedRetries>,
-    observe_tip: std::cell::Cell<Option<crate::log::sync::LegacyGap>>,
-    deadline: std::time::Instant,
-    out: std::cell::RefCell<SyncOutcome>,
-    /// A local failure (a persist that failed) that must reach the caller as itself, not as a code.
-    fatal: std::cell::RefCell<Option<Error>>,
-}
-
-impl ChannelSessionRoom<'_> {
-    /// Keep the first local error: it is the operation which stopped semantic absorption. A
-    /// later cleanup or durability-settlement failure retains its retry owner separately and
-    /// cannot overwrite that causal diagnosis.
-    fn remember_fatal(&self, error: Error) {
-        let mut fatal = self.fatal.borrow_mut();
-        if fatal.is_none() {
-            *fatal = Some(error);
-        }
-    }
-
-    fn room(
-        &self,
-    ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
-    {
-        if self.fence.is_retired() {
-            return Err(crate::wire::WireError::TransportFailed);
-        }
-        let ch = loop {
-            if self.fence.is_retired() || std::time::Instant::now() >= self.deadline {
-                return Err(crate::wire::WireError::TransportFailed);
-            }
-            if let Ok(ch) = self.shared.try_lock() {
-                break ch;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        };
-        if self.fence.is_retired() {
-            return Err(crate::wire::WireError::TransportFailed);
-        }
-
-        if ch.post_pending() {
-            return Err(crate::wire::WireError::TransportFailed);
-        }
-        if ch.poisoned.get() {
-            return Err(crate::wire::WireError::TransportFailed);
-        }
-        if ch.epoch != self.epoch {
-            return Err(crate::wire::WireError::EpochMismatch);
-        }
-        Ok(ch)
-    }
-}
-
-impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
-    fn apply_entries_limit(&self) -> usize {
-        1
-    }
-    fn receive_entry_bytes_limit(&self) -> usize {
-        1024 * 1024
-    }
-    fn receive_limits(&self) -> (usize, usize) {
-        (
-            crate::log::sync::LEGACY_QUANTUM_ENTRIES,
-            crate::log::sync::LEGACY_QUANTUM_BYTES,
-        )
-    }
-    fn frontiers(
-        &self,
-    ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
-    {
-        let ch = self.room()?;
-        let entries = ch
-            .entries
-            .read(self.store, &ch.sek, &ch.channel_id)
-            .map_err(|_| crate::wire::WireError::TransportFailed)?;
-        let mut frontiers = crate::log::sync::verified_frontiers_of(&ch.dag, &entries)
-            .map_err(|_| crate::wire::WireError::TransportFailed)?;
-        if let Some(state) = entries.legacy_provisional() {
-            // A signed staged witness is not a published head. The sealed accepted base
-            // remains the only automatic frontier even before final volatile detachment.
-            frontiers.retain(|head| head.author_id != state.owner.author);
-            if state.base_seq > 0 {
-                frontiers.push(crate::log::sync::FeedFrontier {
-                    author_id: state.owner.author,
-                    max_seq: state.base_seq,
-                    head_hash: state.base_hash,
-                });
-                frontiers.sort_unstable_by_key(|head| head.author_id);
-            }
-        }
-        drop(entries);
-        let generation = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
-        let room_id = ch.channel_id();
-        // The captured frontiers name the authors to settle. Do not wait for the
-        // Store writer while holding the room; later debts only make this conservative.
-        drop(ch);
-        for frontier in &frontiers {
-            let debts = self
-                .store
-                .received_debts_for_author(room_id, frontier.author_id)
-                .map_err(|_| crate::wire::WireError::TransportFailed)?;
-            for debt in debts {
-                self.store
-                    .flush_received_through(debt)
-                    .map_err(|_| crate::wire::WireError::TransportFailed)?;
-            }
-        }
-        Ok((frontiers, generation))
-    }
-
-    fn wants(
-        &self,
-        remote: &[crate::log::sync::FeedFrontier],
-    ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
-        let mut room = self.room()?;
-        // What the peer holds of this identity's feed, by its own frontier: nothing it was sent
-        // counts until it says it holds it (ADR-028 R-6).
-        let me = room.me();
-        self.out.borrow_mut().mine_held = Some(
-            remote
-                .iter()
-                .find(|f| f.author_id == me)
-                .map_or(0, |f| f.max_seq),
-        );
-        let requested = (|| -> Result<_> {
-            let entries = room.entries.read(self.store, &room.sek, &room.channel_id)?;
-            let (mut wants, mut gap) =
-                crate::log::sync::wants_for_current(&room.dag, &entries, remote)?;
-            if let Some(state) = entries.legacy_provisional() {
-                gap = Some(crate::log::sync::LegacyGap {
-                    author: state.owner.author,
-                    from: state.base_seq.saturating_add(1),
-                    through: state.tail_seq.max(state.base_seq.saturating_add(1)),
-                    hash: state.tail_hash,
-                });
-                for want in &mut wants {
-                    let verified = if want.author_id == state.owner.author {
-                        state.base_seq
-                    } else {
-                        room.dag.verified_head(&want.author_id)
-                    };
-                    want.to_seq = want.to_seq.min(verified);
-                }
-                wants.retain(|want| want.from_seq <= want.to_seq);
-            }
-            if entries.legacy_required_any() {
-                for want in &mut wants {
-                    want.to_seq = want.to_seq.min(room.dag.verified_head(&want.author_id));
-                }
-                wants.retain(|want| want.from_seq <= want.to_seq);
-            }
-            if let Some(tip) = gap.filter(|tip| {
-                entries.legacy_provisional().is_none()
-                    && entries
-                        .legacy_required(&tip.author)
-                        .is_none_or(|known| known.through < tip.through)
-            }) {
-                // Observe this signed tip alone: an older overlap may itself hold a
-                // whole legal record and consume the legacy envelope first. Once the
-                // scalar requirement is saved, the next metadata exchange retains the
-                // verified-position overlap and can discover a fork without backfill.
-                wants.clear();
-                wants.push(crate::log::sync::WantRange {
-                    author_id: tip.author,
-                    from_seq: tip.through,
-                    to_seq: tip.through,
-                });
-                self.observe_tip.set(Some(tip));
-            }
-            Ok((wants, gap))
-        })();
-        let wants = match requested {
-            Ok((wants, gap)) => {
-                self.out.borrow_mut().legacy_required = gap;
-                wants
-            }
-            Err(error) => {
-                room.poison(&error);
-                self.remember_fatal(error);
-                return Err(crate::wire::WireError::TransportFailed);
-            }
-        };
-        // Missing older bodies are explicit history demand, never a periodic refill pump.
-        Ok(wants)
-    }
-
-    fn entries(
-        &self,
-        wants: &[crate::log::sync::WantRange],
-    ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
-        let mut room = self.room()?;
-        match room.session_entries_for_bounded(
-            self.store,
-            &self.peer,
-            wants,
-            self.now_ms,
-            crate::log::sync::LEGACY_QUANTUM_ENTRIES,
-            1024 * 1024,
-        ) {
-            Ok(entries) => Ok(entries),
-            Err(error) if session_projection::floor_index::refreshing(&error) => {
-                self.remember_fatal(error);
-                Err(crate::wire::WireError::TransportFailed)
-            }
-            Err(error) => {
-                room.poison(&error);
-                self.remember_fatal(error);
-                Err(crate::wire::WireError::TransportFailed)
-            }
-        }
-    }
-
-    fn apply(&self, mut staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
-        let mut guard = match self.room() {
-            Ok(g) => g,
-            Err(code) => {
-                return crate::log::sync::ApplyReport {
-                    fail: Some(code),
-                    ..crate::log::sync::ApplyReport::default()
-                }
-            }
-        };
-        let ch = &mut *guard;
-        if staged.len() == 1 {
-            if let (Some(tip), Ok(mut entry)) =
-                (self.observe_tip.get(), Entry::from_wire(&staged[0]))
-            {
-                if entry.skeleton.author_id == tip.author && entry.skeleton.seq == tip.through {
-                    let verified = entry.entry_hash() == tip.hash
-                        && entry.is_signed()
-                        && ch
-                            .authors
-                            .get(&tip.author)
-                            .is_some_and(|key| entry.verify(key).is_ok());
-                    if !verified {
-                        return crate::log::sync::ApplyReport {
-                            fail: Some(crate::wire::WireError::AuthenticatorInvalid),
-                            ..crate::log::sync::ApplyReport::default()
-                        };
-                    }
-                    entry.payload = None;
-                    match ch.note_legacy_required(self.store, &entry) {
-                        Ok(_) => {
-                            return crate::log::sync::ApplyReport {
-                                classes: vec![crate::log::sync::EntryClass::Observed],
-                                ..crate::log::sync::ApplyReport::default()
-                            }
-                        }
-                        Err(
-                            Error::MalformedBundle(_)
-                            | Error::StreamRefused(_)
-                            | Error::SizeLimitExceeded(_),
-                        ) => {
-                            return crate::log::sync::ApplyReport {
-                                fail: Some(crate::wire::WireError::AuthenticatorInvalid),
-                                ..crate::log::sync::ApplyReport::default()
-                            }
-                        }
-                        Err(error) => {
-                            ch.poison(&error);
-                            self.remember_fatal(error);
-                            return crate::log::sync::ApplyReport {
-                                fail: Some(crate::wire::WireError::TransportFailed),
-                                ..crate::log::sync::ApplyReport::default()
-                            };
-                        }
-                    }
-                }
-            }
-        }
-        let legacy_state = match ch.legacy_provisional_state(self.store) {
-            Ok(state) => state,
-            Err(error) => {
-                self.remember_fatal(error);
-                return crate::log::sync::ApplyReport {
-                    fail: Some(crate::wire::WireError::TransportFailed),
-                    ..crate::log::sync::ApplyReport::default()
-                };
-            }
-        };
-        if legacy_state.is_some() {
-            let accepted = ch
-                .entries
-                .read(self.store, &ch.sek, &ch.channel_id)
-                .and_then(|read| {
-                    read.restart_state().cloned().ok_or(Error::MalformedAtRest(
-                        "legacy accepted restart state missing",
-                    ))
-                });
-            let accepted = match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    self.remember_fatal(error);
-                    return crate::log::sync::ApplyReport {
-                        fail: Some(crate::wire::WireError::TransportFailed),
-                        ..Default::default()
-                    };
-                }
-            };
-            if staged.iter().any(|wire| {
-                Entry::from_wire(wire).is_ok_and(|entry| {
-                    entry.skeleton.seq
-                        > accepted
-                            .feeds
-                            .get(&entry.skeleton.author_id)
-                            .map_or(0, |feed| feed.seq)
-                })
-            }) {
-                // This WANT may have preceded acquisition of the exact legacy owner.
-                return crate::log::sync::ApplyReport {
-                    classes: vec![crate::log::sync::EntryClass::Unlinked; staged.len()],
-                    ..Default::default()
-                };
-            }
-        }
-        if legacy_state.is_some() || self.out.borrow().legacy_required.is_some() {
-            // Overlap comparison needs signed headers only. It must not refill old bodies
-            // or mutate the paused request's spool as a side effect of periodic metadata.
-            for wire in &mut staged {
-                if let Ok(mut entry) = Entry::from_wire(wire) {
-                    entry.payload = None;
-                    *wire = entry.to_wire();
-                }
-            }
-        }
-        let before = ch.heads();
-        let gen_before = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
-        // The resolver as it is *now*: an author revoked while this batch was on the wire is not
-        // an author of this room any more, and its entries are refused.
-        let resolver = ch.resolver();
-        // **Absorb what was stored, then report the failure.** The DAG takes entries one at a time
-        // and stops at the first hard failure; those before it are already in the log, so they are
-        // persisted, rendered and counted before the failure is reported (one joiner once read
-        // nothing from the host because the order was the other way round: tworooms.sh).
-        let mut batch = match self.store.batch() {
-            Ok(batch) => batch,
-            Err(error) => {
-                ch.poison(&error);
-                self.remember_fatal(error);
-                return crate::log::sync::ApplyReport {
-                    fail: Some(crate::wire::WireError::TransportFailed),
-                    ..crate::log::sync::ApplyReport::default()
-                };
-            }
-        };
-        batch.derived();
-        let staged_result = (|| -> Result<(crate::log::sync::ApplyReport, Option<Error>)> {
-            let mut index = ch.entries.write(&mut batch, &ch.sek, &ch.channel_id)?;
-            let result = crate::log::sync::apply_staged_classified(
-                &mut ch.dag,
-                &mut index,
-                &resolver,
-                &ch.admission,
-                &staged,
-            );
-            if result.1.is_some() {
-                return Ok(result);
-            }
-            index.seal()?;
-            batch.commit()?;
-            ch.entries.committed();
-            Ok(result)
-        })();
-        let (mut report, local) = match staged_result {
-            Ok(result) => result,
-            Err(error) => (crate::log::sync::ApplyReport::default(), Some(error)),
-        };
-        if let Some(error) = local {
-            ch.poison(&error);
-            self.remember_fatal(error);
-            report.stored = 0;
-            report.fail = Some(crate::wire::WireError::TransportFailed);
-            // Fork evidence remains independently durable even when unpublished log work fails.
-            if let Err(error) = ch.keep_forks(self.store) {
-                self.remember_fatal(error);
-            }
-            return report;
-        }
-        match ch.legacy_cache_only(self.store) {
-            Ok(true) => {
-                // Current overlap may discover a fork, but cannot refill or maintain the
-                // mutable roots owned by an explicit legacy publication.
-                if let Err(error) = ch.keep_forks(self.store) {
-                    self.remember_fatal(error);
-                    report.fail = Some(crate::wire::WireError::TransportFailed);
-                }
-                report.stored = 0;
-                return report;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                ch.poison(&error);
-                self.remember_fatal(error);
-                report.fail = Some(crate::wire::WireError::TransportFailed);
-                return report;
-            }
-        }
-        for author in ch.dag.authors() {
-            let verified = ch.dag.verified_head(&author);
-            let tail = ch.dag.feed(&author).map_or(0, |feed| feed.max_seq());
-            if tail > verified {
-                self.out
-                    .borrow_mut()
-                    .legacy_required
-                    .get_or_insert(crate::log::sync::LegacyGap {
-                        author,
-                        from: verified.saturating_add(1),
-                        through: tail,
-                        hash: ch
-                            .dag
-                            .feed(&author)
-                            .map_or(ZERO_HASH, |feed| feed.head_hash()),
-                    });
-            }
-        }
-        if let Err(error) = ch.filter_received_session_bodies(self.store, &staged, self.now_ms) {
-            ch.poison(&error);
-            self.remember_fatal(error);
-            report.stored = 0;
-            report.fail = Some(crate::wire::WireError::TransportFailed);
-            return report;
-        }
-        match ch.absorb_arrived(self.store, &before, self.now_ms, &self.received) {
-            Ok(got) => {
-                let mut out = self.out.borrow_mut();
-                out.rendered += got.rendered;
-                out.governance += got.governance;
-                out.refused += got.refused;
-            }
-            Err(e) => {
-                self.remember_fatal(e);
-                report.fail = Some(crate::wire::WireError::TransportFailed);
-            }
-        }
-        // `stored` means persisted: the generation counts each entry the persist step committed.
-        let gen_after = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
-        report.stored = usize::try_from(gen_after.saturating_sub(gen_before)).unwrap_or(usize::MAX);
-        drop(guard);
-        if report.stored > 0 {
-            (self.on_stored)();
-        }
-        report
-    }
-
-    fn generation(&self) -> std::result::Result<u64, crate::wire::WireError> {
-        Ok(self.room()?.gen.load(std::sync::atomic::Ordering::Relaxed))
     }
 }

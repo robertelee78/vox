@@ -713,9 +713,12 @@ impl Write<'_, '_> {
             }
             return Err(invalid("render cache locator changed"));
         }
+        // The causal clock keys only the semantic Session candidates; every display tree
+        // uses the display time fixed at first publication.
         let clock = source
             .number(self.sek, self.channel, roots.clock, &hashed(&hash))?
             .ok_or(invalid("render has no published clock"))?;
+        let display = self.display_at(&roots, &hash)?;
         let fact = RenderFact {
             cache: row.arrival,
             epoch: self.directory.render_epoch,
@@ -733,7 +736,7 @@ impl Write<'_, '_> {
             Some(fact),
         )?;
         roots.rendered.display =
-            self.change_rendered(roots.rendered.display, ordered((clock, hash)), Some(fact))?;
+            self.change_rendered(roots.rendered.display, ordered((display, hash)), Some(fact))?;
         roots.rendered.created = self.change_rendered(
             roots.rendered.created,
             ordered((row.created_millis, hash)),
@@ -768,7 +771,7 @@ impl Write<'_, '_> {
             self.change_filter(
                 &mut roots.rendered,
                 &filter,
-                (clock, hash),
+                (display, hash),
                 true,
                 Some(fact),
             )?;
@@ -799,6 +802,7 @@ impl Write<'_, '_> {
         let clock = source
             .number(self.sek, self.channel, roots.clock, &hashed(hash))?
             .ok_or(invalid("render clock missing"))?;
+        let display = self.display_at(&roots, hash)?;
         let bytes = source
             .open(
                 self.sek,
@@ -817,7 +821,7 @@ impl Write<'_, '_> {
         roots.rendered.arrival =
             self.change_rendered(roots.rendered.arrival, ordered((fact.cache, *hash)), None)?;
         roots.rendered.display =
-            self.change_rendered(roots.rendered.display, ordered((clock, *hash)), None)?;
+            self.change_rendered(roots.rendered.display, ordered((display, *hash)), None)?;
         roots.rendered.created = self.change_rendered(
             roots.rendered.created,
             ordered((row.created_millis, *hash)),
@@ -849,7 +853,7 @@ impl Write<'_, '_> {
                 false,
                 None,
             )?;
-            self.change_filter(&mut roots.rendered, &filter, (clock, *hash), true, None)?;
+            self.change_filter(&mut roots.rendered, &filter, (display, *hash), true, None)?;
         }
         self.change_operation(&mut roots.rendered, &row, None)?;
         let author = hashed(&row.author);
@@ -870,7 +874,7 @@ impl Write<'_, '_> {
     /// shared log/cache allocator, the old row is deleted, and the retention fact points at the
     /// new one and is marked returned (a hash continuation naming it is refused, its place in
     /// arrival moved). Every expiry input (log id, first sight, claimed time, step kind) stays:
-    /// it never gets a fresh lifetime. Its display key `(clock, hash)` and created time stay, so
+    /// it never gets a fresh lifetime. Its fixed display key and created time stay, so
     /// it is back in its place in the conversation and its threads. The row gets what
     /// `put_rendered` gives a row shown for the first time, with `shown` as its visibility time;
     /// a read receipt gets its references back under its own row. A row already shown, one this
@@ -944,27 +948,22 @@ impl Write<'_, '_> {
             _ => Err(invalid("retained cache hash differs")),
         }
     }
-    pub(super) fn move_rendered(
+    /// A row's fixed display time; never the causal clock.
+    fn display_at(&self, roots: &super::Roots, hash: &Digest32) -> Result<u64> {
+        Source::Batch(self.batch)
+            .number(self.sek, self.channel, roots.display_time, &hashed(hash))?
+            .ok_or(invalid("published entry has no display key"))
+    }
+    /// A late parent moved an entry's causal clock. Public Session candidates and their
+    /// locality are ordered by that clock (a semantic consumer), so only they follow it.
+    /// No display tree moves: a row a person was shown keeps its place.
+    pub(super) fn move_session_candidate(
         &mut self,
         roots: &mut super::Roots,
         hash: Digest32,
         old: u64,
         new: u64,
     ) -> Result<()> {
-        if let Some(value @ Value::Owed(_)) = Source::Batch(self.batch).find_value(
-            self.sek,
-            self.channel,
-            roots.rendered.owed_hash,
-            &hashed(&hash),
-        )? {
-            roots.rendered.owed_display =
-                self.change_ranked(roots.rendered.owed_display, ordered((old, hash)), None)?;
-            roots.rendered.owed_display = self.change_ranked(
-                roots.rendered.owed_display,
-                ordered((new, hash)),
-                Some(value),
-            )?;
-        }
         let source = Source::Batch(self.batch);
         let Some(fact) =
             source.render_fact(self.sek, self.channel, roots.rendered.hash, &hashed(&hash))?
@@ -985,43 +984,146 @@ impl Write<'_, '_> {
         if row.entry_hash != hash {
             return Err(invalid("render cache hash differs"));
         }
-        roots.rendered.display =
-            self.change_rendered(roots.rendered.display, ordered((old, hash)), None)?;
-        roots.rendered.display =
-            self.change_rendered(roots.rendered.display, ordered((new, hash)), Some(fact))?;
-        for filter in filters(&row) {
-            if matches!(filter, Filter::SessionCandidates) {
-                super::super::session_projection::locality::observe_public(
-                    self.batch,
-                    self.sek,
-                    self.channel,
-                    &row,
-                    old,
-                    false,
-                )?;
-                super::super::session_projection::locality::observe_public(
-                    self.batch,
-                    self.sek,
-                    self.channel,
-                    &row,
-                    new,
-                    true,
-                )?;
-                roots.rendered.session_candidates = self.change_rendered(
-                    roots.rendered.session_candidates,
-                    session_key((row.created_millis, old, hash)),
-                    None,
-                )?;
-                roots.rendered.session_candidates = self.change_rendered(
-                    roots.rendered.session_candidates,
-                    session_key((row.created_millis, new, hash)),
+        if !filters(&row)
+            .iter()
+            .any(|filter| matches!(filter, Filter::SessionCandidates))
+        {
+            return Ok(());
+        }
+        for (clock, present) in [(old, false), (new, true)] {
+            super::super::session_projection::locality::observe_public(
+                self.batch,
+                self.sek,
+                self.channel,
+                &row,
+                clock,
+                present,
+            )?;
+        }
+        roots.rendered.session_candidates = self.change_rendered(
+            roots.rendered.session_candidates,
+            session_key((row.created_millis, old, hash)),
+            None,
+        )?;
+        roots.rendered.session_candidates = self.change_rendered(
+            roots.rendered.session_candidates,
+            session_key((row.created_millis, new, hash)),
+            Some(fact),
+        )?;
+        Ok(())
+    }
+
+    /// Display reindex stage 1: move each rendered row of an older store from the causal
+    /// clock its display trees were keyed by to its fixed display time, in the whole display
+    /// tree and every display-keyed selector. Bounded by entries and opened bytes.
+    pub(super) fn display_rendered_chunk(&mut self, start: Option<Key>) -> Result<Option<Key>> {
+        let mut roots = self.render_roots()?;
+        let mut key = start.unwrap_or([0; 64]);
+        let mut bytes = 0usize;
+        for _ in 0..PROMOTION_ENTRIES {
+            let source = Source::Batch(self.batch);
+            let Some((found, value)) =
+                source.first(self.sek, self.channel, roots.rendered.hash, &key, 0)?
+            else {
+                self.set_render_roots(roots)?;
+                return Ok(None);
+            };
+            let Value::Rendered(fact) = value else {
+                return Err(invalid("render locator value"));
+            };
+            let hash: Digest32 = found[..32]
+                .try_into()
+                .map_err(|_| invalid("render locator hash"))?;
+            let clock = source
+                .number(self.sek, self.channel, roots.clock, &found)?
+                .ok_or(invalid("render clock missing"))?;
+            let display = self.display_at(&roots, &hash)?;
+            if clock != display {
+                let opened = Source::Batch(self.batch)
+                    .open(
+                        self.sek,
+                        self.channel,
+                        SegmentKind::PlaintextCache,
+                        fact.cache,
+                    )?
+                    .ok_or(invalid("render cache missing"))?;
+                if bytes != 0 && bytes.saturating_add(opened.len()) > PROMOTION_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(opened.len());
+                let super::super::CacheRow::Text(row) = super::super::parse_cache(&opened)? else {
+                    return Err(invalid("render points to nontext"));
+                };
+                if row.entry_hash != hash {
+                    return Err(invalid("render cache hash differs"));
+                }
+                roots.rendered.display =
+                    self.change_rendered(roots.rendered.display, ordered((clock, hash)), None)?;
+                roots.rendered.display = self.change_rendered(
+                    roots.rendered.display,
+                    ordered((display, hash)),
                     Some(fact),
                 )?;
+                for filter in filters(&row) {
+                    self.change_filter(&mut roots.rendered, &filter, (clock, hash), true, None)?;
+                    self.change_filter(
+                        &mut roots.rendered,
+                        &filter,
+                        (display, hash),
+                        true,
+                        Some(fact),
+                    )?;
+                }
             }
-            self.change_filter(&mut roots.rendered, &filter, (old, hash), true, None)?;
-            self.change_filter(&mut roots.rendered, &filter, (new, hash), true, Some(fact))?;
+            let Some(next) = successor(found) else {
+                self.set_render_roots(roots)?;
+                return Ok(None);
+            };
+            key = next;
         }
-        Ok(())
+        self.set_render_roots(roots)?;
+        Ok(Some(key))
+    }
+
+    /// Display reindex stage 2: the same for "not received yet" rows.
+    pub(super) fn display_owed_chunk(&mut self, start: Option<Key>) -> Result<Option<Key>> {
+        let mut roots = self.render_roots()?;
+        let mut key = start.unwrap_or([0; 64]);
+        for _ in 0..PROMOTION_ENTRIES {
+            let source = Source::Batch(self.batch);
+            let Some((found, value)) =
+                source.first(self.sek, self.channel, roots.rendered.owed_hash, &key, 0)?
+            else {
+                self.set_render_roots(roots)?;
+                return Ok(None);
+            };
+            if !matches!(value, Value::Owed(_)) {
+                return Err(invalid("owed locator value"));
+            }
+            let hash: Digest32 = found[..32]
+                .try_into()
+                .map_err(|_| invalid("owed locator hash"))?;
+            let clock = source
+                .number(self.sek, self.channel, roots.clock, &found)?
+                .ok_or(invalid("owed entry not published"))?;
+            let display = self.display_at(&roots, &hash)?;
+            if clock != display {
+                roots.rendered.owed_display =
+                    self.change_ranked(roots.rendered.owed_display, ordered((clock, hash)), None)?;
+                roots.rendered.owed_display = self.change_ranked(
+                    roots.rendered.owed_display,
+                    ordered((display, hash)),
+                    Some(value),
+                )?;
+            }
+            let Some(next) = successor(found) else {
+                self.set_render_roots(roots)?;
+                return Ok(None);
+            };
+            key = next;
+        }
+        self.set_render_roots(roots)?;
+        Ok(Some(key))
     }
 }
 
@@ -1536,6 +1638,9 @@ impl EntryIndex {
         if !read.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
         }
+        if !read.directory.display_ready {
+            return Err(invalid("display order not yet reindexed"));
+        }
         let order = OrderView { read };
         if !order.read.directory.render_ready {
             return Err(invalid("render facts not yet rebuilt"));
@@ -1692,9 +1797,7 @@ impl EntryIndex {
                 return Err(invalid("room view cache locator"));
             }
             if is_general_root(&row.text) {
-                let clock = Source::Batch(writer.batch)
-                    .number(sek, channel, roots.clock, &hashed(&hash))?
-                    .ok_or(invalid("room view clock missing"))?;
+                let display = writer.display_at(&roots, &hash)?;
                 writer.change_filter(
                     &mut roots.rendered,
                     &Filter::General,
@@ -1705,7 +1808,7 @@ impl EntryIndex {
                 writer.change_filter(
                     &mut roots.rendered,
                     &Filter::General,
-                    (clock, hash),
+                    (display, hash),
                     true,
                     Some(fact),
                 )?;
@@ -1794,9 +1897,7 @@ impl Write<'_, '_> {
         if old == new {
             return Ok(());
         }
-        let clock = source
-            .number(self.sek, self.channel, roots.clock, &hashed(&hash))?
-            .ok_or(invalid("owed entry not published"))?;
+        let display = self.display_at(&roots, &hash)?;
         if let Some(old) = old {
             roots.rendered.owed_expiry = self.change_ranked(
                 roots.rendered.owed_expiry,
@@ -1811,7 +1912,7 @@ impl Write<'_, '_> {
         )?;
         roots.rendered.owed_display = self.change_ranked(
             roots.rendered.owed_display,
-            ordered((clock, hash)),
+            ordered((display, hash)),
             new.map(Value::Owed),
         )?;
         if let Some(new) = new {
@@ -1953,6 +2054,10 @@ impl RenderView<'_> {
             )?
             .is_some())
     }
+    /// A new post's stamp: this clock, or just past the latest signed time of every entry
+    /// this node has published in the room (whatever its kind, readable or not), when that
+    /// is later and within `limit`. The authors returned are those of shown posts stamped
+    /// beyond `limit`, the existing exception for a member whose clock is far ahead.
     pub(crate) fn stamp_info(&self, now: u64, limit: u64) -> Result<(u64, Vec<Digest32>)> {
         let source = self.source();
         let sek = self.order.read.sek;
@@ -1960,7 +2065,7 @@ impl RenderView<'_> {
         let latest = source.last(
             sek,
             room,
-            self.roots().created,
+            self.order.read.directory.active.claimed,
             &ordered((limit, [u8::MAX; 32])),
             0,
         )?;
@@ -2118,6 +2223,27 @@ impl Write<'_, '_> {
             next.map(Value::Number),
         )?;
         self.set_render_roots(roots)
+    }
+    /// Have `author`'s render backfill walk come back to `seq`: its cursor moves back to `seq`
+    /// when it is past it or the walk is done, and stays where it is when it has not reached
+    /// `seq` yet, so one row that must be decided again never sends the walk back over the
+    /// author's whole history.
+    pub(crate) fn lower_backfill(&mut self, author: Digest32, seq: u64) -> Result<()> {
+        let roots = self.render_roots()?;
+        let held = match Source::Batch(self.batch).find_value(
+            self.sek,
+            self.channel,
+            roots.rendered.backfill,
+            &hashed(&author),
+        )? {
+            None => None,
+            Some(Value::Number(at)) if at != 0 => Some(at),
+            Some(_) => return Err(invalid("backfill cursor value")),
+        };
+        if held.is_some_and(|at| at <= seq) {
+            return Ok(());
+        }
+        self.queue_backfill(author, Some(seq.max(1)))
     }
     pub(crate) fn next_backfill_after(
         &self,

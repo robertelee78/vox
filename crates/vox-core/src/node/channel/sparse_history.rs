@@ -5,16 +5,6 @@ use super::*;
 use crate::log::history::LogScope;
 use crate::node::store::Batch;
 
-pub(super) struct KeyProviderPruneWait {
-    pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
-    pub(super) task: tokio::task::JoinHandle<()>,
-}
-impl Drop for KeyProviderPruneWait {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 /// Exact signed header and the length bound governing payload continuations.
 pub(crate) struct HistoryHeader {
     pub wire: Vec<u8>,
@@ -38,113 +28,6 @@ pub(crate) enum HistoryPayload {
     Held { payload_len: u64, bytes: Vec<u8> },
 }
 
-/// One authenticated local debt, or an explicit dependency that must wake before retry.
-// Keep the bounded record inline; boxing would add an uncharged allocation.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum KeyDebtPage {
-    End,
-    Frozen {
-        serial: u64,
-    },
-    Ready {
-        serial: u64,
-        need: crate::node::history_stream::KeyBodyNeed,
-    },
-}
-
-/// Atomic result of persisting one advertised-head refusal. Authorization mismatch is not a
-/// storage error: it carries the fresh generation read by the same batch that fenced the flow's
-/// captured generation.
-pub(crate) enum HistoryDeclineResult {
-    Stored { remembered: bool, current: Digest32 },
-    AuthorizationChanged { current: Digest32 },
-}
-
-/// Exact refusal inputs captured from the currently authorized room. The trust generation
-/// remains an in-transaction check; capturing these scalars does not confer peer authority.
-pub(crate) struct PendingHistoryDecline {
-    room: Digest32,
-    instance: [u8; 16],
-    epoch: u64,
-    sek: crate::atrest::sek::WeakSek,
-    node: Digest32,
-    peer: Digest32,
-    author: Digest32,
-    head: Digest32,
-    authorization: Digest32,
-    metadata: bool,
-    peer_incarnation: u64,
-    author_incarnation: u64,
-}
-
-impl PendingHistoryDecline {
-    pub(crate) fn commit(
-        self,
-        store: &Store,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<HistoryDeclineResult> {
-        let mut batch = store.batch()?;
-        let current = crate::node::history_stream::authorization_generation_in(
-            &batch,
-            self.node,
-            self.room,
-            self.instance,
-            self.epoch,
-        )?;
-        if current != self.authorization {
-            return Ok(HistoryDeclineResult::AuthorizationChanged { current });
-        }
-        self.sek.with(|sek| {
-            let entries = entry_store::EntryIndex::default();
-            let mut index = entries.write(&mut batch, sek, &self.room)?;
-            let prior = if self.metadata {
-                index.history_declined_metadata(&self.peer, &self.author)?
-            } else {
-                index.history_declined_head(&self.peer, &self.author)?
-            };
-            if prior
-                == Some((
-                    self.head,
-                    self.authorization,
-                    self.peer_incarnation,
-                    self.author_incarnation,
-                ))
-            {
-                return Ok(HistoryDeclineResult::Stored {
-                    remembered: false,
-                    current,
-                });
-            }
-            if self.metadata {
-                index.keep_history_declined_metadata(
-                    self.peer,
-                    self.author,
-                    self.head,
-                    self.authorization,
-                    self.peer_incarnation,
-                    self.author_incarnation,
-                )?;
-            } else {
-                index.keep_history_declined_head(
-                    self.peer,
-                    self.author,
-                    self.head,
-                    self.authorization,
-                    self.peer_incarnation,
-                    self.author_incarnation,
-                )?;
-            }
-            index.seal()?;
-            batch.commit()?;
-            committed.store(true, std::sync::atomic::Ordering::Release);
-            Ok(HistoryDeclineResult::Stored {
-                remembered: true,
-                current,
-            })
-        })
-    }
-}
-
 /// Bounded admission facts shared by live preflight and an owned physical transaction.
 pub(crate) trait HistoryAdmissionRoom {
     fn channel_id(&self) -> Digest32;
@@ -152,13 +35,6 @@ pub(crate) trait HistoryAdmissionRoom {
     fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey>;
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>>;
     fn history_publication_busy(&self, store: &Store) -> Result<bool>;
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool>;
-    fn note_role_progress(&self, author: Digest32, seq: u64);
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed>;
     fn generation(&self) -> Arc<std::sync::atomic::AtomicU64>;
     fn history_write_classified<T>(
         &self,
@@ -189,37 +65,40 @@ pub(crate) trait HistoryAdmissionRoom {
     }
 }
 
-impl HistoryAdmissionRoom for ChannelState {
+/// The room while readers' view of it is pinned (`pin_history_read`): the only way history is
+/// written on the room itself, as every other history writer writes (the source writer pins
+/// first too, `history_stream/source.rs`). Readers are answered from the pinned view until the
+/// writer publishes again, so a commit in between never refuses a read (`read_resource.rs`).
+/// Built only from a held pin: no caller can write history on the room without one.
+pub(crate) struct PinnedHistory<'a> {
+    room: &'a ChannelState,
+    pin: &'a history::PendingHistoryRead,
+}
+
+impl<'a> PinnedHistory<'a> {
+    pub(crate) fn new(room: &'a ChannelState, pin: &'a history::PendingHistoryRead) -> Self {
+        Self { room, pin }
+    }
+}
+
+impl HistoryAdmissionRoom for PinnedHistory<'_> {
     fn channel_id(&self) -> Digest32 {
-        ChannelState::channel_id(self)
+        ChannelState::channel_id(self.room)
     }
     fn me(&self) -> Digest32 {
-        ChannelState::me(self)
+        ChannelState::me(self.room)
     }
     fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
-        ChannelState::history_author_key(self, author)
+        ChannelState::history_author_key(self.room, author)
     }
-    fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
-        ChannelState::history_read(self, store)
+    fn history_read<'b>(&'b self, store: &Store) -> Result<entry_store::Read<'b>> {
+        ChannelState::history_read(self.room, store)
     }
     fn history_publication_busy(&self, store: &Store) -> Result<bool> {
-        ChannelState::history_publication_busy(self, store)
-    }
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool> {
-        ChannelState::history_departure_matches(self, store, hint)
-    }
-    fn note_role_progress(&self, author: Digest32, seq: u64) {
-        ChannelState::note_role_progress(self, author, seq)
-    }
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed> {
-        ChannelState::role_owed(self)
+        ChannelState::history_publication_busy(self.room, store)
     }
     fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        ChannelState::generation(self)
+        ChannelState::generation(self.room)
     }
     fn history_write_classified<T>(
         &self,
@@ -227,7 +106,7 @@ impl HistoryAdmissionRoom for ChannelState {
         durable: bool,
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
     ) -> Result<T> {
-        ChannelState::history_write_classified(self, store, durable, operation)
+        ChannelState::history_write_pinned(self.room, self.pin, store, durable, operation)
     }
 }
 
@@ -238,12 +117,7 @@ pub(crate) struct PendingHistoryAdmission {
     pub(super) me: Digest32,
     sek: crate::atrest::sek::WeakSek,
     authors: BTreeMap<Digest32, CompositePublicKey>,
-    members: BTreeSet<Digest32>,
-    role_cuts: BTreeMap<Digest32, u64>,
-    role_owed: Arc<role_owed::RoleOwed>,
     generation: Arc<std::sync::atomic::AtomicU64>,
-    own_left: bool,
-    own_presence: Option<governance::Presence>,
     authorization: Option<(Digest32, Digest32)>,
 }
 
@@ -297,57 +171,6 @@ impl HistoryAdmissionRoom for HistoryAdmission<'_> {
     fn history_publication_busy(&self, store: &Store) -> Result<bool> {
         Ok(self.history_read(store)?.publication_busy())
     }
-    fn history_departure_matches(
-        &self,
-        store: &Store,
-        hint: crate::node::history_stream::HeadHint,
-    ) -> Result<bool> {
-        let own = self.me();
-        if hint.author != own || !self.pending.own_left {
-            return Ok(false);
-        }
-        let read = self.history_read(store)?;
-        if read.publication_busy() {
-            return Ok(false);
-        }
-        let Some(head) = read.history_head(&hint.head)? else {
-            return Ok(false);
-        };
-        if head.binding.author != own
-            || head.root.leaves != hint.size
-            || !read.history_head_committed(&hint.head, head.binding)?
-            || read
-                .sparse_author(&own, LogScope::Public)?
-                .is_none_or(|state| state.committed != Some(hint.head))
-        {
-            return Ok(false);
-        }
-        let Some(included) = read.history_inclusion_receipt(&hint.head, &own, hint.size)? else {
-            return Ok(false);
-        };
-        let entry = included.header().entry();
-        Ok(read
-            .restart_state()
-            .and_then(|state| state.feeds.get(&own))
-            .is_some_and(|feed| feed.seq == hint.size && feed.hash == entry.entry_hash())
-            && self
-                .pending
-                .own_presence
-                .is_some_and(|p| p.last == (hint.size, false)))
-    }
-    fn note_role_progress(&self, author: Digest32, seq: u64) {
-        if !self.pending.members.contains(&author) {
-            self.pending.role_owed.clear(author);
-        } else if author != self.me()
-            && seq != 0
-            && self.pending.role_cuts.get(&author).copied() == Some(seq)
-        {
-            self.pending.role_owed.mark_dirty(author);
-        }
-    }
-    fn role_owed(&self) -> Arc<role_owed::RoleOwed> {
-        Arc::clone(&self.pending.role_owed)
-    }
     fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.pending.generation)
     }
@@ -388,45 +211,8 @@ impl HistoryAdmissionRoom for HistoryAdmission<'_> {
     }
 }
 
-pub(crate) struct PendingKeyProviderCursor {
-    room: Digest32,
-    instance: [u8; 16],
-    epoch: u64,
-    sek: crate::atrest::sek::WeakSek,
-    provider: Digest32,
-    node: Digest32,
-    authorization: Digest32,
-    expected: Option<entry_store::sparse::KeyProviderCursor>,
-    next: entry_store::sparse::KeyProviderCursor,
-}
-
-impl PendingKeyProviderCursor {
-    pub(crate) fn commit(self, store: &Store) -> Result<bool> {
-        let mut batch = store.batch()?;
-        if crate::node::history_stream::authorization_generation_in(
-            &batch,
-            self.node,
-            self.room,
-            self.instance,
-            self.epoch,
-        )? != self.authorization
-        {
-            return Ok(false);
-        }
-        self.sek.with(|sek| {
-            let entries = entry_store::EntryIndex::default();
-            let mut index = entries.write(&mut batch, sek, &self.room)?;
-            if index.key_provider_cursor(&self.provider)? != self.expected {
-                return Ok(false);
-            }
-            index.keep_key_provider_cursor(self.provider, self.next)?;
-            index.seal()?;
-            batch.commit()?;
-            Ok(true)
-        })
-    }
-}
-
+/// The facts one sparse source's publication needs, captured under the room lock before its
+/// transaction: at Begin for a new publication, at `prepare_history_source` to resume one.
 pub(crate) struct PendingHistorySource {
     room: Digest32,
     sek: crate::atrest::sek::WeakSek,
@@ -439,81 +225,146 @@ pub(crate) struct PendingHistorySource {
     late: bool,
 }
 
-pub(crate) struct CommittedHistorySource {
+/// What one publication transaction reached. Nothing of the source is readable history until
+/// `switched`: the log record, the root switch and the governance facts over it are one commit.
+pub(crate) struct PublishedHistorySource {
+    switched: Option<SwitchedHistorySource>,
+    /// The publication's cleanup finished in that transaction: the room's publication is idle,
+    /// with this newest published causal clock.
+    cleaned: Option<Option<u64>>,
+}
+
+struct SwitchedHistorySource {
     next_log: u64,
     current_advanced: bool,
     governance_changed: bool,
 }
 
+impl PublishedHistorySource {
+    pub(crate) fn switched(&self) -> bool {
+        self.switched.is_some()
+    }
+    pub(crate) fn cleaned(&self) -> bool {
+        self.cleaned.is_some()
+    }
+    /// The source changed the room's governance work: the fold's bounded turn is owed.
+    pub(crate) fn governance_changed(&self) -> bool {
+        self.switched
+            .as_ref()
+            .is_some_and(|switched| switched.governance_changed)
+    }
+}
+
 impl PendingHistorySource {
-    pub(crate) fn commit(
+    /// Resume this room's own sparse publication in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish(
         self,
         store: &Store,
         committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
+        binding: entry_store::sparse::CursorBinding,
         now: crate::time::Ms,
         received: &crate::node::store::ReceivedFlow,
-        on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
-    ) -> Result<CommittedHistorySource> {
-        let next_log = self
-            .log
-            .checked_add(1)
-            .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-        let mut batch = store.received_batch(received)?;
-        on_publish(&mut batch)?;
+        check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
+    ) -> Result<PublishedHistorySource> {
         self.sek.with(|sek| {
-            let entries = entry_store::EntryIndex::default();
-            let input = entries.in_batch(&batch, sek, &self.room)?;
-            if input.sparse_publication_source()? != Some((self.hash, self.log))
-                || input.sparse_publication_request() != Some(self.request)
-            {
-                return Err(Error::MalformedAtRest(
-                    "sparse source publication binding changed",
-                ));
-            }
-            drop(input);
-            let mut index = entries.write(&mut batch, sek, &self.room)?;
-            index.publish_promotion()?;
-            index.publish_key_body_debt(entry, now.get())?;
-            index.seal()?;
-            let first_seen = seal_segment(
-                sek,
-                SegmentKind::Index,
-                self.log,
-                &first_seen_bytes(now.get(), false),
-            )?;
-            batch.put_segment(&self.room, SegmentKind::Index, self.log, &first_seen)?;
-            let accepted = governance::accepted_into(
-                &mut batch,
-                &entries,
-                sek,
-                &self.room,
-                &self.authors,
-                &self.creator,
-                &self.me,
-                self.log,
-                entry,
-                self.late,
-            )?;
-            // Preserve the source transaction's original promotion: current consent/presence
-            // flushes here; other received facts remain owned by this Flow until settlement.
-            if accepted.current_advanced
-                && matches!(
-                    GovEntry::body_bound_to(entry),
-                    Ok(GovBody::ConsentGrant(_)
-                        | GovBody::ConsentRevocation(_)
-                        | GovBody::Presence(_))
-                )
-            {
-                batch.ruled();
-            }
+            let mut batch = store.received_batch(received)?;
+            check_binding(&batch)?;
+            let published = self.publish_in(&mut batch, sek, entry, binding, now)?;
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
-            Ok(CommittedHistorySource {
-                next_log,
+            Ok(published)
+        })
+    }
+
+    /// The one place a sparse source becomes history: one source-copy and DAG quantum; when the
+    /// unpublished roots are ready, the log record, root switch, body debt, first-seen fact and
+    /// the governance facts over it (`accepted_into`: observed, applied when live, `known_tail`
+    /// advanced); then one cleanup quantum. All in the caller's one Batch.
+    fn publish_in(
+        &self,
+        batch: &mut Batch<'_>,
+        sek: &crate::atrest::sek::Sek,
+        entry: &Entry,
+        binding: entry_store::sparse::CursorBinding,
+        now: crate::time::Ms,
+    ) -> Result<PublishedHistorySource> {
+        let entries = entry_store::EntryIndex::default();
+        let input = entries.in_batch(batch, sek, &self.room)?;
+        if input.sparse_publication_source()? != Some((self.hash, self.log))
+            || input.sparse_publication_request() != Some(self.request)
+            || entry.entry_hash() != self.hash
+        {
+            return Err(Error::MalformedAtRest(
+                "sparse source publication binding changed",
+            ));
+        }
+        drop(input);
+        let mut index = entries.write(batch, sek, &self.room)?;
+        if !index.advance_sparse_publication()? {
+            index.seal()?;
+            return Ok(PublishedHistorySource {
+                switched: None,
+                cleaned: None,
+            });
+        }
+        index.publish_promotion()?;
+        index.publish_key_body_debt(entry, now.get())?;
+        index.seal()?;
+        drop(index);
+        let first_seen = seal_segment(
+            sek,
+            SegmentKind::Index,
+            self.log,
+            &first_seen_bytes(now.get(), false),
+        )?;
+        batch.put_segment(&self.room, SegmentKind::Index, self.log, &first_seen)?;
+        let accepted = governance::accepted_into(
+            batch,
+            &entries,
+            sek,
+            &self.room,
+            &self.authors,
+            &self.creator,
+            &self.me,
+            self.log,
+            entry,
+            self.late,
+        )?;
+        // Preserve the source transaction's original promotion: current consent/presence
+        // flushes here; other received facts remain owned by this Flow until settlement.
+        if accepted.current_advanced
+            && matches!(
+                GovEntry::body_bound_to(entry),
+                Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_) | GovBody::Presence(_))
+            )
+        {
+            batch.ruled();
+        }
+        let mut index = entries.write(batch, sek, &self.room)?;
+        let cleaned = index.cleanup_chunk()?;
+        if cleaned {
+            index.finish_history_verifier_cursor(binding)?;
+        }
+        index.seal()?;
+        drop(index);
+        let cleaned = if cleaned {
+            let input = entries.in_batch(batch, sek, &self.room)?;
+            Some(input.order_previous(None)?.map(|(clock, _)| clock))
+        } else {
+            None
+        };
+        Ok(PublishedHistorySource {
+            switched: Some(SwitchedHistorySource {
+                next_log: self
+                    .log
+                    .checked_add(1)
+                    .ok_or(Error::MalformedAtRest("log allocator exhausted"))?,
                 current_advanced: accepted.current_advanced,
                 governance_changed: accepted.work_changed,
-            })
+            }),
+            cleaned,
         })
     }
 }
@@ -555,17 +406,7 @@ impl ChannelState {
             me: self.me(),
             sek: self.sek.reader(),
             authors: self.authors.clone(),
-            members: self
-                .authors
-                .keys()
-                .filter(|author| self.is_member(author))
-                .copied()
-                .collect(),
-            role_cuts: self.role_cuts.clone(),
-            role_owed: Arc::clone(&self.role_owed),
             generation: Arc::clone(&self.gen),
-            own_left: self.has_left(&self.me()),
-            own_presence: self.presence.get(&self.me()).copied(),
             authorization,
         })
     }
@@ -640,126 +481,6 @@ impl ChannelState {
         )
     }
 
-    /// Capture one exact refusal without acquiring the Store writer.
-    pub(crate) fn prepare_history_decline(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        author: Digest32,
-        head: Digest32,
-        authorization: (Digest32, Digest32, bool),
-    ) -> Result<PendingHistoryDecline> {
-        if self.post_pending() {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
-        }
-        let (node, expected_authorization, metadata) = authorization;
-        let peer_incarnation =
-            self.history_inventory_incarnation(&peer)
-                .ok_or(Error::MalformedGovernance(
-                    "declined history source is not a member",
-                ))?;
-        let author_incarnation = self.history_author_inventory_incarnation(&author).ok_or(
-            Error::MalformedGovernance("declined history author is not admitted"),
-        )?;
-        if node != self.me() {
-            return Err(Error::Profile(
-                "history authorization changed before refusal",
-            ));
-        }
-        Ok(PendingHistoryDecline {
-            room: self.channel_id,
-            instance: self.history_instance(store)?,
-            epoch: self.epoch,
-            sek: self.sek.reader(),
-            node,
-            peer,
-            author,
-            head,
-            authorization: expected_authorization,
-            metadata,
-            peer_incarnation,
-            author_incarnation,
-        })
-    }
-
-    /// Read the receiver's one provider cursor. The caller owns a bounded worker and must
-    /// recheck the room/connection and peer trust before using the result.
-    pub(crate) fn key_provider_cursor(
-        &self,
-        store: &Store,
-        provider: Digest32,
-    ) -> Result<Option<entry_store::sparse::KeyProviderCursor>> {
-        self.history_read(store)?.key_provider_cursor(&provider)
-    }
-
-    /// Capture only the expected cursor and its current room/authorization incarnation.
-    pub(crate) fn prepare_key_provider_cursor(
-        &self,
-        store: &Store,
-        provider: Digest32,
-        node: Digest32,
-        authorization: Digest32,
-        expected: Option<entry_store::sparse::KeyProviderCursor>,
-        next: entry_store::sparse::KeyProviderCursor,
-    ) -> Result<Option<PendingKeyProviderCursor>> {
-        if self.post_pending() {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
-        }
-        if node != self.me()
-            || !self.is_member(&node)
-            || !self.is_member(&provider)
-            || self.history_inventory_incarnation(&provider) != Some(next.peer_incarnation)
-            || next.authorization != authorization
-        {
-            return Ok(None);
-        }
-        if let Some(old) = expected {
-            if old.authorization == next.authorization
-                && old.peer_incarnation == next.peer_incarnation
-                && old.connection == next.connection
-                && (next.local_after < old.local_after
-                    || (old.instance == next.instance && next.after < old.after))
-            {
-                return Err(Error::Profile("key provider cursor moved backwards"));
-            }
-        }
-        Ok(Some(PendingKeyProviderCursor {
-            room: self.channel_id,
-            instance: self.history_instance(store)?,
-            epoch: self.epoch,
-            sek: self.sek.reader(),
-            provider,
-            node,
-            authorization,
-            expected,
-            next,
-        }))
-    }
-
-    /// A relevant advertised successor or changed membership incarnation removes the durable
-    /// refusal. The inbox holds only charge-free pending scalar hints; this indexed record is the
-    /// sole refusal state.
-    pub(crate) fn forget_history_decline(
-        &self,
-        store: &Store,
-        peer: Digest32,
-        author: Digest32,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<()> {
-        let read = self.history_read(store)?;
-        if read.history_declined_head(&peer, &author)?.is_none() {
-            return Ok(());
-        }
-        drop(read);
-        self.history_write_tracked(store, committed, |index| {
-            index.forget_history_declined_head(peer, author)
-        })
-    }
-
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -826,50 +547,6 @@ impl ChannelState {
         Ok(None)
     }
 
-    /// The own-author committed head whose live-window acknowledgement is the only
-    /// missing piece of [`Self::sparse_settlement_ready`]: the room is unsettled,
-    /// the own sparse state has a committed own head with no observed conflict, the
-    /// local contiguous verified prefix covers that head, and the own live window
-    /// has not (fully) visited it. `None` when the settlement is missing something
-    /// else, or is already ready.
-    pub(crate) fn sparse_settlement_pending_own_head(
-        &self,
-        store: &Store,
-    ) -> Option<(Digest32, Digest32, u64)> {
-        // Asked for whether or not the room is settled (ADR-037 R5): settlement no longer
-        // waits on it, but the own-history conflict detector reads what it fetches.
-        let read = self.history_read(store).ok()?;
-        if read.publication_busy() {
-            return None;
-        }
-        let own = self.me();
-        let contiguous = self.dag.verified_head(&own);
-        if read
-            .history_settled_tip(&own)
-            .ok()?
-            .is_some_and(|tip| tip.skeleton.seq > contiguous)
-        {
-            return None;
-        }
-        let state = read.sparse_author(&own, LogScope::Public).ok()??;
-        if state.observed_conflict.is_some() {
-            return None;
-        }
-        let committed = state.committed?;
-        let head = read.history_head(&committed).ok()??;
-        let acknowledged = state.live.is_some_and(|window| {
-            window.head == committed && window.through == head.root.leaves && window.complete()
-        });
-        if acknowledged
-            || head.binding.author != own
-            || head.binding.scope != LogScope::Public
-            || head.root.leaves > contiguous
-        {
-            return None;
-        }
-        Some((own, committed, head.root.leaves))
-    }
-
     /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
     /// settled, no evidence that a member holds more of the own feed, and current governance.
     /// No peer acknowledgement is waited for; the detector above reads that when it comes.
@@ -919,18 +596,10 @@ impl ChannelState {
         self.authors.get(author).cloned()
     }
 
-    /// One caller-budgeted transaction. The callback may only use the typed storage APIs;
-    /// network waits and queue admission happen before taking this room/store context.
-    pub(crate) fn history_write<T>(
+    /// One history commit on the room, only under a pin of readers' view ([`PinnedHistory`]).
+    fn history_write_pinned<T>(
         &self,
-        store: &Store,
-        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
-    ) -> Result<T> {
-        self.history_write_classified(store, false, operation)
-    }
-
-    fn history_write_classified<T>(
-        &self,
+        _pin: &history::PendingHistoryRead,
         store: &Store,
         durable: bool,
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
@@ -962,20 +631,6 @@ impl ChannelState {
         Ok(result)
     }
 
-    /// Run one history transaction and mark its user-visible lane immediately after the commit.
-    /// A later transaction or callback failure must not turn already durable work into a quiet
-    /// status sample.
-    pub(crate) fn history_write_tracked<T>(
-        &self,
-        store: &Store,
-        committed: &std::sync::atomic::AtomicBool,
-        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
-    ) -> Result<T> {
-        let result = self.history_write(store, operation)?;
-        committed.store(true, std::sync::atomic::Ordering::Release);
-        Ok(result)
-    }
-
     pub(crate) fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -989,54 +644,274 @@ impl ChannelState {
         Ok(read)
     }
 
-    /// A locally queued receipt probe obeys the same durable exact refusal as wire inventory.
-    pub(crate) fn history_own_receipt_targets(
+    /// What a person's `--history older` asks of this room. Each author's history is held here
+    /// as one unbroken run of positions reaching down from what the walk syncs (its floor), and a
+    /// request extends those runs downward, never anything else: per author, the page of up to
+    /// [`OLDER_PAGE`] positions just below the lowest position of that run, down to position 1.
+    /// Positions held below a gap do not count: the run merges with them when it reaches them, so
+    /// no hole is ever left behind. An author is complete when its run reaches position 1. The
+    /// lowest post of each run is read as its row is ([`Self::key_opens`]): one no key held here
+    /// opens is counted (`keys_awaited`) and its walk goes on, since nothing this node holds
+    /// says it was written before its author trusted this node. An author already owed a page
+    /// (`fetching`) gets no second one. Authors whose run ends at the newest row are served
+    /// first, at most `limit` of them (the requests this node may still keep); the others are
+    /// counted (`left_out`). The row named (`before`) is where the person reads; it does not
+    /// decide what is selected.
+    pub(crate) fn history_older_page(
         &self,
         store: &Store,
-        peers: Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
-        head: Digest32,
-        size: u64,
-    ) -> Result<Vec<Digest32>> {
-        // One captured index for all current peers, not a Directory decode per peer.
+        before: &Digest32,
+        fetching: &BTreeSet<Digest32>,
+        limit: usize,
+    ) -> Result<OlderPage> {
         let read = self.history_read(store)?;
-        let authorization = crate::node::history_stream::authorization_generation(
-            store,
-            self.me(),
-            self.channel_id,
-            read.sparse_history_instance(),
-            self.epoch,
-        )?;
-        let mut targets = Vec::new();
-        for (peer, parked) in peers {
-            if !self.is_member(&peer) || self.held_through(&peer).is_some_and(|held| held >= size) {
+        let bytes = read
+            .history_object(entry_store::sparse::ObjectKind::Header, before)?
+            .ok_or(Error::Profile("The older-history cursor is not retained."))?;
+        let anchor = Entry::from_wire(&bytes)?;
+        if anchor.entry_hash() != *before
+            || anchor.skeleton.channel_id != self.channel_id
+            || anchor.skeleton.v2.is_none()
+        {
+            return Err(Error::Profile(
+                "The older-history cursor binding is invalid.",
+            ));
+        }
+        let record = self
+            .room_snapshot
+            .current()
+            .and_then(|s| s.history().cloned());
+        let render = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let me = self.me();
+        let mut page = OlderPage::default();
+        // Per author with something below its run: when the run's lowest row shows, its head,
+        // the author and that lowest position.
+        let mut below = Vec::new();
+        for author in self.authors.keys() {
+            let Some((row, head)) = record
+                .as_deref()
+                .and_then(|history| history.author(author))
+                .and_then(|row| Some((row, row.committed.as_ref()?)))
+                .filter(|(row, _)| row.floor() > 0)
+            else {
+                page.unknown += 1;
+                continue;
+            };
+            if row.window().is_some() {
+                page.arriving += 1;
+            }
+            if fetching.contains(author) {
                 continue;
             }
-            if parked.is_some_and(|(connection, probe)| {
-                probe.matches(
-                    crate::node::ports::SupportDiscovery {
-                        connection,
-                        instance: read.sparse_history_instance(),
-                        epoch: self.epoch,
-                        authorization,
-                    },
-                    head,
-                    self.history_inventory_incarnation(&peer)
-                        .zip(self.history_author_inventory_incarnation(&self.me())),
-                )
-            }) {
+            let lowest = run_lowest(row);
+            if *author != me && self.oldest_unreadable(&read, &render, row, author, lowest)? {
+                page.keys_awaited += 1;
+            }
+            if lowest <= 1 {
                 continue;
             }
-            let refused = read.history_declined_head(&peer, &self.me())?;
-            let current = self
-                .history_inventory_incarnation(&peer)
-                .zip(self.history_author_inventory_incarnation(&self.me()))
-                .map(|(peer_life, author_life)| (head, authorization, peer_life, author_life));
-            if refused != current {
-                targets.push(peer);
+            let shown = match row
+                .header_held(lowest)
+                .then(|| read.history_position_header(author, lowest))
+                .transpose()?
+                .flatten()
+            {
+                Some(header) => read
+                    .display_time(&header.entry_hash())?
+                    .unwrap_or(header.skeleton.claimed_ms),
+                None => 0,
+            };
+            below.push((shown, head.id(), *author, lowest));
+        }
+        below.sort_by(|a, b| b.0.cmp(&a.0));
+        page.left_out = below.len().saturating_sub(limit);
+        for (_, head, author, lowest) in below.into_iter().take(limit) {
+            let lo = lowest.saturating_sub(OLDER_PAGE).max(1);
+            page.owed.push((head, author, lo, lowest - 1));
+        }
+        Ok(page)
+    }
+
+    /// Whether the lowest post of `author`'s run from `lowest` up has no row here because no key
+    /// held here opens it ([`Self::key_opens`]); false when it shows, is still being admitted, or
+    /// no post is found. Reads at most [`OLDER_PAGE`] positions of the run.
+    fn oldest_unreadable(
+        &self,
+        read: &entry_store::Read<'_>,
+        render: &entry_store::RenderView<'_>,
+        row: &super::held_history::HeldAuthor,
+        author: &Digest32,
+        lowest: u64,
+    ) -> Result<bool> {
+        use crate::log::history::SignedEntryKind;
+        for seq in lowest..lowest.saturating_add(OLDER_PAGE) {
+            if !row.held(seq) {
+                if row.walked(seq) {
+                    continue;
+                }
+                break;
+            }
+            let Some(header) = row
+                .header_held(seq)
+                .then(|| read.history_position_header(author, seq))
+                .transpose()?
+                .flatten()
+                .filter(|header| {
+                    header
+                        .skeleton
+                        .v2
+                        .as_ref()
+                        .is_some_and(|v2| v2.kind == SignedEntryKind::Content)
+                })
+            else {
+                continue;
+            };
+            let hash = header.entry_hash();
+            if render.fact(&hash)?.is_some() || !read.history_effect_finished(&hash)? {
+                return Ok(false);
+            }
+            match self.held_post_opens(read, author, &hash)? {
+                None => continue,
+                Some(opens) => return Ok(!opens),
             }
         }
-        Ok(targets)
+        Ok(false)
     }
+
+    /// Whether a key held here opens a held post of another author ([`Self::key_opens`]), or
+    /// `None` when the body is not a room post (a Session's step, which only its node's drive
+    /// key opens).
+    fn held_post_opens(
+        &self,
+        read: &entry_store::Read<'_>,
+        author: &Digest32,
+        hash: &Digest32,
+    ) -> Result<Option<bool>> {
+        let Some(payload) = self
+            .dag
+            .get_by_hash(read, hash)?
+            .and_then(|entry| entry.payload)
+        else {
+            return Ok(None);
+        };
+        let Ok(msg) = GroupMessage::from_wire(&payload) else {
+            return Ok(None);
+        };
+        if msg.header.channel_id == drive_channel(&self.channel_id) {
+            return Ok(None);
+        }
+        Ok(Some(self.key_opens(author, &msg.header)))
+    }
+
+    /// Whether a post of `author` is held here and is not a row: among the newest
+    /// [`OLDER_PAGE`] positions whose body is held here, a room post (not a control, not a
+    /// Session step) whose admission finished, with no row here and not past its retention.
+    /// False when none is found within that bound: it is said only when established.
+    pub(crate) fn holds_unshown_post(
+        &self,
+        store: &Store,
+        author: &Digest32,
+        now_ms: u64,
+    ) -> Result<bool> {
+        use crate::log::history::SignedEntryKind;
+        let record = self
+            .room_snapshot
+            .current()
+            .and_then(|s| s.history().cloned());
+        let Some(row) = record.as_deref().and_then(|history| history.author(author)) else {
+            return Ok(false);
+        };
+        let read = self.history_read(store)?;
+        let render = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut seq = row.held_below(u64::MAX);
+        for _ in 0..OLDER_PAGE {
+            if seq == 0 {
+                break;
+            }
+            let here = seq;
+            seq = row.held_below(here - 1);
+            let Some(header) = row
+                .header_held(here)
+                .then(|| read.history_position_header(author, here))
+                .transpose()?
+                .flatten()
+                .filter(|header| {
+                    header
+                        .skeleton
+                        .v2
+                        .as_ref()
+                        .is_some_and(|v2| v2.kind == SignedEntryKind::Content)
+                })
+            else {
+                continue;
+            };
+            let hash = header.entry_hash();
+            if render.fact(&hash)?.is_some() || !read.history_effect_finished(&hash)? {
+                continue;
+            }
+            let Some(entry) = self.dag.get_by_hash(&read, &hash)? else {
+                continue;
+            };
+            let room_post = entry
+                .payload
+                .as_deref()
+                .and_then(|payload| GroupMessage::from_wire(payload).ok())
+                .is_some_and(|msg| msg.header.channel_id != drive_channel(&self.channel_id));
+            if room_post
+                && !self.already_expired_entry(
+                    read.transaction(),
+                    &entry,
+                    entry.skeleton.claimed_ms,
+                    now_ms,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Positions of one author a person's older-history request owes at most (one page).
+pub(crate) const OLDER_PAGE: u64 = 64;
+
+/// The lowest position of `row`'s unbroken run reaching down from the walk's floor: every
+/// position from it to the floor is held or its admission completed.
+fn run_lowest(row: &super::held_history::HeldAuthor) -> u64 {
+    let mut seq = row.floor().saturating_sub(1);
+    while seq > 0 {
+        let unheld = row.unheld_below(seq);
+        if unheld == 0 {
+            return 1;
+        }
+        let gap = row.walked_runs().absent_below(unheld);
+        if gap == unheld {
+            return unheld + 1;
+        }
+        seq = gap;
+    }
+    1
+}
+
+/// What [`ChannelState::history_older_page`] found.
+#[derive(Default)]
+pub(crate) struct OlderPage {
+    /// Per author: its committed head, the author, and the run `lo..=hi` owed.
+    pub(crate) owed: Vec<(Digest32, Digest32, u64, u64)>,
+    /// Members whose walk still owes this node posts: they are still arriving.
+    pub(crate) arriving: usize,
+    /// Members whose oldest post held here has no row because no key for it has reached this
+    /// node.
+    pub(crate) keys_awaited: usize,
+    /// Members with older posts to fetch that got no page: this node already keeps as many
+    /// older-history requests as it may.
+    pub(crate) left_out: usize,
+    /// Members whose history this node does not know yet.
+    pub(crate) unknown: usize,
 }
 
 pub(crate) struct PendingHistoryPublication {
@@ -1047,23 +922,11 @@ pub(crate) struct PendingHistoryPublication {
 
 pub(crate) struct CompletedHistoryPublication {
     result: Result<(bool, Option<[u8; 64]>)>,
-    order: Option<(u64, Option<u64>)>,
+    /// The newest published causal clock after the publication, for the idle end.
+    newest_clock: Option<Option<u64>>,
 }
 
 impl PendingHistoryPublication {
-    pub(crate) fn advance(
-        self,
-        store: &Store,
-        committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<bool> {
-        self.sek.with(|sek| {
-            let entries = entry_store::EntryIndex::default();
-            let ready = entries.advance_sparse_publication(store, sek, &self.room)?;
-            committed.store(true, std::sync::atomic::Ordering::Release);
-            Ok(ready)
-        })
-    }
-
     pub(crate) fn cleanup(
         self,
         store: &Store,
@@ -1071,7 +934,7 @@ impl PendingHistoryPublication {
         cursor: Option<entry_store::sparse::CursorBinding>,
         verifiers: Option<([u8; 16], Option<[u8; 64]>)>,
     ) -> CompletedHistoryPublication {
-        let mut order = None;
+        let mut newest_clock = None;
         let result = self.sek.with(|sek| {
             let entries = entry_store::EntryIndex::default();
             let source_done = if self.source_owned {
@@ -1086,10 +949,7 @@ impl PendingHistoryPublication {
                 return Ok((false, verifiers.and_then(|(_, after)| after)));
             }
             let read = entries.read(store, sek, &self.room)?;
-            order = Some((
-                read.order_revision(),
-                read.order_previous(None)?.map(|(clock, _)| clock),
-            ));
+            newest_clock = Some(read.order_previous(None)?.map(|(clock, _)| clock));
             drop(read);
             let (done, next) = if cursor.is_some() || verifiers.is_some() {
                 let mut batch = store.batch()?;
@@ -1114,7 +974,10 @@ impl PendingHistoryPublication {
             };
             Ok((done, next))
         });
-        CompletedHistoryPublication { result, order }
+        CompletedHistoryPublication {
+            result,
+            newest_clock,
+        }
     }
 }
 
@@ -1128,7 +991,7 @@ pub(crate) struct PendingHistoryBegin {
 
 #[allow(clippy::large_enum_variant)]
 enum HistoryBeginAction {
-    Start,
+    Start(PendingHistorySource),
     Duplicate,
     Busy,
     Fork {
@@ -1148,6 +1011,7 @@ pub(crate) struct CompletedHistoryBegin {
 }
 
 impl PendingHistoryBegin {
+    /// Begin, and in the same transaction as far as one bounded quantum reaches, publish.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit(
         self,
@@ -1158,31 +1022,41 @@ impl PendingHistoryBegin {
         validated: &governance::ValidatedSparseEntry,
         binding: entry_store::sparse::CursorBinding,
         now: crate::time::Ms,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
     ) -> CompletedHistoryBegin {
         let mut fork = None;
         let mut kept = 0;
         let mut poison = false;
         let result = self.sek.with(|sek| {
+            if entry.entry_hash() != validated.entry_hash()
+                || entry.header_wire() != validated.included().header().entry().header_wire()
+            {
+                return Err(Error::MalformedBundle(
+                    "sparse source differs from validation",
+                ));
+            }
             let entries = entry_store::EntryIndex::default();
             match self.action {
                 HistoryBeginAction::Busy => Ok(HistorySourceStart::Busy),
-                HistoryBeginAction::Start => {
-                    entries.begin_sparse_publication(
-                        store,
-                        sek,
-                        &self.room,
-                        entry_store::SparsePublication {
-                            request,
-                            entry,
-                            validated,
-                            first_log: self.first_log,
-                            received_ms: now.get(),
-                            origin: self.origin,
-                        },
-                    )?;
+                HistoryBeginAction::Start(source) => {
+                    let mut batch = store.received_batch(received)?;
+                    check_binding(&batch)?;
+                    let mut index = entries.write(&mut batch, sek, &self.room)?;
+                    index.begin_sparse_publication(entry_store::SparsePublication {
+                        request,
+                        entry,
+                        validated,
+                        first_log: self.first_log,
+                        received_ms: now.get(),
+                        origin: self.origin,
+                    })?;
+                    index.seal()?;
+                    drop(index);
+                    let published = source.publish_in(&mut batch, sek, entry, binding, now)?;
+                    batch.commit()?;
                     committed.store(true, std::sync::atomic::Ordering::Release);
-                    Ok(HistorySourceStart::Started)
+                    Ok(HistorySourceStart::Started(published))
                 }
                 HistoryBeginAction::Duplicate => {
                     let mut batch = store.batch()?;
@@ -1246,7 +1120,7 @@ impl PendingHistoryBegin {
 /// A retryable scheduling result. Busy never mutates a sender, poisons a room or loses the
 /// caller's request; the actor retains and retries that request at its next eligible turn.
 pub(crate) enum HistorySourceStart {
-    Started,
+    Started(PublishedHistorySource),
     Duplicate,
     Busy,
 }
@@ -1262,164 +1136,14 @@ impl ChannelState {
             .publication_busy())
     }
 
-    /// A newly committed sealed-package debt may be filled by any eligible room peer.
-    pub(crate) fn note_key_body_debt(&self) {
-        for peer in self
-            .authors
-            .keys()
-            .copied()
-            .filter(|peer| *peer != self.me() && self.is_member(peer))
-        {
-            self.role_owed.mark_key_dirty(peer);
-        }
-    }
-
-    /// A newly durable indexed ciphertext may satisfy an exact peer's outstanding debt.
-    pub(crate) fn note_key_body_acquired(&self) {
-        for peer in self
-            .authors
-            .keys()
-            .copied()
-            .filter(|peer| *peer != self.me() && self.is_member(peer))
-        {
-            self.role_owed.mark_key_catalog_changed(peer);
-        }
-    }
-
-    /// Read one exact local debt in insertion order; this does not advance its owner.
-    /// An unavailable author head is a dependency, never evidence that the debt is gone.
-    pub(crate) fn key_debt_after(
-        &self,
-        store: &Store,
-        authorization: Digest32,
-        after: u64,
-    ) -> Result<Option<KeyDebtPage>> {
-        let read = self.history_read(store)?;
-        if read.publication_busy() {
-            return Ok(None);
-        }
-        let Some((serial, debt)) = read.history_key_debt_after(Some(after))? else {
-            return Ok(Some(KeyDebtPage::End));
-        };
-        let author = debt.author;
-        let state = read
-            .sparse_author(&author, crate::log::history::LogScope::Public)?
-            .ok_or(Error::MalformedAtRest("key-body author missing"))?;
-        // A conflicting signed source is permanently frozen, so it cannot be a donor
-        // candidate. Advance past it without blocking unrelated authenticated authors.
-        if state.observed_conflict.is_some() {
-            return Ok(Some(KeyDebtPage::Frozen { serial }));
-        }
-        let target_id = state
-            .committed
-            .ok_or(Error::MalformedAtRest("key-body committed head missing"))?;
-        let target = read
-            .history_head(&target_id)?
-            .ok_or(Error::MalformedAtRest("key-body head object missing"))?;
-        let (source_head, entry) = read
-            .history_validated_header(&author, debt.from)?
-            .ok_or(Error::MalformedAtRest("key-body source missing"))?;
-        let recipient = entry
-            .skeleton
-            .v2
-            .as_ref()
-            .filter(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
-            .and_then(|v| v.recipient)
-            .ok_or(Error::MalformedAtRest("key-body recipient missing"))?;
-        if debt.from != debt.through
-            || source_head != debt.head
-            || entry.entry_hash() != debt.object
-            || !read.history_head_accepted(&source_head, target.binding)?
-            || !read.history_head_accepted(&target.id(), target.binding)?
-            || debt.from > target.root.leaves
-        {
-            return Err(Error::MalformedAtRest("key-body source binding"));
-        }
-        Ok(Some(KeyDebtPage::Ready {
-            serial,
-            need: crate::node::history_stream::KeyBodyNeed {
-                head: source_head,
-                seq: debt.from,
-                hash: debt.object,
-                recipient,
-                authorization,
-                target: crate::node::history_stream::HeadHint {
-                    author,
-                    head: target.id(),
-                    size: target.root.leaves,
-                },
-            },
-        }))
-    }
-
-    /// Match an availability hint against an already authenticated, still-pending local debt.
-    /// The hint is neither evidence of a body nor a grant to admit it.
-    pub(crate) fn key_debt_for_notice(
-        &self,
-        store: &Store,
-        authorization: Digest32,
-        notice: crate::node::history_stream::KeyBodyAvailable,
-    ) -> Result<Option<Option<crate::node::history_stream::KeyBodyNeed>>> {
-        let read = self.history_read(store)?;
-        if read.publication_busy() {
-            return Ok(None);
-        }
-        let Some((source_head, entry)) =
-            read.history_validated_header(&notice.author, notice.seq)?
-        else {
-            return Ok(Some(None));
-        };
-        if entry.entry_hash() != notice.hash
-            || !entry.skeleton.v2.as_ref().is_some_and(|v| {
-                v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    && v.recipient == Some(notice.recipient)
-            })
-        {
-            return Ok(Some(None));
-        }
-        let Some(state) =
-            read.sparse_author(&notice.author, crate::log::history::LogScope::Public)?
-        else {
-            return Ok(Some(None));
-        };
-        if state.observed_conflict.is_some() {
-            return Ok(Some(None));
-        }
-        let Some(target_id) = state.committed else {
-            return Ok(Some(None));
-        };
-        let Some(target) = read.history_head(&target_id)? else {
-            return Ok(Some(None));
-        };
-        if !read.history_head_accepted(&source_head, target.binding)?
-            || !read.history_head_accepted(&target_id, target.binding)?
-        {
-            return Ok(Some(None));
-        }
-        let need = crate::node::history_stream::KeyBodyNeed {
-            head: source_head,
-            seq: notice.seq,
-            hash: notice.hash,
-            recipient: notice.recipient,
-            authorization,
-            target: crate::node::history_stream::HeadHint {
-                author: notice.author,
-                head: target.id(),
-                size: target.root.leaves,
-            },
-        };
-        Ok(Some(
-            read.history_key_body_owed(need, self.me())?.then_some(need),
-        ))
-    }
-
     /// Source validation has already consumed the shared verifier envelope. This checks the
-    /// current room/admission boundary again before starting one unpublished index operation.
+    /// current room/admission boundary again before starting one unpublished index operation;
+    /// the validation token's binding to this entry is checked in its transaction.
     pub(crate) fn prepare_history_begin(
         &self,
         store: &Store,
         entry: &Entry,
-        validated: &governance::ValidatedSparseEntry,
+        request: [u8; 16],
     ) -> Result<PendingHistoryBegin> {
         if self.post_pending() {
             return Err(Error::Profile(
@@ -1439,13 +1163,6 @@ impl ChannelState {
         {
             return Err(Error::MalformedGovernance(
                 "sparse source is not currently admitted",
-            ));
-        }
-        if entry.entry_hash() != validated.entry_hash()
-            || entry.header_wire() != validated.included().header().entry().header_wire()
-        {
-            return Err(Error::MalformedBundle(
-                "sparse source differs from validation",
             ));
         }
         let read = self.history_read(store)?;
@@ -1496,7 +1213,7 @@ impl ChannelState {
         } else if read.history_obligation_capacity() < 2 {
             HistoryBeginAction::Busy
         } else {
-            HistoryBeginAction::Start
+            HistoryBeginAction::Start(self.history_source(&read, entry, request)?)
         };
         Ok(PendingHistoryBegin {
             room: self.channel_id,
@@ -1612,16 +1329,14 @@ impl ChannelState {
         completed: CompletedHistoryPublication,
     ) -> Result<(bool, Option<[u8; 64]>)> {
         self.entries.committed();
-        if let Some((revision, newest)) = completed.order {
-            self.dag.set_order_revision(revision, newest);
+        if let Some(newest) = completed.newest_clock {
+            self.dag.set_newest_clock(newest);
         }
         completed.result
     }
 
-    pub(crate) fn history_write_released(&mut self, store: &Store) -> Result<()> {
-        self.flush_available(store)
-    }
-
+    /// Resume this room's own sparse publication (its fact work or cleanup took more than the
+    /// first transaction's quantum).
     pub(crate) fn prepare_history_source(
         &self,
         store: &Store,
@@ -1636,8 +1351,6 @@ impl ChannelState {
         if self.poisoned.get() {
             return Err(self.save_failure());
         }
-        self.require_history_source_boundary(entry)?;
-        entry.verify_payload_binding()?;
         let read = self.history_read(store)?;
         if read.sparse_publication_request() != Some(request) {
             return Err(Error::Profile("history publication owner changed"));
@@ -1650,8 +1363,19 @@ impl ChannelState {
                 "sparse source publication binding changed",
             ));
         }
-        let late = read.child_after(&hash, None)?.is_some();
-        drop(read);
+        self.history_source(&read, entry, request)
+    }
+
+    /// The source checks a publication has always made before its log record is written.
+    fn history_source(
+        &self,
+        read: &entry_store::Read<'_>,
+        entry: &Entry,
+        request: [u8; 16],
+    ) -> Result<PendingHistorySource> {
+        self.require_history_source_boundary(entry)?;
+        entry.verify_payload_binding()?;
+        let hash = entry.entry_hash();
         Ok(PendingHistorySource {
             room: self.channel_id,
             sek: self.sek.reader(),
@@ -1659,36 +1383,32 @@ impl ChannelState {
             creator: self.genesis.creator_pubkey().fingerprint(),
             me: self.me(),
             hash,
-            log,
+            log: self.next_log_id,
             request,
-            late,
+            late: read.child_after(&hash, None)?.is_some(),
         })
     }
 
     pub(crate) fn install_history_source(
         &mut self,
         entry: &Entry,
-        completed: &CommittedHistorySource,
+        published: &PublishedHistorySource,
     ) -> Result<()> {
-        if entry.payload.is_none()
-            && entry
-                .skeleton
-                .v2
-                .as_ref()
-                .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
-        {
-            self.note_key_body_debt();
-        }
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
-        if completed.governance_changed {
-            self.retire_governance()?;
-        }
-        if completed.current_advanced {
-            self.note_committed_consent(entry)?;
-        }
         self.entries.committed();
-        self.next_log_id = completed.next_log;
+        if let Some(switched) = &published.switched {
+            if switched.governance_changed {
+                self.retire_governance()?;
+            }
+            if switched.current_advanced {
+                self.note_committed_consent(entry)?;
+            }
+            self.next_log_id = switched.next_log;
+        }
+        if let Some(newest) = published.cleaned {
+            self.dag.set_newest_clock(newest);
+        }
         Ok(())
     }
 
@@ -1931,20 +1651,8 @@ impl ChannelState {
 }
 
 impl ChannelState {
-    pub(crate) fn role_owed(&self) -> std::sync::Arc<super::role_owed::RoleOwed> {
+    pub(crate) fn role_owed(&self) -> std::sync::Arc<super::role_owed::BoardOwner> {
         std::sync::Arc::clone(&self.role_owed)
-    }
-
-    /// Keep the exact author runnable after a committed change; the inventory worker
-    /// resolves and authenticates the signed role head separately.
-    pub(crate) fn note_role_progress(&self, author: Digest32, seq: u64) {
-        if !self.is_member(&author) {
-            self.role_owed.clear(author);
-            return;
-        }
-        if author != self.me() && seq != 0 && self.role_cuts.get(&author).copied() == Some(seq) {
-            self.role_owed.mark_dirty(author);
-        }
     }
 
     pub(super) fn note_contiguous_advance(
@@ -1953,14 +1661,8 @@ impl ChannelState {
         progress: entry_store::sparse::ContiguousAdvance,
     ) -> Result<()> {
         if let Some(state) = progress.state {
-            let was_member = self.is_member(&author);
             self.dag.restore_contiguous_author(author, &state)?;
-            if !was_member && self.is_member(&author) {
-                self.key_member_became_current(author);
-            }
             self.role_cuts.insert(author, state.seq);
-            self.note_role_progress(author, state.seq);
-            self.note_history_available();
         }
         if progress.more {
             self.sparse_contiguous_pending.insert(author);

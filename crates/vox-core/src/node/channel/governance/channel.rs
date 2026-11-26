@@ -475,12 +475,17 @@ impl ChannelState {
                 let rendered = self
                     .entries
                     .render_view(store, &self.sek, &self.channel_id)?;
-                let start = entry
+                // One place per notice: it is shown after the last shown row whose display key
+                // is not after its own entry's display key (before the first row when none is).
+                // The shown rows cut the display order into windows that do not overlap, and a
+                // notice has one display key, so it falls in exactly one. What the notice says,
+                // and the order notices are paged in, stay causal (the governance fold).
+                let shown = entry
                     .map(|entry| rendered.order().key(&entry))
                     .transpose()?
                     .flatten();
                 if entry.is_some()
-                    && (start.is_none()
+                    && (shown.is_none()
                         || entry
                             .map(|hash| rendered.fact(&hash))
                             .transpose()?
@@ -491,26 +496,22 @@ impl ChannelState {
                         "notice anchor is no longer visible; reload the page",
                     ));
                 }
-                let end = rendered.step(None, true, start, false)?.map(|(key, _)| key);
-                if after.is_some_and(|cursor| {
-                    start.is_some_and(|start| cursor < start)
-                        || end.is_some_and(|end| cursor >= end)
-                }) {
-                    return Err(crate::error::Error::Profile(
-                        "notice cursor is outside the selected message range",
-                    ));
-                }
+                let end = rendered.step(None, true, shown, false)?.map(|(key, _)| key);
                 let page = self
                     .checked_governance(store, self.now_hint)?
-                    .notices_between(after.or(start), end, true, Some(revision), 64)?;
-                let rows = page
-                    .rows
-                    .into_iter()
-                    .map(|(_, mut notice)| {
-                        notice.after = entry;
-                        notice
-                    })
-                    .collect();
+                    .notices_between(after, None, true, Some(revision), 64)?;
+                let mut rows = Vec::new();
+                for (_, mut notice) in page.rows {
+                    let at = rendered
+                        .order()
+                        .key(&notice.entry_hash)?
+                        .unwrap_or((notice.created_millis, notice.entry_hash));
+                    if shown.is_some_and(|start| at < start) || end.is_some_and(|end| at >= end) {
+                        continue;
+                    }
+                    notice.after = entry;
+                    rows.push(notice);
+                }
                 Page::NoticesAfter {
                     rows,
                     next: page.next,
@@ -647,6 +648,9 @@ impl ChannelState {
             );
             self.install_next_log(next_log);
             let state = state?;
+            if state.retracted {
+                self.rows_retracted(store)?;
+            }
             let mut changed = false;
             let mut consent_ready = false;
             if state.ready {

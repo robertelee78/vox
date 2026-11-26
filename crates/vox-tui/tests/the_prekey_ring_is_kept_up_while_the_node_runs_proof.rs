@@ -904,7 +904,26 @@ async fn reach(
     Digest32,
     vox_core::join::session::JoinContext,
 ) {
-    let status = host.vox(&["status", "--json"], None).stdout;
+    // A restarted node lists its room once the reopen has finished (a person sees it in the
+    // status then); read the status that lists it, as `Profile::prekeys` waits for the ring.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let o = host.vox(&["status", "--json"], None);
+        let listed = o.ok
+            && serde_json::from_str::<serde_json::Value>(o.stdout.trim())
+                .is_ok_and(|v| v["rooms"][0]["id"].is_string());
+        if listed {
+            break o.stdout;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): {}'s `vox status --json` never listed its room: {}{}",
+            host.name,
+            o.stdout,
+            o.stderr
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let addr = ports::loopback_listen(&status).unwrap_or_else(|| {
         panic!(
             "APPARATUS: {}'s status names no loopback address",

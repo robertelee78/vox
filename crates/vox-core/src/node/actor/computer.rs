@@ -129,6 +129,22 @@ impl ComputerAuthority {
         })
     }
 
+    /// The edge on which a `try_acquire_publication` that found the lease held may try again:
+    /// the pending policy writer has finished. Waits on nothing while unmanaged.
+    pub(super) fn publication_released(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let computer = match self {
+            Self::Unmanaged => None,
+            Self::Managed { computer, .. } => Some(Arc::clone(computer)),
+        };
+        Box::pin(async move {
+            if let Some(computer) = computer {
+                computer.wait_publication_writer().await;
+            }
+        })
+    }
+
     pub(super) fn try_acquire_publication(
         &self,
     ) -> crate::error::Result<Option<ComputerPublication>> {

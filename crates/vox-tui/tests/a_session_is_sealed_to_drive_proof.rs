@@ -76,7 +76,11 @@
 //! - **Serve the owner's records to a member that lost drive** (claim 2): the holder check in
 //!   `pending_upgrade/serve.rs` and the continuity range in `permitted_to`
 //!   (`private_session/pending_upgrade.rs`) both cut. Alice serves bob his pre-downgrade ciphertext
-//!   on his raw request: red PRODUCT.
+//!   on his raw request at the position he saved: red PRODUCT. Either check alone still refuses
+//!   him there.
+//! - **A relay serves a regranted member what precedes his regrant** (claim 6): the continuity
+//!   range in `permitted_to` always holds. Carol serves dave earlier step ciphertext on his raw
+//!   request at the position he saved: red PRODUCT.
 //! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
 //!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
 //! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
@@ -1476,14 +1480,70 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
             .expect("APPARATUS: private wire peer binds")
     });
+    // What this member keeps of each donor: the cursor its own asker saved
+    // (`SEG_PRIVATE_PULLS`, sealed with its room key): the donor incarnation it was told and the
+    // last position it read, a record that exists on that donor. An attacker asks with what it
+    // holds; a donor it was never told is asked under an incarnation it does not know.
+    let told: std::collections::BTreeMap<[u8; 32], ([u8; 32], u64)> = {
+        use vox_core::atrest::idfactor::SignatureIdentityFactor;
+        use vox_core::atrest::store::{open_segment, SegmentKind};
+        let store = profile.store();
+        let sek = store
+            .get_sek_wrap(&room)
+            .expect("APPARATUS: member room key reads")
+            .expect("APPARATUS: member room key")
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(profile.signer().expect("APPARATUS: member signs")),
+                &room,
+                ROOM_PASS.as_bytes(),
+            )
+            .expect("APPARATUS: member room key unwraps");
+        let mut told = std::collections::BTreeMap::new();
+        if let Some(segment) = store
+            .get_segment(&room, SegmentKind::KeyMaterial, 23)
+            .expect("APPARATUS: member private pull cursor reads")
+        {
+            let bytes = open_segment(&sek, SegmentKind::KeyMaterial, 23, &segment)
+                .expect("APPARATUS: member private pull cursor opens");
+            let mut d = Decoder::new(&bytes);
+            d.array().expect("APPARATUS: private pull cursor");
+            d.uint().expect("APPARATUS: private pull cursor version");
+            d.bytes().expect("APPARATUS: own private incarnation");
+            d.bytes().expect("APPARATUS: private pull binding");
+            for _ in 0..d.array().expect("APPARATUS: private pull peers") {
+                d.array().expect("APPARATUS: private pull peer cursor");
+                let peer: [u8; 32] = d.bytes().expect("APPARATUS: donor").try_into().unwrap();
+                let incarnation: [u8; 32] = d
+                    .bytes()
+                    .expect("APPARATUS: donor incarnation")
+                    .try_into()
+                    .unwrap();
+                let position = d.uint().expect("APPARATUS: donor position");
+                told.insert(peer, (incarnation, position));
+            }
+        }
+        told
+    };
     'holders: for (name, addr, fingerprint) in targets {
         let connection = rt
             .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
             .expect("APPARATUS: private wire peer connects to holder");
-        let mut incarnation = [0u8; 32];
-        let mut after = 0;
+        let (incarnation, saved) = told.get(&fingerprint).copied().unwrap_or(([0xA5; 32], 0));
+        if saved > 0 {
+            eprintln!(
+                "[proof] {} asks {name} at the position it saved for it, {saved}",
+                member.name
+            );
+        }
         let mut finished = false;
-        for _ in 0..32 {
+        // The anchor the member saved (LiveTail serves only at an exact record that exists),
+        // then every window the current LiveTail names (`through`, the fixed 32 positions ending
+        // at it), positions 1 to 1024.
+        let throughs = (saved > 0)
+            .then_some(saved)
+            .into_iter()
+            .chain((1..=32u64).map(|window| window * 32));
+        for through in throughs {
             // A holder that resets or stops the ask refuses it on purpose
             // (`transport::streams::refuse`) and serves nothing on it: no record outside the
             // member's grant. The pages it answered before the refusal were judged as they came.
@@ -1495,17 +1555,20 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                 let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
                     .await
                     .map_err(|e| refused(e, "APPARATUS: private wire peer opens stream"))?;
-                // The private Session ask, version 2: the room, its epoch, the donor cursor and
-                // the query, here the live tail (`sessionstream::read_ask`).
+                // The private Session ask, version 2: the room, its epoch, the asker's cursor and
+                // the query, here the live tail anchored at `through` under the donor incarnation
+                // this member holds (`sessionstream::read_ask`, `Query::put`).
                 let mut e = Encoder::new();
                 e.array(6)
                     .uint(2)
                     .bytes(&room)
                     .uint(0)
+                    .bytes(&[0u8; 32])
+                    .uint(0)
+                    .array(3)
+                    .uint(0)
                     .bytes(&incarnation)
-                    .uint(after)
-                    .array(1)
-                    .uint(0);
+                    .uint(through);
                 write_frame(&mut send, &e.finish())
                     .await
                     .map_err(|e| refused(e, "APPARATUS: private wire peer asks"))?;
@@ -1544,12 +1607,12 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                 2,
                 "PRODUCT: wrong private Session page version"
             );
-            incarnation = d
+            let _incarnation: [u8; 32] = d
                 .bytes()
                 .expect("PRODUCT: private Session page incarnation")
                 .try_into()
                 .expect("PRODUCT: invalid private Session incarnation");
-            after = d.uint().expect("PRODUCT: private Session page integer");
+            let _after = d.uint().expect("PRODUCT: private Session page integer");
             let more = d.uint().expect("PRODUCT: private Session page integer");
             let records = d.array().expect("PRODUCT: private Session page array");
             for _ in 0..records {
@@ -1576,11 +1639,10 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             }
             d.finish()
                 .expect("PRODUCT: extra bytes in private Session page");
-            if more == 0 {
-                finished = true;
-                break;
+            if more != 0 {
+                assert_eq!(more, 1, "PRODUCT: invalid private Session continuation");
             }
-            assert_eq!(more, 1, "PRODUCT: invalid private Session continuation");
+            finished = through == 32 * 32;
         }
         assert!(
             finished,

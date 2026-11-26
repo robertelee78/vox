@@ -36,8 +36,9 @@ use crate::{digest, failed, input_fingerprint, VoxError};
 
 /// A read under the room's fence: `$body` runs with `$fence` bound and yields the read's value;
 /// if the fence or the acting node changed meanwhile, the read is refused with `$message`. The
-/// fence moves only when the order of rows already read changed, never because a message
-/// arrived or a row changed. Yields `(fence, value)`.
+/// fence moves only when the room it reads was replaced, never because a message arrived, a
+/// row changed or a row was taken away: no admission reorders rows already read. Yields
+/// `(fence, value)`.
 macro_rules! under_fence {
     ($c:expr, $channel_id:expr, $actor:expr, $message:expr, |$fence:ident| $body:block) => {{
         let $fence = room_read_fence($c, $channel_id).await?;
@@ -4785,7 +4786,12 @@ impl VoxClient {
             link,
             passphrase: passphrase.copy(),
         };
-        on_held!(self, |c| done(c, &req).await)?;
+        // A rejoin answered while its own history is still being recovered is still a join: its
+        // posts are refused with the node's own sentence until that has finished.
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Ok | Frame::JoinedRecovering => Ok(()),
+            other => Err(unexpected(&other)),
+        })?;
         self.new_room(before, "joined").await
     }
 

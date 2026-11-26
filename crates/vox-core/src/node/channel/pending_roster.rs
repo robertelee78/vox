@@ -172,6 +172,47 @@ pub(crate) struct Completed {
 }
 
 impl ChannelState {
+    /// Whether a board's records hold anything a roster save could take that this room has not
+    /// already saved: a member it does not know whose admission it can check now (the creator,
+    /// or witnessed by a member it knows), a notice newer than the one it keeps, by a witness
+    /// it knows, or a member's withdraw newer than the one it keeps. The one decision every
+    /// board-driven roster save asks before it reserves the room's pending write; a save that
+    /// starts takes the whole board, so a chain that one known witness opens is still admitted
+    /// in that save.
+    pub(crate) fn roster_news(
+        &self,
+        records: &[MemberBundleRecord],
+        tail: Option<&NoticeTail>,
+    ) -> bool {
+        let known = |id: &Digest32| self.authors.contains_key(id);
+        records.iter().any(|record| {
+            !known(&record.author_id)
+                && match &record.admission {
+                    Admission::Creator => true,
+                    Admission::Witnessed(witness) => known(&witness.witness_id),
+                }
+        }) || tail.is_some_and(|tail| {
+            tail.notices.iter().any(|notice| {
+                // An unknown joiner is news even when its notice is kept: a save interrupted
+                // between keeping the notice and admitting the key leaves exactly that.
+                known(&notice.witness.witness_id)
+                    && (!known(&notice.joiner())
+                        || self
+                            .board_kept
+                            .notices
+                            .get(&notice.joiner())
+                            .is_none_or(|(held, _)| *held < notice.witness.timestamp_ms))
+            }) || tail.withdraws.iter().any(|withdraw| {
+                known(&withdraw.author_id)
+                    && self
+                        .board_kept
+                        .withdraws
+                        .get(&withdraw.author_id)
+                        .is_none_or(|(held, _)| *held < withdraw.timestamp_ms)
+            })
+        })
+    }
+
     pub(crate) fn prepare_pending_roster(
         &mut self,
         store: &Arc<Store>,
@@ -565,14 +606,8 @@ impl Completed {
                 )),
             };
         }
-        let changed_notices: Vec<_> = self.notices.keys().copied().collect();
         channel.board_kept.notices.extend(self.notices);
         channel.board_kept.withdraws.extend(self.withdraws);
-        for author in changed_notices {
-            if channel.is_member(&author) {
-                channel.key_member_became_current(author);
-            }
-        }
         if !self.added.is_empty() {
             channel.now_hint = channel.now_hint.max(self.pending.now.get());
             for key in self.added {
@@ -581,18 +616,12 @@ impl Completed {
                 channel
                     .admission
                     .admit(channel.channel_id, channel.epoch, fingerprint);
-                if channel.is_member(&fingerprint) {
-                    channel.key_member_became_current(fingerprint);
-                }
             }
             channel.owe_private_support();
             channel.governance_ready = false;
         }
         if self.saved.result.is_ok() && self.saved.joined.is_some() {
             channel.now_hint = channel.now_hint.max(self.pending.now.get());
-            channel
-                .role_owed
-                .retain_authors(|peer| channel.authors.contains_key(peer));
         }
         if let Some(error) = self.poison {
             channel.mark_poisoned();

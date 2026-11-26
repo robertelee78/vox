@@ -1,12 +1,7 @@
 //! V210-39 (#212) — **two nodes that each hold a backlog the other lacks both converge**, through
 //! the shipped binary.
 //!
-//! A sync session serves its whole bounded batch before it drains what it is sent
-//! (`log/sync.rs`, `frontier_session_room_inner`). One batch may approach 64 MiB, but a QUIC
-//! stream's receive window is 16 MiB (`transport::quic::STREAM_WINDOW`). When both ends of one
-//! session have more than a window to send, each can block writing into a window the other is
-//! not yet reading. If so, both fail at the frame write timeout having applied nothing, and every
-//! retry repeats it.
+//! Two peers with substantial backlogs must both be able to exchange them.
 //!
 //! The staging uses real `vox` processes only, and no daemon is restarted (a restarted daemon does
 //! not reopen its rooms until V210-35). No freeze lasts as long as the 30 s silence after which a

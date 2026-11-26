@@ -335,7 +335,7 @@ impl Prepared {
             Self::Session(work) => Completed::Session(work.run(store, signer)),
             Self::Consent(work) => Completed::Consent(Box::new(work.run(store, signer))),
             Self::Trust(work) => Completed::Trust(work.run(store, signer)),
-            Self::Private(work) => Completed::Private(work.run(store, signer)),
+            Self::Private(work) => Completed::Private(work.run(store)),
             Self::Governance(work) => Completed::Governance(work.run(store, signer)),
             Self::Packages(work) => Completed::Packages(work.run(store, signer)),
             Self::Recovery(work) => Completed::Recovery(work.run(store, signer)),
@@ -443,7 +443,7 @@ impl Completed {
             Self::Trust(done) => done.finish(channel).map(Saved::Trust),
             Self::Private(done) => done.finish(channel, store).map(Saved::Private),
             Self::Governance(done) => done.finish(channel, store).map(Saved::Governance),
-            Self::Packages(done) => done.finish(channel, store).map(Saved::Packages),
+            Self::Packages(done) => done.finish(channel).map(Saved::Packages),
             Self::Recovery(done) => done.finish(channel, store).map(Saved::Recovery),
             Self::Leave(done) => done.finish(channel, store).map(Saved::Leave),
             Self::Read(done) => Ok(Saved::Read(done.finish(channel, store))),
@@ -1063,6 +1063,33 @@ impl Node {
                 Err(error)
             }
         };
+        // Permission news (every teller decides again what it tells) where an input of what this
+        // node may serve a peer can have changed: a legacy projection that advanced (legacy
+        // content eligibility; not told apart cheaply) and an administrative removal that
+        // appended removals. A trust step (receivers, removal debt, decision marks) changes
+        // none: Drive holders and their trust incarnation move only with the keyring
+        // (`trust_save` `install_owned_policy`).
+        let permission = installable
+            && matches!(
+                &result,
+                Ok(Saved::Governance(
+                    governance_save::Saved::Legacy { advanced: true, .. }
+                        | governance_save::Saved::AdminRemoval { .. }
+                ))
+            );
+        // Otherwise, whether a trust or governance step changed what this room's old automatic
+        // private debt was decided under (`private_refetch_evidence_changed`: the governance
+        // authority generation, this node's membership, the keyring incarnation, an author's
+        // Session floors, a Drive receiver's release, an opening basis), read in this commit's
+        // lock.
+        let refetch = if !permission
+            && installable
+            && matches!(&result, Ok(Saved::Trust(_) | Saved::Governance(_)))
+        {
+            channel.private_refetch_evidence_changed(&pending.store)
+        } else {
+            Ok(false)
+        };
         channel.note_publication_complete();
         drop(channel);
         // A prune is what frees space: give it back now, not at the next start, once this
@@ -1087,35 +1114,38 @@ impl Node {
             )
         {
             self.ingress_room_progress(room, session_save::IngressProgress::Projection);
-            self.private_projection_advanced(room, &instance);
+            // A waiting private page's projection advanced: the loops plan their private debt.
+            self.history_frontier.private_wake(room);
         }
-        if installable
-            && matches!(
-                &result,
-                Ok(Saved::Projection(
-                    session_projection::ProjectionProgress::Sessions { advanced: true }
-                )) | Ok(Saved::Trust(_))
-                    | Ok(Saved::Governance(_))
-            )
-        {
-            if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
-                let changed = {
-                    let channel = instance.lock().await;
-                    channel.private_refetch_evidence_changed(&store)
-                };
-                match changed {
-                    Ok(true) => self.wake_private_refetch(room, &instance).await,
-                    Ok(false) => {}
-                    Err(error) if matches!(fault_of(&error), Fault::GovernanceRefreshing) => {}
-                    Err(error) => {
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!(
-                                "private Session recovery evidence could not be read: {error}"
-                            ),
-                        });
-                    }
+        // Private news of a trust or governance step, only what changes something for a private
+        // teller (`permission`) or asker (`refetch`: old automatic private debt is runnable again
+        // although no tip moved, `select_private_refetch`). Rendering backfill, sparse
+        // contiguity and provisional cleanup that change neither are no private news; a refresh
+        // they end is decided again at the room's next publication, by the teller and the asker.
+        if permission {
+            self.history_frontier.private_permission(room);
+        } else {
+            match refetch {
+                Ok(true) => self.history_frontier.private_wake(room),
+                Ok(false) => {}
+                // Refreshing: the step that ends the refresh reads the evidence again.
+                Err(error) if matches!(fault_of(&error), Fault::GovernanceRefreshing) => {}
+                Err(error) => {
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!(
+                            "private Session recovery evidence could not be read: {error}"
+                        ),
+                    });
                 }
             }
+        }
+        // An author's Session controls became current in this step (`Work::Controls` completed
+        // its control frontier; committed whether or not it installs): permission news, once.
+        if matches!(
+            &result,
+            Ok(Saved::Private(private_save::Saved::Upgrade(native))) if native.controls_ready
+        ) {
+            self.history_frontier.private_permission(room);
         }
         if installable
             && matches!(

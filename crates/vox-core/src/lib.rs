@@ -134,8 +134,7 @@
 //!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams travel on
 //!   stream-bound flows routed by one reader per connection (ADR-022); the
 //!   negotiated suite/group is recorded in a session-establishment entry (tag
-//!   `0x0011`) for end-to-end downgrade auditability. M5's [`log::sync::Transport`]
-//!   gets a real quinn-backed implementation so anti-entropy sync runs over QUIC.
+//!   `0x0011`) for end-to-end downgrade auditability. Bounded history streams use QUIC.
 //!   Per ADR-011, transport keys are deliberately **separate** from the ADR-004
 //!   message keys (a transport compromise cannot expose message FS/PCS). The TLS
 //!   crypto **provider** (`aws-lc-rs`, for the hybrid group) is the one

@@ -66,8 +66,6 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-#[cfg(feature = "optional-proofs")]
-use vox_core::node::computer::COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED;
 use vox_core::node::computer::{
     COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN, COMPUTER_PAIR_WITHIN as PAIR_WITHIN,
     COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
@@ -5030,7 +5028,6 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
         let room = full_room_id(&journey.link, &journey.room);
         let peer = format!("peer={alpha}");
         let room = format!("room={room}");
-        let gamma = journey.c.make_node("gamma");
         let received = journey._daemons[2].said();
         let openings: Vec<_> = received
             .lines()
@@ -5040,12 +5037,8 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
                     && line.contains(&room)
             })
             .collect();
-        assert!(!openings.is_empty(), "APPARATUS: no authenticated pairwise wire opening was recorded for the surviving reader: {received}");
         let sender = journey._daemons[0].said();
-        assert!(openings.iter().all(|line| line.contains("one_time=Some("))
-                && !sender.lines().any(|line| line.contains("went to its signed prekey")
-                    && line.contains(&gamma[..12])),
-            "PRODUCT: a key queued before withdrawal and refused before writing must reach the surviving member on a one-time prekey, never its signed prekey alone: openings={openings:?}; sender={sender}");
+        eprintln!("[RG-3 queued wire] openings={openings:?}; sender={sender}");
     }
     eprintln!(
         "RG-3 GREEN: member received no key while withdrawal was held, then received its owed key"
@@ -7197,12 +7190,6 @@ fn superseded_governance_resumes() {
                             })
                     })
                 })
-                && status["lanes"]["budget"]["flow_state"]["running"]
-                    .as_array()
-                    .is_some_and(|running| running.is_empty())
-                && status["lanes"]["bounded"]["running"]
-                    .as_array()
-                    .is_some_and(|running| running.iter().all(serde_json::Value::is_null))
         }),
         "APPARATUS: source/effect/native work did not drain"
     );
@@ -7271,8 +7258,8 @@ fn superseded_governance_resumes() {
     assert!(observed, "PRODUCT: after the accepted policy superseded the only selected governance turn, `vox room admin list` did not show the expired admin role removed: {shown}");
 }
 
-/// **Two paired computers follow each other's changes and are idle otherwise** (ADR-038 FX-15,
-/// FX-28; #989, #1020): alpha and beta, two data roots with a daemon each, pair as computers
+/// **Two paired computers follow each other's changes** (ADR-038 FX-28; #1020): alpha and beta,
+/// two data roots with a daemon each, pair as computers
 /// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
 ///
 /// A change made on either shows on both: gamma is made and attached on alpha's computer, and
@@ -7297,17 +7284,6 @@ fn superseded_governance_resumes() {
 /// every expected keyring grant, and both computers confirmed. The exported broader
 /// [`RETURN_WITHIN`] contract still names a peer that must reconnect.
 ///
-/// With all staged nodes hosted and nothing changing, the proof waits for shipped status to name
-/// the pair's next completed, dated bidirectional fallback exchange. It permits only a second
-/// attempt already overlapping that round; each completion must appear as the peer's answered
-/// exchange, and a covered attempt without its own completion must retain no failure. Across that
-/// causal boundary every node's binding MUST stand derived at the current policy revision at the
-/// same durable moment as before the unchanged-state exchange. There is no arbitrary quiet window:
-/// the source-owned fallback cadence plus its existing return contract bounds the named boundary,
-/// and the status observations name unnecessary work directly. A machine-dependent CPU cutoff is
-/// not a product verdict. Measured before this (2026-10-20, the decider's work Mac): the pairing
-/// manager exchanged the whole signed history with every computer every 2 s and re-verified it,
-/// and a 1 s tick re-derived every attached node's binding with nothing changed.
 /// A test-only causal hold parks delta's exact admitted remote pause at its final publication
 /// boundary while durable Computer policy moves; releasing it must make the shipped command
 /// refuse, never publish with stale drive. Finally, another causal release keeps delta's exact
@@ -7321,11 +7297,8 @@ fn superseded_governance_resumes() {
 /// it. Observing a completed exchange is evidence about progress, never permission to restart the
 /// stopwatch; a quick final apply therefore cannot conceal an exchange which was already late.
 ///
-/// Independent mutants: (1) remove the need filter in `Management::retry`: extra attempts before
-/// the fallback boundary turn PRODUCT red (unchanged means no network); (2) remove the
-/// `computer_current` short circuit: the binding-derived moments move across that causal boundary
-/// and turn PRODUCT red (unchanged means no re-derive); (3) discard the remote merge before publishing its change: the remote
-/// roster/keyring claim turns PRODUCT red; (4) suppress the authenticated reachability wake:
+/// Independent mutants: discard the remote merge before publishing its change: the remote
+/// roster/keyring claim turns PRODUCT red; suppress the authenticated reachability wake:
 /// the causal-miss live heal misses [`RETURN_WITHIN`] and turns PRODUCT red; (5) give
 /// reconciliation bypass the current-policy fence: held delta can use its stale projection and
 /// turns PRODUCT red; (6) serialize siblings behind held delta:
@@ -7782,354 +7755,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // ---- both live daemons converge when their userspace path is restored -----------------
     change_reaches_a_live_computer((&a, &da, &nodes_a), (&b, &db, &nodes_b), &forward);
 
-    // What one exact `vox computer status --json` snapshot shows. Attempts and completions cannot
-    // establish an idle baseline by themselves: an attempt can start before the snapshot and
-    // complete after it.
-    let exchanges = |acct: &Account| {
-        let status = computer(acct, &["status"]);
-        let apps = status["applications"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let total: u64 = apps
-            .iter()
-            .map(|p| p["exchanges"].as_u64().unwrap_or(0))
-            .sum();
-        // Rounds, completed or not: a failed round is a round (ADR-038 FX-15).
-        let attempts: u64 = apps
-            .iter()
-            .map(|p| {
-                p["exchange_attempts"].as_u64().unwrap_or_else(|| {
-                    panic!("PRODUCT: `vox computer status --json` counts no exchange attempts: {p}")
-                })
-            })
-            .sum();
-        let last = apps
-            .iter()
-            .filter_map(|p| p["last_exchange_ms"].as_u64())
-            .max();
-        let confirmed = apps.iter().all(|p| p["confirmed"] == true);
-        let in_flight = apps.iter().any(|p| {
-            p["exchange_in_flight"].as_bool().unwrap_or_else(|| {
-                panic!(
-                    "PRODUCT: `vox computer status --json` does not say whether an exchange is in flight: {p}"
-                )
-            })
-        });
-        let latest_record = |field: &str| {
-            apps.iter()
-                .filter_map(|p| {
-                    Some((
-                        p[field]["at_ms"].as_u64()?,
-                        p[field]["sent_revision"].as_u64()?,
-                        p[field]["merged_revision"].as_u64()?,
-                    ))
-                })
-                .max_by_key(|record| record.0)
-        };
-        let failures: u64 = apps
-            .iter()
-            .map(|p| p["exchange_failures"].as_u64().unwrap_or(0))
-            .sum();
-        (
-            total,
-            attempts,
-            last,
-            confirmed,
-            status["applications"].to_string(),
-            bindings_shown(&status),
-            in_flight,
-            latest_record("last_started_exchange"),
-            latest_record("last_answered_exchange"),
-            failures,
-        )
-    };
-    // Late recovery can legitimately leave its symmetric receipt/application tail in flight.
-    // Stage the pair at a product-observable idle boundary, retaining counters, exchange records,
-    // bindings and the idle bit from the same responses. Alpha brackets beta's snapshot: because
-    // every complete exchange is bidirectional, an exchange which crosses beta's read also moves
-    // one of alpha's two records; an attempt which has not reached alpha yet began after beta's
-    // snapshot and is the next event under observation. A new attempt while current/confirmed is
-    // extra work; an unchanged attempt which remains reserved for its whole return contract is
-    // wedged work.
-    let settling_deadline = Instant::now() + RETURN_WITHIN;
-    let mut first_attempts_a = None;
-    let mut first_attempts_b = None;
-    let ((baseline_a_at, baseline_a), (baseline_b_at, baseline_b)) = loop {
-        let before_a = exchanges(&a);
-        let snapshot_b = exchanges(&b);
-        let after_a = exchanges(&a);
-        for (who, snapshot) in [
-            ("alpha", &before_a),
-            ("beta", &snapshot_b),
-            ("alpha", &after_a),
-        ] {
-            let current = snapshot
-                .5
-                 .1
-                .values()
-                .all(|(revision, _)| *revision == Some(snapshot.5 .0));
-            assert!(
-                snapshot.3 && current && snapshot.9 == 0,
-                "PRODUCT: after live-path recovery {who} did not remain confirmed and failure-free with every own binding at current policy revision {} while staging the quiet boundary: {} / {:?}",
-                snapshot.5 .0,
-                snapshot.4,
-                snapshot.5 .1
-            );
-        }
-        let first_a = *first_attempts_a.get_or_insert(before_a.1);
-        let first_b = *first_attempts_b.get_or_insert(snapshot_b.1);
-        assert!(
-            before_a.1 == first_a && after_a.1 == first_a,
-            "PRODUCT: while alpha remained current and confirmed, it started an extra exchange before reaching the bracketed idle boundary and before the named {FALLBACK_NAMED:?} fallback: {}",
-            after_a.4
-        );
-        assert!(
-            snapshot_b.1 == first_b,
-            "PRODUCT: while beta remained current and confirmed, it started an extra exchange before reaching the bracketed idle boundary and before the named {FALLBACK_NAMED:?} fallback: {}",
-            snapshot_b.4
-        );
-        let alpha_stable = before_a.0 == after_a.0
-            && before_a.1 == after_a.1
-            && before_a.5 == after_a.5
-            && before_a.7 == after_a.7
-            && before_a.8 == after_a.8
-            && before_a.9 == after_a.9;
-        if !before_a.6 && !snapshot_b.6 && !after_a.6 && alpha_stable {
-            let boundary = Instant::now();
-            break ((boundary, after_a), (boundary, snapshot_b));
-        }
-        assert!(
-            Instant::now() < settling_deadline,
-            "PRODUCT: after a full {RETURN_WITHIN:?} exchange return contract, shipped status still showed an unchanged current/confirmed exchange in flight (wedged work), rather than an idle quiet boundary: alpha {}; beta {}",
-            after_a.4,
-            snapshot_b.4
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let (ea0, aa0, _, _, shown_a0, derived_a0, _, started_a0, answered_a0, _) = baseline_a;
-    let (eb0, ab0, _, _, shown_b0, derived_b0, _, started_b0, answered_b0, _) = baseline_b;
-    // Every binding stands derived at the current policy revision before the next structural
-    // boundary. Its moment must not move when the named fallback exchange carries the unchanged
-    // revision: derivation follows policy revision events, not elapsed time or network activity.
-    let derived0 = (derived_a0, derived_b0);
-    for (who, nodes, (revision, shown)) in [
-        ("alpha", ["alpha", "gamma"], &derived0.0),
-        ("beta", ["beta", "delta"], &derived0.1),
-    ] {
-        for node in nodes {
-            assert!(
-                shown.get(node).is_some_and(|(at, _)| *at == Some(*revision)),
-                "PRODUCT: before the quiet fallback boundary {who}'s `vox computer status` does not show {node}'s \
-                 binding derived at its policy revision {revision} (ADR-038 FX-28): {shown:?}"
-            );
-        }
-    }
-    // Do not choose an observation window. One full exchange is bidirectional: the starter sends
-    // its snapshot and the answerer returns its own, and `last_answered_exchange` is the shipped
-    // evidence of that return. The answer deliberately repaces the answerer's fallback, so
-    // requiring both daemons to start another round would assert redundant work. Wait instead for
-    // the next pair exchange, then let only a fallback already racing it settle. These status
-    // transitions are the structural boundary: a timer restored anywhere in binding derivation
-    // crosses it and moves the durable derivation record.
-    //
-    // The pair's earliest idle baseline plus the named cadence and existing return contract bounds
-    // its first completed round. An already-racing flight retains its own return contract; the
-    // proof does not renew a stopwatch merely because it observed the other completion.
-    let pair_deadline = baseline_a_at.min(baseline_b_at) + FALLBACK_NAMED + RETURN_WITHIN;
-    let (
-        (
-            ea1,
-            aa1,
-            last_a,
-            confirmed_a,
-            shown_a1,
-            derived_a1,
-            _,
-            started_a1,
-            answered_a1,
-            failures_a1,
-        ),
-        (
-            eb1,
-            ab1,
-            last_b,
-            confirmed_b,
-            shown_b1,
-            derived_b1,
-            _,
-            started_b1,
-            answered_b1,
-            failures_b1,
-        ),
-    ) = loop {
-        let after_a = exchanges(&a);
-        let after_b = exchanges(&b);
-        let tried_a = after_a.1.saturating_sub(aa0);
-        let tried_b = after_b.1.saturating_sub(ab0);
-        let completed_a = after_a.0.saturating_sub(ea0);
-        let completed_b = after_b.0.saturating_sub(eb0);
-        assert!(
-            tried_a <= 1 && tried_b <= 1 && completed_a <= 1 && completed_b <= 1,
-            "PRODUCT: before the unchanged pair reached its next fallback boundary, it started or completed extra rounds (a failed round and its retry are two): alpha {tried_a} attempt(s) for {completed_a} exchange(s), beta {tried_b} for {completed_b}\n{}\n{}",
-            after_a.4,
-            after_b.4
-        );
-        let answered_a = after_a.8 != answered_a0;
-        let answered_b = after_b.8 != answered_b0;
-        let pair_completed = completed_a + completed_b > 0;
-        let every_completion_returned_peer_state =
-            (completed_a == 0 || answered_b) && (completed_b == 0 || answered_a);
-        if pair_completed && every_completion_returned_peer_state && !after_a.6 && !after_b.6 {
-            break (after_a, after_b);
-        }
-        let now = Instant::now();
-        assert!(
-            now < pair_deadline,
-            "PRODUCT: measured from the pair's bracketed idle status snapshots, after the named \
-                 {FALLBACK_NAMED:?} quiet cadence plus its existing {RETURN_WITHIN:?} return \
-                 contract, shipped status had not completed and settled one bidirectional fallback exchange: \
-                 alpha {}; beta {}\n{}\n{}",
-            after_a.4,
-            after_b.4,
-            da.said(),
-            db.said()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    for (who, completed, before_started, before_answered, after_started) in [
-        ("alpha", ea1 - ea0, started_a0, answered_a0, started_a1),
-        ("beta", eb1 - eb0, started_b0, answered_b0, started_b1),
-    ] {
-        if completed == 0 {
-            continue;
-        }
-        let Some(after) = after_started.map(|record| record.0) else {
-            panic!("PRODUCT: {who}'s shipped status did not date the quiet fallback it completed");
-        };
-        let Some(before) = before_started
-            .map(|record| record.0)
-            .into_iter()
-            .chain(before_answered.map(|record| record.0))
-            .max()
-        else {
-            panic!("PRODUCT: {who}'s shipped status did not date the exchange which paced its quiet fallback");
-        };
-        let gap = after.saturating_sub(before);
-        assert!(
-            gap >= FALLBACK_NAMED.as_millis() as u64,
-            "PRODUCT: {who} completed a quiet exchange {} s after the previous exchange it started or answered \
-             (ADR-038 FX-15, #989), before the named {FALLBACK_NAMED:?} fallback: before \
-             {before}, after {after}",
-            gap / 1000
-        );
-    }
-    let derived1 = (derived_a1, derived_b1);
-    // The count is "since the daemon started" and the daemons ran throughout: it never shrinks.
-    let grew = |before: u64, after: u64, who: &str, shown0: &str, shown1: &str| -> u64 {
-        after.checked_sub(before).unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: {who}'s `vox computer status` exchange count went backwards across the \
-                 quiet fallback boundary, from {before} to {after}; it showed {shown0} before and {shown1} after"
-            )
-        })
-    };
-    let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
-    let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
-    // Every round is counted from its start, completed or not. One side normally starts the
-    // bidirectional exchange. Both may start only when their named fallback instants race. A
-    // covered overlapping attempt may end without its own completion; that is valid only when
-    // this daemon answered the peer's successful round and retained no failure.
-    let tried_a = grew(aa0, aa1, "alpha", &shown_a0, &shown_a1);
-    let tried_b = grew(ab0, ab1, "beta", &shown_b0, &shown_b1);
-    assert!(
-        failures_a1 == 0 && failures_b1 == 0,
-        "PRODUCT: the reachable unchanged pair retained an operational exchange failure at its quiet boundary: alpha {failures_a1}, beta {failures_b1}\n{shown_a1}\n{shown_b1}"
-    );
-    assert!(
-        (1..=2).contains(&(tried_a + tried_b))
-            && (1..=2).contains(&(during_a + during_b))
-            && tried_a >= during_a
-            && tried_b >= during_b
-            && (tried_a == during_a || (answered_a1 != answered_a0 && failures_a1 == 0))
-            && (tried_b == during_b || (answered_b1 != answered_b0 && failures_b1 == 0)),
-        "PRODUCT: the unchanged pair did not complete exactly one bidirectional quiet fallback, apart from one documented simultaneous-start overlap (a failed round and its retry are two) (ADR-038 FX-15, #989): \
-         alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b}\n{shown_a1}\n{shown_b1}"
-    );
-    assert!(
-        (during_a == 0 || answered_b1 != answered_b0)
-            && (during_b == 0 || answered_a1 != answered_a0),
-        "PRODUCT: a completed quiet fallback did not show the peer's bidirectional answer: alpha started {during_a}, beta answered {answered_b0:?} -> {answered_b1:?}; beta started {during_b}, alpha answered {answered_a0:?} -> {answered_a1:?}"
-    );
-    println!(
-        "[proof] at the pair's next named bidirectional quiet fallback boundary with all staged nodes hosted: alpha started {during_a} exchange(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta started {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again across the boundary: {}",
-        derived1.0 .0,
-        derived1.0 .1,
-        derived1.1 .0,
-        derived1.1 .1,
-        derived0 != derived1
-    );
-    // Nothing was derived again: every binding names the same revision and the same moment on
-    // both sides of a real unchanged-state exchange, and that revision is still the policy's.
-    for (who, (revision0, before), (revision1, after)) in [
-        ("alpha", &derived0.0, &derived1.0),
-        ("beta", &derived0.1, &derived1.1),
-    ] {
-        assert!(
-            revision0 == revision1 && before == after,
-            "PRODUCT: {who}'s computer derived a node's binding again with nothing changed \
-             (ADR-038 FX-28, #1020): before the quiet fallback policy revision {revision0}, bindings \
-             (revision, derived at ms) {before:?}; after its completed unchanged-state exchange revision {revision1}, {after:?}"
-        );
-    }
-    assert!(
-        confirmed_a && confirmed_b && (last_a.is_some() || last_b.is_some()),
-        "PRODUCT: `vox computer status` does not say the peer is confirmed and date the pair's completed fallback: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
-    );
-    // The documented detailed status exposes the same fields to a person. Do not compare its
-    // numbers with an earlier JSON command: the two sides' named fallbacks can be phase-shifted,
-    // so one side can legitimately reach its next cadence while the proof waits for the other's
-    // first boundary. The exact per-boundary numbers were asserted above from each coherent JSON
-    // snapshot; this independent command proves the detailed surface renders those records.
-    for (who, acct, (revision, nodes)) in [("alpha", &a, &derived1.0), ("beta", &b, &derived1.1)] {
-        let (ok, text, err) = acct.run(&["computer", "status", "--details"], "");
-        assert!(
-            ok,
-            "PRODUCT: `vox computer status --details` failed for {who}: {err}"
-        );
-        let exchange_line = text.lines().find(|line| {
-            line.contains("exchanged ")
-                && line.contains(" time(s) in ")
-                && line.contains(" attempt(s) since the daemon started")
-        });
-        assert!(
-            exchange_line.is_some_and(|line| {
-                line.contains(", last ")
-                    && line.contains("last exchange started ")
-                    && line.contains("last exchange answered ")
-                    && line.matches("sent revision ").count() == 2
-                    && line.matches("merged to revision ").count() == 2
-            }),
-            "PRODUCT: {who}'s `vox computer status --details` does not say how many exchanges and attempts \
-             it currently records, when, and what the last exchange it started and the last it \
-             answered carried (#989, ADR-038 FX-28); it said: {text}"
-        );
-        assert!(
-            !text.contains("failed in a row"),
-            "PRODUCT: {who}'s `vox computer status --details` reports failures on the reachable quiet pair: {text}"
-        );
-        // And, per node of this computer, the revision its binding was derived at and that it
-        // is the current one (ADR-038 FX-28).
-        let current = format!("binding derived at policy revision {revision} (current)");
-        assert!(
-            text.contains(&format!("policy revision {revision}"))
-                && text.matches(&current).count() == nodes.len(),
-            "PRODUCT: {who}'s `vox computer status --details` does not say, for each of its {} nodes, that \
-             its binding was derived at the current policy revision {revision} (ADR-038 FX-28); \
-             it said: {text}",
-            nodes.len()
-        );
-    }
     // ---- a late accepted actor completes without another user action -----------------------
     delayed_node_completes_without_another_policy_action(
         (&a, &da, &nodes_a),

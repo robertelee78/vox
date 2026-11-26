@@ -15,7 +15,7 @@ pub(in crate::node::channel) use view::{
 };
 
 pub(crate) use sparse::{
-    sparse_control_evaluation, termination_admitted, ControlEvaluation, PayloadValidation,
+    checked_seen, sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparseParent,
     SparsePayloadState, SparseValidation, SparseValidationStep, TypedSparseBody,
     ValidatedSparseEntry, VerifiedParentPrefix,
 };
@@ -212,6 +212,60 @@ pub(crate) fn content_eligibility_in(
         Err(error) if refreshing(&error) => Ok(ContentEligibility::Refreshing),
         Err(error) => Err(error),
     }
+}
+
+/// ADR-053 M0, the writer's real-change rule: for each `(author, after)`, the highest position
+/// above `after` of a Governance or StepPolicy row of that author that this node has applied
+/// (causally complete and its history effect settled here) and that a post must acknowledge.
+/// Authors with no such row above `after` are omitted. Content, KeyPackage, floors, support,
+/// checkpoints, terminations and empty ContextUpdates are not governance rows and never appear
+/// here. Another author's epoch-0 ConsentGrant is skipped (busy-room ack ruling): it changes
+/// consent under its own author only, so no decision about this node's post. It is skipped
+/// while scanning, so a later grant never masks an earlier removal, revocation or reset of the
+/// same author: the scan goes on to that row. Grants stay validated and applied as before.
+pub(crate) fn applied_governance_after(
+    read: &super::entry_store::Read<'_>,
+    reached: &[(Digest32, u64)],
+) -> Result<Vec<(Digest32, u64)>> {
+    let facts = facts::Read::from_snapshot(read.snapshot(), read.sek(), read.channel())?;
+    let mut applied = Vec::new();
+    for (author, after) in reached {
+        let mut before = Some(facts::position(author, u64::MAX));
+        while let Some((key, log)) = facts.last(facts::Table::Positions, before)? {
+            if key[..32] != author[..] {
+                break;
+            }
+            let seq = u64::from_be_bytes(
+                key[32..40]
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("governance position key"))?,
+            );
+            if seq <= *after {
+                break;
+            }
+            let entry = facts.entry(log)?;
+            let hash = entry.entry_hash();
+            if facts
+                .get(facts::Table::Complete, &facts::hash_key(&hash))?
+                .is_some()
+                && read.history_effect_finished(&hash)?
+                && !foreign_open_grant(&entry)
+            {
+                applied.push((*author, seq));
+                break;
+            }
+            before = Some(key);
+        }
+    }
+    Ok(applied)
+}
+
+/// An epoch-0 ConsentGrant (the callers pass other authors' rows only): no acknowledgement.
+fn foreign_open_grant(entry: &crate::log::entry::Entry) -> bool {
+    matches!(
+        crate::governance::entry::GovEntry::body_bound_to(entry),
+        Ok(crate::governance::entry::GovBody::ConsentGrant(grant)) if grant.body.epoch == 0
+    )
 }
 /// Re-evaluate a recovered signed floor so its recipient decision is built from
 /// the same authenticated frontier as the public author decision.
@@ -780,52 +834,6 @@ fn queue_backfill(
 
 pub(super) fn refreshing(error: &Error) -> bool {
     matches!(error, Error::Profile(why) if *why == view::REFRESHING)
-}
-
-/// `VOX_TEST_MP10_SEND_EVERY_BODY=1` (ADR-053 MP-10, boundary 1 off): a provider sends a
-/// once-removed recipient every body it asks for, whatever its readmission cut says (#1171).
-/// Read only at the provider's two body sends. Says so once when first read.
-#[cfg(feature = "test-knobs")]
-pub(crate) fn send_every_body() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var("VOX_TEST_MP10_SEND_EVERY_BODY").is_ok_and(|value| value == "1");
-        if on {
-            eprintln!(
-                "vox: VOX_TEST_MP10_SEND_EVERY_BODY engaged: bodies sent to a once-removed \
-                 recipient regardless of its readmission cut"
-            );
-        }
-        on
-    });
-    *ON
-}
-
-#[cfg(not(feature = "test-knobs"))]
-pub(crate) const fn send_every_body() -> bool {
-    false
-}
-
-/// `VOX_TEST_MP10_RENDER_EVERY_BODY=1` (ADR-053 MP-10, boundary 2 off): a node that knows its
-/// own applied removal renders every newly received body, whatever its readmission cut says
-/// (#1171). Read only at the two render gates. Says so once when first read.
-#[cfg(feature = "test-knobs")]
-pub(crate) fn render_every_body() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var("VOX_TEST_MP10_RENDER_EVERY_BODY").is_ok_and(|value| value == "1");
-        if on {
-            eprintln!(
-                "vox: VOX_TEST_MP10_RENDER_EVERY_BODY engaged: newly received bodies rendered \
-                 regardless of this node's own readmission cut"
-            );
-        }
-        on
-    });
-    *ON
-}
-
-#[cfg(not(feature = "test-knobs"))]
-pub(crate) const fn render_every_body() -> bool {
-    false
 }
 
 fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Result<u64> {

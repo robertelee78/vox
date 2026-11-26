@@ -616,3 +616,22 @@ impl WireError {
         }
     }
 }
+/// Map a parse/verify [`Error`] to the M0 wire application-error code (ADR-008
+/// §"Abort / error signalling"). This is the single place the structured error
+/// taxonomy is collapsed onto the coded wire contract, so an unknown struct
+/// tag / unsupported version / unknown algo is **never** misreported as a generic
+/// authenticator failure.
+#[must_use]
+pub fn wire_error_for(err: &Error) -> WireError {
+    match err {
+        Error::UnknownStructTag(_) => WireError::UnknownStructTag,
+        Error::UnsupportedVersion { .. } => WireError::ProtocolVersionUnsupported,
+        Error::UnknownAlgoId(_) | Error::UnexpectedAlgo { .. } => WireError::UnknownAlgoId,
+        Error::SuiteBelowFloor { .. } => WireError::SuiteBelowFloor,
+        // Signature/authenticator failures, malformed structures, and oversize/CBOR
+        // malformation are all "this authenticator/
+        // structure is not acceptable" → AuthenticatorInvalid. (Size limits are a
+        // structural rejection; there is no dedicated size code in the M0 table.)
+        _ => WireError::AuthenticatorInvalid,
+    }
+}

@@ -3,10 +3,7 @@
 //! The real network transport the rest of Vox runs over: a single authenticated,
 //! post-quantum-hybrid QUIC connection per peer, multiplexing independent reliable
 //! streams (no cross-stream head-of-line blocking) for bulk/sync traffic and RFC
-//! 9221 unreliable datagrams for low-latency flows. This is the concrete
-//! realization of the abstract [`crate::log::sync::Transport`] M5 defined: M5's
-//! anti-entropy sync runs over a real quinn-backed stream here
-//! ([`quic::QuicStreamTransport`]).
+//! 9221 unreliable datagrams for low-latency flows.
 //!
 //! ## What this layer guarantees (ADR-011)
 //! - **PQ-hybrid key exchange.** The TLS 1.3 handshake offers and accepts *only*

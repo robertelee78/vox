@@ -75,7 +75,7 @@ pub(super) struct Sync {
     pub(super) conn: Arc<VoxConnection>,
     pub(super) peer: Digest32,
     pub(super) epoch: u64,
-    pub(super) history: Option<crate::node::history_stream::Preamble>,
+    pub(super) history: crate::node::history_stream::Preamble,
     pub(super) send: quinn::SendStream,
     pub(super) recv: quinn::RecvStream,
 }
@@ -114,7 +114,7 @@ pub(super) struct JoinAdmission {
     pub(super) lifetime: Arc<maintenance_save::Lifetime>,
 }
 pub(super) struct JoinRequest {
-    pub(super) original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    pub(super) original: std::sync::Weak<crate::node::channel::RoomLock>,
     pub(super) attachment: u64,
     pub(super) peer: Digest32,
     pub(super) identity: crate::identity::composite::CompositePublicKey,
@@ -129,12 +129,11 @@ pub(super) enum AnsweredJoin {
         channel_id: Digest32,
         outcome: std::result::Result<Box<crate::node::joinstream::JoinOutcome>, String>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
-        original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        original: std::sync::Weak<crate::node::channel::RoomLock>,
         attachment: u64,
     },
     PackageRedelivery {
         next: package_save::Redelivery,
-        result: crate::error::Result<()>,
     },
     PackageAdoption {
         next: package_save::AdoptionWait,
@@ -168,11 +167,13 @@ impl Node {
         } else {
             None
         };
-        if records.is_empty()
-            && tail
-                .as_ref()
-                .is_none_or(|tail| tail.notices.is_empty() && tail.withdraws.is_empty())
-        {
+        // Board news starts a save only for a record this room has not saved
+        // (`ChannelState::roster_news`); a join's Sync or Port continuation names its peer.
+        let news = match &after {
+            After::News => instance.lock().await.roster_news(&records, tail.as_ref()),
+            _ => !records.is_empty(),
+        };
+        if !news {
             return;
         }
         let work = Work::Board {
@@ -292,9 +293,7 @@ impl Node {
         match returned {
             Ok(AnsweredJoin::Settled) => {}
             Ok(AnsweredJoin::PackageAdoption { next }) => self.resume_package_adoption(next).await,
-            Ok(AnsweredJoin::PackageRedelivery { next, result }) => {
-                self.resume_package_redelivery(next, result).await
-            }
+            Ok(AnsweredJoin::PackageRedelivery { next }) => self.resume_package_redelivery(next),
             Ok(AnsweredJoin::Join {
                 peer,
                 channel_id,
@@ -403,11 +402,6 @@ impl Node {
         let changed = !saved.admitted.is_empty();
         if changed {
             self.refresh_network_view().await;
-            for ((channel, _), port) in &mut self.ports {
-                if *channel == room {
-                    port.raise();
-                }
-            }
             self.note_local_governance_append(&room);
         }
         match after {
@@ -548,6 +542,10 @@ pub(super) async fn background(
             drop(room);
             changed.await;
             continue;
+        }
+        // Nothing this room has not saved: no save, and no hold on its pending write.
+        if !room.roster_news(&records, tail.as_ref()) {
+            return 0;
         }
         match room.prepare_pending_roster(
             &lifetime.store,

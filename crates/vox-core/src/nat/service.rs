@@ -57,7 +57,6 @@ use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
 use crate::hash::{sha256_concat, Digest32};
 use crate::identity::composite::CompositePublicKey;
-use crate::log::sync::wire_error_for;
 use crate::nat::record::{
     MemberBundleRecord, PreJoinRecord, RendezvousRecord, MAX_PREKEY_BUNDLE_BYTES,
 };
@@ -66,6 +65,7 @@ use crate::time::Clock;
 use crate::transport::framing::{read_frame, read_frame_until, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
 use crate::transport::streams::{open_typed, StreamKind};
+use crate::wire::wire_error_for;
 use crate::wire::{parse_frame, StructTag};
 
 /// The largest rendezvous frame either side will read: the bundle cap plus room

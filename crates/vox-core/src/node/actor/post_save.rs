@@ -2,7 +2,7 @@
 use super::*;
 use crate::identity::composite::RootSigner as _;
 use crate::node::channel::pending_text::{
-    CompletedText, GovernancePreparation, GovernanceWrite, Saved, PENDING_WRITE_WAIT,
+    CompletedText, GovernancePreparation, GovernanceWrite, Saved,
 };
 use crate::node::store::Store;
 
@@ -234,7 +234,7 @@ pub(super) struct AppendPending {
 }
 
 pub(super) struct FailedRead {
-    pub(super) instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    pub(super) instance: std::sync::Weak<crate::node::channel::RoomLock>,
     pub(super) store: Arc<Store>,
     pub(super) _pin: crate::node::channel::history::PendingHistoryRead,
 }
@@ -598,28 +598,20 @@ impl Node {
                 .insert(channel_id, name.clone());
         }
         let worker = tokio::spawn(async move {
-            // The room's one pending write may be held by a peer's served write (or another
-            // local write); every release wakes this edge. Wait for it here, registered so a
-            // served write that wakes on the same release stands aside (`history_stream::
-            // source`): otherwise, with the served writes woken the instant the room frees,
-            // a node that posts back to back would reach `prepare_pending_text` only to find
-            // the room taken again and pay a 100 ms retry per post. Past the cap the save
-            // proceeds and reports the room busy as before, which the poster retries.
-            let mut waiting = None;
-            let cap = tokio::time::Instant::now() + PENDING_WRITE_WAIT;
+            // Ruling correction 5: a member's own post that waits gets the room's next
+            // publication. It is registered as waiting before it first looks, and stays so until
+            // its save holds the room's pending write, so a fetch step that would take that write stands
+            // aside (`history_stream::source`); a fetch step holds that write only while its
+            // native step executes, so this wait ends at that step's release, with no cap.
+            let waiting = worker_room.lock().await.authored_save_waiting();
             loop {
                 let channel = worker_room.lock().await;
                 if !channel.post_pending() {
                     break;
                 }
                 let wake = channel.history_publication_wake();
-                waiting.get_or_insert_with(|| channel.authored_save_waiting());
                 drop(channel);
-                tokio::select! {
-                    biased;
-                    () = tokio::time::sleep_until(cap) => break,
-                    () = wake => {}
-                }
+                wake.await;
             }
             let saved =
                 tokio::task::spawn_blocking(move || -> std::result::Result<SavedAppend, Fault> {
@@ -991,7 +983,7 @@ impl Node {
                 #[cfg(feature = "mutant-sender")]
                 if matches!(pending.kind, ReplyKind::End)
                     && matches!(fault, Fault::NotCreator)
-                    && crate::log::sync::mutant::withdraws_unentitled()
+                    && crate::log::mutant::withdraws_unentitled()
                 {
                     if let Some(authority) = pending.end_authority.clone() {
                         self.begin_metadata_mutant_withdrawal(

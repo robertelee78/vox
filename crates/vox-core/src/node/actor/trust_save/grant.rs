@@ -48,7 +48,7 @@ pub(super) fn run(
     signer: &VaultRootSigner,
 ) -> crate::error::Result<PolicySaved> {
     let mut batch = store.batch()?;
-    let mut trust = Keyring::load(store, signer)?;
+    let (mut trust, loaded) = Keyring::load_at(store, signer)?;
     let target = change.target();
     let was = trust.is_trusted(&target);
     let had_drive = trust.has_drive(&target);
@@ -99,6 +99,7 @@ pub(super) fn run(
             {
                 return Ok(PolicySaved {
                     trust,
+                    incarnation: loaded,
                     removed: Vec::new(),
                     changed_drive: Vec::new(),
                     grant: None,
@@ -124,7 +125,7 @@ pub(super) fn run(
             locks.queue_save(&mut batch, signer)?;
         }
     }
-    trust.queue_save(&mut batch, signer)?;
+    let incarnation = Some(trust.queue_save(&mut batch, signer)?);
     batch.commit()?;
     let grant = GrantSaved {
         target,
@@ -132,6 +133,7 @@ pub(super) fn run(
     };
     Ok(PolicySaved {
         trust,
+        incarnation,
         removed: Vec::new(),
         changed_drive: vec![(target, had_drive)],
         grant: Some(grant),
