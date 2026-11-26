@@ -20,7 +20,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   RG-13); records against ADR-046 and ADR-047, both already superseded for v0.4.31 by ADR-052,
   which of their lines this decision overtakes. The exact lines are under "What this ADR
   supersedes and amends".
-- **Amended by**: ADR-054 (fetching is one pull loop per connection), recorded here as amendment 4.
+- **Amended by**: ADR-054 (fetching is one pull loop per connection), recorded here as amendment 4;
+  and MP-5 and MP-12 by ADR-054's amendment 3 (2026-11-25), marked at each.
 - **Related**: ADR-007 (G-29 to G-32), ADR-018, ADR-023, ADR-036, ADR-046, ADR-047, ADR-052
   (RG-1, RG-6, RG-13, RG-15)
 - **Source**: in the release's evidence archive `/opt/vox-evidence/v0431/`: the decider's words in
@@ -309,6 +310,45 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   - *Proof*: two members on skewed clocks; one posts after a pause of more than ten minutes and the
     other replies at once; every member shows the question before the reply. A message whose hints
     name an unknown tip is shown at once. Mutant: drop `seen` from messages. A room with more than sixteen authors, unknown hints nonblocking (M0 ruling §5). *(Amended 2026-11-23.)*
+  *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26, on the follow-up of the display-order ruling
+  of gpt-6.1-sol, `design/adopt/ruling-order.md` "Follow-up: ADR-053 MP-5": "Amended, not left
+  standing and not wholly superseded", as its second ruling corrects that follow-up,
+  `design/adopt/ruling-order-2.md` §5. The heading and normative paragraph above are replaced by:)*
+  "**MP-5. `seen` stays, as nonblocking references outside ordinary Content authority.** A message
+  SHOULD name recent published tips in its signed `seen` field, retaining the sixteen-slot bound
+  and canonical projection/order checks; for ordinary v2 Content, these hints MUST NOT require
+  receipts, gate text, be fetched for admission, or supply authority, membership, cut, key,
+  private-access or required-ancestor evidence."
+  In place of the follow-up's sentence on the display key, the second ruling's two sentences:
+  "At an entry’s first admitted header publication, the node MUST persist `(D, entry_hash)`, where
+  `B = min(signed claimed_ms, original local first_seen_ms.saturating_add(600000))` and `D = B` if
+  no signed `seen` reference names an entry already held and committed/published in the
+  pre-publication snapshot, otherwise `D = max(B, greatest such entry’s fixed display
+  time.saturating_add(1))`. The key MUST remain unchanged through later admissions, refill,
+  withdrawal/restoration and reopen; absent or receipt-only references contribute nothing and MUST
+  NOT be fetched or awaited for placement, and display keys MUST NOT confer authority or replace
+  existing causal/effect clocks."
+  Its other boundaries are kept: "`seen` remains an input, when held, to the separate existing
+  causal-clock computation with its computed-parent-derived cap, never evidence authorizing a
+  control frontier. Required governing/cut advances remain independent of ordinary Content's hint
+  slots as specified by MP-4, and control entries' checked parent receipts, closure and
+  domination—including MP-6's reserved exact target observation—remain unchanged; an unknown
+  seventeenth author MUST NOT gate Content."
+  There is no absolute ten-minute ceiling on a display key: each link of a chain of named,
+  already-published entries adds at most one millisecond (`ruling-order-2.md` §2).
+  *Why*, replaced: "Display stability no longer depends on receiving hinted parents; their later
+  arrival may update the separate causal clock but cannot move a displayed row."
+  *Proof*, replaced: "Use the ruling's newcomer reading/paging through an old busy room during
+  catch-up, including unknown hints: safe Content remains readable, no shown pair reverses, and
+  history arrival causes no refresh/retry." And, by the second ruling: "On a computer where the
+  named question was already published before the answer's first publication, the answer is
+  placed after that question, even if the answer's signed clock is an hour behind"; the answer
+  must name the question in `seen`. The "ignore `seen` in display placement" mutant returns for
+  this conditional proof: it must fail on the staged screens. It does not restore an all-member
+  eventual-topological-order claim.
+  The former universal skewed-clock question-before-reply requirement stays withdrawn, narrowed to
+  the conditional proof above; one identical or causal display order for every member stays
+  withdrawn. This does not waive the separate M0/MP-6 security proofs.
 
 - **MP-6. A removal cuts its target at the target's latest tip the remover holds, by a narrow
   branch-aware cut (C4).** "The removal explicitly reserves one of the sixteen signed `seen` slots
@@ -682,6 +722,10 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   `BodyNotHeld` or unavailable answer is holder-local: that holder is not asked again on that
   connection, and the position stays owed from other holders; it MUST NOT be abandoned.
   *(Amended 2026-11-24, amendment 4, by ADR-054:)* "that holder is not asked again on that connection" is to be met by the holder's corrected extent in its answer (ADR-054 PL-7), not by a refusal flag the reader keeps (ADR-054 PL-13; `design/simple-sync/design.md:52,69,72`). The rest of MP-12 stands; its missing intervals are the debt ADR-054's loops are to work from (ADR-054 PL-3).
+  *(Amended 2026-11-25 by ADR-054 amendment 3, PL-20 item 2:)* Amendment 3 replaces this
+  connection-lifetime promise for body availability: a denied body is not asked again until an
+  ordinary Have positively advertises it again. The bound is per positive re-advertisement, not
+  per connection (`design/adopt/ruling-body-extents.md:24-25`).
   - *Why*: ledger 66 (Context). The second-lane fix (about 1,100 lines, a marker, a grace period,
     set-aside rules) is not built. The review's step 1. With one version per room (ruling 4) no
     compatibility path for old servers is built.
