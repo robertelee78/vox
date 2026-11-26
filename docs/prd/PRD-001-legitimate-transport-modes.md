@@ -70,6 +70,14 @@ friction for this audience can be fixed later.
 - **R12.** When approving a newcomer, the approver **must** be able to choose "from approval onward" or
   "full history" for their own messages. The default is **from approval onward**.
 - **R13.** Messages **must** appear in the **same order on every node**.
+  *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26:)* A message starts from its author's signed
+  time capped at ten minutes after this node's original first sight. At first publication, this
+  starting time is raised by the saturating one-millisecond floor of entries named in `seen` that
+  this node already holds and has published. The resulting display key can exceed the first-sight
+  cap and is not changed later. Nodes agree for ordinary times; a message signed more than ten
+  minutes ahead of a node's first sight of it, or one naming an entry that one node already held
+  and had published before its first placement and another did not, can stand in a different
+  place on different nodes, for good.
 - **R14.** Sender keys no longer needed **must** be deleted (forward secrecy), consistent with R12.
 
 ### 3.4 Agent comms

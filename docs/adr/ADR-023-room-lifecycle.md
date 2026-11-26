@@ -45,6 +45,19 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
   same entry set MUST compute the identical order. The cap MUST NOT be against the receiving node's
   clock. An author's clock can move its entry only among its concurrent peers, never ahead of
   anything it saw.
+  *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26, the display-order rulings
+  `design/adopt/ruling-order.md` and `design/adopt/ruling-order-2.md`:)* For what a person is shown,
+  this order is replaced: each entry is to keep, from its first admission, the display key
+  `(D, entry_hash)`, where D is `min(signed claimed time, this node's first sight + 10 minutes)`,
+  but no earlier than one millisecond after the fixed display time of the latest entry it names in
+  `seen` that this node already holds and has published; it is not moved once placed. Where
+  RL-1.3 and RL-1.4a place a shown row by its causal position, the row keeps this key instead. The
+  hybrid logical clock and its cap stay unchanged for every use besides display. Every node is no
+  longer promised the identical order: ordinary times agree, but an entry signed more than ten
+  minutes ahead of a node's first sight of it, or one naming an entry that one node already held
+  and had published before its first placement and another did not, can stand in a different place
+  on different nodes, for good; and a backdated entry can stand above an entry it answers on a node
+  that did not yet hold that entry when the answer arrived.
 - **RL-1.3. Late arrivals.** An entry from a member who was offline MUST take its causal position,
   even above rows already shown, and MUST NOT move to the bottom. A row MUST be marked late only
   when it lands above a row the reader was already shown, meaning one placed at least
@@ -486,6 +499,11 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    arrival order. `crates/vox-tui/tests/causal_order_proof.rs`
    `three_members_one_offline_for_a_while_show_one_order`. **Known defect:** intermittently red,
    the second joiner cut off from the first post onward; tracked by V030-03 (#228).
+   *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26, `simple-sync/review/order-1.md`:)* This
+   proof is a regression for its own scenario only, not a proof that members converge to one order
+   (RL-1.2 as amended). A sufficient condition for identical order is that every signed time is
+   within every receiving member's first-sight cap and no floor changes a key; this fixture aims to
+   satisfy that condition. Its description says so; its code is unchanged.
 2. **Causal:** a reply posted after reading a message is ordered after it on every node, even from a
    clock an hour behind. Mutation: `seen` ignored in the sort. Same file,
    `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`. The cap: a post from a clock
@@ -494,6 +512,18 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    RL-1.4): `a_late_arrival_is_marked_and_posts_that_cross_are_not`,
    `a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place`,
    `a_late_arrival_after_a_restart_is_marked` (also tracked by #228).
+   *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26, `design/adopt/ruling-order-2.md` section 3
+   and `simple-sync/review/order-1.md`:)* The causal proof asserts only this: on a computer where
+   the named question was already published before the answer's first publication, the answer is
+   placed after it, even if the answer's signed clock is an hour behind. Its staging makes Bob and
+   Carol both show the question before Bob answers, and keeps the check that the answer's signed
+   time is an hour behind. Its mutation is `seen` ignored in display placement, a hand-made source
+   change, not a switch; it must turn the staged screens red. It does not prove one order on every
+   node. In the day-ahead proof, the clock-bound assertion stays on the member whose clock is right:
+   Alice's post naming Bob's day-ahead post is placed less than 15 minutes ahead of when she wrote
+   it. On Bob, whose own clock is a day ahead, it is withdrawn: his node first saw his post a day
+   ahead, and the post that names it keeps to that floor, as ruled. On both members both posts are
+   delivered and Alice's post follows Bob's. The cap's mutation was not run after this change.
 3. **Retroactive retention:** shortening a room's retention removes older messages on every member,
    and a restart still opens the room. `crates/vox-tui/tests/retention_proof.rs`,
    `crates/vox-tui/tests/retention_requirements_proof.rs` (R6 forever by default; R7 presets, the
