@@ -12,6 +12,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   implementation, acceptance and delivery are recorded on the source-bound issues, separately
   from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies. Amendment 3: the decider's ruling 10 with the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` (MP-9a, MP-6, MP-8), and the moving-head ruling of gpt-6.1-sol, `design/moving-head/ruling.md` (MP-7's prefix serving P, MP-8a's head choice H, W not approved, MP-17), and the Order, each marked where it applies.)*
   *(Amended 2026-11-24, amendment 4: the decider's rulings 11 to 13 (the private-step gap stays in v0.4.31 and is named; v0.4.31 is the busy room, and MP-14 and MP-16 move to v0.4.32; the stack of sync fixes is not the fix); the acknowledgement ruling of gpt-6.1-sol, `design/busy-room/ack-ruling.md` (MP-4); the control-closure ruling of gpt-6.1-sol, `design/busy-room/control-closure-ruling.md` (MP-7); the return ruling of the reviewer of #1393, `mp/cut-disappear/ruling-n.md` (MP-11); what has landed (MP-6 and MP-11 in #1393, MP-10's boundaries in #1392, MP-15 in #1391 with ADR-052 RG-13 closed); and ADR-054, which is to replace the fetching machinery this record's Order assumed (MP-9, MP-12, MP-13, the Order). Each is marked where it applies; the text it amends stays as it was, beside the mark. The coordinator's draft of this amendment is `design/amendment-4-draft.md`.)*
+  *(Amended 2026-11-27, amendment 5: the decider's rulings 14 and 15 of 2026-11-27 (KISS: fix the bad design rather than patch it, without eroding security; a splitter that is the creator or ever held an admin certificate ships named open); rule F3, `design/forked-target/rule-f3.md`, with its design reviews `design/forked-target/sec-1.md` to `sec-5.md` and its code reviews `sec-code-1.md` to `sec-code-6.md`, as built, accepted in review and merged in #1414 (merge commit `f6320b55d`): MP-9b, in the section "Amendment 5". It supersedes MP-9a and the forked-target ruling `design/forked-target/ruling.md` as the thing to build, and amends MP-9, MP-6 where it speaks of a split target, MP-8, and the M0 ruling's clause that controls keep their full parent checks, as carried in MP-1, MP-3 and MP-5. Each is marked where it applies; the text it amends stays as it was, beside the mark.)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -90,10 +91,13 @@ journey of ADR-052 RG-1 decides it, in all sixteen directions, unchanged.
    has been measured after the redesign. It is not built unless measured to be needed; then the decider is asked, because it means trusting the creator's account of the past.
 10. **A member that splits its own history must not escape its removal** (2026-11-23, evening, by the question form; ledger 73; `exec/deviations.md`, "Answer of the owner on 2026-11-23 (evening)"). The defect: a member running altered software signs two versions of its own history; after the creator removes it, members who saw the other version never apply the removal, keep releasing keys to it and stop receiving the creator's later posts, in every release since v0.4.6. "Offered: fix it in v0.4.31, the release waiting for it as well; or ship with the first half, name the rest in the notes and fix next."
     "His answer: **fix it in v0.4.31** (his standing rule; the form's value `fix_now`)." Carried by MP-9a, with MP-6 and MP-8 as amended. *(Amended 2026-11-23, amendment 3.)*
+    *(Amended 2026-11-27, amendment 5:)* Carried by MP-9b, which supersedes MP-9a as the thing to build; MP-9a was never built. For a splitter that is the creator or ever held an admin certificate, ruling 15 applies.
 11. **The private-step gap stays in v0.4.31 and is named** (2026-11-23, late afternoon, by the question form; ledger 76; `exec/deviations.md`, "Answer of the owner on 2026-11-23 (late afternoon)"). The gap: a removed person running altered software writes a private Session step after being removed and gets it shown to a member who was offline when the removal happened and has not processed it yet; once that member processes the removal, further such steps are refused, but the one already taken stays. The reviewer found no small sound rule (`design/private-unaware/ruling.md`).
     "His answer: **leave it and say so in the release notes** (the form's value `keep_and_name`). This is his exception to "every known defect is fixed in the current release", for this one defect." Carried by MP-10 as amended. *(Added 2026-11-24, amendment 4.)*
 12. **v0.4.31 is the busy room; disk-shrinking moves to v0.4.32** (2026-11-24, morning, in chat; `exec/deviations.md:168-183`). On disk space: "this shouldn't be complicated", and then, to the question whether v0.4.31 waits for the disk-shrinking work: "we can do the busy room as v0.4.31, then be better about disk space for v0.4.32". His other words that morning: "still the same 4 open tasks 🙁"; on the fixes that existed only as patches, "get that done"; "but dang -- we just need to actuallly land tasks better"; "we are prone to over engineered messes". The coordinating session's reading (`exec/deviations.md:180`), not a further quotation: MP-14 and MP-16 move to v0.4.32; what is already done for disk space ships in v0.4.31 (#1364, #1354, #1355, and MP-15, #1391); RG-13 closes when #1391 has merged, with MP-14 and MP-16 named on its issue as moved; for v0.4.32 the design is to be the simplest one that works, "to be re-decided then". Carried by MP-14, MP-15 and MP-16 as amended. *(Added 2026-11-24, amendment 4.)*
 13. **The stack of sync fixes is not the fix** (2026-11-24, later the same morning; `exec/deviations.md:185-189`). "yeah -- we have made an ever more elaborate set of if then else conditional messes -- we took something that was a bad design, very brittle, and with our "fix" made it worse -- worse design, more brittle" … "instead of fixing the design". The coordinating session's reading (`exec/deviations.md:189`), not a further quotation: the stack is a prototype, "evidence of what the room needs, not what lands"; what lands is "a design fix of the fetching side of sync: one mechanism in place of the rules, fewer states than today, code deleted rather than added". That design is ADR-054; it is to replace the fetching machinery this record's Order assumed (MP-13, the Order); nothing of it has landed. *(Added 2026-11-24, amendment 4.)*
+14. **KISS: fix the bad design rather than patch it, and do not erode security** (2026-11-27; `exec/deviations.md:226-234`). Told that the full sweep had found three faults in the frozen redesign and that the removal of a member who signs two versions of its history does not reach a member who saw the other version, he wrote: "remember, KISS, fixing bad designs > patching broken bad designs". A minute later he added: "just can't erode security". The coordinating session's reading (`exec/deviations.md:230`, :234), not a further quotation: the eight-rule forked-target ruling (`design/forked-target/ruling.md`) is set aside as the thing to build, and the question becomes why applying an admin's removal waits on the removed member's own history at all; a simpler rule is taken only when it is shown to protect at least what the rule it replaces protected, and an independent security reviewer checks that before it is built into the release line; where simple and safe cannot both be had, safe wins and the owner is told what it costs. Carried by MP-9b. *(Added 2026-11-27, amendment 5.)*
+15. **A splitter that is the creator or ever held an admin certificate ships named open** (2026-11-27, by the question form; `exec/deviations.md:245`). "**ship v0.4.31 with that case named open** (`split_admin = ship_named`)." As recorded with the answer: "This is the decider's exception to "every known defect is fixed in the current release" for that case only: an ordinary member that splits is fixed (rule F3); for a creator or a member that ever held an admin certificate, entries acknowledging what it wrote after the split stay blocked on computers holding its other version, as in every release since v0.4.6. The evidence-walk design (`design/forked-target/slice2-plan.md`, `sec-3.md`) is not built." Carried by MP-9b (section "Amendment 5" (d)). *(Added 2026-11-27, amendment 5.)*
 
 **Earlier rulings that stand:** KISS is the law (ADR-052 ruling 2, RG-0); the release bar is the
 three journeys on the shipped assets (ADR-052 RG-15); a feature is proven on the real binary or a
@@ -107,13 +111,19 @@ ADR-007:299-300).
 
 ## Context: what a person met
 
-**The busy room has never passed.** On builds 9 to 15 of 2026-11-23 the journey showed 7, 8, 7, 6,
+**The busy room had never passed when this record was accepted (2026-11-23).** On builds 9 to 15 of 2026-11-23 the journey showed 7, 8, 7, 6,
 7, **13** and 8 of 16 directions (`rg-5/measurements.md:143-153`). Build 14 reached 13 with sixteen
 scheduling rules stacked on main (the candidate adds 1,655 lines and removes 226,
 `sync-opus.md:95`). One of those rules, the pull-back hunk, is needed for 13 of 16 (8 without it,
 build 15) and turns the smaller act `a_slow_member_delays_only_itself` red (`rg-6/sync-land/
 report.md` §7.1): the rules interact. That is why the stack is parked, not landed
 (`rg-5/measurements.md:155`).
+*(Amended 2026-11-27, amendment 5:)* Since then one busy-room journey, journey-35, passed once on
+the content that #1414 then merged: "GREEN: RG-1 apparatus_smoke=false; every member shown both
+ways; every post each member is owed (of 3629 acknowledged) shown on it after authors stop", 16
+directions observed and 16 shown (`simple-sync/pull/journey-35/paused/receipt.log:1120629`,
+`tables.txt:1`). That is one run on a build from source, not the release gate on the shipped
+assets (ADR-052 RG-15; MP-18).
 
 **Three properties of today's design produced it** (`design/brief-sync.md:68-87`):
 1. *Evidence about other members gates each member's messages.* Every entry cites a tip of every
@@ -224,6 +234,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   stays usable (review §6: "Safety dictates that boundary"). Author eligibility is a membership
   decision, not "the author is currently present" (`node/channel/governance/view.rs:829-872`;
   `node/channel/governance/member_fold.rs:282-343`). Binding form (M0 ruling §7, rule 1): "**The reader MUST** retain current exact committed-head/inclusion/body/context bindings, own predecessor and exact preceding aggregate check, own-control full-source/effect readiness, every context coordinate's full validation and required effects, author/recipient cuts, consent/reset, termination, private classification and all generation/physical-egress fences. Only ordinary v2 Content's `seen` parent receipts, parent closure and domination requirements are removed; controls and legacy admission remain unchanged." What changes against the record as accepted: the message check keeps today's FULL validation of the author's own prefix and of every context coordinate, and effect readiness, not a governing projection; it drops only the proof about the members named in its `seen`. *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`.)*
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* "every context coordinate's full validation" has one exception. A coordinate naming a member this reader holds a fork proof of, at or after that member's boundary, that is not this reader's accepted control there, is decided only after everything else is resolved; if that member is not the creator and no creator-issued certificate naming it is held here, the coordinate is ignored: it requires no entry, adds nothing and is never read as ancestry. Otherwise it waits. Every other coordinate is validated as above.
   - *Why*: today these bindings and own-prefix inheritance are checked
     (`node/channel/governance/sparse.rs:456-468,512-550`), and author eligibility and the
     recipient-body cut consume them (`node/channel/governance/view.rs:829-872,991-1046`). Without
@@ -247,6 +258,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   withdrawal/removal-generation and physical key-send fences. Never read post-removal room content
   while continuing to release replies/keys under the exposed pre-removal state." This MUST NOT be
   weakened to consulting a last-good display view. As amended (M0 ruling §7, "Amendment to MP-1 and MP-2"): "For ordinary v2 Content, retain today's full author-own-prefix and exact context-coordinate source checks and required effect readiness, omitting only receipts/closure/domination for its non-authority `seen` hints; missing required facts remain pending for the affected sender. Before newly displaying text or using a package, apply all required controls exposed by that authenticated own-prefix/context, not merely a governing projection, preserving current author/recipient cuts, withdrawal/removal-generation and physical key-send fences. An unverified Content hint is not an acknowledgement of its referent's governing state." *(Amended 2026-11-23 by the M0 ruling.)*
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* "exact context-coordinate source checks and required effect readiness" and "all required controls exposed by that authenticated own-prefix/context" do not cover a `seen` reference waived for a proved splitter at or after its boundary, or a coordinate of an ordinary splitter there that is ignored; for such a splitter's component imported through another author's parent, MP-9b's parent-domination exemption also applies. Every other required dependency is still checked, kept and served.
   - *Why*: a reader behind on governance (ordinary lag, a returning member, a relay that withholds
     the creator's newest) would otherwise read the room after a removal while still sealing its
     replies to the removed member (`m1-security.md` P1-B; `sync-sol-on-m1.md` §1, "a direct
@@ -270,6 +282,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   today's full control closure and domination. No distinct display/cut admission type or display-only stored meaning is introduced by this step; already-valid sources retain their meaning."
   Binding form (M0 ruling §7, rules 2 and 3): "**Every authority, membership, cut, key, private-access and required-ancestor consumer MUST** ignore Content `seen` as proof or independently verify its exact needed fact. In particular `contains_cut` MUST bypass its entire Content `seen` loop, and raw hint-graph ancestry/referenced/display-order state MUST NOT become an authority predicate. Ordering MAY use held hints without fetching or gating on them." "**A Content source MUST** publish and settle through the existing single strong token/source/effect paths only after rule 1; authoring MUST join settled tips' authenticated own-chain prefix frontiers, never their Content hint closures. Controls' direct parent receipts/domination and MP-6's exact target observation MUST remain enforced."
   *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md` §7, "Amendment replacing MP-3". It withdraws the accepted text, which made a shown message a separate kind of entry ("A display receipt cannot construct `ValidatedSparseEntry` … A separate cut receipt supplies only the exact eligibility facts it proves"; "The three meanings MUST be distinct tokens and distinct stored meanings"), and amendment 1's note that those types are the first change of Order step 3: no such types are built. The earlier text stays in the git history.)*
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 and 5:)* The M0 ruling's control clause, "Controls' direct parent receipts/domination and MP-6's exact target observation MUST remain enforced", stands with these exceptions for a member this reader holds a fork proof of, at or after its boundary: a control's `seen` reference naming it there needs no entry, whoever the splitter is; and when it is neither the creator nor named by a creator-issued certificate held here, another member's parent coordinate of it need not be dominated, and a coordinate of it that is not this reader's accepted control is ignored. For the creator or a certified splitter, exact coordinate validation and parent domination stay enforced; its `seen` reference at or after its boundary still needs no entry (`history_stream/admission.rs:874-876`, `:1013-1023`, `:1284-1297`).
   - *Why*: the accepted text's plan for separate display and cut receipts was reviewed DO NOT
     BUILD: a display-only stored state needs a cut-only reader, source-versus-display dispatch in
     observe, replay, refill and live progress, and a migration (`design/step3-plan-review.md`).
@@ -349,6 +362,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   The former universal skewed-clock question-before-reply requirement stays withdrawn, narrowed to
   the conditional proof above; one identical or causal display order for every member stays
   withdrawn. This does not waive the separate M0/MP-6 security proofs.
+  *(Amended 2026-11-27, amendment 5:)* "control entries' checked parent receipts, closure and domination … remain unchanged" has MP-9b's exceptions for a proved splitter at or after its boundary (items 4 and 5; MP-3's amendment 5).
 
 - **MP-6. A removal cuts its target at the target's latest tip the remover holds, by a narrow
   branch-aware cut (C4).** "The removal explicitly reserves one of the sixteen signed `seen` slots
@@ -360,6 +374,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   source; being displayable MUST NOT satisfy them. "Earlier messages stay" means messages in the
   remover's witnessed accepted prefix, not every message that came earlier in wall time. *(Amended 2026-11-23, amendment 3, by the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` rule 7, for the decider's ruling 10; the cut is by branch, not by position:)* "A removal's witnessed-message exception MUST mean exact authenticated membership in the prefix W named by the remover's signed target reference, intersected with the messages otherwise eligible on this reader; it MUST NOT mean all local messages with sequence at most p, nor automatically the whole local branch or only a guessed shared prefix." "Equal prefix descriptors under the two roots, or independently verified exact ancestry, may establish shared history; absence of that proof is pending for the affected eligibility, not a false ancestry result." Where the reference names a branch other than the one this reader accepted, it is looked up through the retained exact fork-parent witness (MP-9a).
   *(Amended 2026-11-24, amendment 4:)* MP-6 landed together with MP-11 in #1393 (merged 2026-11-24, merge commit `36c60c821`; `exec/review-audit.md:66`). A consequence, by the coordinating session's engineering decision of 2026-11-24 (`exec/deviations.md:193`), which follows the decider's ruling that such messages disappear ("disappears", ruling 8; `exec/deviations.md:127`): a message a member posted just before it was removed, which the member who removed it had not received, is gone from the room for everyone, its author included, when that member is readmitted. The decision was told to him the same day as one he can overrule, and he did not (`exec/deviations.md:193`); his own words on the author's copy are not recorded. The behaviour is as #1393's pull request describes it, from an observation of one run and not an assertion of an act; that text gives the reason: "Nobody can tell such a message from one written after the removal, and a post that only its author still sees would mislead her" (`mp/cut-disappear/fix6/pr-body.md:15-19`). The release notes draft says it (`release/notes-draft.md:82`).
+  *(Amended 2026-11-27, amendment 5, by MP-9b:)* For a split target, the lookup "through the retained exact fork-parent witness (MP-9a)" in amendment 3's text is not built: no witness is retained, and nothing of the target's other version is read. A reference naming the target at or after its boundary needs no entry (MP-9b item 4), and the cut reads it hash-exactly against this reader's own accepted chain, so on a reader of the target's other version it witnesses none of the target's posts: they are cut there, those below the boundary included, which is stricter, not looser (`simple-sync/pull/regress/ForkRemoval.md` §13.7; `design/forked-target/sec-code-1.md`, "Other consumers"). The target's posts from its boundary are out on every reader that holds the proof in any case (MP-9b item 2).
   - *Why*: without per-post control entries, a cut at the target's last control could fall weeks
     back and hide its legitimate earlier messages (ADR-007 G-32; `m1-security.md` P2-D). The
     generic tip picker can discard an author (`node/channel/local_history.rs:493-527`). The message
@@ -375,6 +390,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     (b) *Fork below the cut*: the removed member forks its own feed below the cut and serves a
     different entry at a witnessed position; no reader shows it, and the fork is recorded. Mutant:
     compare positions only. (c) *The forked target*: MP-9a's act and its positions-only cut mutant. *(Amended 2026-11-23, amendment 3.)*
+    *(Amended 2026-11-27, amendment 5:)* (c) is now MP-9b's extended act with its `fallback-off` arm (section "Amendment 5" (f)); no positions-only cut mutant was run for it.
 
 - **MP-7. Control evidence that standing, keys or later controls depend on is kept durably and
   served (C5).** "Before publishing/adopting a control on which standing, keys or future controls
@@ -389,6 +405,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   delays only itself. A newcomer's bootstrap MUST close the governing feeds and obtain each
   sender's own relevant control state and packages, with a pending status per sender rather than a
   barrier across all senders.
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* The "complete verification closure" does not include a `seen` reference waived for a proved splitter at or after its boundary, or a coordinate of an ordinary splitter there that is ignored; MP-9b's parent-domination exemption also applies. Every other required dependency is still checked, kept and served.
   The holder MUST persist the entire verified control-serving trace and its complete semantic verification closure under their exact original heads, atomically with the coverage/source
   owners, and retain the signed heads, contexts and verified consistency links those owners
   require across restart. "A provider may reconstruct another exact prefix for serving from that owned authenticated material; doing so neither rebinds the original owner nor creates permanent ownership of every requested prefix. Do not eagerly store every possible head or prefix."
@@ -492,6 +509,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   alternative binds: a control is applied only after today's full closure, and MP-7 makes that
   closure durable and serveable. Omitted coordinates of any later projection MUST never enter
   authority, cuts or authoring. *(Amended 2026-11-23, amendment 3, by the forked-target ruling §4:)* MP-9a's fork-parent evidence path is a narrow amendment to this rule for a proved forker only: it replaces an impossible committed-branch requirement with equally exact evidence-only proof; it is not a narrower projection and not a global replacement of MP-8a's no-unlinked-authority rule.
+  *(Amended 2026-11-27, amendment 5:)* MP-9a's fork-parent evidence path is superseded and was never built. In its place, MP-9b item 5: a coordinate of an ordinary splitter at or after its boundary that is not this reader's accepted control is ignored, and nothing of the splitter's other version is read; for the creator or a certified splitter, today's full closure binds and such a coordinate waits (ruling 15). This is not a narrower projection in B-1's sense: every other coordinate keeps today's full closure.
   - *Why*: the proposal the decider read says controls keep "full proof of everything it cites, as
     today" (`proposal.md:19`); the first alternative is today's behaviour, so it adds no new
     validator.
@@ -555,6 +573,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   `exec/deviations.md` "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not
   the decider's ruling and not the review's.)*
   *(Amended 2026-11-24, amendment 4:)* Under ADR-054 the signed heads, with unresolved unequal observations, are to travel in each node's Have (ADR-054 PL-2), and the inventory paging and hint queue named in this requirement's *Why* are to be deleted (ADR-054 PL-11); MP-9's rule stands. Whether the `forks` list rides on ADR-054's Have is not decided. MP-9 has not landed when this amendment is written: it is one commit on `36c60c821`, not pushed (`mp/fork/rebase3/report.md:3`).
+  *(Amended 2026-11-27, amendment 5, by MP-9b:)* A recorded fork now does more than hold back. As accepted, it held the splitter's later entries back while its entries already shown stayed shown (`simple-sync/pull/regress/ForkRemoval.md` §8: "Rows already shown stay shown"); the equivocation act's staging required it (section "Amendment 5" (f)). Now the splitter is out on every computer that holds the proof, and its entries from its boundary are no longer shown (MP-9b item 2). The boundary is authenticated against this reader's own entry and moves twice at most (item 1), and a proof is asked of a peer within a fixed allowance (item 8). "Preserve known fork/exclusion evidence permanently" stands.
   - *Why*: today a message citing the forker's other branch is refused, so the room visibly stops;
     under this design messages cite nobody, and the explicit observed-conflict pair is equal-size
     only (`node/channel/entry_store/sparse.rs:2847-2854`; smaller queued hints are collapsed behind
@@ -577,6 +596,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   fork changes parent evidence, not authority." *(Added 2026-11-23, amendment 3, by the
   forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` §1, for the decider's
   ruling 10; question in `question.md` beside it; ledger 73.)* Rule 7 of that ruling is MP-6's cut.
+  *(Amended 2026-11-27, amendment 5:)* Superseded by MP-9b (section "Amendment 5"), which is the thing to build for ruling 10 in place of `design/forked-target/ruling.md`; none of the eight rules below was built. The text stays as it was.
   1. "A reader MUST enable the fork-parent path only for an author T whose attributable,
      room-bound fork proof has been independently verified and durably recorded; a hint,
      equal-size head conflict, failed consistency proof, peer's `frozen` claim or elapsed wait MUST
@@ -748,11 +768,13 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   2. *Cross-author parent receipts for ordinary v2 Content's `seen` only*: remove only those
      references' receipt fetching, preflight, control closure and domination, and helpers exclusively used by that work. MUST retain Content's own predecessor/header/prefix authentication, exact preceding-aggregate check and full own-control source/effect preflight, together with their required receipt/proof machinery. Control kinds and legacy admission retain their existing parent checks (MP-16's C7, M0 rules 1 and 3).
      *(Amended 2026-11-23 by the M0 ruling's author, `design/amendment-2-verdict.md`.)*
+     *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* "Control kinds … retain their existing parent checks", except for a `seen` reference waived for a proved splitter at or after its boundary, a coordinate of an ordinary splitter there that is ignored, and MP-9b's parent-domination exemption. Every other required dependency is still checked, kept and served.
   3. *Withdrawn by amendment 2 (the M0 ruling).* The accepted text listed the live window's control
      closure (`node/history_stream/runtime.rs:1048`, `push_control_closure`) as a gate to delete. M0
      keeps the author's own control-source/effect readiness and every coordinate's full validation
      (MP-1, rule 1), so that closure is not dead; only the closure fetched for Content's `seen`
      parents goes, with item 2. *(Amended 2026-11-23.)*
+     *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* "every coordinate's full validation" excludes a coordinate of an ordinary splitter at or after its boundary that is ignored; every other coordinate is still validated in full.
   4. *Node-wide singletons*: the `Live`, `Control` and `Archive` slots (`node/history_demand.rs:55-61`),
      the serve lanes including `try_serve` (`node/history_budget.rs:399`) and the Live refusal
      "live request is outside the bounded newest window" (`node/history_budget.rs:1088-1091`), and
@@ -934,6 +956,403 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   - *Why*: ruling 1; review §1 ("The sixteen-direction release gate stays unchanged").
   - *Proof*: the three journeys, on the same retained binaries as the acts above.
 
+## Amendment 5 (2026-11-27): a member proved to have signed two versions of its history is out, everywhere
+
+*(Added 2026-11-27, amendment 5.)* This section states MP-9b, the rule built for the second half of
+ledger 73 (ledger 131) by rule F3 (`design/forked-target/rule-f3.md`), and what it changes in this
+record. It supersedes MP-9a and the eight-rule forked-target ruling
+(`design/forked-target/ruling.md`) as the thing to build; neither was ever built. It amends MP-9,
+MP-6 where it speaks of a split target, MP-8, and the M0 ruling's clause that controls keep their
+full parent checks, as carried in MP-1, MP-3 and MP-5; each is marked where it stands, and the text
+it amends stays beside the mark. It is built, accepted in review and merged in #1414 ((g)).
+The builders' record is `simple-sync/pull/regress/ForkRemoval.md` ("the record", by section). Code
+lines in this section are at main's merge commit `f6320b55d`, whose tree is that of `79e134587`
+(branch `scratch/fork-rule` in `/opt/vox-worktrees/acts3`), under `crates/vox-core/src/node/`,
+unless they start with `crates/` or the text says they are at `0bfd8592c`.
+
+### (a) What was found and measured
+
+1. **A removal that names the splitter's other version never reaches a member holding this
+   version** (ledger 73, second half; ledger 131; the record §§1 to 3). Measured on ADR-054's
+   scratch tree `0bfd8592c`, which has MP-9's comparison: carol signs two branches of her own feed
+   of equal length; dave accepted branch B and records her fork; alice, holding branch A, removes
+   carol naming A's tip, then posts. All three runs failed at `MP9 removal applied`: fk1 and fk2
+   with "PRODUCT [MP9 removal applied]: dave is connected to alice, which advertised its feed
+   through 13 or later, reports no governance work queued and took no entry for ten seconds, yet
+   the claim does not hold" (`simple-sync/pull/runs/fk1/fk.log:895`, `fk2/fk.log:891`; ledger 131),
+   and fk3, with the mutant `equal-rival-refused`, with the same words but "through 12 or later"
+   (`fk3/fkm.log:833`); the record's §2 gives one verdict for all three. dave's roster still listed
+   carol, and his read still showed carol's branch-B posts under the fork warning. The entry
+   numbers that follow are fk2's (the record §3): alice's removal (her entry 10), her two
+   governance and key entries after it and her later post (entry 13) never passed on dave, so he
+   never applied the removal, never got her later post or its key, and never rotated his own key
+   away from carol.
+2. **The checks that refuse** (the record §3; lines at `0bfd8592c`). The removal's `seen` names
+   carol@8 on A, and dave holds B@8: `history_stream/admission.rs:946-961` refuses it, "signed
+   parent differs from validated position", and preflight the same at `:1202`, "preflight parent
+   position differs". It is a refusal, not a wait: the root settles as failed and is tried again
+   only when alice commits a newer head (`history_stream/runtime.rs:1025-1057`), failing the same
+   way each time. The fork proof did not help: nothing of a frozen author is fetched
+   (`history_stream/pull.rs:4221`), and admission never looked in the proof.
+3. **With one membership entry after the split, every later entry of anyone on that side is
+   refused on the other** (the record §7, read from the code; ledger 131). Once the splitter
+   writes one control of its own on version A after its split, every entry signed on that side
+   carries `(splitter, x, hashA)` in its signed context: the remover's removal and later controls
+   and, because M0 fully validates every context coordinate, every A-side member's later posts.
+   On a B reader `validate_control_coordinate` (`channel/governance/sparse.rs:778-810`) refuses
+   it, "signed context coordinate is not the exact validated control" (`:799`), or waits for an
+   entry nothing fetches; preflight the same (`history_stream/admission.rs:1290-1302`, "preflight
+   control coordinate differs"). The act extended for this amendment stages exactly this (carol's
+   consent revocation on A only), and its mutant arm, which treats carol as a member that held an
+   admin certificate, stops alice's later post on dave ((f)).
+4. **In every release since v0.4.6** (ruling 10).
+5. **Also found by reading** (ledger 131; the record §8): an admin that splits with different
+   predecessors undoes its own earlier removals (`channel/governance/member_fold.rs:943` at
+   `0bfd8592c`); a relayed proof between two other versions sets a boundary the reader's own
+   version does not share; a later proof giving a lower boundary is ignored once the splitter is
+   frozen (`design/forked-target/sec-1.md`: its P2 list's "boundary-1 removal hole", and its second
+   and third P1 findings). MP-9b items 3 and 1 close them.
+
+### (b) The rule as built
+
+- **MP-9b. A member proved to have signed two versions of its history is out on every computer
+  that holds the proof, and nothing of its other version is read.** *(Added 2026-11-27,
+  amendment 5, by rule F3, `design/forked-target/rule-f3.md`, accepted with conditions in
+  `design/forked-target/sec-5.md`; for the decider's rulings 10, 14 and 15.)* "The splitter" is
+  the member a verified fork proof names: two different entries it signed at one position. MP-9b
+  amends MP-9's held-back-and-kept behaviour (item 2), MP-6's cut for a split target (items 2 and
+  4), MP-8 and the M0 ruling's control clause in MP-1, MP-3 and MP-5 (items 4 to 6); it
+  supersedes MP-9a.
+  1. **The boundary, authenticated, moves twice at most.** The first verified proof of a member
+     sets its boundary: the proof's position when its two entries share their predecessor and that
+     predecessor is this computer's own accepted entry of the member just below; otherwise 1, the
+     member's first entry (`channel/governance.rs:132-150`). Two other versions that share a
+     predecessor prove nothing about this computer's prefix (`sec-1.md`, second P1). Any later
+     proof that would lower the boundary sets it to 1: two different splits of one member leave no
+     prefix of it trusted (`channel/governance/facts.rs:1419-1446`, the boundary's only writer).
+     This departs from `sec-2.md` condition 1 in the conservative direction (the record §15.3;
+     "acceptable in principle", `sec-code-4.md:36`). A proof that would lower nothing is dropped
+     before its signatures are checked (`channel/sparse_history.rs:1316-1321`); at 1 nothing more
+     is asked or taken. So a member's boundary moves, and its governance is replayed, at most
+     twice in a computer's life, however many proofs it signs (the record §15.4, case 5). The
+     boundary is the existing `ForkBoundary` row; each write moves the published display revision
+     in the same commit, so consent, shares and eligibility are read again against it
+     (`sec-code-1.md` finding 1; the record §14.1).
+  2. **A derived, permanent exclusion.** The proof is the splitter's removal on this computer,
+     derived and not fabricated. The current-membership pass marks it removed whatever its signed
+     removals, readmissions and presence say, and no readmission overrides that
+     (`channel/governance/member_fold.rs:1112-1114`, `:1201-1232`); removal-row queries recognise
+     it (`member_fold.rs:1182-1186`; `channel/governance/view.rs:929-941`). When the derived
+     exclusion changes who is currently removed, the removal generation advances
+     (`member_fold.rs:1114-1135`, `:1160-1164`), and every local sender rotates away from the
+     splitter before its next post, key release, package, Session or held consent, dropping its
+     entitlement, history and delivered marks (`channel/pending_text/consent.rs:145`; the record
+     §13.6 (b)). A splitter already removed needs no further rotation merely because its proof
+     arrives or its boundary is lowered; the boundary write moves the display revision on its own
+     (item 1). Its entries from the boundary,
+     and every Session floor addressed to it, are decided ineligible (`member_fold.rs:1313-1316`),
+     so its rows already shown go, as MP-11 retracts rows. Its positive registers confer nothing
+     from the boundary: its consent grants and service shares are filtered where those registers
+     are read (`view.rs:1259-1262`, `:1394-1397`), its presence cannot bring it back (above), and
+     service selectors leave out any host with a current removal row
+     (`channel/governance/channel.rs:434`, `:812`). It fabricates nothing: no removal entry or
+     removal row is made, nothing enters Frontiers or a strict-past scope, a boundary of 1 names no
+     position 0, and no sender-cut row is written, since the rotation drops the splitter outright
+     and a cut is read only to re-entitle a member that is no longer removed (`sec-2.md` §2;
+     `sec-code-1.md`, "Missing sender observation cut").
+  3. **Exclusions the splitter validly signed keep their effect where held.** A removal or
+     revocation the splitter signed, held on this computer's accepted chain, keeps its effect; the
+     fork gate on it is gone, and it is authorized only through its own signed scope: issuer
+     grant, root cutoff and the issuer's past (`member_fold.rs:945-947`; `sec-2.md` §5). Whether
+     a removal was authorized when signed is decided against the issuer's signed leaves and
+     returns read unfiltered, its boundary notwithstanding: quarantine takes away a splitter's
+     positive current effects, never the history that qualifies one of its exclusions
+     (`member_fold.rs:1021-1046`; `sec-code-4.md` first P1, closed in `sec-code-5.md`). An
+     exclusion held only on the other version is not fetched: the proof's own conflicting
+     exclusion stays inert unless it already had validated provenance (the record §13.2).
+  4. **A `seen` reference** naming the splitter at or after its boundary needs no entry, matched
+     here or not (`history_stream/admission.rs:874-876`).
+  5. **A signed-context coordinate is decided last.** A coordinate naming the splitter at or after
+     its boundary that is not this computer's accepted control there is deferred, not refused.
+     Only after the citing author's own prefix and every other coordinate are resolved (their
+     sources at validation, their effects at preflight) is it decided
+     (`channel/governance/sparse.rs:896-919`): it is ignored (it requires no entry, adds nothing,
+     and is never read as ancestry) when the splitter is not the creator and this computer holds
+     no authenticated creator-issued certificate naming it, in force, expired, revoked or
+     policy-only alike (`channel/governance.rs:152-246`); otherwise it is a wait
+     (`Need::Unmatched`, which nothing meets), or for a parent coordinate today's underclaim
+     refusal (`sparse.rs:912-916`). The certificate test is read at each step and never kept. A
+     coordinate that matches the accepted control keeps today's exact path, for anyone. Another
+     member's parent coordinate naming an ordinary splitter at or after its boundary need not be
+     dominated by the citing context, matched here or not
+     (`sparse.rs:812-822`; `sec-code-5.md`). Below the boundary every coordinate stays exact.
+  6. **The same rule at every consumer.** Received-effect readiness skips the coordinates that
+     admission ignored, without deciding certification again (`channel/pending_received.rs:138-155`);
+     both writer routes leave out of an incoming frontier only the coordinates ignored at the
+     writer and join everything else (`channel/local_history.rs:649-689`;
+     `channel/pending_text.rs:956`); the canonical governance order takes no dependency from an
+     ignored coordinate (`channel/governance/canonical.rs:164-213`; `sec-code-1.md` finding 2);
+     every reader of ancestry stays hash-exact against this computer's accepted chain, with no
+     clamp (the record §13.3, §14.2). Signed bytes, entry hashes, accepted headers, contexts and
+     Merkle commitments are unchanged; no wire message, signed format or stored record type is
+     added. The sparse-validation cursor gains a ninth field, the deferred coordinates; an
+     eight-field cursor restores with none (`sparse.rs:473`).
+  7. **Before the proof, a mismatch parks and wakes on the proof.** A mismatch on another member's
+     reference or coordinate, in a flow that holds an admission frontier, parks on that member's
+     fork (`Need::Fork`) at entry start, preflight, and live or restored validation, and is met
+     once the published boundary is at or below the parked position (`history_stream/runtime.rs:1143-1175`;
+     `history_stream/pull.rs:971`, `:4261`); it is no longer a refusal tried again at the citing
+     author's next head (the record §12.1, §12.2, condition 8). A flow without an admission
+     frontier still refuses that mismatch (`history_stream/runtime.rs:1388-1393`).
+  8. **Asking a peer for a proof.** A computer asks a connection for a member's fork proof
+     (`Query::Fork`) only when the peer's Have lists a fork of that member, its own boundary for
+     that member is not 1, the proof identity the Have names is not the proof it holds, and the
+     connection has asked for that member fewer than three times. Each ask spends one before it is
+     sent, whatever comes back (a proof that lowers or not, unavailable, Busy, Cancelled, an
+     error, nothing), and nothing restores one (`history_stream/pull.rs:3345-3372`, `:783-819`).
+     It never asks for the proof it holds. The proof a peer's Have lists is compared by its
+     identity alone (the digest of its two entries), never together with the position the Have
+     advertises, so a Have that changes only that position is not a new listing and spends no ask
+     (`pull.rs:138`; the record §16.7). This is the correction `sec-code-4.md` itself stated ("Compare
+     fork identities independently of the advertised position", "Two qualifications matter", first
+     bullet). The identity is unauthenticated and only spares an ask; the advertised position
+     gates nothing. A new connection starts with three asks again: the bound is per connection,
+     not per member (`sec-code-3.md`, "Reconnects").
+  - *Source*: `design/forked-target/rule-f3.md` (slice 1: `sec-2.md` conditions 1, 2, 5 and 8;
+    slice 2: `sec-5.md` conditions 1 to 9); the code reviews `design/forked-target/sec-code-1.md`
+    to `sec-code-5.md`; the record §§12 to 16.
+  - *Why*: (a). A removal's authority never needed its target's history: the blocking parent made
+    the MP-6 cut and the MP-10 recipient cut sound, and gave anyone who could keep the named entry
+    from a reader a veto over the removal there, which a fork makes permanent (the record §4).
+    By ruling 14 the eight-rule ruling is not the thing to build.
+  - *Built*: (g).
+
+### (c) What a person sees
+
+Once any computer holds two different entries a member signed at one position, every computer that
+learns of it (`rule-f3.md:5`; the record §10):
+
+- names that member as split: the fork line in `vox room read`, as seen in the record's runs,
+  "! carol signed two different messages at the same place in this room (their message 8). Their
+  later messages are held back." (the record §2); status lists the fork and the terminal app says
+  it (the equivocation act, (f));
+- drops it from the roster and releases it no new key or reply; it cannot be readmitted under that
+  identity;
+- no longer shows its posts from the boundary, on any computer that holds the proof: all of them
+  when the shared start is not proved, since the boundary is then 1;
+- no longer lists a service it shared, nor resolves it by name in that room. This holds for any
+  removed member, and the release notes are to say: "A service shared by a member who has been
+  removed from a room is no longer listed in that room or reachable by its name there; before, it
+  stayed listed until that member left the room itself." (the record §14.5);
+- keeps the removals and revocations it validly made, where they are held;
+- when the splitter never held admin rights, keeps everyone else's entries flowing on both sides:
+  in the act, dave applies alice's removal of carol and shows alice's later post, and alice shows
+  dave's later post (the record §13.4);
+- on a computer holding the splitter's other version, a removal that names its tip after the
+  boundary witnesses none of its posts, so its posts below the boundary are cut there too
+  (MP-6's amendment 5).
+
+Nothing recalls keys and sealed bodies released to the splitter before its computer learned of the
+split, plaintext of its posts already read, or its packages already installed (inert once its
+posts are ineligible); what was sealed under the old chain before the fold committed the exclusion
+stays readable by the splitter (the record §9 (b), §13.6 (b); `sec-2.md` §9).
+
+When the splitter is the creator, or ever held an admin certificate, and wrote a membership entry
+after its split, see (d).
+
+### (d) What is deliberately not built, and why
+
+- **The evidence walk.** Rule F2's part D2 (`design/forked-target/rule-f2.md`, D) was to walk the
+  splitter's other version by predecessor hash from a named coordinate down to this computer's
+  own entry below the boundary, fetching every governance body, to find the exclusions it signed;
+  `sec-2.md` held it the minimum for rule F2 (§3, §4). Its build plan
+  (`design/forked-target/slice2-plan.md`) was rejected as designed: "REJECT the plan as written;
+  retain D2, but correct the issues below before building" (`sec-3.md:1`), with eight changes. The
+  plan counted "about 740 product lines and 170 act lines" (`slice2-plan.md:660`), and rule F3
+  records "three review rounds put it near a thousand lines" (`rule-f3.md:3`). Rule F3 replaces it
+  with item 5: a coordinate of an ordinary splitter at or after its boundary is ignored, and
+  nothing of the splitter's other version is read.
+- **And so one case stays OPEN, by the owner's decision.** An ordinary splitter holds no exclusion
+  authority, so ignoring its coordinates hides nothing a dishonest citer could not hide by
+  omission (`sec-5.md` §1, §2). The creator, or a member that ever held an admin certificate, can
+  sign exclusions; without the walk, an ignored coordinate of it could hide one (`sec-4.md` §1,
+  §3), so its coordinates wait (item 5). The case: such a splitter wrote a membership entry after
+  its split; entries acknowledging it stay blocked on computers holding its other version, as
+  before. The decider, by the question form on 2026-11-27: "**ship v0.4.31 with that case named
+  open** (`split_admin = ship_named`)" (ruling 15; `exec/deviations.md:245`). The release notes
+  are to name it.
+- **What changes for that case anyway.** For a person the blocking is the same; its form changes
+  from a refusal tried again at the citing author's next head to a wait nothing meets (the record
+  §13.2, the row for `sec-2.md` condition 8). The rest of MP-9b applies to such a splitter too
+  (exclusion, rotation, retraction, filtered registers), so the product is not byte-for-byte as
+  before (`sec-4.md` §5). The reviewer: "It remains a partial class fix with the
+  certified-splitter obstruction explicitly open—not a claim that every splitter can no longer
+  divide the room." (`sec-5.md:79`). A split creator keeps its historical identity and its
+  removals and revocations; its certificates, readmissions and room effects from the boundary
+  stay refused, as they were (`sec-1.md`, "The creator decision"; `sec-code-1.md`, "Creator
+  splitting"); a removal that depends on its creator-authored inputs from the boundary fails
+  closed (the record §16.1). No run covers a split creator or a certified splitter ((f)).
+- **The eight-rule ruling** (`design/forked-target/ruling.md`, MP-9a) is not built: set aside by
+  ruling 14 (`exec/deviations.md:230`).
+
+### (e) What the simpler rule gives up
+
+1. **Exact validation of a citer's declared coordinates of an ordinary splitter at or after its
+   boundary.** "The lost property is exact validation of those particular signed declarations—not
+   an established additional access capability." (`sec-5.md:75`). A citer may omit or underclaim
+   such a coordinate, and on a reader that does not hold it as its accepted control, it is
+   ignored. An ordinary splitter's post-boundary component imported through another author's
+   parent may also be omitted or underclaimed when it matches at the receiving reader; a matching
+   coordinate actually present in the citing context still takes the exact path
+   (`channel/governance/sparse.rs:812-860`, `:875-890`; `sec-code-5.md:23-33`). `sec-code-4.md`'s
+   third finding asked that such a matched parent component be dominated; built, it refused an
+   honest member on the other version in the act (run fq63/fk, (f)), and `sec-code-5.md` withdrew
+   it: "The counterexample is valid in code"; "The parent exemption therefore must cover an
+   ordinary splitter’s post-boundary component whether it matches at the receiving reader or not"
+   (`sec-code-5.md:19`, :23). On what an attacker gains: "it can omit or underclaim that component
+   imported through a cross-author parent and obtain acceptance of a declaration that previously
+   failed parent domination. That loses the corresponding declared-causality obligation. I have
+   not demonstrated additional read, write, drive, key-release or exclusion authority from that
+   loss" (`sec-code-5.md:25`).
+   Why the reviews found no demonstrated additional read, write, drive, key-release or exclusion
+   authority beyond what a dishonest citer could obtain by omission, under their conditions
+   (`sec-5.md` §1, §2 and "What is and is not preserved"; `sec-code-5.md:27-30`; the adversarial
+   cases (f) lists as covered by no run remain unexercised): an ordinary splitter holds no creator
+   certificate and so no exclusion authority, and everything it signed from its boundary confers
+   nothing (items 2 and 5); a dishonest citer could already omit the coordinate altogether; an
+   honest writer that imports the splitter's prefix also imports every independent governing
+   coordinate exposed with it, and those stay exactly checked (item 6; `sec-5.md` §2); the
+   citer's own prefix and its other coordinates are checked exactly, their effects resolved before
+   the decision; and the decision is denied for the creator and a certified splitter. "I found no
+   additional read, write, drive, key-release or exclusion authority obtained through F3 beyond
+   what a dishonest citer could obtain by omission, while honest citers retain their independent
+   governing acknowledgements." (`sec-5.md:73`). So the claim that a published source proves exact
+   closure of every raw context coordinate is amended: "qualifying post-boundary
+   ordinary-splitter coordinates are deliberately ignored. No consumer may subsequently treat that
+   ignored coordinate as authenticated alternate-branch ancestry." (`sec-5.md:69`; MP-1, MP-3).
+2. **The limit on asks.** "Listing alone does not guarantee eventual release after unsuccessful
+   asks. Once three asks are spent, even a fresh useful listing cannot produce another request"
+   (`sec-code-4.md:50`). An entry parked on that member's fork then stays parked on that
+   connection until another member's connection, or a new connection to the same member, brings
+   the proof; parking itself asks nothing; a lowering recorded before the entry parked releases it
+   at once (the record §16.6). `sec-code-5.md` accepts with this unresolved: "The unchanged
+   asking-rule qualifications from sec-code-4 are not resolved by this commit and are not being
+   claimed resolved here." (`sec-code-5.md:38`). Of those two qualifications, the first (compare
+   a listed proof by its identity alone) is met by the branch's eighth commit (item 8); this one
+   stays (B-12).
+3. **Other limits the record and the reviews state.** A computer that has not recorded the
+   splitter's fork refuses ("underclaims parent control") a control whose `seen` parent's frontier
+   names the splitter's ignored coordinate that the proof-holding author left out, and tries again
+   at that author's next head; the author lists the fork, so the reader normally records it first
+   (the record §13.7). A boundary of 1 "can discard more splitter history, but does not itself
+   grant authority" (`sec-code-4.md:36`). With no splitter, admission and effects behave as
+   before, but the cost "is **not literally identical**" and was not measured
+   (`sec-code-4.md:99`). The flood bounds are "not a proof of a hard global DoS bound"
+   (`sec-code-1.md:98`).
+
+### (f) Proof
+
+Run labels are directories under `simple-sync/pull/runs/`.
+
+- **The extended act**,
+  `a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_branches`
+  (`crates/vox-tui/tests/a_room_can_be_left_and_ended_proof.rs:2299`; the record §1, §13.4).
+  carol, an ordinary member, signs `vox trust remove dave` (a consent revocation, with its re-key)
+  on branch A only; alice holds and applies it, then removes carol, so the removal and every later
+  entry of alice name carol's branch-A control in their signed context; carol's branch B posts
+  until it is as long as A, and dave holds B. Claims on dave, each what a person sees: carol's fork
+  recorded; `MP9 removal applied` (his roster no longer names carol); `MP9 remover's later post`;
+  `MP9 split posts gone`; then alice shows dave's later post, and carol, back on branch B, never
+  shows it. On the tree `sec-code-5.md` accepted (`47f5cfc27`), run fq65/fk: "exit 0, green:
+  `test result: ok. 1 passed … finished in 75.88s`; "dave recorded carol's fork"; "dave's roster no
+  longer names carol"; "dave shows alice's MP9-ALICE-AFTER-REMOVAL"; "dave no longer shows carol's
+  posts after her split"; "carol from branch B never showed MP9-DAVE-AFTER-REMOVAL in 30s"" (the
+  record §16.5). On the tree with the identity-only comparison (the record §16.7), fq67/fk: "exit
+  0, `test result: ok. 1 passed … finished in 73.10s`, through "carol from branch B never showed
+  MP9-DAVE-AFTER-REMOVAL in 30s"", and fq68/ut green. Green also on the earlier trees: fs4/fk,
+  ff1/fk, ff8/fk, fq61/fk (§§13.10, 14.7, 14.9, 15.5). On the merged content, before the merge,
+  run fr1/fk: "test a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_branches
+  ... ok", "test result: ok. 1 passed … finished in 82.20s", after the same five proof lines
+  (`simple-sync/pull/runs/fr1/fk.log`).
+- **Its mutant arm**, `VOX_MUTANT_FORK=fallback-off`, under which every splitter reads as
+  certified (`channel/governance.rs:238`). Run fq65/fkm: exit 101 on the assertion, "PRODUCT [MP9
+  remover's later post]: dave is connected to alice, which advertised its feed through 14 or
+  later, reports no governance work queued and took no entry for ten seconds, yet the claim does
+  not hold" (§16.5); the roster had already dropped carol, through the derived exclusion. The
+  same red on fs4, ff1, ff5, fq61 and fq63. On the merged content, fr2/fkm: exit 101, "PRODUCT
+  [MP9 remover's later post]: dave is connected to alice, which advertised its feed through 13 or
+  later, reports no governance work queued and took no entry for ten seconds, yet the claim does
+  not hold" (`runs/fr2/fkm.log`); an earlier try, fr1/fkm, stopped at staging ("PRODUCT (staging):
+  dave never said it holds carol's whole feed"), not a verdict. Slice 1's arm,
+  `VOX_MUTANT_FORK=seen-required`, was red at `MP9 remover's later post` on slice 1's tree
+  (fk4/fkm, §12.4) and has not been run since (§13.10).
+- **On the merged content, also** (before the merge): `a_post_shown_before_its_authors_removal_was_applied_disappears`,
+  `a_node_that_left_rejoins_and_posts_at_once` and
+  `an_admin_removes_one_member_and_the_creator_readmits_it_forward_only` green (fr1/ps, rj, fx: "test
+  result: ok. 1 passed"); one busy-room journey, journey-35, built from main `a9b428ffa` with the
+  branch's diff applied (`simple-sync/pull/journey-35/source.txt`; its `tree.patch` equals `git diff
+  a9b428ffa 79e134587`): "GREEN: RG-1 apparatus_smoke=false; every member shown both ways; every
+  post each member is owed (of 3629 acknowledged) shown on it after authors stop", 16 directions
+  observed, 16 shown (`journey-35/paused/receipt.log`, `tables.txt`). One run; it stages no
+  splitter.
+- **The refuted finding.** Run fq63/fk, on the tree with `sec-code-4.md`'s third finding built:
+  exit 101, "PRODUCT (staging): alice never showed dave's post after he applied carol's removal:
+  missing ["MP9-DAVE-AFTER-REMOVAL"]" (§16.3, §16.5).
+- **An assertion changed by this ruling**: `an_equivocation_is_caught_said_held_back_and_kept`
+  (`crates/vox-tui/tests/an_equivocation_is_detected_and_said_proof.rs`; the record §13.5).
+  *Before*: its held-back staging required alice still to show the splitters' first-side posts
+  (`EQ-EVE-A-1`, `EQ-FRANK-A-1`) once she listed both forks, failing with "PRODUCT (staging): alice
+  does not both hold the first side and list both equivocations, so her post could cite what bob
+  cannot hold". On slice 1's tree it was red there, by design of the rule (fk7/eq, §12.6).
+  *After*: the staging requires only that alice list both equivocations, and a new claim, "gone
+  from the split", follows: alice, bob and carol, each holding both proofs, show none of
+  `EQ-EVE-A-1` to `EQ-EVE-A-3`, `EQ-EVE-B-1`, `EQ-FRANK-A-1` or `EQ-FRANK-B-1` within the act's
+  detection time, and still show each of their own hellos. Every other claim stays: both forks
+  listed and said on bob and carol, eve's later post held back, alice's post reaching bob, carol
+  keeping both across a restart alone, the terminal app saying both. On the accepted tree, fq66/eq:
+  "exit 0: `test result: ok. 1 passed … finished in 356.88s`". The file's other split acts are
+  green there too (fq66/ud, ut, uu, and pd with the mutant sender), and so is
+  `a_post_shown_before_its_authors_removal_was_applied_disappears` (fq65/ps).
+- **What no run covers** (the record §§13.7, 14.8, 15.4, 16.4): a creator who splits; a certified
+  splitter (the `Unmatched` wait and the certified underclaim refusal); a lower proof after the
+  first, its listing, the re-ask and the wake on an existing connection; any of the six cases of
+  the asking rule (item 8); a restart while an entry is parked on a fork or an `Unmatched` wait;
+  consent, share and service filtering of a splitter, and a post-boundary consent no longer
+  authorizing rendering; floors to a splitter; an ignored coordinate changing which concurrent
+  room-name or policy action applies last, and the legacy-join residual (the record §14.2); the
+  cost of the common path (only its behaviour, runs n1 and n2); a removed host's service listed or
+  resolved; a certified splitter that leaves, removes a member and then meets a lowering proof
+  (`sec-code-4.md`'s first finding); a replacement Have landing inside one observation (its
+  second). They rest on review, and no review ran anything. The reviewer adds: "non-display does
+  not prove absence of key material, and twenty unchanged polls do not establish a structural
+  impossibility of progress" (`sec-code-4.md:103`).
+
+### (g) Built
+
+Built, accepted in review, merged. Pull request #1414, "fix(room): a member that splits its history
+is out everywhere, also on members that saw only one version", merged 2026-11-27 as merge commit
+`f6320b55d3cf5e394e828cfd8b8a1704385819e6` on main: one squashed commit, `ce1627c7e`, on main
+`a9b428ffa`, whose tree is that of the branch head `79e134587` (`git diff 79e134587 f6320b55d`
+is empty). Its checks passed: "every commit builds" and "build · clippy · fmt" on ubuntu-latest and
+macos-26 (`gh pr view 1414`). The branch, `scratch/fork-rule` in `/opt/vox-worktrees/acts3`, was
+eight commits, moved without conflict from ADR-054's scratch commit `8f28b38b8` (head `769cbadd9`)
+onto main `a9b428ffa` (head `79e134587`), with the same changed lines (`git diff 8f28b38b8
+769cbadd9` and `git diff a9b428ffa 79e134587`: 24 files, +1,402 −207). The first seven, up to
+`47f5cfc27` on the old base (`simple-sync/pull/regress/ForkRule.patch` is `git diff 8f28b38b8
+47f5cfc27`), are what `sec-code-5.md` read; the eighth compares a listed proof by its identity
+alone (item 8; the record §16.7, `regress/ForkAsk3.patch`). The design reviews: `sec-1.md` REJECT
+(rule F as written); `sec-2.md` ACCEPT WITH CONDITIONS (rule F2's A, B as a derived exclusion, C,
+E and D2); `sec-3.md` REJECT (the walk's plan); `sec-4.md` REJECT (F3), its counterexamples
+withdrawn in `sec-5.md`, ACCEPT WITH CONDITIONS (F3). The code reviews: `sec-code-1.md` to
+`sec-code-4.md` REJECT, each finding fixed or, for `sec-code-4.md`'s third, refuted by the act;
+`sec-code-5.md`: "ACCEPT", "Fix-only review of commit
+`47f5cfc27ad7833728e7ef8437b81f6f653a9790`. No remaining P1/P2 findings in these fixes."; and
+`sec-code-6.md`, of the eighth commit as rebased (`79e134587`): "ACCEPT: qualification closed;
+digest-only comparison and deduplication introduce no defect found", and of the ask limit "acceptable
+to land as a fail-closed, connection-local availability limit—not guaranteed automatic recovery; a
+fresh connection receives fresh asks". The reviews read the code; none built or ran anything. The
+runs on the merged content are in (f).
+
 ## Order
 
 The review's order (§3), not the proposal's. Commits MAY subdivide a step; behaviour is activated
@@ -956,6 +1375,7 @@ internal paths; each step handles them.
    implemented and proven, not merely listed as an open question or left unexercised by these
    acts. Complete control serviceability is not put after step 4's claims.
    *The work may pause here: the old gate still wins.* *(Amended 2026-11-23, amendment 3:)* step 2 also carries MP-9a (the forked target's fork-parent evidence path, with MP-6's branch cut and MP-11, before the reader switch; forked-target ruling §4) and MP-7's prefix serving P, built first as a serving-only change against the old full admission gate, its focused acts proven before any journey improvement is attributed to it (moving-head ruling §4). Their acts join the acts above that MUST be green before any admission check is weakened. #1387 (MP-7's holder side as first ruled: a member serves the membership proof it verified, across its own linked heads) is merged (`29b808afa`); P generalises its serving rule from linked heads to any authenticated prefix the holder holds.
+   *(Amended 2026-11-27, amendment 5:)* MP-9a is superseded by MP-9b, built, accepted in review (`sec-code-5.md`, `sec-code-6.md`) and merged in #1414 (merge commit `f6320b55d`; section "Amendment 5" (g)).
    *(Amended 2026-11-23: the coordinating session's engineering decisions, `exec/deviations.md`
    "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not the decider's ruling
    and not the review's.)* (a) MP-3's separate display and cut receipt types move from this step
@@ -996,6 +1416,10 @@ readmission starts a fresh chain (ADR-007:299); a removed member's later writes 
 can forge or reorder another member's messages (signature, per-author chain, inclusion); retention
 removes bodies when they expire; the governance evaluator and today's full check for every control
 kind; key rotation; the busy-room gate.
+*(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* "today's full check for every control
+kind" excludes a `seen` reference waived for a proved splitter at or after its boundary and a
+coordinate of an ordinary splitter there that is ignored; MP-9b's parent-domination exemption also
+applies. Every other required dependency is still checked, kept and served.
 
 **What a person is told:**
 - *The unaware-partition window stays.* A removal that has not reached a sender yet cannot stop
@@ -1008,6 +1432,7 @@ kind; key rotation; the busy-room gate.
 - *A removal keeps what the remover witnessed.* Posts of the removed member up to the tip the
   remover held stay; posts concurrent with the removal and outside that prefix are not shown
   (MP-6), as today. *A member that splits its own history is still removed* on members who saw its other version: they record its fork, apply the removal from the remover's exact branch evidence and keep only its messages the remover witnessed; until that evidence arrives they name the remover as waiting and do not claim the removal applied (MP-9a; ruling 10). *(Amended 2026-11-23, amendment 3.)*
+  *(Amended 2026-11-27, amendment 5, by MP-9b:)* *A member that splits its own history is out* on every computer that holds the proof: named as split, dropped from the roster, its posts from where its two versions differ no longer shown (all of them when the shared start is not proved), a service it shared no longer listed; removals it validly made stay; everyone else's entries keep flowing on both sides. Not so when the splitter is the creator or ever held an admin certificate and wrote a membership entry after its split: entries acknowledging that entry stay blocked on computers holding its other version, as in every release since v0.4.6, and the release notes name it (ruling 15).
 - *A sender whose membership evidence has not arrived is named as waiting*; the room's other
   messages are shown (MP-1). *A healthy member's message can still wait on a slow member* where the author's own controls, its inherited context, or a key package or consent grant cite that member; whether the busy room passes is measured by the journey, not proven by the ruling (M0 ruling §6). *(Amended 2026-11-23.)*
 - *A message later proven not acceptable disappears.* When a removal or a fork reaches a member,
@@ -1040,6 +1465,10 @@ kind; key rotation; the busy-room gate.
   this change; whether a newcomer meets the experience there is measured on a copy of the
   decider's real rooms (MP-7 (d)); a creator summary is not built unless that shows it is needed,
   and then the decider is asked (ruling 9).
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* That full closure excludes a `seen`
+  reference waived for a proved splitter at or after its boundary and a coordinate of an ordinary
+  splitter there that is ignored; MP-9b's parent-domination exemption also applies. Every other
+  required dependency is still checked, kept and served.
 - Feeds grow one entry per post instead of two (MP-4); each signed header is stored once (MP-14);
   after expiry only the leaf stays (MP-16), once all six of its consumers have their replacements.
   Recovery from a backup and paging change so that they read no expired header.
@@ -1061,6 +1490,10 @@ kind; key rotation; the busy-room gate.
   verification up to that position": for Content, amended by MP-1 and MP-5. The own-prefix receipt
   and domination stay; `seen` parents of Content need no receipt and are display hints. Control
   kinds keep the sentence as written.
+  *(Amended 2026-11-27, amendment 5, by MP-9b items 4 to 6:)* Control kinds keep it except for a
+  `seen` reference waived for a proved splitter at or after its boundary, a coordinate of an
+  ordinary splitter there that is ignored, and MP-9b's parent-domination exemption; every other
+  required dependency is still checked, kept and served.
 - **ADR-036:90**, "Changed contexts MUST precede content as control records.": stands; MP-4 stops
   the per-post changes that made it fire before nearly every post.
 - **ADR-036:219-222**, "at most 128 entries per logical page and 1 MiB of archive wire work per
@@ -1119,6 +1552,17 @@ kind; key rotation; the busy-room gate.
 - **ADR-053's own Order and MP-13**: the fetching machinery they assumed is to be replaced by
   **ADR-054**, which amends this record by reference; nothing of ADR-054 has landed. *(Amended
   2026-11-24, amendment 4.)*
+- **ADR-053's MP-9a and the forked-target ruling** (`design/forked-target/ruling.md`, rules 1 to 8),
+  cited as the thing to build for ruling 10 by amendment 3 (MP-6, MP-8, MP-9a, Order step 2) and
+  by ledger 73 ("Second half to be built per `design/forked-target/ruling.md`",
+  `exec/found-reds.md:156`): superseded by MP-9b; never built. **The M0 ruling's control clause**
+  (`design/step3-m0-ruling.md` §7, rule 3, carried in MP-3; MP-1's "every context coordinate's
+  full validation"; MP-5's "control entries' checked parent receipts, closure and domination"):
+  narrowed by MP-9b items 4 and 5 for a proved splitter at or after its boundary.
+  **`design/forked-target/sec-2.md` condition 1** ("Later lower boundaries must replace the
+  retained proof"): as built, a later lowering proof sets the boundary to 1, the conservative
+  direction (`simple-sync/pull/regress/ForkRemoval.md` §15.3; `sec-code-4.md:36`). *(Added
+  2026-11-27, amendment 5.)*
 
 ## The decider's answers to the review's product questions
 
@@ -1178,6 +1622,16 @@ Put to him on 2026-11-23 by the coordinating session.
   the reader already holds a newer one. Ruled by gpt-6.1-sol (`design/head-mismatch/ruling.md`,
   question in `question.md` beside it): continuity before authority. Written into MP-7 (rules 4
   and 5, and proof (a)), MP-8a (rules 1 to 3) and MP-9 (rules 6 and 7). *(Amended 2026-11-23, amendment 3: rule 5 is replaced in MP-7 by the moving-head ruling §3, and rule 4 gains its addition.)*
+- **B-11. A splitter that is the creator or ever held an admin certificate** (amendment 5). Not a
+  question for this release: by ruling 15 it ships named open. The only design reviewed for it is
+  the evidence walk (`design/forked-target/slice2-plan.md`; `sec-3.md`, REJECT as written), which
+  is not built (section "Amendment 5" (d)).
+- **B-12. A fork proof a spent connection cannot bring** (amendment 5; `sec-code-4.md`, "Two
+  qualifications matter", second bullet). After three asks of one connection for one member, an
+  entry parked on that member's fork waits for another connection to bring the proof (MP-9b item
+  8; section "Amendment 5" (e)). The first bullet is met: a listed proof is compared by its
+  identity alone, never together with the advertised position, so an ask is not spent on a proof
+  already held because only that position changed (the record §16.7).
 
 ## C1 to C9 and the security findings, by requirement
 
@@ -1216,12 +1670,15 @@ Put to him on 2026-11-23 by the coordinating session.
 | P3: Session floors; termination | MP-10, B-5 |
 | P3: stale consent display; key-package standing checks | MP-7, MP-10 |
 | The M0 ruling (`design/step3-m0-ruling.md`; rules 1 to 5, the amendments to MP-1, MP-2 and MP-3, what M0 does not promise) | MP-1, MP-2, MP-3, MP-4, MP-5, MP-13, MP-17, Order step 3, B-1, B-2 |
-| The forked-target ruling (`design/forked-target/ruling.md`; rules 1 to 8, the decider's ruling 10, ledger 73) | MP-9a (rules 1 to 6, 8), MP-6 (rule 7), MP-8, Order step 2 |
+| The forked-target ruling (`design/forked-target/ruling.md`; rules 1 to 8, the decider's ruling 10, ledger 73) | MP-9a (rules 1 to 6, 8), MP-6 (rule 7), MP-8, Order step 2 *(superseded by amendment 5: MP-9b; never built)* |
 | The moving-head ruling (`design/moving-head/ruling.md`; P rules 1 to 7, the amendment of head-mismatch rules 4 and 5, H, W not approved) | MP-7, MP-8a, MP-17, Order steps 2 and 3 |
 | The acknowledgement ruling (`design/busy-room/ack-ruling.md`; M0 rule 4 narrowed) *(amendment 4)* | MP-4 |
 | The control-closure ruling (`design/busy-room/control-closure-ruling.md`) *(amendment 4)* | MP-7 |
 | The return ruling on #1393 (`mp/cut-disappear/ruling-n.md`) *(amendment 4)* | MP-11 |
 | The decider's rulings 11 to 13 (2026-11-23 and 2026-11-24) *(amendment 4)* | MP-10; MP-14, MP-15, MP-16; MP-13, the Order, ADR-054 |
+| Rule F3 (`design/forked-target/rule-f3.md`) with its design reviews `sec-1.md` to `sec-5.md` (the decider's rulings 10, 14 and 15; ledger 73 and 131) *(amendment 5)* | MP-9b; MP-1, MP-3, MP-5, MP-6, MP-8, MP-9 as marked; B-11 |
+| The code reviews of rule F3 (`design/forked-target/sec-code-1.md` to `sec-code-5.md`) *(amendment 5)* | MP-9b items 1, 3, 5, 6 and 8; section "Amendment 5" (e) to (g); B-12 |
+| The decider's rulings 14 and 15 (2026-11-27) *(amendment 5)* | MP-9b; section "Amendment 5" (d); B-11 |
 
 ## Links
 
@@ -1239,3 +1696,10 @@ Put to him on 2026-11-23 by the coordinating session.
   `rg-13/close/requirement-audit.md`; `exec/awa/receipt-integrate-1327.json`;
   `exec/review-audit.md`; `exec/found-reds.md`; `m0/land/report.md`; `mp/fork/rebase3/report.md`; `design/simple-sync/`
   (ADR-054's sources); `release/notes-draft.md`.
+- Added by amendment 5: `design/forked-target/rule-f3.md`, `rule-f2.md`, `slice2-plan.md`,
+  `sec-1.md` to `sec-5.md` and `sec-code-1.md` to `sec-code-6.md`;
+  `simple-sync/pull/regress/ForkRemoval.md` and `ForkRule.patch`; the runs fk1 to fk8, fs1 to fs6,
+  ff1 to ff8, fq61 to fq68, fr1 and fr2 under `simple-sync/pull/runs/`, and
+  `simple-sync/pull/journey-35/`; `exec/deviations.md` (the owner on 2026-11-27);
+  `exec/found-reds.md` (ledger 73 and 131); `simple-sync/pull/regress/ForkAsk3.patch`; pull
+  request #1414 (merge commit `f6320b55d`).
