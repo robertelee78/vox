@@ -44,13 +44,13 @@ impl ChannelState {
         snapshot: &Snapshot,
         id: u64,
         now: u64,
-        retention: (u64, u64),
+        retention: super::super::history::Lifetimes,
     ) -> Result<Option<SessionRow>> {
         let segment = snapshot
             .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             .ok_or(Error::MalformedAtRest("Session file locator has no record"))?;
         let saved = self.read_private(id, &segment)?;
-        if super::super::private_session::expired(&saved, now, retention) {
+        if super::super::private_session::expired(&saved, now, retention.at()) {
             return Ok(None);
         }
         let Some(row) = saved.row else {
@@ -85,13 +85,7 @@ impl ChannelState {
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)
                 .and_then(|view| {
-                    self.session_file_query_view(
-                        &view,
-                        query,
-                        max_bytes,
-                        now,
-                        (self.effective_retention(), self.effective_step_retention()),
-                    )
+                    self.session_file_query_view(&view, query, max_bytes, now, self.lifetimes())
                 }),
         };
         if let Err(error) = &answer {
@@ -109,7 +103,7 @@ impl ChannelState {
         query: FileQuery,
         max_bytes: usize,
         now: u64,
-        retention: (u64, u64),
+        retention: super::super::history::Lifetimes,
     ) -> Result<FileReply> {
         (|| -> Result<FileReply> {
             let instance = view.history_instance();

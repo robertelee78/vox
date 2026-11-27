@@ -2304,6 +2304,18 @@ impl JournalWork {
         signer: &VaultRootSigner,
         admitted: impl FnOnce() -> crate::error::Result<()>,
     ) -> crate::error::Result<JournalDelta> {
+        // The room a completed join's journal checks is locked before this batch and held through
+        // its checks: room, then the Store writer, the node's one order. Taken after the writer,
+        // it waited for a room whose holder (a stop save) waited for this writer.
+        let instance = match &self {
+            Self::AbortCompleted { completed, .. } | Self::AcceptCompleted { completed, .. } => {
+                Some(Arc::clone(&completed.instance))
+            }
+            Self::Complete { instance, .. } => Some(Arc::clone(instance)),
+            _ => None,
+        };
+        let held_room = instance.as_deref().map(|room| room.blocking_lock());
+        let room_epoch = held_room.as_ref().map(|room| room.epoch());
         // Every journal RMW observes the latest committed map after this exact writer admission.
         let mut batch = store.batch()?;
         admitted()?;
@@ -2405,8 +2417,7 @@ impl JournalWork {
                 if load_accepted_joins(store, signer)?.contains_key(&room) {
                     return Err(Error::Profile("accepted join remains pending"));
                 }
-                let epoch = completed.instance.blocking_lock().epoch();
-                if epoch != completed.epoch
+                if room_epoch != Some(completed.epoch)
                     || store.get_sek_wrap(&room)?.as_ref() != Some(&completed.wrap)
                 {
                     return Err(Error::Profile("completed join room incarnation changed"));
@@ -2423,8 +2434,7 @@ impl JournalWork {
                 return Ok(delta);
             }
             Self::AcceptCompleted { room, completed } => {
-                let epoch = completed.instance.blocking_lock().epoch();
-                if epoch != completed.epoch
+                if room_epoch != Some(completed.epoch)
                     || store.get_sek_wrap(&room)?.as_ref() != Some(&completed.wrap)
                 {
                     return Err(Error::Profile("accepted join room incarnation changed"));
@@ -2456,8 +2466,7 @@ impl JournalWork {
                 epoch,
                 lifetime,
             } => {
-                let room_epoch = instance.blocking_lock().epoch();
-                if room_epoch != epoch {
+                if room_epoch != Some(epoch) {
                     return Err(Error::Profile("join room epoch changed before completion"));
                 }
                 let mut pending = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
@@ -3073,6 +3082,11 @@ impl Node {
                 {
                     return Err(Error::ComputerPolicySuperseded);
                 }
+                // The withdrawn room is locked before the journal's batch and held through its
+                // check below: room, then the Store writer, never the writer, then a room.
+                let withdrawn = withdrawal_fence
+                    .as_ref()
+                    .map(|(_, instance, ..)| instance.blocking_lock());
                 work.run_admitted(&worker_store, &worker_signer, || {
                     if strict
                         && (*attachment.borrow() != epoch
@@ -3083,7 +3097,7 @@ impl Node {
                     {
                         return Err(Error::ComputerPolicySuperseded);
                     }
-                    if let Some((room_cancel, instance, room_epoch, now, idle, authority)) =
+                    if let Some((room_cancel, _, room_epoch, now, idle, authority)) =
                         &withdrawal_fence
                     {
                         #[cfg(feature = "test-knobs")]
@@ -3107,7 +3121,9 @@ impl Node {
                             return Err(Error::AtRestLocked);
                         }
                         {
-                            let channel = instance.blocking_lock();
+                            let Some(channel) = withdrawn.as_deref() else {
+                                return Err(Error::AtRestLocked);
+                            };
                             if channel.epoch() != *room_epoch {
                                 return Err(Error::AtRestLocked);
                             }

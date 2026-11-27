@@ -449,10 +449,7 @@ impl<'a> Read<'a> {
         now: u64,
     ) -> Self {
         self.sources = Some(super::source::Eligibility {
-            policy: super::source::SourcePolicy {
-                retention: channel.effective_retention(),
-                step_retention: channel.effective_step_retention(),
-            },
+            policy: channel.expiry(),
             room: self.room,
             dag: &channel.dag,
             view,

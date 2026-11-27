@@ -22,6 +22,9 @@ use crate::node::store::{Batch, Snapshot, Store};
 const PAGE_BYTES: usize = 16 * 1024;
 const DIRECTORY_BYTES: usize = 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
+/// The saved projection record's bound (`history::State`): up to `retention::FENCE_PAIRS`
+/// lengthenings per kind beside its positions.
+const PROJECTION_BYTES: usize = 512;
 // A one-pair redb leaf has a 4-byte header, a 4-byte value offset and a
 // fixed 41-byte SegmentKey. Sealing adds 34 bytes at this size: CBOR array
 // and version (2), nonce bytes and header (13), ciphertext header (3), and
@@ -1705,11 +1708,6 @@ impl EntryIndex {
 }
 
 impl<'s> Write<'_, 's> {
-    /// Read related sealed state in the same transaction as an entry update.
-    pub(crate) fn batch(&self) -> &Batch<'s> {
-        self.batch
-    }
-
     fn allocate(&mut self) -> Result<u64> {
         let id = self.directory.next_page;
         self.directory.next_page = id
@@ -2239,7 +2237,7 @@ impl Write<'_, '_> {
         Ok(())
     }
     pub(crate) fn note_projection(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if bytes.len() > 256 {
+        if bytes.len() > PROJECTION_BYTES {
             return Err(invalid("projection state bound"));
         }
         self.directory

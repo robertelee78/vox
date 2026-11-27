@@ -23,8 +23,9 @@ pub(super) struct ReadFacts {
     me: Digest32,
     retention: u64,
     step_retention: u64,
-    /// What a lengthening kept expired, `[messages, Session steps]` (see `State::floor`).
-    pub retention_floor: [u64; 2],
+    /// The lifetimes and the fences in force when this read was captured or refreshed: those the
+    /// saved projection record names (`ChannelState::switch_lifetimes`).
+    lifetimes: Lifetimes,
     pub verified: BTreeMap<Digest32, u64>,
     members: Vec<Digest32>,
     pub held: BTreeMap<Digest32, u64>,
@@ -45,8 +46,8 @@ impl ReadFacts {
             projection_ready: !ch.projection_state.pending
                 && ch.projection_state.policy
                     == Some([
-                        ch.effective_retention(),
-                        ch.effective_step_retention(),
+                        ch.configured_lifetimes()[0],
+                        ch.configured_lifetimes()[1],
                         ch.legacy_sessions.display_revision(),
                     ]),
             display_rewrite: ch.display_rewrite,
@@ -61,7 +62,7 @@ impl ReadFacts {
             me: ch.me(),
             retention: ch.effective_retention(),
             step_retention: ch.effective_step_retention(),
-            retention_floor: ch.projection_state.floor,
+            lifetimes: ch.lifetimes(),
             verified: members
                 .iter()
                 .map(|author| (*author, ch.dag.verified_head(author)))
@@ -89,6 +90,17 @@ impl ReadFacts {
     }
     pub(super) fn effective_step_retention(&self) -> u64 {
         self.step_retention
+    }
+    /// The fences in force for this read.
+    pub(super) fn retention_fence(&self) -> [Fence; 2] {
+        self.lifetimes.at().fence
+    }
+    /// The fences a walk for due rows applies (`history::State::clean`).
+    pub(super) fn walk_fence(&self) -> [Fence; 2] {
+        self.lifetimes.walk()
+    }
+    pub(super) fn lifetimes(&self) -> Lifetimes {
+        self.lifetimes
     }
     pub(super) fn governance_current(&self, now: u64) -> bool {
         self.governance_ready && (self.governance_until == 0 || now < self.governance_until)
@@ -121,6 +133,7 @@ impl ReadFacts {
             && self.incarnation == other.incarnation
             && self.retention == other.retention
             && self.step_retention == other.step_retention
+            && self.lifetimes == other.lifetimes
             && self.members == other.members
             && self.held == other.held
             && self.verified == other.verified
@@ -339,6 +352,7 @@ impl ReadResource {
         };
         let changed = facts.retention != retention
             || facts.step_retention != step_retention
+            || facts.lifetimes != ch.lifetimes()
             || facts.classification_revision != classification
             || facts.projection_ready != projection_ready
             || facts.members != members
@@ -350,6 +364,7 @@ impl ReadResource {
         facts.retention = retention;
         facts.step_retention = step_retention;
         facts.classification_revision = classification;
+        facts.lifetimes = ch.lifetimes();
         facts.projection_ready = projection_ready;
         facts.members = members;
         facts.consent = consent;
@@ -393,10 +408,11 @@ impl ReadResource {
 
     /// The closure must finish its bounded read before returning: no snapshot/key escapes.
     /// Both history and read-only attention select against these same committed roots.
-    /// Retention is captured with the publication, never sampled from a pending room delta.
+    /// Retention is captured with the publication, never sampled from a pending room delta; the
+    /// reader applies it at its own time (`Lifetimes::at`).
     pub(crate) fn with_snapshot<T>(
         &self,
-        read: impl FnOnce(&Sek, &entry_store::RenderView<'_>, (u64, u64)) -> Result<T>,
+        read: impl FnOnce(&Sek, &entry_store::RenderView<'_>, Lifetimes) -> Result<T>,
     ) -> Result<T> {
         let publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
         let publication = publication.as_ref().ok_or(Error::AtRestLocked)?;
@@ -406,14 +422,7 @@ impl ReadResource {
             if rendered.directory_revision() != publication.directory_revision {
                 return Err(Error::StreamRefused(CHANGED));
             }
-            let answer = read(
-                sek,
-                &rendered,
-                (
-                    publication.facts.retention,
-                    publication.facts.step_retention,
-                ),
-            )?;
+            let answer = read(sek, &rendered, publication.facts.lifetimes())?;
             // A concurrent lock may have wiped the sole owner between decryptions.
             sek.key_bytes()?;
             Ok(answer)
@@ -511,30 +520,13 @@ impl ChannelState {
             resource.refresh_pinned_authority(self, trusted);
             return Ok(resource);
         }
-        let entries = self.entries.fork_reader();
         // Admission derives its publication and retained roots from one MVCC generation.
         let pending_snapshot = if retain_snapshot {
             Some(Arc::new(store.snapshot()?))
         } else {
             None
         };
-        let rendered = match &pending_snapshot {
-            Some(snapshot) => {
-                entries.render_snapshot(Arc::clone(snapshot), &self.sek, &self.channel_id)?
-            }
-            None => entries.render_view(&store, &self.sek, &self.channel_id)?,
-        };
-        let directory_revision = rendered.directory_revision();
-        let cache_only = rendered.legacy_cache_only();
-        drop(rendered);
-        let mut publication = Publication {
-            facts: ReadFacts::capture(self),
-            entries,
-            directory_revision,
-            cache_only,
-            revision: 1,
-            pending_snapshot,
-        };
+        let mut publication = self.capture_publication(&store, pending_snapshot)?;
         if let Some(trusted) = trusted {
             publication.facts.legacy_cache_trusted = Some(trusted.clone());
         }
@@ -543,35 +535,7 @@ impl ChannelState {
                 .publication
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(previous) = current.as_mut() {
-                if trusted.is_none() {
-                    publication.facts.legacy_cache_trusted =
-                        previous.facts.legacy_cache_trusted.clone();
-                }
-                publication.facts.now_hint =
-                    publication.facts.now_hint.max(previous.facts.now_hint);
-                publication
-                    .facts
-                    .member_hello_epoch
-                    .set(previous.facts.member_hello_epoch.get());
-                publication
-                    .facts
-                    .member_hello_expiry
-                    .set(previous.facts.member_hello_expiry.get());
-                let changed = publication.directory_revision != previous.directory_revision
-                    || publication.cache_only != previous.cache_only
-                    || !publication.facts.same_publication(&previous.facts);
-                publication.revision = if changed {
-                    previous.revision.wrapping_add(1).max(1)
-                } else {
-                    previous.revision
-                };
-                previous
-                    .entries
-                    .copy_reader_visibility(&publication.entries);
-                std::mem::swap(&mut publication.entries, &mut previous.entries);
-            }
-            *current = Some(publication);
+            replace_publication(&mut current, publication, trusted.is_some());
             return Ok(resource.clone());
         }
         let resource = Arc::new(ReadResource {
@@ -581,6 +545,66 @@ impl ChannelState {
         });
         self.history_read = Some(resource.clone());
         Ok(resource)
+    }
+    fn capture_publication(
+        &self,
+        store: &Arc<Store>,
+        pending_snapshot: Option<Arc<crate::node::store::Snapshot>>,
+    ) -> Result<Publication> {
+        let entries = self.entries.fork_reader();
+        let rendered = match &pending_snapshot {
+            Some(snapshot) => {
+                entries.render_snapshot(Arc::clone(snapshot), &self.sek, &self.channel_id)?
+            }
+            None => entries.render_view(store, &self.sek, &self.channel_id)?,
+        };
+        let directory_revision = rendered.directory_revision();
+        let cache_only = rendered.legacy_cache_only();
+        drop(rendered);
+        Ok(Publication {
+            facts: ReadFacts::capture(self),
+            entries,
+            directory_revision,
+            cache_only,
+            revision: 1,
+            pending_snapshot,
+        })
+    }
+    /// Run `switch` with every history reader of this room held out, and publish what it
+    /// installed before any of them runs again. `switch` gets the batch it commits in and the
+    /// publication's read-time watermark: the latest clock any reader has applied expiry at.
+    /// The room lock, which the caller holds, keeps out every other reader, arrival and cleanup;
+    /// acquiring the publication's lock drains the reads that hold only it. Lock order: room,
+    /// then the Store writer (the batch, begun first), then the publication, as in
+    /// `ReadResource::with_removal_fence`; no holder of the publication waits for the writer.
+    /// Nothing is published if `switch` fails: readers go on under what was in force.
+    pub(crate) fn with_readers_held(
+        &mut self,
+        store: &Arc<Store>,
+        switch: impl FnOnce(&mut Self, crate::node::store::Batch<'_>, u64) -> Result<()>,
+    ) -> Result<()> {
+        let batch = store.batch()?;
+        let resource = self.history_read.clone();
+        let mut current = resource.as_ref().map(|resource| {
+            resource
+                .publication
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        let watermark = current
+            .as_deref()
+            .and_then(Option::as_ref)
+            .map_or(0, |publication| publication.facts.now_hint);
+        switch(self, batch, watermark)?;
+        if let Some(current) = current.as_deref_mut() {
+            if current.is_some() {
+                let publication = self.capture_publication(store, None)?;
+                replace_publication(current, publication, false);
+            }
+        }
+        drop(current);
+        self.publish_room_snapshot(store);
+        Ok(())
     }
     pub(crate) fn pin_history_read(&mut self, store: Arc<Store>) -> Result<PendingHistoryRead> {
         let resource = self.publish_history_read_inner(store, None, true)?;
@@ -600,4 +624,40 @@ impl ChannelState {
     pub(crate) fn history_read_resource(&self) -> Option<Arc<ReadResource>> {
         self.history_read.clone()
     }
+}
+
+/// Put `publication` in place of the current one, keeping what readers selected under it and
+/// its page cache; `trusted`: `publication` names its own trusted legacy authors.
+fn replace_publication(
+    current: &mut Option<Publication>,
+    mut publication: Publication,
+    trusted: bool,
+) {
+    if let Some(previous) = current.as_mut() {
+        if !trusted {
+            publication.facts.legacy_cache_trusted = previous.facts.legacy_cache_trusted.clone();
+        }
+        publication.facts.now_hint = publication.facts.now_hint.max(previous.facts.now_hint);
+        publication
+            .facts
+            .member_hello_epoch
+            .set(previous.facts.member_hello_epoch.get());
+        publication
+            .facts
+            .member_hello_expiry
+            .set(previous.facts.member_hello_expiry.get());
+        let changed = publication.directory_revision != previous.directory_revision
+            || publication.cache_only != previous.cache_only
+            || !publication.facts.same_publication(&previous.facts);
+        publication.revision = if changed {
+            previous.revision.wrapping_add(1).max(1)
+        } else {
+            previous.revision
+        };
+        previous
+            .entries
+            .copy_reader_visibility(&publication.entries);
+        std::mem::swap(&mut publication.entries, &mut previous.entries);
+    }
+    *current = Some(publication);
 }

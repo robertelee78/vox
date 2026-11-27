@@ -281,22 +281,30 @@ fn age(saved: &Stored, id: u64) -> (Tree, Key) {
     )
 }
 
+/// The first private Session item expired by `expiry` at `now`, records then steps. An item a
+/// fence reaches by age but first seen here after it was set arrived late and is walked past.
 pub(in crate::node::channel) fn next_expired(
     snapshot: &Snapshot,
     sek: &Sek,
     room: &Digest32,
     now: u64,
-    ttl: u64,
-    step_ttl: u64,
+    expiry: crate::node::retention::Expiry,
 ) -> Result<Option<u64>> {
     let Some(read) = Read::existing(snapshot, sek, room)? else {
         return Ok(None);
     };
-    for (tree, ttl) in [(Tree::PrivateAge, ttl), (Tree::PrivateStepAge, step_ttl)] {
-        if ttl == 0 {
+    for (kind, tree) in [Tree::PrivateAge, Tree::PrivateStepAge]
+        .into_iter()
+        .enumerate()
+    {
+        let ttl = expiry.ttl[kind];
+        let fence = expiry.fence[kind];
+        let cutoff = (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1000)));
+        let Some(reach) = cutoff.max(fence.reach()) else {
             continue;
-        }
-        if let Some((key, id)) = read.next(tree, None)? {
+        };
+        let mut after = None;
+        while let Some((key, id)) = read.next(tree, after)? {
             let base = u64::from_be_bytes(
                 key[..8]
                     .try_into()
@@ -310,9 +318,30 @@ pub(in crate::node::channel) fn next_expired(
             if indexed != id {
                 return Err(Error::MalformedAtRest("Session age locator differs"));
             }
-            if base <= now.saturating_sub(ttl.saturating_mul(1000)) {
+            if base > reach {
+                break;
+            }
+            if cutoff.is_some_and(|cutoff| base <= cutoff) {
                 return Ok(Some(id));
             }
+            let segment = snapshot
+                .get_segment_bounded(
+                    room,
+                    SegmentKind::PrivateSession,
+                    id,
+                    2 * crate::node::sessionstream::MAX_RECORD,
+                )?
+                .ok_or(Error::MalformedAtRest("Session expiry locator missing"))?;
+            let saved = Stored::read(&open_segment(
+                sek,
+                SegmentKind::PrivateSession,
+                id,
+                &segment,
+            )?)?;
+            if expiry.expired(kind, base, saved.first_seen, now) {
+                return Ok(Some(id));
+            }
+            after = Some(key);
         }
     }
     Ok(None)

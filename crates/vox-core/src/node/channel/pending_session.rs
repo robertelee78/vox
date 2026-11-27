@@ -81,9 +81,8 @@ pub(crate) struct PendingSession {
     entries: entry_store::EntryIndex,
     next: u64,
     refresh: Option<RefreshWork>,
-    retention: u64,
+    expiry: Expiry,
     drive_input: Option<Zeroizing<Vec<u8>>>,
-    step_retention: u64,
     refresh_wait: Option<&'static str>,
     refresh_finished: bool,
     release_ready: bool,
@@ -431,8 +430,7 @@ impl ChannelState {
             entries: entry_store::EntryIndex::default(),
             next: self.private_sessions.next,
             refresh,
-            retention: self.effective_retention(),
-            step_retention: self.effective_step_retention(),
+            expiry: self.expiry(),
             refresh_wait,
             refresh_finished,
             release_ready,
@@ -1236,23 +1234,7 @@ impl PendingSession {
     }
 
     fn expired(&self, saved: &Stored) -> bool {
-        let ttl = if saved
-            .row
-            .as_ref()
-            .is_some_and(|row| crate::node::sessions::is_record(&row.body))
-        {
-            self.retention
-        } else {
-            self.step_retention
-        };
-        let claimed = saved
-            .row
-            .as_ref()
-            .map(|row| row.created_millis)
-            .or_else(|| saved.record.legacy_claimed_ms())
-            .unwrap_or(saved.first_seen);
-        ttl != 0
-            && saved.first_seen.min(claimed) <= self.now.saturating_sub(ttl.saturating_mul(1000))
+        private_session::expired(saved, self.now, self.expiry)
     }
 
     fn private_at(&self, store: &Store, sek: &Sek, id: u64) -> Result<Stored> {
@@ -1453,10 +1435,12 @@ impl PendingSession {
                             .read(store, sek, &self.room)?
                             .retention(&row.entry_hash)?
                             .ok_or(Error::MalformedAtRest("Session refresh retention missing"))?;
-                        if self.retention == 0
-                            || tracked.first_seen_ms.min(row.created_millis)
-                                > self.now.saturating_sub(self.retention.saturating_mul(1000))
-                        {
+                        if !self.expiry.expired(
+                            0,
+                            tracked.first_seen_ms.min(row.created_millis),
+                            tracked.first_seen_ms,
+                            self.now,
+                        ) {
                             let env = vox_agentcomms::envelope::Envelope::parse(&row.text)
                                 .map_err(|_| {
                                     Error::MalformedAtRest("classified Session envelope changed")

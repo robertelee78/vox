@@ -127,7 +127,7 @@ pub(crate) struct PendingUpgrade {
     controls_ready: bool,
     next_log_id: u64,
     now: u64,
-    retention: (u64, u64),
+    retention: crate::node::retention::Expiry,
     expiry_allowed: bool,
     finish_initial: bool,
     work: Work,
@@ -261,7 +261,12 @@ impl ChannelState {
         } else if self.private_sessions.pending_active {
             Work::Replay
         } else {
-            return Ok(if self.private_expiry_ready(store, now.get())? {
+            // A proof's removal hold (`test-knobs` only) leaves an expired item stored: the
+            // room's Session work completes without waiting for its removal, as it would once
+            // removed, so other work on the room (a policy change among it) is not held behind
+            // it. Reads still wait for the removal (`private_expiry_ready`).
+            let held = crate::node::channel::pending_retention::removal_held();
+            return Ok(if held || self.private_expiry_ready(store, now.get())? {
                 Preparation::Complete
             } else {
                 Preparation::PrivateExpiry
@@ -440,7 +445,7 @@ impl ChannelState {
             now: now.get(),
             finish_initial,
             work,
-            retention: (self.effective_retention(), self.effective_step_retention()),
+            retention: self.expiry(),
             entries_changed: false,
             body_changes: 0,
             records: 0,
@@ -1463,13 +1468,26 @@ impl PendingUpgrade {
                     first_seen: tracked.first_seen_ms,
                     attention_after: None,
                 };
-                let id = next;
-                next = id
-                    .checked_add(1)
-                    .ok_or(Error::SizeLimitExceeded("private Session records"))?;
-                let segment = seal_segment(sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
-                batch.put_segment(&self.room, SegmentKind::PrivateSession, id, &segment)?;
-                private_index::put(&mut batch, sek, &self.room, id, &saved)?;
+                // What a lengthening keeps expired here is not stored again as a private item,
+                // so no stored item is ever covered (`history::State::clean`).
+                let fenced = expired(
+                    &saved,
+                    self.now,
+                    crate::node::retention::Expiry {
+                        ttl: [0; 2],
+                        fence: self.retention.fence,
+                    },
+                );
+                if !fenced {
+                    let id = next;
+                    next = id
+                        .checked_add(1)
+                        .ok_or(Error::SizeLimitExceeded("private Session records"))?;
+                    let segment =
+                        seal_segment(sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
+                    batch.put_segment(&self.room, SegmentKind::PrivateSession, id, &segment)?;
+                    private_index::put(&mut batch, sek, &self.room, id, &saved)?;
+                }
             }
         }
         let dropped = u64::from(entry.prune_payload());
@@ -2288,7 +2306,7 @@ pub(in crate::node::channel) use expiry::sweep_private;
 pub(crate) use serve::{Discovered, MediaAdmission, QUANTUM_BYTES};
 
 impl ChannelState {
-    /// Exact place_committed/backfill cadence: one bounded migration turn, not the
+    /// Exact backfill cadence: one bounded migration turn, not the
     /// restore/import/replay/expiry prerequisite sequence used before private release.
     pub(crate) fn prepare_pending_legacy_migration(
         &mut self,

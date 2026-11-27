@@ -12,11 +12,9 @@ use super::record::{EnvelopeRef, Part, Source};
 use super::storage::{Read, Tree};
 use super::text::Input;
 
-#[derive(Clone, Copy)]
-pub(super) struct SourcePolicy {
-    pub retention: u64,
-    pub step_retention: u64,
-}
+/// The lifetimes in force and their fences (`ChannelState::expiry`): a metadata source the
+/// shorter lifetime expired stays expired after a lengthening, as the Session item itself does.
+pub(super) type SourcePolicy = crate::node::retention::Expiry;
 
 pub(super) struct Eligibility<'a> {
     pub policy: SourcePolicy,
@@ -71,14 +69,14 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
         {
             return Err(invalid("Session metadata source binding"));
         }
-        let ttl = if crate::node::sessions::is_record(&row.body) {
-            scope.policy.retention
-        } else {
-            scope.policy.step_retention
-        };
+        let kind = usize::from(!crate::node::sessions::is_record(&row.body));
         let claimed = row.created_millis;
-        return Ok(ttl == 0
-            || saved.first_seen.min(claimed) > scope.now.saturating_sub(ttl.saturating_mul(1000)));
+        return Ok(!scope.policy.expired(
+            kind,
+            saved.first_seen.min(claimed),
+            saved.first_seen,
+            scope.now,
+        ));
     }
     let Some(fact) = scope.view.fact(&source.position.hash)? else {
         return Ok(false);
@@ -122,18 +120,19 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
         // All replacement body, age and author bindings above remain mandatory.
         return Ok(false);
     }
-    let ttl = if entry
+    if entry
         .payload
         .as_deref()
         .is_some_and(super::super::retained_control)
     {
-        0
-    } else if tracked.steps {
-        scope.policy.step_retention
-    } else {
-        scope.policy.retention
-    };
-    Ok(ttl == 0 || scope.now < tracked.base().saturating_add(ttl.saturating_mul(1000)))
+        return Ok(true);
+    }
+    Ok(!scope.policy.expired(
+        usize::from(tracked.steps),
+        tracked.base(),
+        tracked.first_seen_ms,
+        scope.now,
+    ))
 }
 
 fn invalid(why: &'static str) -> Error {

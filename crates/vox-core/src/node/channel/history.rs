@@ -10,6 +10,7 @@ use crate::node::api::{
 };
 
 mod read_resource;
+use crate::node::retention::Pair;
 use read_resource::ReadFacts;
 pub(crate) use read_resource::{PendingHistoryRead, ReadResource};
 
@@ -308,7 +309,7 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
-                self.ch.retention_floor,
+                self.ch.walk_fence(),
             )?)
         {
             return Err(Failure::Request(crate::node::api::HISTORY_REFRESHING));
@@ -338,7 +339,7 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
-                self.ch.retention_floor,
+                self.ch.walk_fence(),
             )?
         {
             self.answer(select(), bytes)
@@ -347,32 +348,29 @@ impl View<'_> {
         }
     }
 
-    fn entry_retention(&self, entry: &Entry) -> Result<u64> {
-        if entry.payload.as_deref().is_some_and(retained_control) {
-            return Ok(0);
+    /// A body-less place's `(kind, first sight)`, as `place_age_in` reads it, from this view.
+    fn place_age(&self, entry: &Entry) -> Result<(usize, u64)> {
+        let hash = entry.entry_hash();
+        if let Some(tracked) = self.rendered.retention(&hash)? {
+            return Ok((usize::from(tracked.steps), tracked.first_seen_ms));
         }
-        let steps = if let Some(tracked) = self.rendered.retention(&entry.entry_hash())? {
-            tracked.steps
-        } else if let Some(body) = entry.payload.as_deref() {
-            is_step_body(self.ch.channel_id(), body)
-        } else if let Some(log) = self.rendered.read_index().log_id(&entry.entry_hash())? {
-            self.rendered
-                .snapshot()
-                .get_segment(self.ch.channel_id(), SegmentKind::Index, log)?
-                .map(|segment| {
-                    open_segment(self.rendered.key(), SegmentKind::Index, log, &segment)
-                        .and_then(|bytes| parse_first_seen(&bytes).map(|fact| fact.1))
-                })
-                .transpose()?
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        Ok(if steps {
-            self.ch.effective_step_retention()
-        } else {
-            self.ch.effective_retention()
-        })
+        let log = self
+            .rendered
+            .read_index()
+            .log_id(&hash)?
+            .ok_or(Error::MalformedAtRest("place age locator missing"))?;
+        let segment = self
+            .rendered
+            .snapshot()
+            .get_segment(self.ch.channel_id(), SegmentKind::Index, log)?
+            .ok_or(Error::MalformedAtRest("place age missing"))?;
+        let (first_seen, steps) = parse_first_seen(&open_segment(
+            self.rendered.key(),
+            SegmentKind::Index,
+            log,
+            &segment,
+        )?)?;
+        Ok((usize::from(steps), first_seen))
     }
 
     fn entry_expiry(&self, entry: &Entry) -> Result<Option<u64>> {
@@ -389,8 +387,8 @@ impl View<'_> {
             self.ch.effective_retention()
         };
         // Made due by a shorter lifetime that a later, longer one replaced: expired already.
-        let floor = self.ch.retention_floor[usize::from(tracked.steps)];
-        if floor != 0 && tracked.base() <= floor {
+        let fence = self.ch.retention_fence()[usize::from(tracked.steps)];
+        if let Some(floor) = fence.covering(tracked.base(), tracked.first_seen_ms) {
             return Ok(Some(floor));
         }
         if ttl == 0 {
@@ -457,8 +455,10 @@ impl View<'_> {
             } else {
                 self.ch.effective_retention()
             };
-            if ttl == 0
-                || self.ch.now_hint < tracked.base().saturating_add(ttl.saturating_mul(1_000))
+            if (ttl == 0
+                || self.ch.now_hint < tracked.base().saturating_add(ttl.saturating_mul(1_000)))
+                && !self.ch.retention_fence()[usize::from(tracked.steps)]
+                    .covers(tracked.base(), tracked.first_seen_ms)
             {
                 out.push(key.1);
             }
@@ -496,7 +496,7 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
-                self.ch.retention_floor,
+                self.ch.walk_fence(),
             )?
         {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
@@ -634,11 +634,13 @@ impl View<'_> {
             || !self
                 .rendered
                 .missing_contains(&entry.skeleton.author_id, entry.skeleton.seq)?
-            || expired_at(
-                entry.skeleton.claimed_ms,
+            || owed_window(
+                &entry,
                 self.ch.now_hint,
-                self.entry_retention(&entry)?,
+                self.ch.lifetimes().at(),
+                self.place_age(&entry)?,
             )
+            .is_none()
             || self.legacy_is_session_current(hash)?
         {
             return Ok(None);
@@ -2089,10 +2091,22 @@ pub(super) struct State {
     pub(super) cursor: Option<(Digest32, u64)>,
     pub(super) through: Option<(Digest32, u64)>,
     pub(super) cleanup_cursor: Option<(Digest32, u64)>,
-    /// `[messages, Session steps]`: rows aged from at or before this instant (ms) stay expired.
-    /// A longer lifetime sets it, when first projected, to what the shorter one had made due,
-    /// so a lengthening never brings back what a read already left out. `0`: none.
-    pub(super) floor: [u64; 2],
+    /// `[messages, Session steps]`: what lengthenings keep expired here (`retention::Fence`).
+    /// A longer lifetime sets it, when first projected, from what the shorter one had made due,
+    /// so a lengthening never brings back what a read here already left out.
+    pub(super) fence: [Fence; 2],
+    /// The instant this node stopped (or locked) with `policy` in force, saved as it stopped;
+    /// `0`: it did not stop cleanly, or the projection has run since. A lengthening first
+    /// projected at the next start fences from here, not from that start.
+    pub(super) stopped: u64,
+    /// Not saved: no stored row of either kind is covered by `fence` (`[public rows, private
+    /// Session items]`). Set by a cleanup pass that walked the whole due band and removed what
+    /// the fences cover; cleared when the fences change, at every open, and (public) when an
+    /// arrival or a returning body is stored with a covered retention fact, whether or not it
+    /// could be read (`ChannelState::note_covered`). While set, a due walk takes the lifetimes
+    /// only: a read public body that arrives covered is removed on arrival, and a received
+    /// private item is checked against the fences and never stored covered.
+    pub(super) clean: [bool; 2],
 }
 impl Default for State {
     fn default() -> Self {
@@ -2104,16 +2118,21 @@ impl Default for State {
             cursor: None,
             through: None,
             cleanup_cursor: None,
-            floor: [0; 2],
+            fence: [Fence::default(); 2],
+            stopped: 0,
+            clean: [false; 2],
         }
     }
 }
 impl State {
-    /// Persist only bounded progress; incarnation remains new for every live room. The
-    /// seventh element is the retention floor; a six-element record has none.
+    /// Persist only bounded progress; incarnation remains new for every live room. Eight
+    /// elements: the seventh is the fences, one list of `[floor, seen_by]` pairs per kind
+    /// (`retention::Fence`), the eighth the stop instant. v0.4.30 wrote six (no fence); a 0.4.31
+    /// build before the fences knew first sight wrote seven, `[floor; 2]`, which fenced every row
+    /// aged by its floor whenever it arrived, and still does.
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut e = crate::cbor::Encoder::new();
-        e.array(7).uint(1);
+        e.array(8).uint(1);
         match self.policy {
             Some(policy) => {
                 e.array(3);
@@ -2136,13 +2155,20 @@ impl State {
                 }
             }
         }
-        e.array(2).uint(self.floor[0]).uint(self.floor[1]);
+        e.array(2);
+        for fence in self.fence {
+            e.array(fence.pairs().len());
+            for pair in fence.pairs() {
+                e.array(2).uint(pair.floor).uint(pair.seen_by);
+            }
+        }
+        e.uint(self.stopped);
         e.finish()
     }
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut d = crate::cbor::Decoder::new(bytes);
         let arity = d.array()?;
-        if !matches!(arity, 6 | 7) || d.uint()? != 1 {
+        if !matches!(arity, 6..=8) || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("projection restart format"));
         }
         let policy = match d.array()? {
@@ -2168,13 +2194,48 @@ impl State {
                 _ => return Err(Error::MalformedAtRest("projection restart position")),
             };
         }
-        let floor = match arity {
-            6 => [0; 2],
-            _ => match d.array()? {
-                2 => [d.uint()?, d.uint()?],
+        let fence = match arity {
+            6 => [Fence::default(); 2],
+            7 => match d.array()? {
+                2 => {
+                    let mut fence = [Fence::default(); 2];
+                    for fence in &mut fence {
+                        fence.add(Pair {
+                            floor: d.uint()?,
+                            seen_by: u64::MAX,
+                        });
+                    }
+                    fence
+                }
                 _ => return Err(Error::MalformedAtRest("projection restart floor")),
             },
+            _ => {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedAtRest("projection restart fences"));
+                }
+                let mut fence = [Fence::default(); 2];
+                for fence in &mut fence {
+                    let n = d.array()?;
+                    if n > crate::node::retention::FENCE_PAIRS {
+                        return Err(Error::MalformedAtRest("projection restart fence"));
+                    }
+                    let mut pairs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        if d.array()? != 2 {
+                            return Err(Error::MalformedAtRest("projection restart fence"));
+                        }
+                        pairs.push(Pair {
+                            floor: d.uint()?,
+                            seen_by: d.uint()?,
+                        });
+                    }
+                    *fence = Fence::from_pairs(&pairs)
+                        .ok_or(Error::MalformedAtRest("projection restart fence"))?;
+                }
+                fence
+            }
         };
+        let stopped = if arity == 8 { d.uint()? } else { 0 };
         d.finish()?;
         Ok(Self {
             policy,
@@ -2182,9 +2243,123 @@ impl State {
             cursor: positions[0],
             through: positions[1],
             cleanup_cursor: positions[2],
-            floor,
+            fence,
+            stopped,
             ..Self::default()
         })
+    }
+    /// The fences a lengthening from the saved lifetimes to `current` saves: the saved ones and
+    /// one pair per kind whose lifetime grew, fenced until this node stopped under the shorter
+    /// lifetime, or else until `boundary`: the switch's instant, no earlier than any clock a
+    /// reader, an arrival or a cleanup of this room applied the shorter lifetime at
+    /// (`ChannelState::switch_lifetimes`).
+    pub(super) fn fence_in_force(&self, current: [u64; 2], boundary: u64) -> [Fence; 2] {
+        let until = if self.stopped != 0
+            && !crate::node::retention::edge_mutant(crate::node::retention::EdgeMutant::Stopped)
+        {
+            self.stopped
+        } else {
+            boundary
+        };
+        crate::node::retention::lengthened(self.fence, self.policy, current, until)
+    }
+    /// What a restart must find exactly as it was last in force: the lifetimes projected, the
+    /// fences and the stop instant. A save that changes it is flushed, never left to ride with a
+    /// later commit: after a kill, an older copy fences too little (an earlier stop's instant,
+    /// or a longer lifetime than the one this node last hid rows by).
+    pub(super) fn retention(&self) -> (Option<[u64; 3]>, [Fence; 2], u64) {
+        (self.policy, self.fence, self.stopped)
+    }
+}
+/// The lifetimes in force and their saved fences, captured with a read's publication. Two are
+/// equal when they expire the same rows: the walk bounds work, not what is shown.
+#[derive(Clone, Copy)]
+pub(crate) struct Lifetimes {
+    ttl: [u64; 2],
+    fence: [Fence; 2],
+    /// The fences a due walk of public rows still needs (`State::clean`).
+    walk: [Fence; 2],
+}
+impl Lifetimes {
+    /// Both lifetimes and the fences in force: those the saved projection record names.
+    pub(crate) fn at(&self) -> Expiry {
+        Expiry {
+            ttl: self.ttl,
+            fence: self.fence,
+        }
+    }
+    /// The fences a walk for due public rows applies: none once no stored row is covered.
+    pub(crate) fn walk(&self) -> [Fence; 2] {
+        self.walk
+    }
+}
+impl PartialEq for Lifetimes {
+    fn eq(&self, other: &Self) -> bool {
+        self.ttl == other.ttl && self.fence == other.fence
+    }
+}
+impl Eq for Lifetimes {}
+impl ChannelState {
+    /// Whether this room opened after a clean stop and has not run its first projection turn:
+    /// it is not published to readers yet (every start projects before it opens), and a
+    /// lengthening waiting since the stop already applies, fenced from the stop instant, to its
+    /// cleanup, private expiry and arrivals alike. The switch then saves exactly that.
+    pub(super) fn opening_after_stop(&self) -> bool {
+        self.projection_state.stopped != 0
+            && !crate::node::retention::edge_mutant(crate::node::retention::EdgeMutant::Stopped)
+    }
+    /// The fences in force in this room: the saved ones, or, opening after a clean stop, those
+    /// the waiting lengthening saves (see [`Self::lifetimes_in_force`]).
+    pub(super) fn retention_fence(&self) -> [Fence; 2] {
+        if self.opening_after_stop() {
+            let stopped = self.projection_state.stopped;
+            return self
+                .projection_state
+                .fence_in_force(self.configured_lifetimes(), stopped);
+        }
+        self.projection_state.fence
+    }
+    /// The fences a due walk of `store` (0 public rows, 1 private Session items) applies.
+    fn walk_fence(&self, store: usize) -> [Fence; 2] {
+        if self.projection_state.clean[store] {
+            [Fence::default(); 2]
+        } else {
+            self.retention_fence()
+        }
+    }
+    /// Both lifetimes in force and their fences.
+    pub(super) fn expiry(&self) -> Expiry {
+        Expiry {
+            ttl: self.lifetimes_in_force(),
+            fence: self.retention_fence(),
+        }
+    }
+    /// [`Self::expiry`] for a walk of `store` for what is due (0 public rows, 1 private Session
+    /// items): the fences only while a stored item may still be covered (`State::clean`).
+    pub(super) fn walk_expiry(&self, store: usize) -> Expiry {
+        Expiry {
+            ttl: self.lifetimes_in_force(),
+            fence: self.walk_fence(store),
+        }
+    }
+    /// What a read of this room needs to apply expiry at its own time.
+    pub(super) fn lifetimes(&self) -> Lifetimes {
+        Lifetimes {
+            ttl: self.lifetimes_in_force(),
+            fence: self.retention_fence(),
+            walk: self.walk_fence(0),
+        }
+    }
+    /// A cleanup pass of `store` walked everything due and removed it: no stored item of it is
+    /// covered by the fences any more.
+    pub(super) fn note_clean(&mut self, store: usize) {
+        self.projection_state.clean[store] = true;
+    }
+    /// A body was stored here whose retention fact the fences cover (one this node could not
+    /// read, or one not yet removed on arrival): the next cleanup pass of public rows walks the
+    /// fences again, and removes it.
+    pub(super) fn note_covered(&mut self) {
+        self.projection_state.clean[0] = false;
     }
 }
 impl ChannelState {
@@ -2201,8 +2376,8 @@ impl ChannelState {
             return Ok(None);
         }
         let snapshot = store.snapshot()?;
-        let ttl = self.entry_retention(Transaction::Snapshot(&snapshot), entry)?;
-        Ok(owed_window(entry, now, ttl))
+        let age = self.place_age_in(Transaction::Snapshot(&snapshot), entry)?;
+        Ok(owed_window(entry, now, self.expiry(), age))
     }
 
     /// The row to write for a body-less signed message as its effect lands: `(created, expires,
@@ -2313,16 +2488,26 @@ impl OwedDecided {
     }
 }
 
-/// A "not received yet" row's created/expiry pair: `None` once the body has expired here.
-pub(super) fn owed_window(entry: &Entry, now: u64, ttl: u64) -> Option<(u64, u64)> {
+/// A "not received yet" row's created/expiry pair: `None` once the body has expired here, by the
+/// lifetime in force or by what a lengthening keeps expired (`Expiry::expired`). `age` is the
+/// place's `(kind, first sight)` (`place_age_in`); it ages from the claim, never from later
+/// than first sight, as a held body does.
+pub(super) fn owed_window(
+    entry: &Entry,
+    now: u64,
+    expiry: Expiry,
+    (kind, first_seen): (usize, u64),
+) -> Option<(u64, u64)> {
     let created = entry.skeleton.claimed_ms;
-    if expired_at(created, now, ttl) {
+    let base = created.min(first_seen);
+    if expiry.expired(kind, base, first_seen, now) {
         return None;
     }
+    let ttl = expiry.ttl[kind];
     let expires = if ttl == 0 {
         u64::MAX
     } else {
-        created.saturating_add(ttl.saturating_mul(1_000))
+        base.saturating_add(ttl.saturating_mul(1_000))
     };
     Some((created, expires))
 }

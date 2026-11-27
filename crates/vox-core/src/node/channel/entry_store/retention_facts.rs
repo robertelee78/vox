@@ -3,7 +3,7 @@
 
 use super::dag_facts::successor;
 use super::*;
-use crate::node::retention::Tracked;
+use crate::node::retention::{Fence, Tracked};
 
 pub(crate) const DUE_ENTRIES: usize = 64;
 pub(crate) const DUE_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -118,6 +118,9 @@ fn get(
         .map(fact)
         .transpose()
 }
+/// The first row after `after` due by lifetime (aged at or before `cutoff`) or kept expired by
+/// `fence`. A row the fence reaches by age but first seen here after it was set arrived late and
+/// is walked past: the longer lifetime keeps it.
 fn next_due(
     source: &Source<'_>,
     sek: &Sek,
@@ -125,34 +128,42 @@ fn next_due(
     root: u64,
     after: Option<Key>,
     cutoff: Option<u64>,
+    fence: Fence,
 ) -> Result<Option<(Key, Tracked)>> {
-    let Some(cutoff) = cutoff else {
+    let Some(reach) = cutoff.max(fence.reach()) else {
         return Ok(None);
     };
-    let key = match after {
+    let mut key = match after {
         Some(k) => match successor(k) {
             Some(k) => k,
             None => return Ok(None),
         },
         None => [0; 64],
     };
-    source
-        .first(sek, room, root, &key, 0)?
-        .map(|(key, value)| {
-            let (base, _) = age_parts(key)?;
-            let t = fact(value)?;
-            if base != t.base() {
-                return Err(invalid("retention age differs"));
-            }
-            Ok((base <= cutoff).then_some((key, t)))
-        })
-        .transpose()
-        .map(Option::flatten)
+    loop {
+        let Some((found, value)) = source.first(sek, room, root, &key, 0)? else {
+            return Ok(None);
+        };
+        let (base, _) = age_parts(found)?;
+        let t = fact(value)?;
+        if base != t.base() {
+            return Err(invalid("retention age differs"));
+        }
+        if base > reach {
+            return Ok(None);
+        }
+        if cutoff.is_some_and(|cutoff| base <= cutoff) || fence.covers(base, t.first_seen_ms) {
+            return Ok(Some((found, t)));
+        }
+        key = match successor(found) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+    }
 }
-/// The newest due age: by lifetime, and never below what a lengthening kept expired.
-fn cutoff(now: u64, ttl: u64, floor: u64) -> Option<u64> {
-    let by_ttl = (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)));
-    by_ttl.max((floor != 0).then_some(floor))
+/// The newest due age by lifetime.
+fn cutoff(now: u64, ttl: u64) -> Option<u64> {
+    (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)))
 }
 #[allow(clippy::too_many_arguments)]
 fn due(
@@ -163,7 +174,7 @@ fn due(
     now: u64,
     ttl: u64,
     step_ttl: u64,
-    floor: [u64; 2],
+    fence: [Fence; 2],
     limit: usize,
 ) -> Result<(Vec<(Digest32, Tracked)>, bool)> {
     let mut after = None;
@@ -178,7 +189,8 @@ fn due(
             room,
             roots.age,
             after,
-            cutoff(now, ttl, floor[0]),
+            cutoff(now, ttl),
+            fence[0],
         )?;
         let steps = next_due(
             source,
@@ -186,7 +198,8 @@ fn due(
             room,
             roots.steps,
             after,
-            cutoff(now, step_ttl, floor[1]),
+            cutoff(now, step_ttl),
+            fence[1],
         )?;
         let next = match (regular, steps) {
             (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
@@ -302,7 +315,7 @@ impl Read<'_> {
         now: u64,
         ttl: u64,
         step_ttl: u64,
-        floor: [u64; 2],
+        fence: [Fence; 2],
         limit: usize,
     ) -> Result<(Vec<(Digest32, Tracked)>, bool)> {
         if self.directory.retention_stage != 2 {
@@ -316,7 +329,7 @@ impl Read<'_> {
             now,
             ttl,
             step_ttl,
-            floor,
+            fence,
             limit,
         )
     }

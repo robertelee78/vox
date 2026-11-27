@@ -9,7 +9,7 @@
 //! The cause was the room's lock. A sync session applying Bob's messages committed every entry on
 //! its own — two durable commits apiece, about 17 ms each on macOS — while it held the room, so a
 //! batch of 133 entries held it for 2.3 s and Alice's post waited behind it. The fix commits the
-//! batch once (`ChannelState::absorb_arrived`, `render_content_into`).
+//! batch once (`ChannelState::absorb_arrived`).
 //!
 //! **The second cause was a storm on the actor** (CI ubuntu, p95 148 ms with a normal p50). A
 //! member's routine republish of a record a board already held counted as news, so the board's

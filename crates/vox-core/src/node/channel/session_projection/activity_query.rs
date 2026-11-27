@@ -434,12 +434,7 @@ impl ChannelState {
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)
                 .and_then(|view| {
-                    self.session_activity_query_view(
-                        &view,
-                        query,
-                        now,
-                        (self.effective_retention(), self.effective_step_retention()),
-                    )
+                    self.session_activity_query_view(&view, query, now, self.lifetimes())
                 }),
         };
         if let Err(error) = &result {
@@ -455,7 +450,7 @@ impl ChannelState {
         view: &super::super::entry_store::RenderView<'_>,
         query: Query,
         now: u64,
-        retention: (u64, u64),
+        retention: super::super::history::Lifetimes,
     ) -> Result<Reply> {
         (|| -> Result<Reply> {
             let (authors, refreshing) = self.drive_from_known_view(view)?;
@@ -589,7 +584,7 @@ impl ChannelState {
                         )?
                         .ok_or_else(bad)?;
                     let saved = self.read_private(arrival, &sealed)?;
-                    if super::super::private_session::expired(&saved, now, retention) {
+                    if super::super::private_session::expired(&saved, now, retention.at()) {
                         return Err(Error::StreamRefused(REFRESHING));
                     }
                     let row = saved.row.ok_or_else(bad)?;
