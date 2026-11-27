@@ -3684,15 +3684,17 @@ async fn drain(
     let mut drains = Vec::new();
     let mut joined = Vec::new();
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
-    // in one line, and its cursor stays where it was.
+    // in one line, and its cursor stays where it was. A room that did not reopen adds the line
+    // `vox room list` gives it, saying how to reopen it.
     let mut unread: Vec<String> = Vec::new();
     for (channel_id, name, open, _, preparing, _, open_failure) in rooms {
         if let Some(reason) = open_failure {
+            let advice = crate::room_cli::reopen_advice(crate::client::name_of(paths)?.as_str());
             if input.native_notice.is_some() || input.omp_registration.is_some() {
-                return Err(AppError::Usage(reason));
+                return Err(AppError::Usage(format!("{reason}\n  {advice}")));
             }
             unread.push(format!(
-                "Vox could not read room {} this turn: {reason}\n",
+                "Vox could not read room {} this turn: {reason}\n{advice}\n",
                 room_heading(&b32_encode(&channel_id), &name)
             ));
             continue;

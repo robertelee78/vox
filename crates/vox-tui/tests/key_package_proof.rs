@@ -1270,7 +1270,10 @@ fn an_abandoned_key_request_is_selected_again() {
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(a_delayed_relay_keeps_up_with_a_two_per_second_author);
+optional_proof::not_run!(
+    a_delayed_relay_keeps_up_with_a_two_per_second_author,
+    a_delayed_relay_keeps_up_with_two_authors_each_posting_twice_a_second
+);
 
 #[cfg(feature = "optional-proofs")]
 #[path = "support/room.rs"]
@@ -1475,10 +1478,34 @@ while True:
     #[test]
     #[ignore = "optional counted delayed-relay measurement; run ALONE"]
     fn a_delayed_relay_keeps_up_with_a_two_per_second_author() {
+        relay(1);
+    }
+
+    /// The same path and delay with two members each posting twice a second at once: the reader
+    /// needs four posts a second over its relayed path, and each author reads the other through
+    /// the same relay.
+    #[test]
+    #[ignore = "optional counted delayed-relay measurement; run ALONE"]
+    fn a_delayed_relay_keeps_up_with_two_authors_each_posting_twice_a_second() {
+        relay(2);
+    }
+
+    /// What a person reads for author `i`'s posts, as the reader and as each author.
+    fn prefix(i: usize) -> String {
+        if i == 0 {
+            "rg6-post".to_owned()
+        } else {
+            format!("rg6-a{}-post", i + 1)
+        }
+    }
+
+    /// `writers` authors each post twice a second, [`POSTS`] times, to a reader that reaches
+    /// every one of them only through the anchor's relay, 75 ms each way on every hop.
+    fn relay(writers: usize) {
         watchdog::arm();
         let tmp = room::diagnostic_tempdir();
         eprintln!(
-            "[RG6] scratch={} author=2/s maximum={POSTS}",
+            "[RG6] scratch={} authors={writers} each=2/s maximum={POSTS}",
             tmp.path().display()
         );
         let (_anchor, spec) = room::spawn_anchor(tmp.path());
@@ -1512,10 +1539,25 @@ while True:
         };
         let a_spec = world::respec(&spec, format!("127.0.0.1:{v4}").parse().unwrap());
         let b_spec = world::respec(&spec, format!("[::1]:{v6}").parse().unwrap());
-        let author = room::named_worker_as(tmp.path(), "author", "author", VOX);
+        // Authors listen on IPv4 and the reader on IPv6 only, so the reader reaches every author
+        // only through the delayed relay.
+        let authors: Vec<Worker> = (0..writers)
+            .map(|i| {
+                let name = if i == 0 {
+                    "author".to_owned()
+                } else {
+                    format!("author{}", i + 1)
+                };
+                room::named_worker_as(tmp.path(), &name, &name, VOX)
+            })
+            .collect();
         let reader = room::named_worker_as(tmp.path(), "reader", "reader", VOX);
-        let _a = start(&author, "127.0.0.1:0", &a_spec);
+        let _authors: Vec<_> = authors
+            .iter()
+            .map(|author| start(author, "127.0.0.1:0", &a_spec))
+            .collect();
         let _b = start(&reader, "[::1]:0", &b_spec);
+        let author = &authors[0];
         accepted(author.vox_in(
             None,
             &[
@@ -1541,44 +1583,42 @@ while True:
             .lines()
             .find(|line| line.starts_with("vox://"))
             .unwrap();
-        accepted(reader.vox_in(
-            None,
-            &["room", "join", "--passphrase-file", "-", link],
-            Some(&format!("{}\n", room::ROOM_PASS)),
-        ));
+        let everyone: Vec<&Worker> = authors.iter().chain([&reader]).collect();
+        for w in everyone.iter().skip(1) {
+            accepted(w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link],
+                Some(&format!("{}\n", room::ROOM_PASS)),
+            ));
+        }
         // The typed-command stand-in also needs the empty headless passphrase explicitly.
-        accepted(author.vox(
-            None,
-            &[
-                "trust",
-                "add",
-                &reader.b32(),
-                "--name",
-                "reader",
-                "--identity-passphrase-file",
-                author.pass.to_str().unwrap(),
-            ],
-        ));
-        accepted(reader.vox(
-            None,
-            &[
-                "trust",
-                "add",
-                &author.b32(),
-                "--name",
-                "author",
-                "--identity-passphrase-file",
-                reader.pass.to_str().unwrap(),
-            ],
-        ));
-        for w in [&author, &reader] {
+        for w in &everyone {
+            for other in everyone.iter().filter(|other| other.name != w.name) {
+                accepted(w.vox(
+                    None,
+                    &[
+                        "trust",
+                        "add",
+                        &other.b32(),
+                        "--name",
+                        &other.name,
+                        "--identity-passphrase-file",
+                        w.pass.to_str().unwrap(),
+                    ],
+                ));
+            }
+        }
+        for w in &everyone {
             accepted(w.vox(None, &["room", "post", &id, &format!("ready-{}", w.name)]));
         }
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if read(&reader, &id).contains("ready-author")
-                && read(&author, &id).contains("ready-reader")
-            {
+            if everyone.iter().all(|w| {
+                let texts = read(w, &id);
+                everyone
+                    .iter()
+                    .all(|other| texts.contains(&format!("ready-{}", other.name)))
+            }) {
                 break;
             }
             assert!(
@@ -1602,71 +1642,109 @@ while True:
                 .is_some_and(|n| n > 0)),
             "APPARATUS: anchor did not report carrying a relay circuit: {relay_log}"
         );
+        // With one author a line reads as it always has; with more, each author's part names it.
+        let who = move |w: &Worker| {
+            if writers == 1 {
+                String::new()
+            } else {
+                format!("{}: ", w.name)
+            }
+        };
         let stop = AtomicBool::new(false);
-        let acknowledged = Mutex::new(Vec::<u64>::new());
+        let acknowledged: Vec<Mutex<Vec<u64>>> =
+            (0..writers).map(|_| Mutex::new(Vec::new())).collect();
         let failure = Mutex::new(None::<String>);
+        let begun = Instant::now();
         let progress = std::thread::scope(|scope| {
-            let poster = scope.spawn(|| {
-                let start = Instant::now();
-                for n in 1..=POSTS {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let due = start + Duration::from_millis((n as u64 - 1) * 500);
-                    if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                        std::thread::sleep(wait);
-                    }
-                    if Instant::now().saturating_duration_since(due) > Duration::from_secs(1) {
-                        *failure.lock().unwrap() =
-                            Some("APPARATUS: 2/s posting cadence not attained".into());
-                        break;
-                    }
-                    let out = author.vox(None, &["room", "post", &id, &format!("rg6-post-{n:04}")]);
-                    if !out.ok {
-                        *failure.lock().unwrap() = Some(format!(
-                            "{}: post {n} refused: {out:?}",
-                            if out.code.is_none() {
-                                "APPARATUS"
-                            } else {
-                                "PRODUCT"
+            let posters: Vec<_> = authors
+                .iter()
+                .enumerate()
+                .map(|(i, author)| {
+                    let (stop, failure, acked, id) = (&stop, &failure, &acknowledged[i], &id);
+                    scope.spawn(move || {
+                        let start = Instant::now();
+                        for n in 1..=POSTS {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
                             }
-                        ));
-                        break;
-                    }
-                    let through = status(&author)["own_feed_through"]
-                        .as_u64()
-                        .expect("APPARATUS: author feed position");
-                    acknowledged.lock().unwrap().push(through);
-                    eprintln!(
-                        "[RG6 ACK] post={n} feed_seq={through} at_ms={}",
-                        start.elapsed().as_millis()
-                    );
-                }
-            });
+                            let due = start + Duration::from_millis((n as u64 - 1) * 500);
+                            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                                std::thread::sleep(wait);
+                            }
+                            if Instant::now().saturating_duration_since(due)
+                                > Duration::from_secs(1)
+                            {
+                                *failure.lock().unwrap() =
+                                    Some("APPARATUS: 2/s posting cadence not attained".into());
+                                break;
+                            }
+                            let out = author.vox(
+                                None,
+                                &["room", "post", id, &format!("{}-{n:04}", prefix(i))],
+                            );
+                            if !out.ok {
+                                *failure.lock().unwrap() = Some(format!(
+                                    "{}: {}post {n} refused: {out:?}",
+                                    if out.code.is_none() {
+                                        "APPARATUS"
+                                    } else {
+                                        "PRODUCT"
+                                    },
+                                    who(author)
+                                ));
+                                break;
+                            }
+                            let through = status(author)["own_feed_through"]
+                                .as_u64()
+                                .expect("APPARATUS: author feed position");
+                            acked.lock().unwrap().push(through);
+                            eprintln!(
+                                "[RG6 ACK] {}post={n} feed_seq={through} at_ms={}",
+                                who(author),
+                                start.elapsed().as_millis()
+                            );
+                        }
+                    })
+                })
+                .collect();
             let deadline = Instant::now() + Duration::from_secs(240);
             let outcome = loop {
                 let texts = read(&reader, &id);
-                let ack = acknowledged.lock().unwrap().clone();
-                let newest = (1..=ack.len())
-                    .rev()
-                    .find(|n| texts.contains(&format!("rg6-post-{n:04}")))
-                    .unwrap_or(0);
-                let shown = (1..=ack.len())
-                    .filter(|n| texts.contains(&format!("rg6-post-{n:04}")))
-                    .count();
-                let raw = held(&status(&reader), &author.b32());
-                let count = ack.iter().filter(|seq| **seq <= raw).count();
-                eprintln!("[RG6 count] reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}; latest_shown={newest}", ack.len(), ack.len());
+                let reader_status = status(&reader);
+                let mut line = String::new();
+                let mut starving = None;
+                let mut done = true;
+                let mut all_shown = true;
+                for (i, author) in authors.iter().enumerate() {
+                    let ack = acknowledged[i].lock().unwrap().clone();
+                    let p = prefix(i);
+                    let newest = (1..=ack.len())
+                        .rev()
+                        .find(|n| texts.contains(&format!("{p}-{n:04}")))
+                        .unwrap_or(0);
+                    let shown = (1..=ack.len())
+                        .filter(|n| texts.contains(&format!("{p}-{n:04}")))
+                        .count();
+                    let raw = held(&reader_status, &author.b32());
+                    let count = ack.iter().filter(|seq| **seq <= raw).count();
+                    line += &format!("{}reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}; latest_shown={newest}; ", who(author), ack.len(), ack.len());
+                    if ack.len().saturating_sub(newest) >= 100 {
+                        starving = Some(format!("{}author acknowledged {} further posts after last shown post {newest}; reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}",
+                            who(author), ack.len() - newest, ack.len(), ack.len()));
+                    }
+                    done &= ack.len() == POSTS && newest == POSTS;
+                    all_shown &= shown == POSTS;
+                }
+                eprintln!("[RG6 count] {line}at_ms={}", begun.elapsed().as_millis());
                 if failure.lock().unwrap().is_some() {
                     break (false, false);
                 }
-                if ack.len().saturating_sub(newest) >= 100 {
-                    eprintln!("[RG6 starvation] PRODUCT: author acknowledged {} further posts after last shown post {newest}; reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}",
-                        ack.len() - newest, ack.len(), ack.len());
+                if let Some(starving) = starving {
+                    eprintln!("[RG6 starvation] PRODUCT: {starving}");
                     break (false, false);
                 }
-                if ack.len() == POSTS && newest == POSTS {
-                    break (shown == POSTS, false);
+                if done {
+                    break (all_shown, false);
                 }
                 if Instant::now() >= deadline {
                     break (false, true);
@@ -1674,20 +1752,14 @@ while True:
                 std::thread::sleep(Duration::from_millis(250));
             };
             stop.store(true, Ordering::Relaxed);
-            poster.join().expect("APPARATUS: poster panicked");
+            for poster in posters {
+                poster.join().expect("APPARATUS: poster panicked");
+            }
             outcome
         });
         let texts = read(&reader, &id);
-        let own = read(&author, &id);
-        let ack = acknowledged.lock().unwrap();
-        let raw = held(&status(&reader), &author.b32());
-        let count = ack.iter().filter(|seq| **seq <= raw).count();
-        let shown = (1..=ack.len())
-            .filter(|n| texts.contains(&format!("rg6-post-{n:04}")))
-            .count();
-        let author_shown = (1..=ack.len())
-            .filter(|n| own.contains(&format!("rg6-post-{n:04}")))
-            .count();
+        let reader_status = status(&reader);
+        let author_texts: Vec<_> = authors.iter().map(|a| read(a, &id)).collect();
         let delays = output.lock().unwrap().clone();
         std::fs::write(tmp.path().join("emulator.out"), delays.join("\n")).unwrap();
         assert!(
@@ -1705,11 +1777,36 @@ while True:
         );
         let failure = failure.lock().unwrap();
         let apparatus = progress.1 || failure.as_ref().is_some_and(|s| s.starts_with("APPARATUS"));
-        let green =
-            progress.0 && failure.is_none() && shown == ack.len() && author_shown == ack.len();
-        let verdict = format!("{} {}: reader shows {shown} of {}; author shows {author_shown} of {}; feed held through {count} of {}; raw_seq={raw}; last-post deadman={}; failure={failure:?}",
-            if green { "GREEN" } else { "RED" }, if apparatus { "APPARATUS" } else { "PRODUCT" },
-            ack.len(), ack.len(), ack.len(), progress.1);
+        let mut green = progress.0 && failure.is_none();
+        let mut counts = String::new();
+        for (i, author) in authors.iter().enumerate() {
+            let ack = acknowledged[i].lock().unwrap();
+            let p = prefix(i);
+            let shown_in = |texts: &BTreeSet<String>| {
+                (1..=ack.len())
+                    .filter(|n| texts.contains(&format!("{p}-{n:04}")))
+                    .count()
+            };
+            let shown = shown_in(&texts);
+            // Every author shows every author's posts too.
+            let author_shown = author_texts.iter().map(shown_in).min().unwrap_or(0);
+            let raw = held(&reader_status, &author.b32());
+            let count = ack.iter().filter(|seq| **seq <= raw).count();
+            green &= shown == ack.len() && author_shown == ack.len();
+            let n = ack.len();
+            counts += &format!(
+                "{}reader shows {shown} of {n}; author{} shows {author_shown} of {n}; feed held \
+                 through {count} of {n}; raw_seq={raw}; ",
+                who(author),
+                if writers == 1 { "" } else { "s" }
+            );
+        }
+        let verdict = format!(
+            "{} {}: {counts}last-post deadman={}; failure={failure:?}",
+            if green { "GREEN" } else { "RED" },
+            if apparatus { "APPARATUS" } else { "PRODUCT" },
+            progress.1
+        );
         eprintln!("{verdict}");
         assert!(green, "{verdict}");
     }

@@ -194,9 +194,16 @@ def startup():
     opening_session = host.session
     # Record what the shipped product answers at both boundaries, not a read-count timer.
     run(["status", "--node", "agent", "--json"])
-    policy_answer = run(["room", "post", gate_room, "--node", "agent", "rg4-policy-held"], check=False)
-    assert policy_answer.returncode != 0, "APPARATUS: the policy hold did not stage a real publication refusal"
+    # A post that meets the held policy installation is kept, not refused (465f2345e): start it
+    # now and judge it only after the release, by its answer and by what the room shows.
+    held_post = subprocess.Popen([VOX, "room", "post", gate_room, "--node", "agent", "rg4-policy-held"],
+                                 cwd=WORK, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    children.append(held_post)
     assert opening_session not in open_sessions(r), "PRODUCT: Session opening bypassed the held policy installation"
+    assert held_post.poll() is None, "PRODUCT: a post made while the policy installation was held was answered before it, not kept: " \
+        + " ".join(held_post.communicate())
+    assert "rg4-policy-held" not in run(["room", "read", gate_room, "--node", "agent"], check=False).stdout, \
+        "PRODUCT: a post was accepted while the policy installation was held"
     release(base, "policy")
     wait(lambda: base.with_suffix(".rooms.selected").exists(), "sibling has installed policy")
     starting = run(["node", "list"])
@@ -210,7 +217,12 @@ def startup():
     assert p.returncode == 0, f"PRODUCT: sibling failed to attach: {attach_out}{attach_err}"
     wait(lambda: opening_session in open_sessions(r), "the original registered Session opens with no new hook")
     assert gate_answer.returncode == 0, "PRODUCT: policy is installed but the sibling's room operation was refused: " + gate_answer.stdout + gate_answer.stderr
-    print("VERDICT GREEN: installed policy no longer gates the sibling's room operation; the original Session opens without another hook", flush=True)
+    held_out, held_err = held_post.communicate()
+    print("[held post]", held_post.returncode, held_out, held_err, flush=True)
+    assert held_post.returncode == 0, "PRODUCT: the post kept across the policy installation was refused: " + held_out + held_err
+    assert "rg4-policy-held" in run(["room", "read", gate_room, "--node", "agent"]).stdout, \
+        "PRODUCT: the post kept across the policy installation was accepted but the room does not show it"
+    print("VERDICT GREEN: installed policy no longer gates the sibling's room operation; the post kept across it is accepted and shown; the original Session opens without another hook", flush=True)
 
 class Host:
     def __init__(self, cwd, room_id=None, stop_after_decision=False, binary=None):

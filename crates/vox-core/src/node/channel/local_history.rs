@@ -561,6 +561,9 @@ pub(super) fn authored_context(
     let mut seen: Vec<_> = tips.into_values().collect();
     seen.sort_unstable_by_key(|reference| reference.author);
     if kind == SignedEntryKind::Content {
+        // The test-side attacker: a member whose posts name forged hints in `seen`.
+        #[cfg(feature = "test-knobs")]
+        forge_seen(read, &mut seen)?;
         let advance = required_positions.iter().any(|(required_author, seq)| {
             reached_by(&context, author, own_seq, required_author) < *seq
         }) || !applied_changes(read, binding, authors, &context, own_seq)?.is_empty();
@@ -575,6 +578,27 @@ pub(super) fn authored_context(
             reference.seq,
             splits,
         )?;
+    }
+    // Mutant `VOX_TEST_SEEN_HINT=joined` (test-knobs only): a control also joins the unchecked
+    // hints of each Content tip it names, as if they were part of that tip's frontier.
+    #[cfg(feature = "test-knobs")]
+    if governance::seen_hint_mutant("joined") {
+        for reference in &seen {
+            let Some(tip) = read
+                .history_settled_tip(&reference.author)?
+                .and_then(|tip| tip.skeleton.v2)
+                .filter(|v2| v2.kind == SignedEntryKind::Content)
+            else {
+                continue;
+            };
+            for hint in tip.seen.into_iter().filter(|hint| hint.author != *author) {
+                context = context.join(&ControlContext {
+                    room: channel_id,
+                    scope: LogScope::Public,
+                    coordinates: vec![hint],
+                })?;
+            }
+        }
     }
     if kind == SignedEntryKind::ContextUpdate {
         // The advance before Content acknowledges every applied real change and required
@@ -597,6 +621,54 @@ pub(super) fn authored_context(
     }
     let changed = context.hash() != original;
     Ok((context, seen, changed))
+}
+
+/// The test-side attacker of the proofs that a post's `seen` is a hint, never authority
+/// (test-knobs only). While the file `VOX_TEST_SEEN_HINTS` names exists, each of its lines
+/// `<author> <at> <hash>` puts `hash` in place of that author's reference in what this member's
+/// Content names in `seen`, at the position `at` gives: `+N` is N past this node's settled tip of
+/// the author, `@<entry>` the position at which this node holds that entry. So a hostile member
+/// signs an otherwise valid post that names a made-up tip, another member's other branch, or an
+/// entry that never comes.
+#[cfg(feature = "test-knobs")]
+fn forge_seen(read: &entry_store::Read<'_>, seen: &mut Vec<EntryReference>) -> Result<()> {
+    let Some(text) =
+        std::env::var_os("VOX_TEST_SEEN_HINTS").and_then(|path| std::fs::read_to_string(path).ok())
+    else {
+        return Ok(());
+    };
+    let decode = |field: &str| crate::node::link::b32_decode(field, "forged hint").ok();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [author, at, hash] = fields.as_slice() else {
+            eprintln!("vox: VOX_TEST_SEEN_HINTS: unusable line {line:?}");
+            continue;
+        };
+        let (author, hash) = (decode(author), decode(hash));
+        let seq = match (author, at.strip_prefix('+'), at.strip_prefix('@')) {
+            (Some(author), Some(ahead), _) => match ahead.parse::<u64>() {
+                Ok(ahead) => read
+                    .history_settled_tip(&author)?
+                    .map_or(0, |tip| tip.skeleton.seq)
+                    .checked_add(ahead),
+                Err(_) => None,
+            },
+            (Some(_), None, Some(entry)) => match decode(entry) {
+                Some(entry) => read.locate(&entry)?.map(|(_, seq)| seq),
+                None => None,
+            },
+            _ => None,
+        };
+        let (Some(author), Some(seq), Some(hash)) = (author, seq, hash) else {
+            eprintln!("vox: VOX_TEST_SEEN_HINTS: unusable line {line:?}");
+            continue;
+        };
+        seen.retain(|reference| reference.author != author);
+        seen.push(EntryReference { author, seq, hash });
+        eprintln!("vox: VOX_TEST_SEEN_HINTS: signing seen hints: {line}");
+    }
+    seen.sort_unstable_by_key(|reference| reference.author);
+    Ok(())
 }
 
 /// The position of `who` that `context` reaches; the author's own feed is reached through its

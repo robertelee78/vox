@@ -64,6 +64,20 @@
 //! 1. Bob shows Alice's post as not received yet, in its place right after her first, without its text;
 //! 2. once Alice is back, Bob reads the post and no longer shows it as not received yet.
 //!
+//! ## What a post names as seen is a hint, never authority (ADR-053 M0)
+//! Mallory runs this build of `vox` with `VOX_TEST_SEEN_HINTS` (test-knobs only): every post
+//! she signs names, in `seen`, what the proof wrote into her hints file in place of her honest
+//! tips. Her posts are otherwise fully valid.
+//! - **A poisoned hint** ([`a_poisoned_hint_made_up_tip_is_shown_and_grants_nothing`],
+//!   [`a_poisoned_hint_other_branch_is_shown_and_grants_nothing`]): her hint names dave at a
+//!   made-up position and hash, or the hash dave signed on a branch nobody keeps (dave's profile
+//!   copied and posted from once, every other node stopped meanwhile). Every honest member shows
+//!   her posts; then alice, the creator, removes erin and the removal takes effect on every honest
+//!   member, and a later control (alice makes bob an admin) does too: no control acquired the
+//!   hinted coordinate.
+//! - **A hint that never arrives** ([`a_hint_that_never_arrives_holds_nothing_back`]): her post
+//!   names alice 1000 positions past alice's tip; bob shows it between alice's post before and
+//!   alice's post after, and shows mallory's next post too: nothing waits on the hint.
 //!
 //! ## Mutations
 //! - v0.2.10's Withheld rule (a payload-less entry set aside): the stripped arm goes red at (2);
@@ -75,9 +89,16 @@
 //!   (2), and the kept-less arm at (1);
 //! - `VOX_MUTANT_OWED_ROW=marked` (Bob's terminal app gets it: it submits placeholders with the
 //!   rest of what it showed): the stripped arm goes red at (3);
+//! - `VOX_MUTANT_SEEN_HINT=checked` (bob's daemon gets `VOX_TEST_SEEN_HINT=checked` from just
+//!   before mallory's hinted post: a Content's hints are checked parents again, as before M0;
+//!   bob alone and only then, because every honest post names hints too): the poisoned-hint and
+//!   never-arriving-hint arms go red, bob never shows mallory's post;
+//! - `VOX_MUTANT_SEEN_HINT=joined` (every honest daemon gets `VOX_TEST_SEEN_HINT=joined`: a
+//!   control joins the hints of the Content tips it names into its context): the poisoned-hint
+//!   arms go red at the removal.
 //!
-//! Every owed-row mutant, the switch and its value, is checked for in the `vox` under test first
-//! (`test_knobs::require`): a `vox` that does not read it says CANNOT MEASURE.
+//! Every owed-row and hint mutant, the switch and its value, is checked for in the `vox` under
+//! test first (`test_knobs::require`): a `vox` that does not read it says CANNOT MEASURE.
 
 #![cfg(unix)]
 
@@ -855,4 +876,468 @@ fn member_row(status: &serde_json::Value, room: &str, of: &Member) -> serde_json
         })
         .cloned()
         .unwrap_or_default()
+}
+
+// ---- ADR-053 M0: what a post names as seen is a hint, never authority ----------------------
+
+/// The hint mutants the runner may select with `VOX_MUTANT_SEEN_HINT`, each given to daemons as
+/// `VOX_TEST_SEEN_HINT`: `checked` to bob's daemon only, from just before mallory's hinted post
+/// (every honest post names hints too, so a reader that checks them holds the staging's posts);
+/// `joined` to every honest daemon.
+const HINT_MUTANTS: [&str; 2] = ["checked", "joined"];
+
+/// The forger this act needs, and the runner's hint mutant if it selected one. A `vox` that does
+/// not read the forger's file or the switch cannot run it: CANNOT MEASURE.
+fn hint_mutant() -> Option<&'static str> {
+    test_knobs::require(&["VOX_TEST_SEEN_HINTS"]);
+    let mode = std::env::var("VOX_MUTANT_SEEN_HINT")
+        .ok()
+        .filter(|m| !m.is_empty())?;
+    let mode = HINT_MUTANTS
+        .into_iter()
+        .find(|m| *m == mode)
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE (precondition unmet): VOX_MUTANT_SEEN_HINT={mode:?} names none of \
+                 this act's mutants {HINT_MUTANTS:?}"
+            )
+        });
+    test_knobs::require(&["VOX_TEST_SEEN_HINT", mode]);
+    Some(mode)
+}
+
+/// An honest member's daemon behind `spec`, given the runner's `joined` mutant.
+fn honest(m: &Member, spec: &str, mutant: Option<&str>) -> Proc {
+    if mutant == Some("joined") {
+        m.daemon_with_anchor(Some(spec), &[("VOX_TEST_SEEN_HINT", "joined")])
+    } else {
+        m.daemon_with_anchor(Some(spec), &[])
+    }
+}
+
+/// Mallory's daemon behind `spec`: this build of `vox`, putting what `hints` names into the
+/// `seen` of every post she signs while that file exists.
+fn forger(m: &Member, spec: &str, hints: &std::path::Path) -> Proc {
+    let hints = hints.to_str().expect("APPARATUS: UTF-8 temp path");
+    m.daemon_with_anchor(Some(spec), &[("VOX_TEST_SEEN_HINTS", hints)])
+}
+
+/// Whether the forger said it signed the hints of its file into a post.
+fn forged(p: &Proc) -> bool {
+    p.transcript()
+        .contains("VOX_TEST_SEEN_HINTS: signing seen hints")
+}
+
+/// Whether any of these daemons said it engaged the hint mutant it was given.
+fn engaged(procs: &[&Proc]) -> bool {
+    procs.iter().any(|p| {
+        p.transcript()
+            .lines()
+            .any(|l| l.contains("VOX_TEST_SEEN_HINT=") && l.ends_with("engaged"))
+    })
+}
+
+/// A temporary directory for an act's nodes, kept when the run sets `VOX_PROOF_KEEP_DIRS` so that
+/// a red can be read.
+fn act_dir() -> tempfile::TempDir {
+    let mut dir = tempfile::tempdir().expect("APPARATUS: tempdir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        dir.disable_cleanup(true);
+        eprintln!(
+            "[proof] retained daemon directory: {}",
+            dir.path().display()
+        );
+    }
+    dir
+}
+
+/// Replace mallory's hints file in one step (written beside it, then renamed): her daemon reads
+/// it on every post, and must never read it half-written.
+fn write_hints(hints: &std::path::Path, text: &str) {
+    let next = hints.with_extension("next");
+    std::fs::write(&next, text).expect("APPARATUS: write mallory's hints");
+    std::fs::rename(&next, hints).expect("APPARATUS: replace mallory's hints");
+}
+
+/// How long a removal or an admin change may take to reach a member.
+const WITHIN: Duration = Duration::from_secs(60);
+
+/// `m`'s rows of `room` as `vox room read --json` gives them, oldest first; none if it failed.
+fn json_rows(m: &Member, room: &str) -> Vec<serde_json::Value> {
+    let (ok, out, _) = m.vox(&["room", "read", room, "--json"], None);
+    if !ok {
+        return Vec::new();
+    }
+    out.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// The entry hash `m` shows `text` under, from `vox room read --json`.
+fn entry_of(m: &Member, room: &str, text: &str) -> Option<String> {
+    json_rows(m, room)
+        .iter()
+        .rev()
+        .find(|r| r["text"] == text)
+        .and_then(|r| r["entry_hash"].as_str().map(str::to_owned))
+}
+
+/// Run `vox args` as `m`, again only while the product says a change is still being applied or
+/// keys are rotating (for up to [`WITHIN`]); whether it worked, and what it said.
+fn settle(m: &Member, args: &[&str]) -> (bool, String) {
+    let t = Instant::now();
+    loop {
+        let (ok, out, err) = m.vox(args, None);
+        let said = format!("{out}{err}");
+        let transient = said.contains("keys are rotating")
+            || said.contains("still being applied")
+            || said.contains(vox_core::node::api::Fault::GovernanceRefreshing.explain());
+        if ok || !transient || t.elapsed() > WITHIN {
+            return (ok, said);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Poll `ok` every 250 ms for up to `within`; whether it held.
+fn until(within: Duration, mut ok: impl FnMut() -> bool) -> bool {
+    let t = Instant::now();
+    loop {
+        if ok() {
+            return true;
+        }
+        if t.elapsed() > within {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `m`'s `vox room <verb> room` output, or the failure quoted.
+fn said(m: &Member, verb: &[&str], room: &str) -> String {
+    let mut args = vec!["room"];
+    args.extend_from_slice(verb);
+    args.push(room);
+    let (ok, out, err) = m.vox(&args, None);
+    if ok {
+        out
+    } else {
+        format!("FAILED: {out}{err}")
+    }
+}
+
+/// A hash no node holds: 52 base32 characters of a digest of this moment.
+fn made_up_hash() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    vox_core::node::link::b32_encode(&vox_core::hash::sha256(&nanos.to_be_bytes()))
+}
+
+/// A stopped member's whole profile, copied with each directory's mode (a node refuses a
+/// management path that is not private): a second process of the same identity.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("APPARATUS: create a copied profile directory");
+    let mode = std::fs::metadata(from)
+        .expect("APPARATUS: read a profile directory's mode")
+        .permissions();
+    std::fs::set_permissions(to, mode).expect("APPARATUS: keep a profile directory's mode");
+    for e in std::fs::read_dir(from).expect("APPARATUS: read a profile to copy") {
+        let e = e.expect("APPARATUS: read a profile entry");
+        let target = to.join(e.file_name());
+        let kind = e.file_type().expect("APPARATUS: profile entry type");
+        if kind.is_dir() {
+            copy_dir(&e.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(e.path(), &target).expect("APPARATUS: copy a profile file");
+        }
+    }
+}
+
+/// Every member trusts every other.
+fn trust_all(members: &[&Member]) {
+    for (i, a) in members.iter().enumerate() {
+        for b in &members[i + 1..] {
+            a.trust(b);
+            b.trust(a);
+        }
+    }
+}
+
+/// Each member posts a hello and every member reads every hello (else `PRODUCT (staging)`).
+fn hellos(room: &str, members: &[&Member]) {
+    for m in members {
+        m.post(room, &format!("{} says hello", m.name));
+    }
+    for reader in members {
+        for author in members {
+            let text = format!("{} says hello", author.name);
+            if let Err(e) = arrives(reader, room, &text) {
+                panic!(
+                    "PRODUCT (staging): {} never read {text:?} before anything hostile: {e}",
+                    reader.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "real daemons, one a test-knobs `vox` that signs forged hints; run with test-knobs"]
+fn a_poisoned_hint_made_up_tip_is_shown_and_grants_nothing() {
+    poisoned_hint(false);
+}
+
+#[test]
+#[ignore = "real daemons, one a test-knobs `vox` that signs forged hints; run with test-knobs"]
+fn a_poisoned_hint_other_branch_is_shown_and_grants_nothing() {
+    poisoned_hint(true);
+}
+
+fn poisoned_hint(other_branch: bool) {
+    let arm = if other_branch {
+        "dave's other branch"
+    } else {
+        "a made-up tip of dave"
+    };
+    watchdog::arm();
+    let mutant = hint_mutant();
+    let tmp = act_dir();
+    let root = tmp.path();
+    let (anchor_d, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let dave = Member::new(root, "dave");
+    let erin = Member::new(root, "erin");
+    let mallory = Member::new(root, "mallory");
+    trust_all(&[&alice, &bob, &dave, &erin, &mallory]);
+    let hints = root.join("mallory.hints");
+    let alice_d = honest(&alice, &spec, mutant);
+    let mut bob_d = honest(&bob, &spec, mutant);
+    let mut dave_d = honest(&dave, &spec, mutant);
+    let erin_d = honest(&erin, &spec, mutant);
+    let mallory_d = forger(&mallory, &spec, &hints);
+    let room = alice.create("hints");
+    let link = alice.invite(&room);
+    for m in [&bob, &dave, &erin, &mallory] {
+        m.join(&link, "hints");
+    }
+    hellos(&room, &[&alice, &bob, &dave, &erin, &mallory]);
+
+    let line = if other_branch {
+        // dave signs a message on a branch nobody keeps: his profile copied, posted from once
+        // while every other node is stopped, and gone before any of them runs again.
+        drop(dave_d);
+        let copy = Member {
+            name: "dave-copy",
+            dir: root.join("dave-copy"),
+            pass: dave.pass.clone(),
+            fp: dave.fp.clone(),
+        };
+        copy_dir(&dave.dir, &copy.dir);
+        let others = [
+            (&anchor_d, "the anchor"),
+            (&alice_d, "alice"),
+            (&bob_d, "bob"),
+            (&erin_d, "erin"),
+            (&mallory_d, "mallory"),
+        ];
+        for (p, who) in others {
+            signal_took(p, "-STOP", who);
+        }
+        let copy_d = copy.daemon_with(&[("VOX_TEST_NO_NEARBY", "1")]);
+        let lost = "dave, on a branch nobody keeps";
+        copy.post(&room, lost);
+        let other = entry_of(&copy, &room, lost)
+            .unwrap_or_else(|| panic!("APPARATUS: the copy of dave does not show {lost:?}"));
+        drop(copy_d);
+        for (p, who) in others {
+            signal_took(p, "-CONT", who);
+        }
+        dave_d = honest(&dave, &spec, mutant);
+        let kept = "dave, on his kept branch";
+        dave.post(&room, kept);
+        for m in [&bob, &mallory] {
+            if let Err(e) = arrives(m, &room, kept) {
+                panic!("PRODUCT (staging): {} never read {kept:?}: {e}", m.name);
+            }
+        }
+        let kept = entry_of(&bob, &room, kept).expect("APPARATUS: bob's row of dave's kept post");
+        assert_ne!(
+            kept, other,
+            "APPARATUS: dave's two branches signed one entry"
+        );
+        format!("{} @{kept} {other}\n", dave.fp)
+    } else {
+        format!("{} +5 {}\n", dave.fp, made_up_hash())
+    };
+    write_hints(&hints, &line);
+    if mutant == Some("checked") {
+        drop(bob_d);
+        bob_d = bob.daemon_with_anchor(Some(&spec), &[("VOX_TEST_SEEN_HINT", "checked")]);
+    }
+    let hinted = format!("mallory, naming {arm}");
+    mallory.post(&room, &hinted);
+    assert!(
+        forged(&mallory_d),
+        "APPARATUS (the forger): mallory never signed with the hints {line:?}:\n{}",
+        mallory_d.transcript()
+    );
+    for m in [&alice, &bob, &dave, &erin] {
+        if let Err(e) = arrives(m, &room, &hinted) {
+            panic!(
+                "PRODUCT: {} never showed mallory's post whose `seen` names {arm} ({e}): an \
+                 unchecked hint held a valid message back\n{}'s status: {}\nhint mutant engaged \
+                 on bob: {}",
+                m.name,
+                m.name,
+                m.status(),
+                engaged(&[&bob_d])
+            );
+        }
+    }
+    let again = "mallory again, the same hint";
+    mallory.post(&room, again);
+    if let Err(e) = arrives(&bob, &room, again) {
+        panic!("PRODUCT: bob never showed mallory's next post ({e}): it waited on her hint");
+    }
+
+    // The creator removes erin: the removal must not inherit the hinted coordinate.
+    let (removed, why) = settle(&alice, &["room", "remove-member", &room, &erin.fp]);
+    assert!(
+        removed,
+        "PRODUCT: after mallory's hint ({arm}) alice could not remove erin: {why}\nhint mutant \
+         engaged on alice: {}",
+        engaged(&[&alice_d])
+    );
+    for m in [&alice, &bob, &dave] {
+        let gone = until(WITHIN, || {
+            let roster = said(m, &["roster"], &room);
+            !roster.starts_with("FAILED") && !roster.contains(&erin.fp)
+        });
+        assert!(
+            gone,
+            "PRODUCT: alice's removal of erin, made after mallory's hint ({arm}), never took \
+             effect on {}: its roster is {}\n{}'s status: {}\nhint mutant engaged on alice: {}",
+            m.name,
+            said(m, &["roster"], &room),
+            m.name,
+            m.status(),
+            engaged(&[&alice_d])
+        );
+    }
+    let (named, why) = settle(&alice, &["room", "admin", "add", &room, &bob.fp]);
+    assert!(
+        named,
+        "PRODUCT: alice's later control (bob made an admin) failed: {why}"
+    );
+    for m in [&bob, &dave] {
+        let listed = until(WITHIN, || {
+            said(m, &["admin", "list"], &room).contains(&bob.fp)
+        });
+        assert!(
+            listed,
+            "PRODUCT: alice's later control never validated on {}: `vox room admin list` says {}",
+            m.name,
+            said(m, &["admin", "list"], &room)
+        );
+    }
+    let after = "bob, after the removal";
+    bob.post(&room, after);
+    for m in [&alice, &dave] {
+        if let Err(e) = arrives(m, &room, after) {
+            panic!(
+                "PRODUCT: the room stopped after the removal: {} ({e})",
+                m.name
+            );
+        }
+    }
+    println!(
+        "[proof] poisoned hint ({arm}): alice, bob, dave and erin showed mallory's post; erin's \
+         removal and bob's admin took effect on every honest member; hint mutant {mutant:?} \
+         engaged: {}",
+        engaged(&[&alice_d, &bob_d, &dave_d, &erin_d])
+    );
+}
+
+#[test]
+#[ignore = "real daemons, one a test-knobs `vox` that signs forged hints; run with test-knobs"]
+fn a_hint_that_never_arrives_holds_nothing_back() {
+    watchdog::arm();
+    let mutant = hint_mutant();
+    let tmp = act_dir();
+    let root = tmp.path();
+    let (_anchor_d, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let mallory = Member::new(root, "mallory");
+    trust_all(&[&alice, &bob, &mallory]);
+    let hints = root.join("mallory.hints");
+    let alice_d = honest(&alice, &spec, mutant);
+    let mut bob_d = honest(&bob, &spec, mutant);
+    let mallory_d = forger(&mallory, &spec, &hints);
+    let room = alice.create("never");
+    let link = alice.invite(&room);
+    bob.join(&link, "never");
+    mallory.join(&link, "never");
+    hellos(&room, &[&alice, &bob, &mallory]);
+    let before = "alice, before the hint";
+    alice.post(&room, before);
+    for m in [&bob, &mallory] {
+        if let Err(e) = arrives(m, &room, before) {
+            panic!("PRODUCT (staging): {} never read {before:?}: {e}", m.name);
+        }
+    }
+    let line = format!("{} +1000 {}\n", alice.fp, made_up_hash());
+    write_hints(&hints, &line);
+    if mutant == Some("checked") {
+        drop(bob_d);
+        bob_d = bob.daemon_with_anchor(Some(&spec), &[("VOX_TEST_SEEN_HINT", "checked")]);
+    }
+    let hinted = "mallory, naming a post of alice that never comes";
+    mallory.post(&room, hinted);
+    assert!(
+        forged(&mallory_d),
+        "APPARATUS (the forger): mallory never signed with the hints {line:?}:\n{}",
+        mallory_d.transcript()
+    );
+    for m in [&bob, &alice] {
+        if let Err(e) = arrives(m, &room, hinted) {
+            panic!(
+                "PRODUCT: {} never showed mallory's post whose `seen` names an entry that never \
+                 arrives ({e}): it waited on the hint\n{}'s status: {}\nhint mutant engaged on \
+                 bob: {}",
+                m.name,
+                m.name,
+                m.status(),
+                engaged(&[&bob_d])
+            );
+        }
+    }
+    let after = "alice, after reading mallory";
+    alice.post(&room, after);
+    if let Err(e) = arrives(&bob, &room, after) {
+        panic!("PRODUCT: bob never showed alice's post after the hinted one ({e})");
+    }
+    let next = "mallory again, the same hint";
+    mallory.post(&room, next);
+    if let Err(e) = arrives(&bob, &room, next) {
+        panic!("PRODUCT: bob never showed mallory's next post ({e}): it waited on her hint");
+    }
+    let rows: Vec<String> = json_rows(&bob, &room)
+        .iter()
+        .filter_map(|r| r["text"].as_str().map(str::to_owned))
+        .collect();
+    let at = |text: &str| rows.iter().position(|t| t == text);
+    let order = (at(before), at(hinted), at(after));
+    assert!(
+        matches!(order, (Some(b), Some(h), Some(a)) if b < h && h < a),
+        "PRODUCT: bob shows the hinted post out of its place in the conversation (positions \
+         before/hinted/after {order:?}): {rows:?}"
+    );
+    println!(
+        "[proof] never-arriving hint: bob showed mallory's hinted post between alice's before \
+         and after ({order:?}), and mallory's next post; hint mutant {mutant:?} engaged: {}",
+        engaged(&[&alice_d, &bob_d])
+    );
 }

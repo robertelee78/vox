@@ -525,9 +525,10 @@ Each process uses scratch data and config roots. Run one exact act in release wi
   later news is shown once.
 - `nine_restarted_sessions_wait_for_registration`: nine real hooks contend on the kernel lock.
 - `a_sibling_room_post_is_accepted_after_policy_installation`: holds real sibling startup across policy
-  installation and the room-startup boundary. A sibling room operation is accepted after
-  policy installation, and the pending native Session opens after release without another hook.
-  Its verdict uses the product's response, not a count of status polls.
+  installation and the room-startup boundary. A post made during the policy hold is kept (neither
+  refused nor shown) and is accepted and shown after the release; a sibling room operation is
+  accepted after policy installation, and the pending native Session opens after release without
+  another hook. Its verdict uses the product's response, not a count of status polls.
 - `a_linked_worktree_gets_its_repository_offer_and_names_map_authority`: checks both hook riders.
 - `a_native_omp_decided_turn_does_not_retry_a_permanently_refused_identity`: a decided turn's
   late exit meets the node rebuilt under a new identity; the refusal is said once, never promises
@@ -706,12 +707,19 @@ as `[RG-6 mutant]`.
 The relay act: an author posts twice a second, 300
 times, to a reader whose only path is a relay circuit with 75 ms each way on every member's hop
 (a userspace forwarder); green when the reader shows every acknowledged post. A red names how many
-the reader shows and holds. Run it quiet.
+the reader shows and holds. Its `two` arm,
+`a_delayed_relay_keeps_up_with_two_authors_each_posting_twice_a_second`, has two members post that
+way at once over the same path (four posts a second for the reader); it is green when the reader
+and each author show every post of each author, and a red names those counts per author. Run each
+quiet.
 
 ```sh
 cargo test --release -p vox-tui --features optional-proofs,test-knobs --test key_package_proof \
   delayed_relay::a_delayed_relay_keeps_up_with_a_two_per_second_author -- --ignored --exact \
   --nocapture
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test key_package_proof \
+  delayed_relay::a_delayed_relay_keeps_up_with_two_authors_each_posting_twice_a_second -- \
+  --ignored --exact --nocapture
 ```
 
 ## The proofs

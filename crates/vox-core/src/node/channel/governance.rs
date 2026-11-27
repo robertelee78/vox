@@ -14,6 +14,8 @@ pub(in crate::node::channel) use view::{
     recipient_body_eligibility_at, ConsentFacts, SemanticState, SemanticWork, PAGE_ROWS, REFRESHING,
 };
 
+#[cfg(feature = "test-knobs")]
+pub(crate) use sparse::seen_hint_mutant;
 pub(crate) use sparse::{
     checked_seen, sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparseParent,
     SparsePayloadState, SparseValidation, SparseValidationStep, TypedSparseBody,
