@@ -1184,6 +1184,10 @@ afterwards and who delivers it (LE-2, LE-3); what is erased, when, and what that
   leftover of the old membership are discarded first, the node's own signed feed continues
   without a fork, and the person sees nothing older than the join and no refusal.** *(new in
   r2: the decider, 2026-11-13, row 34; fix-list item 10; row 22. **Changed r3: N1, N2, N5.**)*
+  *(Overtaken 2026-11-27 by ADR-055 FO-2 to FO-4, for keys: the others do not treat a rejoin as a
+  fresh join. They exclude the node from keys from its departure, apply its signed return like a
+  readmission (one return cut and one rotation per return) and send it only their fresh chains, by
+  key packages bound to that return. The person still sees nothing written before the return.)*
 
   *What the person sees.* `vox room join <link>` on a node that left the room (any state: the
   departure not yet verified, verified, erasure in progress, the room ended meanwhile) runs as

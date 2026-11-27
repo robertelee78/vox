@@ -310,7 +310,7 @@ requirement.
     only what the peer lacks; body extents in bounded pages that cover every held body, told to
     every peer; the own-release section only to its author; the private section only after a
     record that peer may be served was found; and what a peer says it holds is kept within one
-    bound per connection.
+    bound per connection. *(Amended 2026-11-27 by ADR-055 FO-7: there is no own-release section.)*
 
 ### What a node owes
 
@@ -822,6 +822,8 @@ app is a waste".
      was not found entitled to, not even a zero one.
   5. The own-release section (which sender-key releases of an author this node can give back) is
      told only to that author.
+     *(Amended 2026-11-27 by ADR-055 FO-7: there is no own-release section. No sender-key release is
+     advertised, asked for or served over the network; frame tag `0x0D` is decoded and discarded.)*
   6. A key package's body is told as held only when its stored entry carries the body, the same
      fact serving sends from, and as owed only when it is not held and its debt is live; a debt that
      expired unfilled is not possession. Every write that changes either fact touches that
@@ -852,6 +854,8 @@ app is a waste".
      rearm, timers, retry policies or author fallback.
   4. Own-key requests are independent across donors: every connection whose peer offers this
      node's missing sender-key release may ask for it, and none waits for another.
+     *(Amended 2026-11-27 by ADR-055 FO-7: withdrawn; no own key is asked for. A recovery request
+     or reply for an own key is refused on every connection.)*
   - *Source*: `ruling-in-flight.md:5`, :9, :15, :17; design.md:172; `simple-sync/review/keys.md`
     first P1 finding and `loop.md` finding 3; `keys-2.md:5`.
   - *Why*: every loop plans from the same record and frontier by the same rule, so for pages the
@@ -910,6 +914,8 @@ app is a waste".
      correction counts as progress only when it withdraws a body. A private section is news each
      time it comes, by the private-tip ruling, which costs at most one public re-ask per private
      announcement received.
+     *(Amended 2026-11-27 by ADR-055 FO-7: an own-release entry is no longer news; a reserved
+     release frame (tag `0x0D`) is decoded for its structure and discarded with no effect.)*
   - *Source*: `design/adopt/ruling.md:11`, :61; `simple-sync/pull/on-main/step1-3.md:11`,
     `step6.md:61`; `simple-sync/review/loop.md` finding 2, `serve.md` finding 6, `private.md:47`;
     `simple-sync/review/fix-FixLoopA.md:11`, :118-127; `serve-2.md:15`; `loop-2.md:7`; items 1, 2
@@ -928,6 +934,8 @@ app is a waste".
   1. Every kind of fetching has one asking owner, the connection's loop: public history, own-history
      recovery, key bodies, own sender-key releases, exact receipts, private Sessions and saved
      history requests.
+     *(Amended 2026-11-27 by ADR-055 FO-7: "own sender-key releases" is withdrawn; own-history
+     recovery fetches entries only and opens them with the keys the node still holds.)*
   2. Key bodies are asked as bodies under the Have's body extents, with the recipient checks
      unchanged.
   3. Private Sessions keep their existing queries and checks; the one loop chooses them from what
@@ -965,6 +973,9 @@ app is a waste".
      three, and the reader accepts them.
   5. Every worker of an own sender-key release holds the secret lease until its physical work and
      the disposal of its result are done.
+     *(Overtaken 2026-11-27 by ADR-055 FO-7: the own sender-key release worker is deleted; the
+     secret leases other lifecycles hold (leave, close, purge, untrust, own recovery's Computer
+     policy wait) are unchanged.)*
   - *Source*: `simple-sync/review/private.md` findings 2 and 3; `serve.md` findings 3, 4 and 5;
     `keys.md` second P1 and P2 findings; `simple-sync/pull/on-main/step5c.md:80`, :86;
     `keys-2.md:7`, :9; `private-2.md:7`, :9; `private-3.md:11`; `serve-2.md:9-13`.
@@ -1307,6 +1318,9 @@ app is a waste".
      connection has closed. A record is removed only after its connection has closed: by its own
      watch on that close, or by the next charge of the same peer in the same room, whichever comes
      first. Nothing removes a record while its connection is live.
+     *(Amended 2026-11-27 by ADR-055 FO-7, items 1 and 2: no own-release section is kept in a
+     connection's record or makes one; the other sources of a record and the rules of its lifetime
+     are unchanged.)*
   3. One allowance of 16 MiB per room and peer is shared by that peer's live connections. A record
      is charged a fixed cost when it is made, and then each row it keeps; closed connections'
      records are removed before the allowance is read, so what is counted is what is kept. A charge
@@ -1606,6 +1620,9 @@ here.
      `Complete`, "Nothing older to fetch: every member's history here reaches back to its first
      post.", with the sentence above where it applies. When this node can take no more saved
      requests, the members left out are counted and said, and the answer is never `Complete`.
+     *(Amended 2026-11-27 by ADR-055 FO-11: the sentence is "The oldest posts held here of K
+     member(s) cannot be read with the keys this node retains. Coming back to a room does not
+     restore earlier keys.", and K counts this node's own posts too.)*
   - *Source*: `design/adopt/ruling.md:12`, :62; `simple-sync/pull/on-main/older.md:130`, :136-146,
     :223-224; `simple-sync/review/delete.md` findings 2, 4 and 5, `private.md` finding 5;
     `simple-sync/review/fix-FixSeen.md:317-337`, :359-365, :376-378; `delete-2.md:11-13`;

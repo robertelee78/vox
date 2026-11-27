@@ -110,9 +110,20 @@ recipient, which is what per-sender trust needs.
   History MUST be per sender and trust-gated exactly as live messages are: a node that never trusts a
   member reveals no history to it, and nobody can release another member's history.
   Except as limited for once-removed identities by ADR-007 G-30 (v0.4.20).
+  *(Amended 2026-11-27 by ADR-055 FO-5 and FO-7: there is no `full` choice and no `--history`
+  option. A grant releases the sender's key from the member's trust point on; a member trusted
+  while offline catches up on generations minted after that point; nothing before it is released.
+  Key releases to a member untrusted and trusted again start where the sender trusted it again:
+  only this room's mark of the sender's current decision counts, and only when it was taken after
+  the latest signed revocation (FO-5); keys and messages it already holds stay usable. A member that
+  left and comes back reads from its return on (FO-3).)*
 - **S-19.** A superseded generation's origin key MUST be deleted once no full-history grant is still owed
   in the room (`prune_superseded_origins`, PRD-001 R14). For a trusted identity that has not joined, it
   MUST be kept `UNJOINED_HOLD_SECS` = 30 days in a room kept forever, or for the room's retention.
+  *(Amended 2026-11-27 by ADR-055 FO-1 and FO-6: the full-grant gate is gone. A history floor of a
+  member that has left or was removed pins nothing; a continuously entitled member's floor is kept
+  until it takes its keys. A received generation deleted by R14 stays deleted on that node: an
+  exact tombstone is written with the deletion and a later offer of it installs nothing.)*
 
 ### Known gaps
 

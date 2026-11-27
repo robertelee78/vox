@@ -405,6 +405,9 @@ repairing the first.
   need exactly that key (`own_history.rs:900-943`, `OwnReadability::KeyDebt`) before it can pay
   its own withdrawal; fencing it on the donor's debt would make two indebted members wait on
   each other (F2). W's node cannot use this path: it is untrusted, and the key is its own.
+  *(Overtaken 2026-11-27 by ADR-055 FO-7: the own-original release, its donor and the readability
+  audit that needed it are deleted; own-history recovery needs no key from another member, so
+  this exemption has nothing left to exempt.)*
 
   The reservation function `reserve_pending_write` (`pending_text.rs:278-296`) is **not** the
   fence and gains no `purpose` argument; Appendix B of ADR-040 revision 2 is withdrawn. The
@@ -722,6 +725,8 @@ repairing the first.
     write is refused by the peer fence (TC-3 case 5);
   - `room <id>: released <peer>'s own key, generation <g>` when an own-original release is
     sent (TC-3's exemption);
+    *(Overtaken 2026-11-27 by ADR-055 FO-7: no own-original release exists, so this line is never
+    logged.)*
   - `room <id>: Session refresh: preparing` before a Refresh prepares (TC-9 act 9(c));
   and none of `computer trust reconciliation at revision N failed`, `trust withdrawal is
   incomplete`, `authored save worker stopped`, `cannot save` for this cause. When the debt is
@@ -871,6 +876,8 @@ repairing the first.
     package append; the package commits during the hold, M serves it, Z
     opens it and reads C before the release: red. The same surviving checks as (i) plus the
     append's own `check_removal_generation` (unchanged).
+    *(Overtaken 2026-11-27 by ADR-055 FO-7: `--history full`, `HistoryGrant::Full` and
+    `full_consent_release` are deleted; this act's staging no longer exists.)*
   - **Act 2c, a typed refusal is parked, not dropped.** Before the narrowing M is trusted and
     admitted to R3 but M's daemon is stopped, so N owes M the live chain (`owed_rekeys` keeps
     M, `channel.rs:5014-5052`). Withdraw hold on R3; `vox trust remove Y`; start M: the rekey
@@ -916,6 +923,8 @@ repairing the first.
     logged and no release or no completion within 10 s is PRODUCT. Mutant: fence
     `own_original_release` on the donor's debt; the request is logged, the release never is,
     M's recovery does not complete: red (PRODUCT).
+    *(Overtaken 2026-11-27 by ADR-055 FO-7: no own key is requested or released over the network,
+    so there is no donor and no such cycle.)*
   - **Act 6, restart with a debt (candidate only; CANNOT MEASURE on v0.4.30).** Withdraw hold
     on R3 (the knob applies to the preparation trust stage too); `vox computer remove W3
     --keep-rooms`; kill N; start N with the hold still set: the trust stage parks R3's debt and
