@@ -1257,7 +1257,7 @@ impl Management {
             }
             if s.invitations.len() >= MAX_RECORDS {
                 return Err(Error::Profile(
-                    "retained computer invitation history is full",
+                    "retained computer pairing code history is full",
                 ));
             }
             if let Some(link) = s.pair_link.take() {
@@ -1318,7 +1318,7 @@ impl Management {
                 })?;
                 *lock(&self.conflict) = None;
                 *lock(&self.closed_problem) = Some(
-                    "Conflict review closed locally. The inviting computer may retain its proposal or signature; this did not withdraw it there.".into(),
+                    "Conflict review closed locally. The computer that made the pairing code may retain its proposal or signature; this did not withdraw it there.".into(),
                 );
                 return self.status();
             }
@@ -1792,7 +1792,7 @@ impl Management {
     fn replace_group(&self, token: &str, expected: &str) -> Result<ComputerStatus> {
         let _review_guard = hold(&self.review_gate);
         let review = lock(&self.conflict).clone().ok_or(Error::Profile(
-            "the group replacement review is no longer available; review the invitation again",
+            "the group replacement review is no longer available; review the pairing code again",
         ))?;
         if review.public.review_id != token || review.public.frontier != expected {
             return Err(Error::Profile(
@@ -1800,12 +1800,12 @@ impl Management {
             ));
         }
         if review.public.expires_ms <= now() {
-            return Err(Error::Profile("the reviewed proposal expired; close it on the inviting computer and review a fresh invitation"));
+            return Err(Error::Profile("the reviewed proposal expired; close it on the computer that made the pairing code and review a fresh pairing code"));
         }
         let local = self.computer.signer.fingerprint();
         let (post_frontier, post_revision) = self.computer.change(|s| {
             if review.public.expires_ms <= now() {
-                return Err(Error::Profile("the reviewed proposal expired; review a fresh invitation"));
+                return Err(Error::Profile("the reviewed proposal expired; review a fresh pairing code"));
             }
             if frontier(s) != expected || s.revision != review.revision || sha256(&s.body()) != review.snapshot {
                 return Err(Error::Profile("computer authority changed; review the replacement again"));
@@ -2015,7 +2015,7 @@ impl Management {
             let names: Vec<_> = descriptions.values().map(|d| d.name.clone()).collect();
             if !names.is_empty() {
                 topology.push(format!(
-                    "Group members: {}. Their managed nodes have mutual Read directly, not through the inviter.",
+                    "Group members: {}. Their managed nodes have mutual Read directly, not through the computer that made the pairing code.",
                     names.join(", ")
                 ));
             }
@@ -2586,7 +2586,7 @@ impl Management {
                 .all(|lease| lease.peer != Some(target) || lease.anchors.nodes().is_empty())
         {
             return Err(Error::Profile(
-                "this pairing link has no address and no anchor to reach its computer; on the other computer, run vox computer invite with a reachable address or add an anchor, then use its new link",
+                "this pairing link has no address and no anchor to reach its computer; on the other computer, run vox computer pair with a reachable address or add an anchor, then use its new link",
             ));
         }
         // The direct dial starts immediately. Anchor registration is a separate raced path and
@@ -2598,7 +2598,7 @@ impl Management {
                 .into_iter()
                 .find(|l| l.peer == Some(target))
                 .ok_or(Error::Unreachable(
-                    "no current computer transport invitation or enrolled pair",
+                    "no current computer transport pairing code or enrolled pair",
                 ))?;
             self.configure_transport_anchors(&lease.anchors);
             let mut attempts = tokio::task::JoinSet::new();
@@ -2770,7 +2770,7 @@ impl Management {
             .is_some_and(|s| offered_grant(s, &link.target).is_none())
         {
             return Err(Error::Profile(
-                "the inviting computer's group authority is removed or suspended",
+                "the group authority of the computer that made the pairing code is removed or suspended",
             ));
         }
         write_frame_until(&mut send, &local_offer, deadline).await?;
@@ -5039,7 +5039,7 @@ const RETIRED_OR_INVALID_GROUP: &str = "this computer group was retired or is in
 fn invitation_refusal(e: Error) -> Error {
     match e {
         Error::Profile(RETIRED_OR_INVALID_GROUP) => Error::Profile(
-            "this invitation offers a group retired on this computer, or an invalid group; nothing was paired. If it is your former group, the computer you want to pair with must leave it and run vox computer retire before you pair into a new group; otherwise discard this invitation and request a valid one",
+            "this pairing code offers a group retired on this computer, or an invalid group; nothing was paired. If it is your former group, the computer you want to pair with must leave it and run vox computer retire before you pair into a new group; otherwise discard this pairing code and request a valid one",
         ),
         e => e,
     }

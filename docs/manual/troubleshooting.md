@@ -300,8 +300,8 @@ at each step, so that part of a step grows with the store: on a store grown to 2
 about 0.23 s of each step. In five runs on stores grown to 2.8 and 2.9 GB, one step held writes
 for at most 1.7 s (in a pass that took the file from about 2.24 to 2.23 GB) and the longest wait
 of one post was 1.6 s (while the running node gave back the space of the first expiry, the file
-going from 2.8 to 1.9 GB). Larger stores have not been measured. Startup no longer compacts
-before Ready.
+going from 2.8 to 1.9 GB). Larger stores with this capped implementation have not been measured.
+Startup no longer compacts before Ready.
 
 If a read that began before a step can still see the pages the pass moved, the pass stops
 there and `vox status` says `giving back disk space when reads end` (`--json`:
@@ -331,6 +331,12 @@ to bypass the refusal. Missing data cannot be recreated if no member retains it.
 **Confirm:** the daemon says `this node recovered its own history; it can write here again`.
 `vox room read` shows the recovered messages as this node's own, and another member reads its
 next new post.
+
+If `vox room join` says `this room was not joined: a member holds signed history of this node in
+it that this node cannot reconcile with its own record`, the join added nothing to this node, so
+`vox status` shows no line for that room and there is nothing to wait for. Use the copy of this
+node that wrote that history instead of this one, if you still have it; otherwise join with a new
+node (`vox node create <name>`), which the members trust separately.
 
 ## A message says not received yet
 

@@ -259,7 +259,14 @@ fn property(object: &mut Object, mode: Mode, key: &str, value: Value) {
                 "session_name" => 16,
                 _ => return,
             };
-            let valid = matches!(&value, Value::Null | Value::Text(_));
+            // A Session's name is refused as `Envelope::parse` refuses it in one record
+            // (`valid_origin`): a string, not blank, and nothing that would break or reorder a
+            // line. Its 64 KiB bound is a single record's; metadata in parts carries longer names.
+            let valid = match (&value, key) {
+                (Value::Text(text), "session_name") => text.one_line && !text.blank,
+                (_, "session_name") => false,
+                (value, _) => matches!(value, Value::Null | Value::Text(_)),
+            };
             field(object, bit, valid);
             if key == "session_name" || key == "cwd" {
                 let target = if key == "cwd" {

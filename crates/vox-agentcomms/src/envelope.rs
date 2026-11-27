@@ -36,13 +36,25 @@ pub fn is_plumbing(kind: &str) -> bool {
 /// How a Session is labelled (ADR-029 SE-3), in the TUI, the app and `vox` alike (CL-1): the
 /// viewer's alias for its node, its name when it has one, and the first 8 characters of its id,
 /// `codex@device-2 · gso-cap · 3f0c25bf`.
+///
+/// The name and the id are the Session's node's own text, carried unvalidated, so both are
+/// [`session_shown`]: a name holding a newline, an escape sequence or a bidi override is
+/// labelled on one line with each such character as `⟨U+XXXX⟩`, never as itself.
 #[must_use]
 pub fn session_label(node_alias: &str, name: Option<&str>, id: &str) -> String {
-    let short: String = id.chars().take(8).collect();
+    let short = session_shown(&id.chars().take(8).collect::<String>());
     match name.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(name) => format!("{node_alias} \u{b7} {name} \u{b7} {short}"),
+        Some(name) => format!("{node_alias} \u{b7} {} \u{b7} {short}", session_shown(name)),
         None => format!("{node_alias} \u{b7} {short}"),
     }
+}
+
+/// Text a Session's node chose (its name, its id) as a reader is shown it: whole, on one line,
+/// every character that could break or reorder the line or that a reader cannot see as
+/// `⟨U+XXXX⟩` ([`reveal_keeping`], the rule a message's text is shown by, #331).
+#[must_use]
+pub fn session_shown(text: &str) -> String {
+    reveal_keeping(text, |_| false)
 }
 
 /// What a Session's opening or end says as a line of the room (ADR-029, CL-1), in the TUI, the app

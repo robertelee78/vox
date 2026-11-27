@@ -14,7 +14,9 @@
 //! 1. It joins a room a peer (a second `vox daemon`, its own data root) created, and its post shows
 //!    in the peer's `vox room read`; read back at once, its own room holds the post: a post is
 //!    answered once the node has it.
-//! 2. A message the peer posts reaches the Swift program **through its listener**.
+//! 2. A message the peer posts reaches the Swift program **through its listener**. The program
+//!    subscribes before it joins, as Vox.app does; the join opens the room, which ends that
+//!    observation, and the program subscribes again, as Vox.app does.
 //! 3. A service the peer shares (`vox service add`) is listed by `services` at the address the
 //!    app's own `vox service list` prints, with the commands (each with the canonical address)
 //!    and needs `vox service list --json` gives (ADR-028 S-3, #444); `forward` to that address
@@ -57,8 +59,8 @@
 //!    call and its result, a second call that asks permission and is left waiting), is listed by
 //!    `sessions` with one request waiting on the app (`pending` 1); `sessionRead` gives its
 //!    entries line for line as `vox room session --json` prints them on the app's own data root,
-//!    the request open with its reference; and the listener heard of the entries and of the
-//!    room's Sessions changing.
+//!    the request open with its reference; and the listener heard the room's Sessions change
+//!    (news of a Session's entries rides that one callback since 7bc390c74).
 //!
 //! 9. **A file addressed to someone else** (ADR-028 F-3, D5): the peer shares a file addressed to
 //!    itself alone. Its card says whom it is for (`to`, the peer) and that its sharer is in the
@@ -625,6 +627,9 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     let app_fp = expect(&from_app, &seen, "FP ")[3..].to_owned();
     let listed = mine.run(&["node", "list"], "");
     let joined = expect(&from_app, &seen, "JOINED ");
+    // The joined room opened on the app's node: the listener is told observation ended, so that
+    // the app subscribes again and follows the room (as Vox.app does); otherwise (2) never comes.
+    expect(&from_app, &seen, "ENDED ");
     let posted = expect(&from_app, &seen, "POSTED ");
     // The peer decides to trust the app's node, as a person would with `vox trust add`.
     peer.run(&["trust", "add", &app_fp, "--name", "swift"], "");
@@ -1191,14 +1196,10 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "SessionEnd",
         serde_json::json!({ "reason": "prompt_input_exit" }),
     );
-    let counts: Vec<u64> = heard[6..]
-        .split_whitespace()
-        .filter_map(|n| n.parse().ok())
-        .collect();
     assert!(
-        counts.len() == 2 && counts[0] >= 1 && counts[1] >= 1,
-        "PRODUCT: the listener must hear of the Session's entries and of the room's Sessions \
-         changing: {heard}"
+        heard[6..].trim().parse::<u64>().is_ok_and(|n| n >= 1),
+        "PRODUCT: the listener must hear the room's Sessions change once the Session has entries \
+         (entry news rides `onSessions` since 7bc390c74): {heard}"
     );
 
     // (8b) Drive over a Session of the peer's, as the app keeps it: given, taken back, given

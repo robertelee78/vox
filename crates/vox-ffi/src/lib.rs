@@ -125,7 +125,9 @@ fn outcome(_what: &str, out: Outcome) -> Result<(), VoxError> {
         | Outcome::Bound(_)
         | Outcome::OwnRetention { .. }
         | Outcome::Appended(_)
-        | Outcome::JoinedRecovering => Ok(()),
+        | Outcome::JoinedRecovering
+        // A saved trust whose key is still being delivered: the request succeeded.
+        | Outcome::TrustedKeyPending => Ok(()),
         // The one sentence vox-core writes for the fault (ADR-028 E-7), never its variant's name
         // and never prefixed with the call's.
         Outcome::Failed(f) => Err(failed(f.explain())),

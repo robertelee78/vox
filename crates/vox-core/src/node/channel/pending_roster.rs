@@ -386,6 +386,8 @@ impl Prepared {
         };
         let mut witnesses = std::mem::take(&mut self.witnesses);
         let mut join = self.join.take();
+        // A join's worker that stops part-way may have stopped inside or after its commit.
+        let joining = join.is_some();
         let mut joined = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.sek.with(|sek| {
@@ -565,7 +567,11 @@ impl Prepared {
         }))
         .unwrap_or_else(|_| {
             kernel.poison = Some("native roster worker stopped".to_owned());
-            Err(Error::Profile("native roster worker stopped"))
+            Err(if joining {
+                Error::JoinAdmissionUnsettled
+            } else {
+                Error::Profile("native roster worker stopped")
+            })
         });
         Completed {
             pending: self,
@@ -885,7 +891,7 @@ impl NativeRoster {
         )?;
         let mut batch = store.batch()?;
         governance::check_removal_generation_in(&batch, sek, &pending.room, generation)?;
-        let committed = (|| {
+        let queued = (|| {
             batch.put_segment(
                 &pending.room,
                 SegmentKind::KeyMaterial,
@@ -897,11 +903,19 @@ impl NativeRoster {
                 SegmentKind::KeyMaterial,
                 SEG_BOARD_KEPT,
                 &board_seg,
-            )?;
-            batch.commit()
+            )
         })();
-        if let Err(error) = committed {
+        if let Err(error) = queued {
+            // Queued in a transaction that never commits: nothing of this admission is saved.
             return Err(self.failed(error));
+        }
+        if let Err(error) = batch.commit() {
+            // **A failed commit is not a join refused.** redb may report a commit error after
+            // the transaction became durable (`vendor/redb/src/transactions.rs`, `commit`), so
+            // this admission may be on disk: its joiner is told no definite refusal.
+            let _ = self.failed(error);
+            self.failure = Some(Error::JoinAdmissionUnsettled);
+            return Err(Error::JoinAdmissionUnsettled);
         }
         if let Some(wire) = wire {
             self.notices.insert(fingerprint, (at, wire));

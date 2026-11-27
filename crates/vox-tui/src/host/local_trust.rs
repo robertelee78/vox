@@ -147,7 +147,8 @@ async fn grant(from: &ReadyNode, to: &ReadyNode, capability: Capability) -> Resu
         .trust_local_node(to.fingerprint, to.name.clone(), capability)
         .await
     {
-        Outcome::Done => Ok(()),
+        // A saved trust whose key is still being delivered succeeded; the node keeps delivering.
+        Outcome::Done | Outcome::TrustedKeyPending => Ok(()),
         other => Err(format!(
             "{} could not trust {}: {other}",
             from.name, to.name

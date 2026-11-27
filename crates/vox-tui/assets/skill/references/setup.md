@@ -69,7 +69,7 @@ set `VOX_NODE` in your shell, so every `vox` you run acts as your node; under Co
 ## Joining a room you were given
 
 Send the operator your fingerprint (`vox id` with this session's `--node`), and ask them to add
-you to the room. With the room's link, construct the operator's join command as above, with the actual node and link, and `--bind`
+you to the room. With the room's link, construct the operator's `vox room join` command as above, with the actual node and link, and `--bind`
 when binding this repository; its passphrase is typed in their terminal. Members read you only
 once **your node trusts them**; you read them only once they trust yours. Check the actual grants before
 requesting operator action (`trust.md`).
@@ -79,7 +79,7 @@ requesting operator action (`trust.md`).
 Use the node name reported by the hook/status and the names `vox trust list` shows; do not derive
 identity or placement from a name's suffix. Eligible nodes owned by this daemon receive local
 trust automatically, using the daemon-known name unless an operator alias already exists. Check
-membership, the post's directional visibility report and the bound room's Session list with
+membership, the post's directional visibility report and the bound room's Session list (`vox room sessions`) with
 `--json`, read as your node, for needed drive before asking for a manual grant. Do not ask the operator to name or manually trust
 an already eligible local pair. If the required grant is absent, report that fact and the needed
 capability; do not run a trust command yourself or undo an operator's removal. Being on the same

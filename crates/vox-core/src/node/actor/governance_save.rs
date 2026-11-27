@@ -704,6 +704,13 @@ impl Node {
                         turn.ready = progress.ready;
                         turn.changed = progress.changed;
                         self.governance_work.again |= progress.pending;
+                        // A ready fold with queued pages left is local work the room's next turn
+                        // takes at once. The sweep that began this turn ended while it saved, so
+                        // `again` alone waited for an unrelated wake: after 2000 posted Sessions,
+                        // one page every two seconds.
+                        if progress.ready && progress.pending {
+                            self.governance_work.wake_room(room);
+                        }
                         if progress.ready && !progress.pending {
                             self.governance_work.settled.insert(room);
                             if self.key_package_governance_wait.remove(&room) {

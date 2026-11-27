@@ -331,7 +331,8 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String, String) {
 fn circuits(anchor: &Running) -> Option<usize> {
     anchor.said().lines().rev().find_map(|l| {
         let rest = l.split("vox node: ").nth(1)?;
-        let (_, after) = rest.split_once(" peer(s) connected, ")?;
+        let (_, after) = rest.split_once(" peer(s) connected [")?;
+        let (_, after) = after.split_once("], ")?;
         after.split_whitespace().next()?.parse().ok()
     })
 }

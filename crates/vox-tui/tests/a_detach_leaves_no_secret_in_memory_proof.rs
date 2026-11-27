@@ -18,7 +18,7 @@
 //! with `crates/vox-test-interpose` loaded, whose scan (`VOX_INTERPOSE_SCAN`) reports every copy
 //! of a byte string in the process's written memory on cue. It holds a node `keeper`, with a
 //! passphrase of its own that no scan looks for, so it is a daemon with something attached; bob's node is attached by bob's real
-//! `vox tui`, given his identity passphrase at its "Attach node" prompt
+//! `vox tui`, given his identity passphrase at its "Unlock node" prompt
 //! (`tests/pty/tui_attach_for_scan.py`). `VOX_TEST_SECRET_WORK_DELAY_MS` makes each blocking thread
 //! holding a secret wait, holding its inputs, before it works, so the detach lands while one runs.
 //! Per case: start the work, scan until the passphrase it was given shows up in the daemon's memory
@@ -28,9 +28,11 @@
 //! - **seal:** `vox room create`, the room passphrase; detached with `vox node detach bob`;
 //! - **check:** `vox trust add`, the identity passphrase typed at its prompt over a pty (a keyring
 //!   change takes it from nothing else, ADR-028 K-13), which it sends for the node to check;
-//! - **reopen:** bob's TUI attaches a node with a remembered room, and is stopped with SIGHUP while
-//!   that room reopens: the TUI was the node's last holder, so the node detaches once its attach is
-//!   done (L-3); the room passphrase;
+//! - **reopen:** bob's TUI unlocks a node with a remembered room, and is stopped with SIGHUP while
+//!   that room reopens; then bob locks the node (`vox node detach bob`). The TUI's unlock is a
+//!   remembered one that its going does not undo (`7f1cfa048`), so the node is locked by hand, as
+//!   a person does; the room passphrase. Asserted besides the scan: once the lock is done, `vox
+//!   node list` says bob is Locked;
 //! - **grind:** bob joins alice's room and his node's proof-of-work grind is held long
 //!   (`VOX_TEST_SOLVE_AT_LEAST_MS`); detached mid-grind; the room passphrase. Asserted besides the
 //!   scan: the detach is done within [`SETTLES`], not once the held grind ends.
@@ -93,8 +95,8 @@ const DELAY_MS: &str = "15000";
 
 /// `keeper`'s identity passphrase: every node has one (ADR-028 K-11); no scan looks for it.
 const KEEPER: &str = "keeper's identity passphrase";
-/// The same for the reopen case, where the attach's own passphrase check is held first and a scan
-/// of the daemon takes a second or so: long enough that the reopen is still held when it is seen.
+/// The same for the reopen case: a scan of the daemon takes a second or so, and the TUI goes before
+/// the lock is asked; long enough that the reopen is still held when the lock comes.
 const REOPEN_DELAY_MS: &str = "45000";
 /// How long the work has to show up in memory once started.
 const SHOWS_UP: Duration = Duration::from_secs(60);
@@ -414,7 +416,24 @@ impl Account {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let daemon = start_with(cmd, Some(&format!("{KEEPER}\n")));
+        let mut daemon = start_with(cmd, Some(&format!("{KEEPER}\n")));
+        // **Nothing is asked until the daemon started here serves.** A `vox node list` that finds
+        // no daemon answering starts one of its own (`7f1cfa048`), detached and with the list's
+        // environment (no scanner, no knob), and the two race for the account (ADR-026 D-1):
+        // asked too soon, it made the work run in a daemon no scan reads.
+        let serving = format!("vox daemon: serving (pid {})", daemon.0.id());
+        let log = self.dir.join(".daemon").join("log");
+        let t0 = Instant::now();
+        while !std::fs::read_to_string(&log).is_ok_and(|l| l.contains(&serving)) {
+            let exited = daemon.0.try_wait().staged();
+            assert!(
+                exited.is_none() && t0.elapsed() < Duration::from_secs(60),
+                "PRODUCT (staging): the daemon started here never said {serving:?} in {} (exited: \
+                 {exited:?})",
+                log.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let t0 = Instant::now();
         loop {
             let (ok, said) = run(&self.dir, "keeper", &["node", "list"]);
@@ -764,7 +783,9 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
             "PRODUCT (staging): vox room create failed"
         );
         tui.stop();
-        wait_detached(&account, "bob1's TUI quit");
+        // Unlocked at the TUI's prompt, the node is remembered and stays Ready when the TUI quits
+        // (`7f1cfa048`): bob locks it, so that his next unlock reopens the room.
+        lock_bob(&account, "bob1's TUI quit");
     }
     // The daemon again, now with each secret-holding thread slow: the reopen is held.
     drop(_daemon);
@@ -775,14 +796,13 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
     let before = scanner.scan();
     tui.submit();
     let during = scanner.until_more("room", before.of("room"));
-    assert!(
-        !tui.cues.join("attached").exists(),
-        "PRODUCT (staging): the TUI's node finished attaching, so the reopening was not in flight"
-    );
+    // The TUI's status bar says Ready once the identity opens (`7f1cfa048`); its rooms reopen after
+    // that, off the actor (#208, `c76df105e`). So whether the reopen is in flight is seen at the
+    // lock: it waits for it.
     let hup = Instant::now();
     tui.hang_up();
     let gone = hup.elapsed();
-    // Still held when the TUI had gone: the reopen was in flight when its last holder went.
+    // Still held when the TUI had gone: the reopen was in flight when the TUI went.
     let held = scanner.scan();
     println!(
         "[proof] reopen: the TUI was gone {gone:?} after SIGHUP; the room passphrase then: {} \
@@ -794,26 +814,36 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
         "PRODUCT (staging): the reopen had finished by the time the TUI went ({gone:?} after \
          SIGHUP), so nothing was in flight"
     );
-    let took = wait_detached(&account, "bob2's TUI went on SIGHUP mid-attach");
+    // **The person locks the node** the gone TUI had been unlocking, mid-reopen.
+    let asked = Instant::now();
+    let mut lock = account.detach_bob();
+    std::thread::sleep(Duration::from_secs(2));
+    let settled_first = lock.0.try_wait().staged().is_some();
+    let took = detached(lock, asked);
+    assert!(
+        !settled_first,
+        "PRODUCT (staging): the lock settled before the probe, so nothing was in flight"
+    );
+    locked(&account, "bob2's TUI went on SIGHUP mid-unlock", took);
     let after = scanner.scan();
     tui.stop();
     judge("reopen", "daemon", &before, &during, &after, took);
 }
 
-/// Wait until `vox node list` says bob is detached, within [`SHOWS_UP`] plus the held delay:
-/// how long that took. `PRODUCT` if it never does — the TUI was his node's last holder (L-3).
-fn wait_detached(account: &Account, after: &str) -> Duration {
-    let t0 = Instant::now();
-    let bound = SHOWS_UP + Duration::from_millis(REOPEN_DELAY_MS.parse().staged());
-    while !account.bob_detached() {
-        assert!(
-            t0.elapsed() < bound,
-            "PRODUCT: bob's node was still attached {bound:?} after {after}; the TUI was its last \
-             holder (ADR-026 L-3)"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    t0.elapsed()
+/// Lock bob's node by hand (`vox node detach bob`) and wait until that is done.
+fn lock_bob(account: &Account, after: &str) {
+    let took = detached(account.detach_bob(), Instant::now());
+    locked(account, after, took);
+}
+
+/// `PRODUCT` if `vox node list` does not say bob is Locked once his lock, asked after `after`, was
+/// done in `took`.
+fn locked(account: &Account, after: &str, took: Duration) {
+    assert!(
+        account.bob_detached(),
+        "PRODUCT: `vox node detach bob`, asked after {after}, was done in {took:?} and `vox node \
+         list` does not say bob is Locked"
+    );
 }
 
 /// Read `child`'s stdout until a line matches `wanted`; the line.

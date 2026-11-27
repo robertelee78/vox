@@ -97,7 +97,11 @@ pub(crate) async fn lookup(
 ) -> Result<Option<crate::node::channel::session_projection::Row>, String> {
     use crate::node::channel::session_projection::{Query, Reply};
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut view = handle.watch();
     loop {
+        // Read before the query, so a publication between its refusal and the wait below is
+        // not missed.
+        let seen = published(&view.borrow_and_update(), room);
         match handle
             .session_projection(
                 room,
@@ -119,11 +123,25 @@ pub(crate) async fn lookup(
             Err(reason)
                 if opening_refreshing(&reason) && tokio::time::Instant::now() < deadline =>
             {
-                tokio::task::yield_now().await
+                // The answer changes only when the room publishes more of its Sessions or of its
+                // governance: wait for that. Asked again at once, each query began a catch-up
+                // that took the room's save, about 3000 a second, and starved the governance
+                // turn the fold itself waits on (2000 posted Sessions listed none for minutes).
+                let moved = view.wait_for(|now| published(now, room) != seen);
+                let _ = tokio::time::timeout_at(deadline, async { drop(moved.await) }).await;
             }
             Err(reason) => return Err(reason),
         }
     }
+}
+
+/// What a refused Session lookup in `room` waits on: the room's published Sessions and
+/// governance revisions (`None` once the room is no longer open, which the next query says).
+fn published(view: &crate::node::api::NodeView, room: Digest32) -> Option<(Digest32, u64)> {
+    view.open_channels
+        .iter()
+        .find(|channel| channel.channel_id == room)
+        .map(|channel| (channel.session_revision, channel.governance_revision))
 }
 
 /// Read an exact open Session only when its published projection is current.

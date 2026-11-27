@@ -784,7 +784,7 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 |---|---|---|---|---|
 | `update_proof::an_older_release_updates_itself_and_refuses_a_bad_download` | A person on the previous release runs `vox update` and is not moved to the newest, or a download whose digest does not match its record is installed anyway (claims `journey.update_replaces_an_older_install` and `verify.digest_mismatch_is_refused`). It runs a binary GitHub already serves, so it measures that artifact as much as this tree. | `cargo test --release -p vox-tui --features optional-proofs --test update_proof -- --ignored --exact an_older_release_updates_itself_and_refuses_a_bad_download` | the network, `curl` and `gh` (it lists the releases); it accepts no gap, so an unreachable GitHub or no earlier release reads `CANNOT MEASURE` | not timed here |
 
-`update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
+`update_proof`'s blocking test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback` with nothing to roll back to, and is not optional. Its half that needs another compiled version is optional; see the next section but one.
 
 ### Rollback to a published older CLI (macOS, RG-9)
 
@@ -817,6 +817,103 @@ cargo test --release -p vox-tui --features test-knobs,optional-proofs \
 
 Every product process uses the proof's scratch HOME and data/config roots; no installed app
 or login item is involved. A fixture that is not older is an `APPARATUS` refusal.
+
+### Two genuinely compiled versions (`VOX_PROOF_NEXT_BINARY`)
+
+These journeys move an install, a daemon or a claim between this build and another genuinely
+compiled `vox`. The release gate supplies no second version, so they are optional and block
+neither CI nor release. Each needs `VOX_PROOF_NEXT_BINARY` naming a `vox` built from a copy of
+the same tree with the workspace version's first character changed to `9` (0.4.31 becomes
+9.4.31), with `cargo build --release --bin vox --features vox-tui/test-knobs`; a fixture saying
+any other version is an `APPARATUS` refusal. A patched version string is not a fixture. Every
+product process uses the proof's scratch HOME and data/config roots. None reads
+`VOX_PROOF_ALLOW_UNPROVEN`.
+
+| Proof | Helps troubleshoot |
+|---|---|
+| `a_rollback_survives_a_power_loss_proof::an_interrupted_rollback_is_finished_by_the_next_one` | A rollback cut short between its renames is refused afterwards ("no previous vox was retained") instead of finished, or a leftover copy is installed (#242). |
+| `update_proof::vox_update_moves_an_install_it_owns_to_another_compiled_version_and_back` | `vox update --rollback` to another version ignores `VOX_NO_SHELL_SETUP`; on macOS, a controlled Vox.app bundle is not updated, rolled back and rolled back again as a whole, or a forged record changes it (ADR-014 M-29). macOS also needs `codesign`, `ditto` and `PlistBuddy`. |
+| `update_proof::an_update_restarts_its_daemon_and_uses_a_different_local_version` | After `vox update` the daemon is not restarted onto the new version, or a node is left detached without being named (ADR-034 UP-1, UP-2). |
+| `update_proof::a_client_uses_another_package_version_with_the_same_control_protocol` | A client of another package version with the same control protocol is refused by the daemon (ADR-041 RS-12). |
+| `update_proof::a_claim_is_still_held_after_the_package_version_changes` | A claim made before an update is no longer held by its session afterwards (ADR-041 RS-10). |
+
+Run each separately, in release, for example:
+
+```sh
+VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox \
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test update_proof a_claim_is_still_held_after_the_package_version_changes \
+  -- --ignored --exact --nocapture
+```
+
+On macOS, `a_client_uses_another_package_version_with_the_same_control_protocol` and
+`a_claim_is_still_held_after_the_package_version_changes` also need the `test-knobs` scratch
+keychain the build provides (`VOX_TEST_KEYCHAIN`).
+
+### Root is told at once (Linux, ADR-026 C-1)
+
+`the_daemon_and_its_nodes_proof::root_is_told_at_once_that_it_cannot_use_the_daemon` runs
+`vox serve` and `vox daemon` as uid 0 in an unprivileged Linux user namespace
+(`unshare --user --map-root-user`, no sudo) and requires each to end within 10 s saying it runs
+as root and to run it as an ordinary user. macOS, where the release gate runs, cannot make root
+without sudo, so it is optional. It needs Linux with unprivileged user namespaces and
+`unshare` (util-linux) on `PATH`; a machine that refuses them reads `CANNOT MEASURE`.
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test the_daemon_and_its_nodes_proof root_is_told_at_once_that_it_cannot_use_the_daemon \
+  -- --ignored --exact --nocapture
+```
+
+### A v0.4.30 store opened by this build (the update from v0.4.30)
+
+These proofs open a store a v0.4.30 `vox` left behind: store schema 1, with no MP-6 or MP-11. They
+check that nothing is lost or misread, and that a removed member's later posts leave. Updating from
+v0.4.30 is in scope for this release. The release gate keeps no such store and no such binary, so
+the proofs are optional. Each one names its fixture and refuses with `APPARATUS` when the fixture
+is missing or the wrong shape. None reads `VOX_PROOF_ALLOW_UNPROVEN`.
+
+| Proof | Helps troubleshoot | Needs |
+|---|---|---|
+| `retention_proof::old_small_rows_move_atomically_when_their_room_opens` | A v0.4.30 room's small rows are lost, duplicated or changed by the move into the shared table (store schema 2) when a SIGKILL interrupts it, or Sessions, roster or admins differ after two restarts. | `VOX_PROOF_OLD_STORE`, `test-knobs` |
+| `retention_proof::a_failed_small_row_move_keeps_the_room_readable_and_retries` | A move that fails on a full disk keeps the room closed or hides a post, or the move is not resumed at the next open. | `VOX_PROOF_OLD_STORE`, `test-knobs` |
+| `retention_proof::old_128_item_locator_pages_read_and_split_when_rewritten` | v0.4.30's 128-item locator pages are not read, or a rewritten page still needs an oversized allocation. | `VOX_PROOF_OLD_LOCATORS` |
+| `a_room_can_be_left_and_ended_proof::a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open` | A post that the member's own completed removal decision refuses is still shown after the update, or the posts the remover had read disappear (ADR-053 MP-6, MP-11). | `VOX_PROOF_BASE_BINARY`, `test-knobs` |
+
+Fixtures:
+
+- `VOX_PROOF_OLD_STORE` is a directory holding a stopped profile written by a store-schema-1 `vox`.
+  - It contains the data root itself, with `cfg/` inside it; `.daemon/` and `proof.keychain-db` are not copied.
+  - The identity passphrase is the proof's `IDENTITY`.
+  - It holds one room with the 160 `PACKED-ROW-nnnn-` posts and their `Packed nnnn` Sessions, and at least 80 B-tree leaves that each hold a single small row.
+  - A file `proof-room` names the room.
+  - `tiny_rows_share_leaves_beside_large_values` writes exactly this when `VOX_PROOF_OLD_STORE` names a directory. It writes it after its staging and before its own schema-2 assertion. So the fixture comes from running that test with a harness whose `vox` writes schema 1, for example this proof file built at `afa78a1ae^` with `test-knobs`. Where the schema-2 assertion then fails, that is expected. This was not tried for v0.4.31.
+- `VOX_PROOF_OLD_LOCATORS` is the same kind of directory. It is written by `locator_pages_fit_one_physical_page` (128 `LEGACY-LOCATOR-nnnn` rows, `proof-room`) under a schema-1 `vox` whose locator pages hold 128 items.
+- `VOX_PROOF_BASE_BINARY` is a `vox` built before MP-6 and MP-11, for example tag `v0.4.30` (`8d71ab337`) built with `cargo build --release --bin vox --features vox-tui/test-knobs`. Every process the act starts uses its scratch roots.
+
+What this machine already has does not fit as it stands (checked by reading, not run):
+
+- `/opt/vox-evidence/v0431/simple-sync/upgrade/v0430/vox-aarch64-apple-darwin` is the published v0.4.30 asset. It is genuinely schema 1 and genuinely before MP-6 and MP-11. It is built without `test-knobs`: it contains no `VOX_TEST_KEYCHAIN`, so the proofs' scratch-keychain knob does not reach it on macOS. It is the right version for `VOX_PROOF_BASE_BINARY`, but use a `test-knobs` build of `v0.4.30` instead. It cannot write either store fixture by itself, because those come from this proof's own staging.
+- `/opt/vox-evidence/v0431/simple-sync/upgrade/run1-before/` is a pristine v0.4.30 data set of three nodes and an anchor (`a/`, `b/`, `c/`, `anchor/`, each with `data/` and `cfg/` side by side, its own `*.pass`, and `room.id`). It is real v0.4.30 data for the update journey. It is not the shape these acts read:
+  - It has no `proof-room`.
+  - `cfg/` is not inside the data root.
+  - Its passphrases are not the proof's.
+  - It has no `PACKED-ROW` or `LEGACY-LOCATOR` rows.
+  - It does not promise the single-row leaves or a 128-item page.
+
+Run each separately, in release, for example:
+
+```sh
+VOX_PROOF_OLD_STORE=/absolute/stopped-schema-1-profile \
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test retention_proof old_small_rows_move_atomically_when_their_room_opens \
+  -- --ignored --exact --nocapture
+VOX_PROOF_BASE_BINARY=/absolute/v0.4.30-test-knobs/vox \
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test a_room_can_be_left_and_ended_proof \
+  a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open \
+  -- --ignored --exact --nocapture
+```
 
 ### Computer convergence journeys
 
@@ -1188,7 +1285,7 @@ its measured apparatus cost reported before another run, not a false product-tim
 cargo test --release -p vox-tui --features test-knobs --test install_sh_proof \
   install_sh_installs_what_it_verified_and_refuses_what_it_could_not -- --exact --nocapture
 VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
-  --features test-knobs --test update_proof \
+  --features test-knobs,optional-proofs --test update_proof \
   an_update_restarts_its_daemon_and_uses_a_different_local_version -- --ignored --exact --nocapture
 ```
 

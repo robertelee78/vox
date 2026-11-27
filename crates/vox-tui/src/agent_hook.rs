@@ -188,6 +188,79 @@ async fn check_native_notice(
     Ok(())
 }
 
+/// The notice an OpenCode turn was started by: its id and route as the Vox TUI receiver put them
+/// on the notice's message, passed by Vox's plugin. Only the exact notice Vox sealed for this
+/// Session on that route can be admitted with them; they select nothing else.
+fn opencode_notice() -> Option<([u8; 16], Digest32)> {
+    fn hex<const N: usize>(name: &str) -> Option<[u8; N]> {
+        let text = std::env::var(name).ok()?;
+        if text.len() != N * 2 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut bytes = [0; N];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(bytes)
+    }
+    Some((
+        hex("VOX_OPENCODE_NOTICE")?,
+        hex("VOX_OPENCODE_NOTICE_ROUTE")?,
+    ))
+}
+
+/// Admit `notice` for this exact OpenCode Session in `room`: the wake it records is what the
+/// Session's next post without `--re` answers (ADR-020 §9.4, V210-121).
+async fn admit_opencode_notice(
+    paths: &Paths,
+    owner: Digest32,
+    room: Digest32,
+    session: &str,
+    (notice_id, route): ([u8; 16], Digest32),
+) -> Result<(), AppError> {
+    use vox_core::node::attention::{local, Operation, Reply};
+    let at = crate::client::one_shot(paths)?;
+    let recipient = match local(
+        &at,
+        owner,
+        room,
+        None,
+        Operation::Resolve {
+            session: session.to_owned(),
+        },
+    )
+    .await
+    .map_err(AppError::Usage)?
+    {
+        Reply::Resolved { recipient, .. } => recipient,
+        _ => {
+            return Err(AppError::Usage(
+                "unexpected OpenCode attention selection answer".into(),
+            ))
+        }
+    };
+    let instance = recipient.instance;
+    match local(
+        &at,
+        owner,
+        room,
+        Some(instance),
+        Operation::Admit {
+            recipient,
+            notice_id,
+            route,
+        },
+    )
+    .await
+    .map_err(AppError::Usage)?
+    {
+        Reply::Done => Ok(()),
+        _ => Err(AppError::Usage(
+            "unexpected OpenCode attention admission answer".into(),
+        )),
+    }
+}
+
 fn omp_route_matches(saved: &crate::wake::Session) -> bool {
     let route = crate::wake::Session::from_env(&saved.session, false);
     saved.harness == "omp"
@@ -671,12 +744,24 @@ async fn notice_pending(
     {
         Ok(Reply::Resolved { notice_pending, .. }) => Ok(notice_pending),
         // Manual/headless hooks have no private Session obligation, but still read room news.
-        Err(reason) if reason == "the selected Session is no longer open" => Ok(false),
+        Err(reason) if not_a_recipient(&reason) => Ok(false),
         Err(reason) => Err(AppError::Usage(reason)),
         _ => Err(AppError::Usage(
             "unexpected attention reservation answer".into(),
         )),
     }
+}
+
+/// Whether the node's refusal to resolve this session's attention says it has no attention
+/// recipient now: its Session is no longer open (a manual or headless hook has none), or its
+/// opening is not yet folded. The registration opens the Session in the background and attention
+/// never waits on the saved-Sessions refresh (ADR-037 R4), so until then no notice to it can be
+/// pending and nothing it is shown can be owed to it: the turn takes its room news regardless.
+fn not_a_recipient(reason: &str) -> bool {
+    matches!(
+        reason,
+        "the selected Session is no longer open" | "the room is refreshing saved Sessions; retry"
+    )
 }
 
 /// Read this session's cursor for `room`, if it has one: the first line of its cursor file, a
@@ -1483,11 +1568,11 @@ fn preview_line(text: &str) -> String {
 pub(crate) fn addressed(
     text: &str,
     me: Option<&Digest32>,
-    trusted: &[(Digest32, String)],
+    keyring: crate::ident::Keyring<'_>,
 ) -> String {
     match vox_agentcomms::envelope::Envelope::parse(text) {
         Ok(e) if !e.to.is_empty() => {
-            format!("to {}", crate::ident::recipients(&e.to, me, trusted))
+            format!("to {}", crate::ident::recipients(&e.to, me, keyring))
         }
         _ => String::new(),
     }
@@ -2500,6 +2585,7 @@ pub async fn run(
             Err(
                 u @ (Unregistered::NoDaemon(_)
                 | Unregistered::Attaching(_)
+                | Unregistered::Starting(_)
                 | Unregistered::DaemonUnanswered
                 | Unregistered::Temporary(_)
                 | Unregistered::Version(_)),
@@ -2562,6 +2648,9 @@ pub(crate) enum Unregistered {
     NoDaemon(String),
     /// The hook's node is being attached by the daemon's start (a kept node), not yet done.
     Attaching(vox_core::node::paths::NodeName),
+    /// The daemon this hook started has not answered yet, so whether the node is kept or locked
+    /// is not known here; only the daemon's answer says that.
+    Starting(vox_core::node::paths::NodeName),
     /// A daemon owns the local socket but did not answer within the hook's short bound.
     DaemonUnanswered,
     /// A local daemon of another release is refused before any request.
@@ -2635,6 +2724,7 @@ impl Unregistered {
                 | Self::NoNode(_)
                 | Self::NoDaemon(_)
                 | Self::Attaching(_)
+                | Self::Starting(_)
                 | Self::DaemonUnanswered
                 | Self::Temporary(_)
         )
@@ -2663,6 +2753,10 @@ impl Unregistered {
             Self::Attaching(node) => format!(
                 "Vox is preparing node {node}; this session joins it once it is Ready, and \
                  your rooms show from your next turn."
+            ),
+            Self::Starting(node) => format!(
+                "Vox's daemon has not answered yet; try again next turn. This session can join \
+                 node {node} once it is Ready."
             ),
             Self::DaemonUnanswered => "Vox could not read your rooms because the vox daemon here \
                  did not answer promptly; try again next turn, and ask the operator to restart it \
@@ -2973,7 +3067,7 @@ impl Daemon {
             // The saved record carries no unproved authority; this live turn still presents it.
             record.tmux_claim = claim;
             if !restarting {
-                return Err(Unregistered::Attaching(self.node.clone()));
+                return Err(Unregistered::Starting(self.node.clone()));
             }
         }
         let record = serde_json::to_string(&record)
@@ -3569,6 +3663,24 @@ async fn drain(
             return Ok(());
         }
     }
+    // **An OpenCode notice is admitted by the turn it starts, before anything is read** (ADR-020
+    // §9.4, V210-121), as Claude's native hook and OMP's prepare hook admit theirs. The client
+    // submits the notice and acknowledges it only once OpenCode has run that turn, whose drain
+    // below delivers the notice's sources and so retires the notice; admitted after that, it
+    // would be stale, and the wake never recorded.
+    if let (Some(room), Some(me), Some(notice)) = (
+        selected_room,
+        me,
+        opencode_notice()
+            .filter(|_| format == Format::OpenCode && input.omp_registration.is_none()),
+    ) {
+        if let Err(error) = admit_opencode_notice(paths, me, room, &input.session_id, notice).await
+        {
+            // A retried model request carries the notice again, already admitted. The turn
+            // still reads its room: the notice is in the conversation either way.
+            eprintln!("vox agent hook: the Vox notice of this turn was not admitted: {error}");
+        }
+    }
     let mut drains = Vec::new();
     let mut joined = Vec::new();
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
@@ -3842,7 +3954,7 @@ async fn drain(
                 .await
                 {
                     Ok(Reply::Resolved { recipient, .. }) => recipient,
-                    Err(reason) if reason == "the selected Session is no longer open" => continue,
+                    Err(reason) if not_a_recipient(&reason) => continue,
                     Err(reason) => {
                         cancel_attention_receipts(paths, owner, &attention_receipts).await;
                         return Err(AppError::Usage(reason));

@@ -940,8 +940,10 @@ export default {
         // Whether this message is a wake notice Vox relayed, not something the operator typed:
         // its metadata is one this session was relayed and has not had a turn on yet. It is
         // supplied by our actual TUI receiver; room text and operator typing cannot
-        // synthesize it. It labels source; it grants no room/drive permission and is not an
-        // admission credential.
+        // synthesize it. It labels source and grants no room/drive permission. Its id and route
+        // name the notice, which the hook admits for this exact Session before it reads, as
+        // Claude's hook admits the reference in its prompt: only the notice Vox sealed for this
+        // Session on that route matches them (ADR-020 §9.4).
         const origin = message.metadata?.vox_attention ?? typed.metadata?.vox_attention
         const isWake = origin?.source === "vox"
           && /^[0-9a-f]{64}$/.test(origin.client ?? "")
@@ -958,6 +960,12 @@ export default {
         delete env.VOX_OPENCODE_ATTENTION_SOCKET
         delete env.VOX_OPENCODE_ATTENTION_TOKEN
         delete env.VOX_OPENCODE_ATTENTION_ROUTE
+        delete env.VOX_OPENCODE_NOTICE
+        delete env.VOX_OPENCODE_NOTICE_ROUTE
+        if (isWake) {
+          env.VOX_OPENCODE_NOTICE = origin.id
+          env.VOX_OPENCODE_NOTICE_ROUTE = origin.route
+        }
         const attention = HEADLESS ? null : await attentionRoute(sessionID, ctx.location?.directory ?? process.cwd())
         if (attention) {
           env.VOX_OPENCODE_ATTENTION_SOCKET = attention.socket

@@ -172,6 +172,7 @@ impl<'a, S: Input> Reader<'a, S> {
         let mut bytes = 0u64;
         let mut hash = Sha256::new();
         let mut saved = Some(String::new());
+        let (mut one_line, mut blank) = (true, true);
         while let Some(character) = self.character()? {
             let mut encoded = [0; 4];
             let text = character.encode_utf8(&mut encoded);
@@ -179,6 +180,8 @@ impl<'a, S: Input> Reader<'a, S> {
                 .checked_add(text.len() as u64)
                 .ok_or_else(|| invalid("Session metadata length exhausted"))?;
             hash.update(text.as_bytes());
+            one_line &= !vox_agentcomms::envelope::breaks_lines(character);
+            blank &= character.is_whitespace();
             if let Some(s) = &mut saved {
                 if s.len().saturating_add(text.len()) <= small {
                     s.push_str(text);
@@ -193,6 +196,8 @@ impl<'a, S: Input> Reader<'a, S> {
             bytes,
             hash: hash.finalize().into(),
             small: saved,
+            one_line,
+            blank,
         })
     }
 }
@@ -204,6 +209,10 @@ pub(super) struct StringRef {
     pub bytes: u64,
     pub hash: Digest32,
     pub small: Option<String>,
+    /// No character of it would break or reorder a line (`breaks_lines`).
+    pub one_line: bool,
+    /// Empty, or whitespace alone (what `str::trim` leaves empty).
+    pub blank: bool,
 }
 
 pub(super) struct TextPage {

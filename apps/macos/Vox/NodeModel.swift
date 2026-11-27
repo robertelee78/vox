@@ -3575,6 +3575,12 @@ final class NodeModel: ObservableObject {
         try await client.roster(room: room)
     }
 
+    /// The keyring as the node gives it now. While it applies a new computer trust revision the
+    /// node says so instead of giving a list, and that refusal is what the caller shows.
+    func currentKeyring() async throws -> [TrustedNode] {
+        try await client.trustList()
+    }
+
     /// What listens on this Mac, as one-step sharing lists it (S-4).
     func listeningHere() async throws -> ListeningServices {
         try await client.listening()
@@ -4456,7 +4462,10 @@ private final class Listener: ClientListener {
 
 // A room's Sessions (ADR-029): read when one is shown, and again when the node says it changed.
 extension NodeModel {
-    /// One open page and one history page are retained, never the complete descriptor log.
+    /// One open page and one history page are retained, never the complete descriptor log. A
+    /// page continuing after a Session that has left the listing (its node lost Drive, for the
+    /// open tabs, or left the room) is refused as changed however often it is asked: the listing
+    /// then starts over from its first pages, through the same fences, and replaces these rows.
     func refreshSessionMetadata() async {
         guard let room = roomOnScreen else { return }
         let epoch = nodeObservationEpoch, generation = roomReadGeneration, token = UUID()
@@ -4475,6 +4484,13 @@ extension NodeModel {
         } catch {
             guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
                   generation == roomReadGeneration, roomOnScreen == room else { return }
+            if liveAfter != nil || historyAfter != nil, case let VoxError.Failed(reason) = error,
+               reason == "the room's Sessions changed; refresh the listing" {
+                sessionsOpenAfter = nil
+                sessionsHistoryAfter = nil
+                await refreshSessionMetadata()
+                return
+            }
             invalidateSessionPause()
             invalidateSessionAttention()
             reportBackground(error)

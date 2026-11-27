@@ -421,14 +421,30 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         !issued.contains(&format!("a={anchor_id}")),
         "PRODUCT: room link carried the hand-added machine anchor: {issued:?}"
     );
-    // An explicitly supplied room-link anchor is permitted existing input. Keep only
-    // the original room/responder pin, then provide that anchor at its current address.
-    // Removing Alice's directly reachable member address forces Bob through the anchor.
-    let (base, _) = only_anchor(issued, anchor_id);
+    // A link's anchor is a rendezvous hint, never the room's (3c3208aa1, #781): a room's anchors
+    // are its signed statement, which the joiner adopts. So alice names the moved anchor as the
+    // room's, at its current address, and the link then carries it. Keep only that anchor and the
+    // room/responder pin: removing Alice's directly reachable member address forces Bob through
+    // the anchor.
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["room", "anchors", &room, "add", real_spec.as_str()],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox room anchors {room} add` failed: {out}{err}"
+    );
+    let (ok, issued, err) = vox(&data, &cfg, &["room", "link", &room]);
+    assert!(ok, "PRODUCT: room link failed: {err}");
+    let (link, _) = only_anchor(issued.trim(), anchor_id);
+    assert!(
+        link.contains(&format!("a={anchor_id}")),
+        "PRODUCT (staging): the room's link does not name the room's anchor: {issued:?}"
+    );
     let (_, address) = real_spec
         .split_once('@')
         .expect("APPARATUS: anchor spec was checked above");
-    let link = format!("{base}&a={anchor_id}&b={address}");
     if bad_line {
         let stderr = std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default();
         let named = stderr
@@ -513,12 +529,31 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
 
-    let (ok, bob_list, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
-    assert!(ok, "PRODUCT: Bob's anchor list failed after joining: {err}");
-    let bob_projection: serde_json::Value =
-        serde_json::from_str(&bob_list).unwrap_or_else(|error| {
-            panic!("PRODUCT: Bob's anchor list returned invalid JSON: {error}: {bob_list:?}")
-        });
+    // The room's anchors reach Bob with its signed governance, after the join's own rendezvous
+    // (3c3208aa1, #781: "Until that history arrives, no room anchors are known"), so his
+    // machine list names the anchor once that history has arrived, not at the join's return.
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    let (bob_list, bob_projection) = loop {
+        let (ok, bob_list, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+        assert!(ok, "PRODUCT: Bob's anchor list failed after joining: {err}");
+        let bob_projection: serde_json::Value =
+            serde_json::from_str(&bob_list).unwrap_or_else(|error| {
+                panic!("PRODUCT: Bob's anchor list returned invalid JSON: {error}: {bob_list:?}")
+            });
+        if bob_projection["anchors"].as_array().is_some_and(|anchors| {
+            anchors
+                .iter()
+                .any(|anchor| anchor["fingerprint"] == anchor_id)
+        }) {
+            break (bob_list, bob_projection);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: within {READ_PATIENCE:?} of joining, Bob's machine list never named the \
+             room's anchor: {bob_list:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     let learned = bob_projection["anchors"]
         .as_array()
         .and_then(|anchors| {
@@ -526,9 +561,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
                 .iter()
                 .find(|anchor| anchor["fingerprint"] == anchor_id)
         })
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: Bob's machine list omitted the room-link anchor: {bob_list:?}")
-        });
+        .expect("found above");
     let sources = learned["sources"]
         .as_array()
         .unwrap_or_else(|| panic!("PRODUCT: Bob's room-link anchor has no sources: {bob_list:?}"));
@@ -723,11 +756,30 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
 
-    // A second local copy of the same room may hold a different address observation. Supply
-    // that input through the public join command, just as Bob's invitation supplied its anchor.
-    // The extra, old address need not answer: the link still carries the real current route.
+    // A second local copy of the same room may hold a different address observation. A link's
+    // `b=` is a rendezvous hint, never the room's (3c3208aa1, #781): what a copy observes is the
+    // room's signed anchor statement. So alice's statement names an extra, old address for the
+    // anchor while Dave joins, and no longer once his copy is locked. The extra address need not
+    // answer: the statement still carries the real current route.
     let extra_address = format!("/ip4/127.0.0.1/udp/{}", dead_ports[0]);
-    let dave_link = format!("{link}&b={extra_address}");
+    let extra_spec = format!("{anchor_id}@{extra_address}");
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "anchors",
+            &room,
+            "add",
+            real_spec.as_str(),
+            &extra_spec,
+        ],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox room anchors {room} add` of the extra address failed: \
+         {out}{err}"
+    );
     let (ok, out, err) = vox_stdin(
         &bob_data,
         &bob_cfg,
@@ -738,7 +790,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             "dave",
             "--passphrase-file",
             "-",
-            &dave_link,
+            &link,
         ],
         Some(ROOM_PASS),
     );
@@ -746,7 +798,26 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         ok,
         "PRODUCT: Dave could not join Bob's room on the same daemon: {out}{err}"
     );
-    let mut union_addresses = vec![address.to_owned(), extra_address];
+    // Where each copy stands is what its own `vox room link` names as the room's anchors.
+    let names_extra = |node: &str| {
+        let (ok, out, err) = vox(
+            &bob_data,
+            &bob_cfg,
+            &["room", "link", "--node", node, &room],
+        );
+        assert!(ok, "PRODUCT: {node}'s `vox room link` failed: {out}{err}");
+        out.contains(&format!("b={extra_address}"))
+    };
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    while !names_extra("dave") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: within {READ_PATIENCE:?}, Dave's copy of the room never named the \
+             anchor's extra address its signed statement gives"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let mut union_addresses = vec![address.to_owned(), extra_address.clone()];
     union_addresses.sort();
     let union_addresses = serde_json::json!(union_addresses);
     let joined = machine_list(&bob_data, &bob_cfg);
@@ -763,6 +834,27 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         ok,
         "PRODUCT: locking Dave's shared-room copy failed: {out}{err}"
     );
+    // The statement names the real address alone again: Bob's live copy follows it, Dave's
+    // locked copy keeps the extra address it last observed.
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["room", "anchors", &room, "add", real_spec.as_str()],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox room anchors {room} add` of the real address alone \
+         failed: {out}{err}"
+    );
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    while names_extra("default") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: within {READ_PATIENCE:?}, Bob's live copy of the room still named the \
+             anchor's extra address the room's signed statement no longer gives"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 
     // Bob observes the rename live while Dave keeps the old name and extra address on disk.
     // The union must keep that address, prefer the live name, and still say it is last-known.
@@ -891,7 +983,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     assert!(
         ok && ["default", "dave"].iter().all(|node| nodes
             .lines()
-            .any(|line| line.split_whitespace().take(2).eq([*node, "detached"]))),
+            .any(|line| line.split_whitespace().take(2).eq([*node, "Locked"]))),
         "PRODUCT: reading saved anchor provenance unlocked a node: {nodes}{err}"
     );
     println!("[proof] a restarted daemon lists the saved room while its node stays locked");

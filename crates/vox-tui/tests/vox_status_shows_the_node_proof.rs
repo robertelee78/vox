@@ -1138,9 +1138,11 @@ enum WindowScene {
     Offline,
 }
 
-/// The archive is deliberately never requested. The verdict is the reader's real status,
-/// after it shows every post in the newest 128 feed positions and completes three more
-/// room exchanges.
+/// No history is ever requested. A newcomer shows every post in the newest 128 feed positions
+/// and never the archive below them; a reader that was away while the posts were made owes every
+/// one of them from where it already held, and shows all of them unasked, newest first (ADR-052
+/// RG-6, ADR-053 MP-12, ADR-054 PL-3). The verdict is the reader's real status, after it shows
+/// that and its status clock crosses the receipt threshold.
 fn sparse_live_window_reads_healthy(scene: WindowScene) {
     let offline = matches!(scene, WindowScene::Offline);
     use vox_core::node::ipc::{Frame, Request};
@@ -1243,32 +1245,39 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
             .unwrap_or(head);
         // The 180 consecutive posts end at `head`: post 52 starts its newest 128 entries.
         // A newcomer can make the author append a key package, moving that floor forward.
-        let first_post = 52 + advertised.saturating_sub(head) as usize;
+        // A reader that was away owes all 180.
+        let first_post = if offline {
+            0
+        } else {
+            52 + advertised.saturating_sub(head) as usize
+        };
         let shown =
             (first_post..180).all(|number| read.contains(&format!("live-window-post-{number:03}")));
         if shown {
             assert!(
-                !read.contains("live-window-post-000"),
+                offline || !read.contains("live-window-post-000"),
                 "APPARATUS: the on-demand archive was fetched without being requested: {read}"
             );
             break snapshot;
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let member = snapshot["rooms"][0]["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|member| member["id"] == w.host_fp)
-        .unwrap();
-    assert!(
-        member["verified_through"].as_u64().unwrap_or(0) < head.saturating_sub(128),
-        "APPARATUS: the reader has no deliberate contiguous archive gap: {member}"
-    );
+    if !offline {
+        let member = snapshot["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == w.host_fp)
+            .unwrap();
+        assert!(
+            member["verified_through"].as_u64().unwrap_or(0) < head.saturating_sub(128),
+            "APPARATUS: the reader has no deliberate contiguous archive gap: {member}"
+        );
+    }
     receipt_mutant_witness(&snapshot, restarted.as_mut());
     receipt_observation(&reader, "fully received live window");
     let text = status_text(&reader, "sparse reader");
-    eprintln!("[proof] offline={offline}, author's feed head={head}, newest live-window posts shown, archive absent:\n{text}\n{snapshot}");
+    eprintln!("[proof] offline={offline}, author's feed head={head}, every post owed shown, none requested:\n{text}\n{snapshot}");
     assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
         "PRODUCT: reader offline={offline} holds its live window, but status counts the unrequested archive as missing:\n{text}");
     drop(restarted);

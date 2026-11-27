@@ -520,7 +520,12 @@ impl Node {
         }
     }
 
-    pub(super) async fn complete_identity_startup(&mut self) {
+    pub(super) fn complete_identity_startup(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.complete_identity_startup_unboxed())
+    }
+
+    /// [`Self::complete_identity_startup`], unboxed: see [`Boxed`].
+    async fn complete_identity_startup_unboxed(&mut self) {
         let ready = self.pending_startup.as_ref().is_some_and(|pending| {
             pending
                 .result

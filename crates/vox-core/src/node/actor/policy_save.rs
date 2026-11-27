@@ -280,7 +280,12 @@ impl Node {
         true
     }
 
-    pub(super) async fn complete_pending_policies(&mut self) {
+    pub(super) fn complete_pending_policies(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.complete_pending_policies_unboxed())
+    }
+
+    /// [`Self::complete_pending_policies`], unboxed: see [`Boxed`].
+    async fn complete_pending_policies_unboxed(&mut self) {
         let Some(pending) = self.pending_policy.take() else {
             return;
         };
@@ -412,7 +417,14 @@ impl Node {
                 match consent_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                        // The trust is saved by now: a delivery refused because a save holds
+                        // publication ("room publication is busy") changed nothing of that, and
+                        // the owed key goes out with the node's later delivery passes. The
+                        // request succeeded; the pending delivery is said as a note.
+                        let _ = reply.send(match fault_of(&error) {
+                            Fault::RoomChangePending => Outcome::TrustedKeyPending,
+                            fault => Outcome::Failed(fault),
+                        });
                         return;
                     }
                     Err(_) => {

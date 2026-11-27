@@ -81,7 +81,9 @@ mod ipc_omp_media;
 /// 10: `Using` identifies the attachment incarnation; derived connections can require it.
 /// 11: stale-safe operator repository decision and replacement requests; typed registration
 /// refusals distinguish retryable mutations from invalid ownership.
-pub const PROTOCOL_VERSION: u64 = 11;
+/// 12: the node snapshot reply says whether its keyring is known (13 fields; v0.4.30 read 12), so
+/// a client of another build is refused at the handshake instead of failing to read node state.
+pub const PROTOCOL_VERSION: u64 = 12;
 
 /// Largest frame accepted in either direction.
 ///
@@ -249,6 +251,8 @@ const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 /// [`Frame::JoinedRecovering`].
 const T_JOINED_RECOVERING: u64 = 11650010;
+/// [`Frame::TrustedKeyPending`].
+const T_TRUSTED_KEY_PENDING: u64 = 11650011;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_HISTORY_DEMAND_REQ: u64 = 94101;
@@ -1367,6 +1371,10 @@ pub const MAX_ROOM_SELECTION: usize = 128;
 /// this refusal; a changed selection or failed authority check must remain a failure.
 pub const ROOM_VIEW_CHUNK_TOO_LARGE: &str =
     "the selected room chunk exceeds its byte budget; request fewer messages";
+/// A room's Sessions changed while a Session answer was read (each answer is read under one
+/// revision), or since the revision a continuing cursor names. A selection that carries no
+/// revision is read again ([`IpcClient::session_selection`]); a stale cursor starts over.
+pub const SESSIONS_CHANGED: &str = "the room's Sessions changed; refresh the listing";
 
 #[path = "ipc_governance.rs"]
 mod governance_page;
@@ -3465,6 +3473,9 @@ pub enum Frame {
     /// A join succeeded, and this node's own history in the room is still being recovered
     /// ([`crate::node::api::Outcome::JoinedRecovering`]).
     JoinedRecovering,
+    /// A trust succeeded, and a key it owes is still being delivered
+    /// ([`crate::node::api::Outcome::TrustedKeyPending`]).
+    TrustedKeyPending,
     /// A request failed. The reason is for a person to read, not to branch on.
     Error {
         /// Why it failed.
@@ -3876,6 +3887,9 @@ impl Frame {
             }
             Frame::JoinedRecovering => {
                 e.array(1).uint(T_JOINED_RECOVERING);
+            }
+            Frame::TrustedKeyPending => {
+                e.array(1).uint(T_TRUSTED_KEY_PENDING);
             }
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
@@ -4738,6 +4752,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         }
         (T_OK, 1) => return Ok(Frame::Ok),
         (T_JOINED_RECOVERING, 1) => return Ok(Frame::JoinedRecovering),
+        (T_TRUSTED_KEY_PENDING, 1) => return Ok(Frame::TrustedKeyPending),
         (T_ERROR, 2) => {
             return Ok(Frame::Error {
                 reason: d
@@ -6555,14 +6570,14 @@ async fn write_sessions(
                 writing,
             )
             .await?;
-            if field.is_none_or(|f| f.bytes == 0) {
+            let Some(listed) = field.filter(|f| f.bytes != 0) else {
                 continue;
-            }
+            };
             let mut after = None;
             let mut sent = 0u64;
             loop {
                 let answer = tokio::select! {
-                    result = handle.session_projection(room, Query::Text { opening: row.opening, field: which, after, revision: revision.clone() }) => result,
+                    result = handle.session_projection(room, Query::Text { opening: row.opening, field: which, listed, after, revision: revision.clone() }) => result,
                     () = subscriber_gone(stream) => return Ok(false),
                 };
                 let page = match answer {
@@ -6593,18 +6608,6 @@ async fn write_sessions(
                 return Err(Error::MalformedIpc("Session field length changed"));
             }
         }
-        let checked = tokio::select! {
-            result = handle.session_projection(room, Query::Validate { revision: revision.clone() }) => result,
-            () = subscriber_gone(stream) => return Ok(false),
-        };
-        match checked {
-            Ok(Reply::Valid) => {}
-            Ok(_) => return Err(Error::MalformedIpc("unexpected Session revision answer")),
-            Err(reason) => {
-                found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
-                return Ok(true);
-            }
-        }
         if !whole && cursors.is_none() {
             if row.can_drive {
                 let summary = tokio::select! {
@@ -6621,6 +6624,20 @@ async fn write_sessions(
                 }
             } else {
                 summaries.push(None);
+            }
+        }
+        // Last, after its text and summary were read: the row is still the one listed (retained,
+        // its author's standing, ended as listed), or the page is refused as changed.
+        let checked = tokio::select! {
+            result = handle.session_projection(room, Query::Validate { opening: row.opening, ended: row.ended, revision: revision.clone() }) => result,
+            () = subscriber_gone(stream) => return Ok(false),
+        };
+        match checked {
+            Ok(Reply::Valid) => {}
+            Ok(_) => return Err(Error::MalformedIpc("unexpected Session revision answer")),
+            Err(reason) => {
+                found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                return Ok(true);
             }
         }
         let mut suffix = Encoder::new();
@@ -8429,6 +8446,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                crate::node::api::Outcome::TrustedKeyPending => Frame::TrustedKeyPending,
                 other => Frame::Error {
                     reason: other.to_string(),
                 },
@@ -8637,12 +8655,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::TrustList { after, .. } => {
             handle.reconcile_local_folders();
-            let view = handle.view();
-            let rows = view
-                .trusted
+            // Never an empty list for a keyring that is not known: every reader (`vox trust
+            // list` and the commands that check the keyring first, the app) says why instead.
+            let crate::node::api::Keyring { trusted, drive } = match handle.keyring() {
+                Ok(keyring) => keyring,
+                Err(unknown) => {
+                    return Frame::Error {
+                        reason: unknown.explain().into(),
+                    }
+                }
+            };
+            let rows = trusted
                 .into_iter()
                 .map(|(id, petname)| {
-                    let capability = if view.drive.contains(&id) {
+                    let capability = if drive.contains(&id) {
                         crate::node::trust::Capability::ReadDrive
                     } else {
                         crate::node::trust::Capability::Read
@@ -10626,6 +10652,47 @@ impl IpcClient {
             })
             .await?;
         Ok(self.older_daemon(reply))
+    }
+
+    /// A Session selection that carries no revision ([`Request::SessionsPage`],
+    /// [`Request::SessionsOpenPage`], [`Request::SessionLookup`], [`Request::SessionJoin`]),
+    /// asked again while the node refuses it as [`SESSIONS_CHANGED`] because the room's
+    /// Sessions moved: each answer is read under one revision and binds no later request, so a
+    /// torn answer is read again whole, as its words ask, and no caller keeps rows from before
+    /// the change. A refusal that no move of the room's Session selection revision explains is
+    /// answered as it came, so a node that keeps refusing is not asked again for ever. One such
+    /// refusal is a page continuing after a Session that has left its listing (its node left the
+    /// room, or lost Drive for the open page): asking for that cursor again cannot answer, so
+    /// whoever holds the listing's earlier pages starts it over from its first page.
+    ///
+    /// # Errors
+    /// The node cannot be reached or answers with a malformed frame, or `req` is not one of
+    /// these selections (a cursor bound to a revision must start over, not be asked again).
+    pub async fn session_selection(&mut self, req: &Request) -> Result<Frame> {
+        let (Request::SessionsPage { channel_id, .. }
+        | Request::SessionsOpenPage { channel_id, .. }
+        | Request::SessionLookup { channel_id, .. }
+        | Request::SessionJoin { channel_id, .. }) = req
+        else {
+            return Err(Error::MalformedIpc("not a Session selection"));
+        };
+        let mut moved_to = None;
+        loop {
+            let reply = self.request(req).await?;
+            let reply = self.older_daemon(reply);
+            if !matches!(&reply, Frame::Error { reason } if reason == SESSIONS_CHANGED) {
+                return Ok(reply);
+            }
+            let Frame::SessionSelectionRevision { revision } =
+                self.session_selection_revision(*channel_id).await?
+            else {
+                return Ok(reply);
+            };
+            if moved_to == Some(revision) {
+                return Ok(reply);
+            }
+            moved_to = Some(revision);
+        }
     }
 
     /// `reply` as this client says it: a daemon that does not know a request this build makes is

@@ -770,7 +770,12 @@ impl Node {
         );
     }
 
-    pub(super) async fn complete_pending_posts(&mut self) {
+    pub(super) fn complete_pending_posts(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.complete_pending_posts_unboxed())
+    }
+
+    /// [`Self::complete_pending_posts`], unboxed: see [`Boxed`].
+    async fn complete_pending_posts_unboxed(&mut self) {
         let rooms: Vec<_> = self.pending_posts.keys().copied().collect();
         for room in rooms {
             let owner = self.pending_posts.get(&room).map(Pending::owner);
@@ -785,6 +790,8 @@ impl Node {
                     self.resume_parked_private_drive(room).await;
                 }
             }
+            // The event that frees the room for a pass a person waits for (`vox trust add`).
+            self.resume_parked_consents(room).await;
         }
     }
 

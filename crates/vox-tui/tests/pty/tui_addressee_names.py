@@ -61,6 +61,12 @@ def spawn(w, *args, out):
     PROCS.append(p)
     return p
 
+def serving(w, p, out):
+    """`w`'s daemon `p` serves before anything asks it: a `vox` command asked earlier starts a
+    detached daemon of its own (7f1cfa048), which can win the account lock and outlives `stop(p)`."""
+    if not until(lambda: f"serving (pid {p.pid})" in open(f"{S}/{out}.out").read(), 60):
+        staging(f"{w}'s daemon never said it was serving within 60 s: " + open(f"{S}/{out}.err").read())
+
 def stop(p):
     p.terminate()
     try:
@@ -130,8 +136,7 @@ try:
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
                         "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
-        if not until(lambda: run(w, "room", "list").returncode == 0, 60):
-            staging(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
+        serving(w, daemons[w], w)
     stage("room create, invite, join")
     c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
     if c.returncode != 0: staging(f"alice's `vox room create` failed: {c.stderr.strip()}")
@@ -191,21 +196,23 @@ try:
     # case. His TUI must tell the two apart by a fingerprint suffix, and his composer's "@alice"
     # must address Alice's whole fingerprint.
     stage("lookalike aliases, and @alias in the composer")
-    # Bob's daemon was stopped for his TUI: a keyring change asks the node, so it runs again for it.
-    daemons["bob"] = spawn("bob", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
-                           "--passphrase-file", f"{S}/idpass", out="bob-again")
-    if not until(lambda: run("bob", "room", "list").returncode == 0, 60):
-        staging("bob's daemon, started again, never answered `vox room list` within 60 s: "
-                + open(f"{S}/bob-again.err").read())
+    # Bob's TUI is a client of the daemon it started, not its holder (7f1cfa048): that daemon
+    # outlives the TUI with his node Ready, so the keyring change asks it, and his next TUI opens
+    # on it with nothing to unlock. (A `vox daemon` started here waits on that daemon's account
+    # lock and never serves.) A passphrase is typed only where the TUI asks for one. The TUI starts
+    # on its room list (74077fa71: "No room open — Enter opens the room selected in the sidebar"),
+    # so Enter opens the room, the one there is, before the composer is reached.
     trust("bob", "carol", "Alice")
-    stop(daemons["bob"])
     t = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("bob"))
     try:
         t.pump(4)
-        t.key("id pass\r", 4)
-        t.key("\r", 2)
-        t.key("room pass\r", 4)
-        t.key("\r", 2)
+        if "Unlock node" in t.text():
+            t.key("id pass\r", 4)
+            t.key("\r", 2)
+            t.key("room pass\r", 4)
+            t.key("\r", 2)
+        if "No room open" in t.text():
+            t.key("\r", 2)
         t.until(lambda: MARK in "\n".join(t.display()), 60, 1)
         t.key("\t", 1)  # timeline -> composer
         t.key(f"@alice {AT_MARK} for you", 1)

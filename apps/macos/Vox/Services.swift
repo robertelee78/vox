@@ -36,7 +36,8 @@ extension NodeModel {
     /// node's decision, so the members it trusts can (ADR-017 4.2).
     func reach(in room: String) async throws -> (can: [String], cannot: [String]) {
         let roster = try await rosterOf(room)
-        let keyring = Set(trusted.map(\.fingerprint))
+        // Read now, not the held list: one held from no answer yet would say nobody can reach it.
+        let keyring = Set(try await currentKeyring().map(\.fingerprint))
         let others = roster.filter { $0.fingerprint != me }
         let name = { (m: Member) in m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name }
         return (others.filter { keyring.contains($0.fingerprint) }.map(name),

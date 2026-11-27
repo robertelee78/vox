@@ -37,7 +37,8 @@
 //!    that was running. As root (uid 0 in a Linux user namespace, `unshare --user
 //!    --map-root-user`: no sudo), `vox serve` and `vox daemon` each end within 10 s saying vox is
 //!    running as root and to run it as an ordinary user. Linux only: elsewhere root needs sudo,
-//!    which no proof uses, and the case is CANNOT MEASURE. Mutation: the root checks taken out of
+//!    which no proof uses, and the case is CANNOT MEASURE. The release gate runs on macOS, so it is
+//!    an optional proof (docs/release/optional-proofs.md). Mutation: the root checks taken out of
 //!    the client and the daemon turns it red with the old wait and its message.
 //!
 //! 6. **The login item's daemon waits its turn (ADR-014 M-9).** `vox daemon --no-node`, what
@@ -58,13 +59,17 @@ mod watchdog;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
-#[cfg(target_os = "linux")]
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 #[path = "support/typed.rs"]
 mod typed;
 #[cfg(target_os = "linux")]
-optional_proof::not_run!(a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop);
+optional_proof::not_run!(
+    a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop,
+    root_is_told_at_once_that_it_cannot_use_the_daemon,
+);
+#[cfg(not(target_os = "linux"))]
+optional_proof::not_run!(root_is_told_at_once_that_it_cannot_use_the_daemon);
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -1111,17 +1116,84 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
-    let (h1, h2) = std::thread::scope(|s| {
-        let one = s.spawn(|| a.hook("agent", "s-1", "UserPromptSubmit"));
-        let two = s.spawn(|| a.hook("agent", "s-2", "UserPromptSubmit"));
-        (one.join().unwrap(), two.join().unwrap())
-    });
-    for (n, (ok, out, err)) in [(1, &h1), (2, &h2)] {
-        eprintln!("[proof] cold hook {n}, exit ok={ok}: {out}{err}");
+    // Its node is not attached, and a hook never attaches it (ADR-028 K-13): checked after every
+    // turn, with the account's one daemon. A daemon whose start lost the lock (D-1) leaves on its
+    // own; the lock holder is the one.
+    let after_turn = |turn: usize| {
+        let settled = wait_until(Duration::from_secs(10), || {
+            a.lock_pid()
+                .is_some_and(|pid| daemons_of(&a.data) == vec![pid])
+        });
+        assert!(
+            settled,
+            "PRODUCT: after cold turn {turn}, two hooks with no daemon must have started exactly \
+             one daemon: the lock names {:?}, daemons serving the account {:?}\nlog:\n{}",
+            a.lock_pid(),
+            daemons_of(&a.data),
+            a.log()
+        );
+        assert!(
+            !a.log()
+                .lines()
+                .filter_map(|l| l.split_once(' ').map(|(_stamp, said)| said))
+                .any(|l| l.starts_with("vox daemon: node agent is Ready")),
+            "PRODUCT: after cold turn {turn}, a hook attached its node (ADR-028 K-13)\nlog:\n{}",
+            a.log()
+        );
+    };
+    // The daemon the first turns started may not have answered within a hook's bound (on a loaded
+    // machine): then a turn says exactly that, and the person's next prompt is the next turn of
+    // the same session, for a few turns at most. The turn the daemon answered says the node is
+    // not attached and the operator's command.
+    let not_answered = |out: &str| {
+        serde_json::from_str::<serde_json::Value>(out.trim()).ok()
+            == Some(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "Vox's daemon has not answered yet; try again next turn. \
+                                      This session can join node agent once it is Ready.\n"
+            }}))
+    };
+    let at_most = 8;
+    let sessions = ["s-1", "s-2"];
+    let mut said = {
+        let (h1, h2) = std::thread::scope(|s| {
+            let one = s.spawn(|| a.hook("agent", sessions[0], "UserPromptSubmit"));
+            let two = s.spawn(|| a.hook("agent", sessions[1], "UserPromptSubmit"));
+            (one.join().unwrap(), two.join().unwrap())
+        });
+        [(1, h1), (1, h2)]
+    };
+    let mut turn = 1;
+    loop {
+        for (n, (at, (ok, out, err))) in said.iter().enumerate() {
+            if *at == turn {
+                eprintln!(
+                    "[proof] cold hook {}, turn {at}, exit ok={ok}: {out}{err}",
+                    n + 1
+                );
+            }
+        }
+        after_turn(turn);
+        if turn == at_most
+            || !said
+                .iter()
+                .any(|(_, (ok, out, _))| *ok && not_answered(out))
+        {
+            break;
+        }
+        turn += 1;
+        for (session, (at, h)) in sessions.iter().zip(said.iter_mut()) {
+            if h.0 && not_answered(&h.1) {
+                *at = turn;
+                *h = a.hook("agent", session, "UserPromptSubmit");
+            }
+        }
+    }
+    for (n, (at, (ok, out, err))) in [(1, &said[0]), (2, &said[1])] {
         assert!(
             *ok && out.contains("node agent is Locked") && out.contains("vox node unlock -- agent"),
             "PRODUCT: hook {n} must exit 0 telling the agent its node is not attached and the \
-             command for the operator (ADR-028 K-13): {out}{err}\nlog:\n{}",
+             command for the operator (ADR-028 K-13); on turn {at}: {out}{err}\nlog:\n{}",
             a.log()
         );
     }
@@ -1147,19 +1219,36 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
     assert!(
         ok && !out.contains("Locked") && !out.contains("could not read your rooms"),
-        "PRODUCT: a session's second turn must not say again that its node is not attached \
+        "PRODUCT: a session's next turn must not say again that its node is not attached \
          (once per session): {out}{err}"
     );
-    let notified = a.notified();
-    assert!(
+    // The hook hands the notification to a detached notifier and returns without waiting for it
+    // (`2dae8aca0`, "detach locked-node notification"): it lands after the turn, so it is looked
+    // for until both sessions' notices are there, for at most 10 s.
+    let notices = |notified: &str| {
         notified
             .lines()
-            .filter(|l| l.contains("node agent needs its passphrase")
-                && l.contains("vox node unlock -- agent"))
+            .filter(|l| {
+                l.contains("node agent needs its passphrase")
+                    && l.contains("vox node unlock -- agent")
+            })
             .count()
-            == 2,
-        "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
-         node agent needs its passphrase, with the command; notified:\n{notified}"
+    };
+    let looking = std::time::Instant::now();
+    let mut notified = a.notified();
+    while notices(&notified) < 2 && looking.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+        notified = a.notified();
+    }
+    eprintln!(
+        "[proof] {} notice(s) {:?} after session 1's next turn",
+        notices(&notified),
+        looking.elapsed()
+    );
+    assert!(
+        notices(&notified) == 2,
+        "PRODUCT: the person must be notified once per session (two sessions, every turn so far) \
+         that node agent needs its passphrase, with the command; notified:\n{notified}"
     );
     let pid = a
         .lock_pid()
@@ -1171,9 +1260,11 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         "PRODUCT: two hooks with no daemon must end with exactly one daemon\nlog:\n{}",
         a.log()
     );
+    // Each log line is `<UTC time> <said> [count=…]` (`daemon_log`): the time goes before matching.
     assert!(
         !a.log()
             .lines()
+            .filter_map(|l| l.split_once(' ').map(|(_stamp, said)| said))
             .any(|l| l.starts_with("vox daemon: node agent is Ready")),
         "PRODUCT: a hook attached its node (ADR-028 K-13)\nlog:\n{}",
         a.log()
@@ -3249,6 +3340,8 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
     // loser's daemon exits saying another is running while the winner serves nothing yet. The
     // losing client must wait for the winner's socket (S-2), not report a failed start. Unstaged,
     // the winner bound its socket before the loser looked, and a client that gave up passed.
+    // The loser's words stay in its own client's private startup file, never the account's log
+    // (#704, `0e92db7cb`), so the lost start is seen as two daemon processes of the account.
     let start = || {
         let out = a
             .cmd(&["daemon", "--detach"])
@@ -3263,7 +3356,8 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
         )
     };
     let barrier = std::sync::Barrier::new(2);
-    let (one, two) = std::thread::scope(|s| {
+    let starting = std::sync::atomic::AtomicBool::new(true);
+    let (one, two, started) = std::thread::scope(|s| {
         let one = s.spawn(|| {
             barrier.wait();
             start()
@@ -3272,7 +3366,17 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
             barrier.wait();
             start()
         });
-        (one.join().unwrap(), two.join().unwrap())
+        let seen = s.spawn(|| {
+            let mut seen = std::collections::BTreeSet::new();
+            while starting.load(std::sync::atomic::Ordering::Relaxed) {
+                seen.extend(daemons_of(&a.data));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            seen
+        });
+        let (one, two) = (one.join().unwrap(), two.join().unwrap());
+        starting.store(false, std::sync::atomic::Ordering::Relaxed);
+        (one, two, seen.join().unwrap())
     });
     // Both clients have returned, so the winner serves from about now.
     let served = Instant::now();
@@ -3283,9 +3387,10 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
         a.log()
     );
     assert!(
-        a.log().contains("a daemon is already running"),
-        "CANNOT MEASURE: no daemon start lost the race (both clients found a socket, or only one \
-         started a daemon), so a losing client's wait was not exercised: {one:?} {two:?}\nlog:\n{}",
+        started.len() >= 2,
+        "CANNOT MEASURE: no daemon start lost the race (only {started:?} ran for the account while \
+         both clients started one), so a losing client's wait was not exercised: {one:?} {two:?}\n\
+         log:\n{}",
         a.log()
     );
     let pid = a.lock_pid().expect("PRODUCT: no daemon holds the lock");
@@ -3614,6 +3719,7 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
     assert!(
         a.log()
             .lines()
+            .filter_map(|l| l.split_once(' ').map(|(_stamp, said)| said))
             .any(|l| l.starts_with("vox daemon: node agent finished its work (asked to)")),
         "PRODUCT: the detach was not said\nlog:\n{}",
         a.log()
@@ -3768,8 +3874,9 @@ fn hook_read_to_end(a: &Account, session: &str, within: Duration) -> (Option<Str
 
 /// **A hook answers within a second while the daemon it starts attaches its kept nodes** (#666,
 /// the decider's bound for a hook: under 1 s). Eight kept nodes (made with no passphrase, so the
-/// daemon attaches each at its start, each an Argon2id unlock) and one node not attached; no
-/// daemon runs. A hook turn as the node not attached answers within 1 s, saying it is not
+/// daemon attaches each at its start, each an Argon2id unlock) and one node not attached, made with
+/// a passphrase (a passphrase-free node is one a hook's turn starts, 7f1cfa048); no daemon runs.
+/// A hook turn as the node not attached answers within 1 s, saying it is not
 /// attached; a hook turn as a kept node answers within 1 s, saying the node is attaching and the
 /// rooms show from the next turn; the daemon keeps that first turn's registration, and once the
 /// node is attached the session's Session is in its room with no second turn; a later turn says
@@ -3786,10 +3893,17 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     std::fs::write(&empty, "\n").unwrap();
     let empty = empty.to_str().unwrap().to_owned();
     let kept: Vec<String> = (1..=8).map(|i| format!("kept{i}")).collect();
-    for n in kept.iter().map(String::as_str).chain(["plain"]) {
+    for n in &kept {
         let (ok, out, err) = a.run(&["node", "create", n, "--passphrase-file", &empty], "");
         assert!(ok, "APPARATUS: vox node create {n}: {out}{err}");
     }
+    let protected = a._tmp.path().join("identity.pass");
+    let protected = protected.to_str().unwrap();
+    let (ok, out, err) = a.run(
+        &["node", "create", "plain", "--passphrase-file", protected],
+        "",
+    );
+    assert!(ok, "APPARATUS: vox node create plain: {out}{err}");
     for n in &kept {
         let (ok, out, err) = a.run(&["node", "attach", n, "--passphrase-file", &empty], "");
         assert!(
@@ -3890,7 +4004,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     );
     let (_, ok, said) = timed("kept1", "s-kept");
     assert!(
-        ok && !said.contains("attaching") && !said.contains("could not read"),
+        ok && !said.contains("preparing") && !said.contains("could not read"),
         "PRODUCT: once kept1 is attached, the next turn must read its rooms, not say it is \
          attaching: {said}"
     );
@@ -3932,10 +4046,15 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
             match got {
                 Some(out) => {
                     let _ = child.wait();
-                    // Its node is not attached, and a hook never attaches it (ADR-028 K-13): the
-                    // hook answers with the command for the operator, and ends.
+                    // Its node is not attached, and a hook never attaches it (ADR-028 K-13). The
+                    // daemon answered: the hook gives the operator's command. The daemon this hook
+                    // started had not answered yet: the hook says so and to try again next turn.
+                    // Either way it ends.
                     assert!(
-                        out.contains("vox node unlock -- agent"),
+                        out.contains("vox node unlock -- agent")
+                            || out.contains(
+                                "Vox's daemon has not answered yet; try again next turn. This session can join node agent once it is Ready."
+                            ),
                         "PRODUCT (staging): round {round}, hook {}: {out}",
                         i + 1
                     );
@@ -3983,6 +4102,7 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
 /// Run `vox args` as root — uid 0 in a new user namespace, which needs no sudo — to its end, or
 /// until `within` has passed (then it is killed by its pid). `None` when this machine has no
 /// unprivileged user namespaces.
+#[cfg(feature = "optional-proofs")]
 fn as_root(a: &Account, args: &[&str], within: Duration) -> Option<(Duration, String)> {
     let probe = Command::new("unshare")
         .args(["--user", "--map-root-user", "id", "-u"])
@@ -4027,8 +4147,9 @@ fn as_root(a: &Account, args: &[&str], within: Duration) -> Option<(Duration, St
 }
 
 /// ADR-026 C-1, said: root is refused by every daemon, and told so at once (case 5 above).
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binaries; run in release"]
+#[ignore = "optional: Linux with unprivileged user namespaces (`unshare --user --map-root-user`); run in release"]
 fn root_is_told_at_once_that_it_cannot_use_the_daemon() {
     watchdog::arm();
     if !cfg!(target_os = "linux") {

@@ -149,7 +149,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
             name is index 255 and Carol's 247. In each the accent is on the focused border alone.
   copies    Alice shares an ssh stand-in; in Bob's TUI the room's Shared pane lists it, and `y` on it
-            puts `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full
+            puts `ssh <its canonical address>` on the clipboard by OSC 52, prints it in full
             under the service and says "copied" on the status line, the address the one Alice's
             `vox service list --json` gives
             (ADR-028 S-3, #490);
@@ -394,7 +394,9 @@ try:
     if not until(lambda: ssh_canonical() is not None, 60, 1):
         product("alice's `vox service list --json` never listed nas-ssh as ssh within 60 s: "
                 + run("alice", "service", "list", room, "--json").stdout)
-    SSH_COPY = f"ssh $USER@{ssh_canonical()}"
+    # The command as the product prints it for a shell paste since a483f5f51, which dropped the
+    # `$USER@` it used to carry.
+    SSH_COPY = f"ssh {ssh_canonical()}"
     stage("alice posts")
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
@@ -624,6 +626,10 @@ try:
           f"@alice reply must answer q-mid in q-root's thread and address alice; got {addressed!r}")
 
     stage("thread-summary")
+    # The reply above left the focus in the Composer (Ctrl-R moves it there, 73749bde0), which
+    # owns every printable key (20ba74ca9): `:general` typed there is a message. Commands are
+    # typed from another pane.
+    focus("Timeline")
     tui.key(":general\r", 0.5)
     focus("Timeline")
     for _ in range(FILL + 5):
@@ -888,8 +894,10 @@ try:
     stage("retention")
     # A retention change is one line in each member's timeline, saying who set what and what it
     # does from now on; the room's header always says the retention (ADR-028 R-7, #483).
+    # The header is the Timeline pane's top border; a room with older pages says so there first,
+    # "Timeline — 3 older · ↑ at top to load · ⏱ …" (28d77d3a2), so it is found by its border.
     def header(t):
-        return next((bare(r) for r in t.display() if "Timeline ·" in r), "")
+        return next((bare(r) for r in t.display() if "\u250cTimeline" in r), "")
     def says(t, want):
         # The line wraps across rows of the narrow timeline: read the pane as one text, without
         # the spaces a wrap may have taken from either side of a break.
@@ -1349,15 +1357,18 @@ try:
     OPEN_ID, ENDED_ID = "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd", "9a1b22c0-aaaa-4bbb-8ccc-eeeeeeeeeeee"
     hook("alice", claude(OPEN_ID, "UserPromptSubmit", prompt="port the codec"))
     hook("alice", claude(ENDED_ID, "UserPromptSubmit", prompt="look at the tests"))
-    hook("alice", claude(ENDED_ID, "SessionEnd", reason="prompt_input_exit"))
     def cli_labels(w="bob"):
         r = run(w, "room", "sessions", room, "--json")
         if r.returncode != 0:
             product(f"{w}'s room sessions refused: {r.stderr.strip()}")
         rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
         return {x["id"]: x for x in rows}
+    # A registered Session opens after its hook returns, and an end that comes first cancels the
+    # opening (57926b34d, ADR-029 SE-1): the second session ends once its Session is open, as a
+    # person's does.
     if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels("alice")), 60):
         product(f"alice's own Sessions never opened: {cli_labels('alice')!r}")
+    hook("alice", claude(ENDED_ID, "SessionEnd", reason="prompt_input_exit"))
     # SA-1–SA-3 supersede the old read-only Session listing. Both the CLI and the TUI must
     # hide these Sessions until Alice grants Bob drive. The existing drive action moves here.
     private = not ({OPEN_ID, ENDED_ID} & set(cli_labels()))
@@ -1883,7 +1894,8 @@ try:
     pulls = f"{S}/bob/data/nodes/default/pulls"
     def pulled(name):
         import glob
-        for f in glob.glob(f"{pulls}/*.json"):
+        # A pull's record is kept under `records/<entry>/` (7bc390c74), an older one in `pulls/`.
+        for f in glob.glob(f"{pulls}/*.json") + glob.glob(f"{pulls}/records/*/*.json"):
             try:
                 path = json.load(open(f))["path"]
             except (OSError, ValueError, KeyError):

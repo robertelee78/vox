@@ -703,6 +703,27 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
         found.extend(vox_plugins(&cwd.join(".opencode")));
     }
     let target = dir.join("plugin").join("vox.js");
+    // The command that writes this build's plugin to `file`; for a path no pasted word carries
+    // whole (one ending in a line break), the same in words.
+    let write_plugin = |file: &std::path::Path| {
+        let print = vox_text::shell::command(&[
+            "vox",
+            "agent",
+            "plugin",
+            "opencode",
+            "--node",
+            node.as_str(),
+        ]);
+        let file = file.display().to_string();
+        match vox_text::shell::arg(&file) {
+            Some(quoted) => format!("`{print} > {quoted}`"),
+            None => format!(
+                "write the output of `{print}` to {} (the path ends in a line break, which a \
+                 pasted command cannot carry)",
+                vox_text::reveal_keeping(&file, |_| false)
+            ),
+        }
+    };
     match found.as_slice() {
         [] if !dir.exists() => ok(
             id,
@@ -711,11 +732,7 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
         [] => warn(
             id,
             format!("no Vox plugin in {}", dir.join("plugin").display()),
-            format!(
-                "`{} > {}`",
-                vox_text::shell::command(&["vox", "agent", "plugin", "opencode", "--node", node.as_str()]),
-                vox_text::shell::arg(&target.display().to_string())
-            ),
+            write_plugin(&target),
         ),
         [(path, text)] if *text == this => {
             ok(id, format!("{} is this build's plugin", path.display()))
@@ -727,11 +744,7 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
                 path.display(),
                 crate::coord::VERSION
             ),
-            format!(
-                "`{} > {}`",
-                vox_text::shell::command(&["vox", "agent", "plugin", "opencode", "--node", node.as_str()]),
-                vox_text::shell::arg(&path.display().to_string())
-            ),
+            write_plugin(path),
         ),
         many => fail(
             id,

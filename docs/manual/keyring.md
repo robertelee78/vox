@@ -267,19 +267,19 @@ not through an agent. Ready managed nodes apply the policy; Locked nodes need un
 they can apply it.
 
 Computer trust is an operator choice shared by the enrolled daemons. Either computer may create
-the invitation: in Vox.app use Add Computer, or run `vox computer invite` on one computer and
-`vox computer pair` on the other. If one is already enrolled and the other is individual, the
-individual joins that existing group whichever computer issued the invitation. Two individual
+the pairing code: in Vox.app use Add Computer, or run `vox computer pair` on one computer and
+`vox computer pair` with that code on the other. If one is already enrolled and the other is individual, the
+individual joins that existing group whichever computer made the pairing code. Two individual
 computers create a new group. If both already belong to the same group, pairing synchronizes
 their existing membership instead of creating another enrollment. Begin on either computer:
 
 ```sh
 vox computer status
-vox computer invite
+vox computer pair
 ```
 
-Send the invitation to the other computer through your trusted channel. Paste the complete
-terminal command printed by `invite`, or paste the code into Add Computer. Both sides show the
+Send the pairing code to the other computer through your trusted channel. Paste the complete
+terminal command printed by `vox computer pair`, or paste the code into Add Computer. Both sides show the
 authenticated peer, fixed policy and exact operation, and whether it creates a new group or joins
 the identified existing group. Check the entire group identifier when joining an existing group.
 Authentication of the code and peer permits this review; it does not grant permission or approve
@@ -289,11 +289,11 @@ shows the proposal without approving it. Until computer trust is established, re
 preserves individual node trust, including choices made after retiring an old group. Pairing grants
 no room membership; join the same room and verify a message both ways.
 
-If the daemon restarts after the authenticated invitation is claimed but before the proposal
+If the daemon restarts after the authenticated pairing code is claimed but before the proposal
 is recorded, the same computer can authenticate again; another computer cannot take over that
 claim. A recorded proposal and its approvals survive restart as the same operation. A changed
 operation or group needs a fresh review and both approvals; an approval is not transferred.
-Cancel an unused invitation or unapproved proposal on the computer where it is pending. Closing
+Cancel an unused pairing code or unapproved proposal on the computer where it is pending. Closing
 a window alone leaves it pending. A cancellation cannot withdraw an approval already signed
 and retained elsewhere; an incomplete signed attempt may need to expire before it can be closed.
 If Vox reports that the other computer's pairing software needs updating, update it and start a
@@ -304,10 +304,11 @@ conflict instead of calling it a bad signature. On the computer to move, review 
 identities and grants and explicitly choose local replacement. Declining changes no trust.
 To keep the existing group, close the review on this computer using the button or the complete
 `vox computer cancel` command shown there. That local closure prevents reuse of that proposal
-here; it does not cancel or withdraw a signature on the inviting computer.
+here; it does not cancel or withdraw a signature on the computer that made the pairing code.
 This preserves identities, local data and signed history; unreachable computers may retain
-old access and data. On the inviting computer, close its old proposal and create a fresh
-invitation; if it already signed, wait until the incomplete attempt expires before closing.
+old access and data. On the computer that made the pairing code, close its old proposal and
+create a fresh pairing code; if it already signed, wait until the incomplete attempt expires
+before closing.
 Closing locally cannot withdraw a signature already retained elsewhere. Both computers must
 approve the fresh operation.
 
@@ -364,6 +365,18 @@ The same update then continues without another approval or manual node grants; a
 history remains available. Storage failures and changed authority remain errors, not successful
 policy application.
 
+While a node applies a new computer trust revision, it relies on no keyring entry until the
+revision is applied to it. A new revision holds every node of this computer until each has applied
+it; saving one node's own application of a revision holds only that node. For a node held so,
+`vox trust list` and commands that check its keyring first say `this node is applying a new
+computer trust revision, so who it trusts is not known yet` instead of listing nobody; run the
+command again. The terminal app and the Mac app keep showing the keyring they last had.
+
+If the trust storage of a paired computer has failed, its nodes rely on no keyring entry until the
+storage is repaired and the daemon restarted. The same commands then say `computer policy storage
+failed; computer trust is suspended until storage is repaired and the daemon restarted`, and the
+terminal app shows that line once and draws the keyring as not known.
+
 To remove a computer, review its full fingerprint and nodes in `vox computer status --details`,
 then use the exact displayed frontier:
 
@@ -382,14 +395,14 @@ fingerprint from `vox computer status --details` and `--keep-rooms`, then run
 `vox computer retire` there too. Without `--keep-rooms`, a removal evicts the removed nodes from
 rooms where this computer's node is an admin, and names the other rooms for their creator or an
 admin. When a computer removes itself, the removed nodes are its own. Review and confirm each
-removal and retirement. Have B make a fresh `vox computer invite`; use its link with
+removal and retirement. Have B make a fresh pairing code with `vox computer pair`; use it with
 `vox computer pair` on A and approve the reviewed pairing on both computers. This creates a new
 group, not a restoration of the old one.
 
 Only this two-computer route has been run end to end. For a group of three or more, the same
 rules apply. First decide which computers will move to the new group. Only those computers
 leave: each moving computer is removed from the old group, with `--keep-rooms`, and retires it
-locally. Each one joins the new group by a fresh `vox computer invite` and approval on both
+locally. Each one joins the new group by a fresh pairing code from `vox computer pair` and approval on both
 computers. Computers not moving can keep the old group: they need not remove themselves or
 retire, but they no longer share computer-policy Read and Drive with the computers that left.
 Reuniting ALL the former members with the removed computer requires moving them ALL to a new

@@ -12,9 +12,14 @@
 //! alice's and bob's `vox daemon`, a room both joined. Bob has three sessions, registered the way
 //! each harness's hook registers one, by `vox agent hook` in a **cleared** environment:
 //! - `cc`, Claude Code: `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` name a stand-in for Claude Code's
-//!   messaging socket, which records what the daemon writes;
-//! - `oc`, OpenCode: `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN` name a stand-in for the Vox OpenCode
-//!   plugin's wake socket, which takes each prompt (`{"ok":true}`) and records it;
+//!   messaging socket, which records what the daemon writes, with the
+//!   `VOX_CLAUDE_NATIVE_ATTENTION` of the settings `vox agent plugin claude` prints (without it
+//!   no notice is sent: ADR-020 §6.15 RA-5, 8cade3da0); its turns run both `UserPromptSubmit`
+//!   commands Vox installs;
+//! - `oc`, OpenCode: `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN` register it, as the server plugin does,
+//!   and a stand-in for the Vox TUI plugin's client, listed where that plugin lists them, is the
+//!   one its wakes go to (RA-5, d1dec07b3): it answers that its route is available, takes each
+//!   prompt (`"outcome":"accepted"`) and records it;
 //! - `cx`, Codex: `VOX_HARNESS=codex` and no wake endpoint, as the Codex hook registers.
 //!
 //! No `vox` command plays a harness session, so the two sockets are the only stand-ins. A `codex`
@@ -24,7 +29,7 @@
 //! (by its whole fingerprint, as `to` names nodes, V210-161), where all three sessions are, each
 //! with its own canary. Nothing reaches bob's node but by sync. Each round:
 //! 1. **`cc` and `oc` are each woken, within [`WITHIN`] of alice's post returning**, by a notice
-//!    naming one urgent message from alice, with the token each registered; the latency of every
+//!    naming one message from alice, with the token each registered; the latency of every
 //!    wake is printed, so the bound is read against its spread;
 //! 2. **no byte of any message reaches either endpoint** (the canaries);
 //! 3. then each session's turn drains the room, as its harness would, so the next round's wake is
@@ -95,29 +100,96 @@ fn claude_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String)> {
     rx
 }
 
-/// A stand-in for the Vox OpenCode plugin's wake socket. It takes every prompt, as the plugin does
-/// when OpenCode accepts it, and records when it arrived, the auth line and the prompt line.
-fn opencode_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String, String)> {
+/// The token the stand-in OpenCode client registers, as the Vox TUI plugin does: 64 hex digits.
+const OC_TOKEN: &str = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
+
+/// A stand-in OpenCode client of the Vox TUI plugin (`assets/opencode-tui-plugin.js`): since
+/// ADR-020 §6.15 RA-5 (d1dec07b3, 0a45c7c0c) the only receiver an OpenCode wake may go to, never
+/// the server plugin's socket. It is listed where the plugin lists the clients of `node`'s
+/// sessions started in `directory` (`/tmp/vox-oc-clients-<scope>/client-<id>/client.json`), says
+/// every session's route is available, and takes every prompt (`"outcome":"accepted"`), as the
+/// plugin does when OpenCode accepts it, recording when it arrived, the auth line and the prompt
+/// line. Its listing is removed when the guard drops.
+struct OpenCodeClient(std::path::PathBuf);
+impl Drop for OpenCodeClient {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn opencode_client(
+    node: &str,
+    directory: &std::path::Path,
+) -> (OpenCodeClient, mpsc::Receiver<(Instant, String, String)>) {
     use std::io::{BufRead as _, Write as _};
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let directory = std::fs::canonicalize(directory).expect("APPARATUS: canonical directory");
+    let directory = directory
+        .to_str()
+        .expect("APPARATUS: a UTF-8 directory")
+        .to_owned();
+    let scope = serde_json::to_vec(&[node, directory.as_str()]).expect("APPARATUS: scope");
+    let scope: String = vox_core::hash::sha256(&scope)[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let registry = std::path::PathBuf::from("/tmp").join(format!("vox-oc-clients-{scope}"));
+    let mut private = std::fs::DirBuilder::new();
+    private.mode(0o700);
+    if !registry.exists() {
+        private
+            .create(&registry)
+            .expect("APPARATUS: the client registry");
+    }
+    let dir = registry.join(format!("client-o{:05}", std::process::id() % 100_000));
+    private
+        .create(&dir)
+        .expect("APPARATUS: the stand-in client's directory");
+    let guard = OpenCodeClient(dir.clone());
+    let socket = dir.join("attention.sock");
     let listener =
-        UnixListener::bind(path).expect("APPARATUS: bind the stand-in OpenCode plugin socket");
+        UnixListener::bind(&socket).expect("APPARATUS: bind the stand-in OpenCode client socket");
+    let client = "c".repeat(64);
+    let descriptor = serde_json::json!({
+        "version": 1, "node": node, "directory": directory,
+        "socket": socket.to_str().expect("APPARATUS: a UTF-8 socket path"),
+        "token": OC_TOKEN, "client": client,
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("client.json"))
+        .and_then(|mut f| f.write_all(descriptor.to_string().as_bytes()))
+        .expect("APPARATUS: write the stand-in client's descriptor");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let at = Instant::now();
             let mut reader = std::io::BufReader::new(&stream);
-            let (mut auth, mut prompt) = (String::new(), String::new());
-            if reader.read_line(&mut auth).is_err() || reader.read_line(&mut prompt).is_err() {
+            let (mut auth, mut request) = (String::new(), String::new());
+            if reader.read_line(&mut auth).is_err() || reader.read_line(&mut request).is_err() {
                 continue;
             }
-            let _ = writeln!(&stream, r#"{{"ok":true}}"#);
-            if tx.send((at, auth, prompt)).is_err() {
+            let v: serde_json::Value =
+                serde_json::from_str(request.trim()).unwrap_or(serde_json::Value::Null);
+            if v["type"] == "route" {
+                let answer = serde_json::json!({"outcome": "available", "session": v["session"],
+                    "client": client, "route": "d".repeat(64)});
+                let _ = writeln!(&stream, "{answer}");
+                continue;
+            }
+            let _ = writeln!(
+                &stream,
+                "{}",
+                serde_json::json!({"id": v["id"], "outcome": "accepted"})
+            );
+            if tx.send((at, auth, request)).is_err() {
                 return;
             }
         }
     });
-    rx
+    (guard, rx)
 }
 
 /// `vox agent hook …` as bob's harness runs it, in a **cleared** environment: `PATH`, `HOME`,
@@ -338,24 +410,41 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
     let mut failures = Vec::new();
 
     // ---- bob's three sessions register with his daemon, as each harness's hook does ----
+    // `cc` registers with the `VOX_CLAUDE_NATIVE_ATTENTION` that `vox agent plugin claude` puts in
+    // Claude's settings: since ADR-020 §6.15 RA-5 (8cade3da0) only a session registered with that
+    // live native route is sent a notice.
+    let plugin = bob.vox(None, &["agent", "plugin", "claude", "--node", "default"]);
+    let native = plugin.json()["env"]["VOX_CLAUDE_NATIVE_ATTENTION"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): Claude's generated settings must enable native attention: {plugin:?}")
+        })
+        .to_owned();
     let cc_sock = tmp.path().join("cc.sock");
     let cc_inbox = claude_socket(&cc_sock);
     let cc_s = cc_sock.to_string_lossy().into_owned();
     let cc_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", cc_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "cc-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
         ("VOX_AGENT_NAME", "cc"),
     ];
-    let oc_sock = tmp.path().join("oc.sock");
-    let oc_inbox = opencode_socket(&oc_sock);
-    let oc_s = oc_sock.to_string_lossy().into_owned();
+    // `oc`: the server plugin's half registers the session (its hook runs in this process's
+    // directory, the session's), and the TUI plugin's client is the one a wake goes to.
+    let (_oc_client, oc_inbox) = opencode_client(
+        "default",
+        &std::env::current_dir().expect("APPARATUS: the current directory"),
+    );
+    let oc_s = tmp.path().join("oc.sock").to_string_lossy().into_owned();
     let oc_env = [
         ("VOX_OPENCODE_WAKE_SOCKET", oc_s.as_str()),
         ("VOX_OPENCODE_WAKE_TOKEN", "oc-token"),
         ("VOX_AGENT_NAME", "oc"),
     ];
     let cx_env = [("VOX_HARNESS", "codex"), ("VOX_AGENT_NAME", "cx")];
-    // Each session's turn: the drain its harness runs at the start of one.
+    // Each session's turn: the drain its harness runs at the start of one. Claude Code runs both
+    // `UserPromptSubmit` commands Vox installs, the ordinary drain and `--native-attention`
+    // (which admits a Vox notice and drains for it); each prints nothing for the other's prompts.
     let cc_turn = |prompt: &str| {
         let input = serde_json::json!({
             "session_id": "session-cc",
@@ -367,12 +456,19 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
             "prompt_id": "p",
         })
         .to_string();
-        hook(
+        let ordinary = ["agent", "hook", "--node", "default", "--room", &room];
+        let given = hook(bob, &cc_env, &ordinary, Some(&input));
+        let native = hook(
             bob,
             &cc_env,
-            &["agent", "hook", "--node", "default", "--room", &room],
+            &[&ordinary[..], &["--native-attention"]].concat(),
             Some(&input),
-        )
+        );
+        if native.trim().is_empty() {
+            given
+        } else {
+            native
+        }
     };
     let oc_turn = || {
         hook(
@@ -427,7 +523,19 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
     }
 
     // Bob's daemon must be in sync with alice, and every session must have read everything so far.
-    let _ = post(alice, &room, "SYNC-MARKER");
+    // Alice's registered session posts the marker: a person's bare post to nobody is ordinary
+    // room conversation, offered to every session in the room (ADR-020 §6.15 RA-1), and its
+    // notice would stand in the first round's place.
+    support::register_sending_session(alice, &room, "alice-s");
+    let o = alice.vox_in(
+        Some("alice-s"),
+        &["room", "post", &room, "-"],
+        Some("SYNC-MARKER"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT (staging): alice's session could not post: {o:?}"
+    );
     until(
         bob,
         None,
@@ -491,21 +599,16 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
                 &cc_text,
                 cc_frame.contains("cc-token"),
             ),
-            (
-                "oc (OpenCode)",
-                oc_at,
-                &oc_text,
-                oc_auth.contains("oc-token"),
-            ),
+            ("oc (OpenCode)", oc_at, &oc_text, oc_auth.contains(OC_TOKEN)),
         ] {
             check(
                 &mut failures,
                 at.is_some_and(|s| s <= WITHIN.as_secs_f64())
-                    && text.contains("1 urgent message addressed to you from alice")
+                    && text.contains("1 unread room message(s) from alice")
                     && auth_ok,
                 format!(
                     "PRODUCT (1) round {n}: {who} must be woken within {} s of alice's post, by a \
-                     notice naming one urgent message from alice, with its registered token; \
+                     notice naming one message from alice, with its registered token; \
                      woken after {at:?} s with {text:?}; bob's daemon:\n{}",
                     WITHIN.as_secs(),
                     bob_err()
@@ -598,7 +701,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         check(
             &mut failures,
             at.is_some_and(|s| s <= WITHIN.as_secs_f64())
-                && notice.contains("1 urgent message addressed to you from alice")
+                && notice.contains("1 unread room message(s) from alice")
                 && !notice.contains("SHARE-NOTE"),
             format!(
                 "PRODUCT (7): an urgent share must wake {who} within {} s as an urgent message \
@@ -718,6 +821,16 @@ fn an_urgent_message_to_one_session_wakes_that_session_alone() {
     let bob_fp = bob.b32();
 
     // ---- bob's three Claude Code sessions ----
+    // Registered with the `VOX_CLAUDE_NATIVE_ATTENTION` that `vox agent plugin claude` puts in
+    // Claude's settings: since ADR-020 §6.15 RA-5 (8cade3da0) only a session registered with that
+    // live native route is sent a notice.
+    let plugin = bob.vox(None, &["agent", "plugin", "claude", "--node", "default"]);
+    let native = plugin.json()["env"]["VOX_CLAUDE_NATIVE_ATTENTION"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): Claude's generated settings must enable native attention: {plugin:?}")
+        })
+        .to_owned();
     let mut inboxes = Vec::new();
     let mut socks = Vec::new();
     for name in ["one", "two", "gone"] {
@@ -725,10 +838,13 @@ fn an_urgent_message_to_one_session_wakes_that_session_alone() {
         inboxes.push(claude_socket(&sock));
         socks.push(sock.to_string_lossy().into_owned());
     }
+    // A turn runs both `UserPromptSubmit` commands Vox installs, the ordinary drain and
+    // `--native-attention` (which admits a Vox notice and drains for it), as Claude Code does.
     let turn = |i: usize, session: &str, event: &str| {
         let env = [
             ("CLAUDE_CODE_MESSAGING_SOCKET", socks[i].as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "tok"),
+            ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
         ];
         let input = serde_json::json!({
             "session_id": session,
@@ -741,17 +857,45 @@ fn an_urgent_message_to_one_session_wakes_that_session_alone() {
             "prompt_id": "p",
         })
         .to_string();
-        hook(
+        let ordinary = ["agent", "hook", "--node", "default", "--room", &room];
+        let given = hook(bob, &env, &ordinary, Some(&input));
+        if event != "UserPromptSubmit" {
+            return given;
+        }
+        let noticed = hook(
             bob,
             &env,
-            &["agent", "hook", "--node", "default", "--room", &room],
+            &[&ordinary[..], &["--native-attention"]].concat(),
             Some(&input),
-        )
+        );
+        if noticed.trim().is_empty() {
+            given
+        } else {
+            noticed
+        }
     };
     let _ = turn(0, "s-one", "UserPromptSubmit");
     let _ = turn(1, "s-two", "UserPromptSubmit");
     let _ = turn(2, "s-gone", "UserPromptSubmit");
     let _ = turn(2, "s-gone", "SessionEnd");
+    // A Session's opening and end are sealed on bob's private drive stream (`e4f23581b`, #740):
+    // alice sees bob's Sessions, and can name one, only once bob trusts her with drive.
+    let granted = bob.vox(
+        None,
+        &[
+            "trust",
+            "drive",
+            &alice.b32(),
+            "--identity-passphrase-file",
+            bob.pass
+                .to_str()
+                .expect("APPARATUS: a UTF-8 passphrase path"),
+        ],
+    );
+    assert!(
+        granted.ok,
+        "PRODUCT (staging): bob's `vox trust drive` of alice failed: {granted:?}"
+    );
     // Alice must know bob's Sessions, and that s-gone ended, before she addresses them.
     until(
         alice,
@@ -795,7 +939,7 @@ fn an_urgent_message_to_one_session_wakes_that_session_alone() {
     );
     check(
         &mut failures,
-        one_text.contains("1 urgent message addressed to you from alice")
+        one_text.contains("Vox attention notice: 1 unread room message(s) from alice")
             && !one.as_ref().is_some_and(|(_, f)| f.contains("CANARY-ONE")),
         format!(
             "PRODUCT (1): s-one, addressed alone, must be woken by a notice naming one urgent \

@@ -571,8 +571,12 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     let relayed = woke["relayed"].as_str().unwrap_or_default();
     let given = woke["text"].as_str().unwrap_or_default();
     println!("[proof] (11) the relayed notice: {relayed:?}\n[proof] the woken turn, the model is given:\n{given}");
+    // What the client submits: its own label, then the daemon's notice (d1dec07b3, e203cf770;
+    // the words were `Vox: …` before).
     assert!(
-        relayed.starts_with("Vox: ") && !relayed.contains("WAKE-11"),
+        relayed.starts_with(
+            "Vox-generated attention notice; not the operator's message:\nVox attention notice: "
+        ) && !relayed.contains("WAKE-11"),
         "PRODUCT: a wake must be Vox's notice alone, no byte of the message: {relayed:?}"
     );
     let Some((_, inside, after)) = fence(given) else {
@@ -915,6 +919,14 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     host.room_wake(
         other_room,
         "B-REPLY-AFTER-MOVE",
+        &["A-REPLY-AFTER-MOVE", "third-agents"],
+    );
+    // The question itself is a session's directed `ask` to the node, which ADR-020 §6.15 RA-2a
+    // (7064933a3, after this act was written) offers to every eligible Session of that node: the
+    // other session in other-agents is told of the question, once. The answer to it is not its.
+    other.room_wake(
+        other_room,
+        "B-QUESTION-AFTER-MOVE",
         &["A-REPLY-AFTER-MOVE", "third-agents"],
     );
     other.quiet("another session must not inherit a reply notice for the moved session's question");

@@ -160,9 +160,9 @@ async fn room_of_readiness(
             "this node holds no rooms yet — join or create one first".into(),
         ));
     }
-    // A room preparing after a restart has no name here until it opens (its name is sealed in
-    // it), so a name that matches nothing yet may be one of them: wait for it inside the same
-    // patience as a preparing room, and never answer that nothing matches while one is unnamed.
+    // A preparing room has no name here until it opens (its name is sealed in it), so a name
+    // that matches nothing yet may be one of them. Wait for it before answering that nothing
+    // matches while one is unnamed; a found room has its own separate preparation wait.
     let unnamed_preparing = |rooms: &[vox_core::node::ipc::RoomRow]| {
         rooms
             .iter()
@@ -203,7 +203,7 @@ async fn room_of_readiness(
                     error
                 } else {
                     AppError::Usage(format!(
-                        "no room named so far matches {:?}, and {preparing} of this node's rooms are still preparing: a room is named once it is open; try again when `vox room list` names them",
+                        "no room named so far matches {:?}; rooms on this node still preparing: {preparing}. A room is named once it is open; try again when `vox room list` names them",
                         prefix.trim()
                     ))
                 };
@@ -402,7 +402,8 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
             println!(
                 "  To reopen it once the cause above is fixed, run `{join}` with this room's \
-                 address and passphrase (another member's `vox room link` prints the address)."
+                 address and passphrase (the `vox://` address you joined with, or another \
+                 member's `vox room link`, gives the address)."
             );
         }
     }
@@ -850,7 +851,29 @@ pub(crate) async fn post_structured(
             data.insert("attempt".into(), a);
         }
     }
-    let (re, hops_of_reply, known_thread) = answers(&mut client, cid, opts.re.as_deref()).await?;
+    // **A retried operation answers what its first post answered** (V210-121). With no `--re`, a
+    // post answers the wake open now; by the retry that wake may be settled, or another open, and
+    // the retry would then conflict with its own first post instead of returning it. So the
+    // parent recorded on that post (or that it had none) is the retry's, before any wake is read.
+    let recorded = match (&opts.re, &opts.coord.op) {
+        (None, Some(_)) => coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
+            .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
+            .map(|p| p.envelope.re),
+        _ => None,
+    };
+    let (re, hops_of_reply, known_thread, mut notes) = answers(
+        &mut client,
+        cid,
+        paths,
+        (!session.is_empty() && recorded != Some(None)).then_some(session.as_str()),
+        opts.re
+            .as_deref()
+            .or(recorded.as_ref().and_then(Option::as_deref)),
+        opts.urgent,
+    )
+    .await?;
     // An operation keeps the root its first post used even if a missing parent arrives, or
     // retention removes one, before a retry. Changed --re/--thread still goes through normal
     // refusal and semantic conflict checks; post_once checks every other semantic field.
@@ -918,7 +941,6 @@ pub(crate) async fn post_structured(
     // message is posted, and waits in the room for that session's next turn. This node's
     // sessions only: another node decides for its own.
     let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
-    let mut notes = Vec::new();
     if opts.urgent {
         if let Some(line) = crate::wake::uninterruptible(paths, &me, &draft.to) {
             notes.push(line);
@@ -1098,6 +1120,26 @@ pub async fn post_cmd(
                      operation id and a version stamp. Use `vox room {}`.",
                     env.kind, env.kind
                 )));
+            }
+            // **A raw envelope cannot start an urgent chain of its own from a woken session**
+            // (V210-121): it is posted exactly as given, so it would not answer what woke the
+            // session as a structured post does, and two agents answering each other that way
+            // woke each other for ever.
+            if env.urgent && env.re.is_none() {
+                if let Some(session) = coord::posting_session(paths, opts.coord.session.as_deref())?
+                {
+                    let (mut client, cid, _) = open_room(paths, room).await?;
+                    let open = open_wakes(&mut client, cid, paths, &session).await?;
+                    if !open.is_empty() {
+                        return Err(AppError::Usage(format!(
+                            "refusing a raw urgent message with no `re` from session {session}: \
+                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
+                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
+                             which answer the message that woke it when only one is open.",
+                            open.join(", ")
+                        )));
+                    }
+                }
             }
         }
         return post(
@@ -1868,20 +1910,55 @@ async fn reply_entry(
     }
 }
 
-/// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
-/// `vox share` follow (ADR-020 §9): `re` if given, and that parent's budget less one.
+/// What a post answers, its hop budget, its known thread root and what the poster is told of it,
+/// by the rule `vox room post` and `vox share` follow (ADR-020 §9, V210-121): `re` if given, else
+/// the one message that woke `session` and that it has not replied to; and that parent's budget
+/// less one.
 ///
 /// # Errors
-/// The node cannot answer. An unavailable parent leaves the root unknown: callers must use
-/// `reply_thread` before a new post, after checking for an existing operation retry.
+/// An urgent post from a session woken by several messages it has not replied to names none of
+/// them, or the node cannot answer. An unavailable parent leaves the root unknown: callers must
+/// use `reply_thread` before a new post, after checking for an existing operation retry.
 pub(crate) async fn answers(
     client: &mut IpcClient,
     cid: Digest32,
+    paths: &Paths,
+    session: Option<&str>,
     re: Option<&str>,
-) -> Result<(Option<String>, Option<u32>, Option<String>), AppError> {
-    let re = match re {
-        Some(re) => Some(reply_entry(client, cid, re).await?),
-        None => None,
+    urgent: bool,
+) -> Result<(Option<String>, Option<u32>, Option<String>, Vec<String>), AppError> {
+    let mut notes = Vec::new();
+    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
+    // chain of its own at a fresh hop budget, and two agents answering each other urgently that
+    // way woke each other for ever. When exactly one wake is open, that is the reply; with
+    // several, an urgent post must say which.
+    let re = match (re, session) {
+        (Some(re), _) => Some(reply_entry(client, cid, re).await?),
+        (None, None) => None,
+        (None, Some(session)) => {
+            let open = open_wakes(client, cid, paths, session).await?;
+            match &open[..] {
+                [] => None,
+                [only] => {
+                    notes.push(format!(
+                        "replying to {} (the message that woke this session); pass --re to \
+                         answer another",
+                        &only[..12.min(only.len())]
+                    ));
+                    Some(only.clone())
+                }
+                several if urgent => {
+                    return Err(AppError::Usage(format!(
+                        "refusing an urgent message with no --re from session {session}: it was \
+                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
+                         which one this answers.",
+                        several.len(),
+                        several.join(", ")
+                    )));
+                }
+                _ => None,
+            }
+        }
     };
     // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
     // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
@@ -1899,7 +1976,73 @@ pub(crate) async fn answers(
         }
         None => (None, None),
     };
-    Ok((re, hops_of_reply, thread))
+    // **The bound, said where it stops a wake** (ADR-020 §9.3): a session's reply with no hops
+    // left is offered to nobody.
+    if session.is_some() && hops_of_reply == Some(0) {
+        notes.push(format!(
+            "this reply has no hops left (each reply spends one of its conversation's {}, \
+             ADR-020 §9), so Vox tells nobody of it: each addressee reads it at its next turn. If \
+             it needs an answer sooner, ask the person you work for.",
+            vox_agentcomms::envelope::DEFAULT_HOPS
+        ));
+    }
+    Ok((re, hops_of_reply, thread, notes))
+}
+
+/// The messages that woke `session` in room `cid` and that it has not replied to, oldest first
+/// (ADR-020 §9.4, V210-121): the sources of the notices its own prompt hook admitted, as the
+/// node's attention ledger keeps them, that the room still holds. A session is woken only in the
+/// room it works in.
+///
+/// # Errors
+/// The node cannot answer.
+async fn open_wakes(
+    client: &mut IpcClient,
+    cid: Digest32,
+    paths: &Paths,
+    session: &str,
+) -> Result<Vec<String>, AppError> {
+    // Only an interactive session registered in this room is ever woken here (the daemon's own
+    // selection, `node_tasks`), and only while its Session is open.
+    let room = b32_encode(&cid);
+    if !crate::wake::registration(paths, session).is_some_and(|registered| {
+        registered.interactive && registered.room.as_deref() == Some(room.as_str())
+    }) {
+        return Ok(Vec::new());
+    }
+    let owner = client
+        .me()
+        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
+    let at = crate::client::one_shot(paths)?;
+    let woke = match vox_core::node::attention::local(
+        &at,
+        owner,
+        cid,
+        None,
+        vox_core::node::attention::Operation::Resolve {
+            session: session.to_owned(),
+        },
+    )
+    .await
+    {
+        Ok(vox_core::node::attention::Reply::Resolved { woke, .. }) => woke,
+        Err(reason) if reason == "the selected Session is no longer open" => return Ok(Vec::new()),
+        Err(reason) => return Err(AppError::Usage(reason)),
+        Ok(_) => {
+            return Err(AppError::Usage(
+                "unexpected attention answer for the posting session".into(),
+            ))
+        }
+    };
+    if woke.is_empty() {
+        return Ok(Vec::new());
+    }
+    let held = coord::find(client, cid, &woke).await?;
+    Ok(woke
+        .iter()
+        .filter(|hash| held.iter().any(|row| row.entry_hash == **hash))
+        .map(b32_encode)
+        .collect())
 }
 
 /// Inherit only the canonical starting message's tags, even when a reply answers another reply.
@@ -2663,11 +2806,16 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => {
             let presented = client.presented_names().await.unwrap_or_default();
+            // A keyring that cannot be read now is not known, never empty: no member is then
+            // marked as outside it.
             let trusted = match client.trusted("").await {
-                Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
-                _ => Vec::new(),
+                Ok(Frame::Trusted { entries }) => Some(crate::ident::names_of(entries)),
+                _ => None,
             };
-            let shown = crate::ident::display_names(&trusted, &presented);
+            let shown = crate::ident::display_names(
+                crate::ident::Keyring::of(trusted.as_deref()),
+                &presented,
+            );
             for m in members {
                 println!("{}", id(&m));
                 if let Some((_, name)) = shown.iter().find(|(fp, _)| *fp == m) {
@@ -2706,7 +2854,7 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     crate::ident::load_names(&mut client).await;
-    let stamp = vox_core::node::sessions::selection::revision(&mut client, channel_id)
+    let mut stamp = vox_core::node::sessions::selection::revision(&mut client, channel_id)
         .await
         .map_err(AppError::Usage)?;
     let label = |s: &vox_core::node::sessions::SessionRow| {
@@ -2744,14 +2892,16 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
                 Ok(other) => return Err(crate::client::unexpected(&other)),
                 Err(e) => return Err(AppError::Usage(e.to_string())),
             };
-            if vox_core::node::sessions::selection::revision(&mut client, channel_id)
+            // Sessions that moved between pages (a fold publishing, a member joining) leave
+            // the listing as read so far, and the rest is read under the new revision: the
+            // answer is given at once and said to be provisional, as a fold still behind is
+            // (ADR-037 R4: answer the locally applied data), not refused.
+            let now = vox_core::node::sessions::selection::revision(&mut client, channel_id)
                 .await
-                .map_err(AppError::Usage)?
-                != stamp
-            {
-                return Err(AppError::Usage(
-                    "the room's Sessions changed while listing; run the command again".into(),
-                ));
+                .map_err(AppError::Usage)?;
+            if now != stamp {
+                provisional = true;
+                stamp = now;
             }
             let next = rows.last().map(|s| s.opening);
             if more && (next.is_none() || next == after) {
@@ -2791,7 +2941,7 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     }
     if provisional {
         notes.push(
-            "note: this room is still folding its saved Sessions; this listing is provisional"
+            "note: the room's Sessions may be incomplete or may have changed during this read; this listing is provisional."
                 .to_owned(),
         );
     }
@@ -4089,7 +4239,7 @@ pub async fn service_add(
     println!("vox: about to offer {tag:?} at {local} in {which}");
     println!(
         "     the members of it in your keyring are to reach it: {}",
-        listed(&reach, "none yet")
+        reach_listed(reach.as_deref(), "none yet")
     );
     match client
         .request(&Request::AddService {
@@ -4106,12 +4256,14 @@ pub async fn service_add(
                 "vox: offering {tag:?} at {local} in room {}",
                 crate::tunnel_cli::short_id_of(&channel_id)
             );
-            if reach.is_empty() {
-                println!(
+            match reach.as_deref() {
+                Some([]) => println!(
                     "     it is dark until you trust a member from the room's trust offers — and they join this room"
-                );
-            } else {
-                println!("     {} can reach it now", listed(&reach, ""));
+                ),
+                Some(reach) => println!("     {} can reach it now", listed(reach, "")),
+                None => println!(
+                    "     who can reach it is not known just now: this node's keyring is not known yet (`vox trust list` says why)"
+                ),
             }
             Ok(())
         }
@@ -6699,6 +6851,18 @@ pub(crate) fn listed(items: &[String], none: &str) -> String {
     }
 }
 
+/// Who a service or a file shared in a room reaches ([`trusted_in`]), as a person reads it:
+/// `none` for a known keyring that holds no member of it, and "not known just now" while the
+/// keyring is not known.
+pub(crate) fn reach_listed(reach: Option<&[String]>, none: &str) -> String {
+    match reach {
+        Some(items) => listed(items, none),
+        None => "not known just now: this node's keyring is not known yet (`vox trust list` says \
+                 why)"
+            .to_owned(),
+    }
+}
+
 /// A room as a person names it: its name, or its short id when it has none.
 fn room_said(id: &Digest32, name: &str) -> String {
     if name.is_empty() {
@@ -6737,16 +6901,23 @@ pub(crate) async fn room_named(client: &mut IpcClient, channel_id: Digest32) -> 
 }
 
 /// The members of `channel_id` in this node's keyring, by name: who a service or a file shared
-/// there reaches.
-pub(crate) async fn trusted_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
-    let names = crate::ident::names();
-    members_of(client, channel_id)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|m| names.iter().any(|(t, _)| t == *m))
-        .map(|m| crate::ident::member_name(names, m))
-        .collect()
+/// there reaches. `None` while the keyring is not known ([`crate::ident::names`]).
+pub(crate) async fn trusted_in(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Option<Vec<String>> {
+    let crate::ident::Keyring::Known(names) = crate::ident::names() else {
+        return None;
+    };
+    Some(
+        members_of(client, channel_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| names.iter().any(|(t, _)| t == *m))
+            .map(|m| crate::ident::member_name(crate::ident::Keyring::Known(names), m))
+            .collect(),
+    )
 }
 
 /// The services this node offers in `channel_id`, by tag, as `vox service list` names them.
@@ -6938,7 +7109,7 @@ pub async fn trust_add(
     })
     .await
     {
-        Ok(Frame::Ok) => {
+        Ok(answer @ (Frame::Ok | Frame::TrustedKeyPending)) => {
             println!(
                 "vox: trusting {} as {petname:?}: {}",
                 crate::ident::author_id(&target),
@@ -6949,6 +7120,11 @@ pub async fn trust_add(
                 }
                 .words()
             );
+            // The trust is saved and nothing is left to do: a note on the same stream, never an
+            // error, and the command exits 0.
+            if answer == Frame::TrustedKeyPending {
+                println!("vox: {}", vox_core::node::api::Outcome::KEY_PENDING);
+            }
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
                 println!("     In rooms that removed this identity, readmission does not restore earlier history.");
@@ -7014,7 +7190,7 @@ pub async fn trust_rename(paths: &Paths, fingerprint: &str, name: &str) -> Resul
              `vox trust add` it first"
         ))
     })?;
-    crate::ident::check_new_name(&entries, &target, name)?;
+    crate::ident::check_new_name(crate::ident::Keyring::Known(&entries), &target, name)?;
     match keyring_change(&mut client, |identity_passphrase| Request::Rename {
         target,
         petname: name.to_owned(),

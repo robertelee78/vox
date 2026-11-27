@@ -552,7 +552,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &made("dave"),
         "startup",
         &["daemon", "--listen", "127.0.0.1:0"],
-        &["attached: default"],
+        &["Ready: default"],
     ));
 
     // ---- 5. CLI, past the patience: A never lets go while B waits ---------------------------

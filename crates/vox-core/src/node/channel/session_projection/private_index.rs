@@ -447,13 +447,14 @@ pub(in crate::node::channel) fn observe_control(
 
 /// Caller has authenticated this exact entry and publishes it in the same Batch. This helper
 /// must never run on an unpublished promotion chunk. Bodyless gaps are caught up separately.
+/// Returns the author's announced drive-key generation when this entry's floor raised it.
 pub(in crate::node::channel) fn observe_public(
     batch: &mut Batch<'_>,
     sek: &Sek,
     room: &Digest32,
     entry: &crate::log::entry::Entry,
     current_epoch: u64,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     if entry.skeleton.channel_id != *room {
         return Err(Error::MalformedAtRest("Session control room binding"));
     }
@@ -482,14 +483,14 @@ pub(in crate::node::channel) fn observe_public(
         }
     }
     merge_control(&mut index, &author, seen)?;
-    let floors = super::floor_index::observe(&mut index, room, entry, current_epoch)?;
+    let (floors, announced) = super::floor_index::observe(&mut index, room, entry, current_epoch)?;
     index.seal()?;
     if floors {
         // A Session floor or its signed source changed: in this same transaction, the room's
         // private permission generation moves (`permission_generation`).
         raise_permission_generation(batch, room)?;
     }
-    Ok(())
+    Ok(announced)
 }
 
 /// A committed fact that per-record private permission reads changed in `batch`'s transaction

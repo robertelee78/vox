@@ -585,10 +585,31 @@ impl Reader {
         }
     }
 
+    /// Wait while the room is preparing its saved history (after a restart), as `vox room read`
+    /// does before it reads (`room_cli::room_of_readiness`): looked at every 50 ms for at most
+    /// 15 s (`daemon_client::START_WITHIN`). A room still preparing then is read anyway, and the
+    /// node's refusal is the red.
+    fn until_prepared(&mut self, room: vox_core::hash::Digest32) {
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(15) {
+            let preparing = match self.rt.block_on(self.client.rooms()) {
+                Ok(Frame::Rooms { rooms }) => rooms
+                    .iter()
+                    .any(|(id, _, open, _, preparing, ..)| *id == room && !open && *preparing),
+                _ => false,
+            };
+            if !preparing {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Every rendered text in the room now, every page of it. A read that fails is a red —
     /// **never an empty room**, which would let a proof that something was never read pass on a
     /// broken socket, and read a broken socket as slow sync.
     pub fn texts(&mut self, room: vox_core::hash::Digest32) -> Vec<String> {
+        self.until_prepared(room);
         match self.rt.block_on(self.client.read_rows(room, None)) {
             Ok(Frame::Rows { rows }) => rows.into_iter().map(|r| r.text).collect(),
             Ok(other) => panic!(
@@ -611,6 +632,7 @@ impl Reader {
     /// Every row the room shows now, every page of it, messages not received yet included. A
     /// read that fails is a red, as in [`Reader::texts`].
     pub fn rows(&mut self, room: vox_core::hash::Digest32) -> Vec<vox_core::node::api::MessageRow> {
+        self.until_prepared(room);
         match self.rt.block_on(self.client.read_rows(room, None)) {
             Ok(Frame::Rows { rows }) => rows,
             Ok(other) => panic!(

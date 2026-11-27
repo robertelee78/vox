@@ -244,6 +244,16 @@ fn fold_unpublished_governance(
     }
 }
 
+/// The refusal of a room construction that failed. A failed join leaves no room on this node, so
+/// its own-history refusal is the one that says the room was not joined, never the one that sends
+/// the person to that room's status line.
+fn refused(error: &crate::error::Error) -> Fault {
+    match error {
+        crate::error::Error::OwnHistoryBehind => Fault::OwnHistoryNotJoined,
+        other => fault_of(other),
+    }
+}
+
 impl Pending {
     pub(super) async fn retire(self) {
         let _ = self.task.await;
@@ -262,7 +272,7 @@ impl Pending {
             let channel = match result {
                 Ok(channel) => channel,
                 Err(error) => {
-                    let _ = self.reply.send(Outcome::Failed(fault_of(&error)));
+                    let _ = self.reply.send(Outcome::Failed(refused(&error)));
                     return;
                 }
             };
@@ -690,7 +700,7 @@ impl Node {
                 })
                 .await;
                 let outcome = match result {
-                    Ok(Err(error)) => Outcome::Failed(fault_of(&error)),
+                    Ok(Err(error)) => Outcome::Failed(refused(&error)),
                     Err(_) => Outcome::Failed(Fault::Internal),
                     Ok(Ok(())) => Outcome::Failed(Fault::Locked),
                 };
@@ -705,13 +715,13 @@ impl Node {
                     self.answer_when_published(
                         pending.room,
                         pending.reply,
-                        Outcome::Failed(fault_of(&error)),
+                        Outcome::Failed(refused(&error)),
                     )
                     .await
                 }
                 After::Join { .. } => self.begin_metadata_abort_join(
                     pending.room,
-                    fault_of(&error),
+                    refused(&error),
                     Some(pending.reply),
                     Some(lifetime),
                 ),

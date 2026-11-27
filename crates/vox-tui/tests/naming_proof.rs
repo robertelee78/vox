@@ -30,8 +30,9 @@
 //!    bob's rename of family to *home* reaches her, `22.nas.home.vox` then reaches bob and
 //!    `22.nas.family.vox` leads nowhere. **Mutation:** a member keeps the name it heard at its
 //!    join over the log's (`ChannelState::name`), and alice still lists family.
-//! 8. **One room of a name on a node** (ADR-028 R-3). carol cannot create a second *home*, and
-//!    alice cannot join bob's room called *work*, each told which room holds the name. When bob
+//! 8. **One room of a name on a node** (ADR-028 R-3). carol cannot create a second *home*, told
+//!    which room holds the name, and alice cannot join bob's room called *work*, told that a room
+//!    she holds already has it (she holds one room of a name, so that is her *work*). When bob
 //!    renames his room *extra* to *work*, carol, in both, lists each by its room ID and says why
 //!    once, and alice, in one, sees nothing change; renamed again, carol sees names again.
 //!    **Mutation:** a clashing join is let through, and alice holds two rooms called work.
@@ -745,7 +746,8 @@ fn a_local_name_reaches_the_node_it_names() {
 
     // (8) **One room of a name on a node** (ADR-028 R-3). carol, who holds family (now home),
     // cannot create another home; alice, who holds work, cannot join bob's new room called work,
-    // and is told which of hers holds the name. A rename that clashes is not refused: carol, in
+    // and is told that a room she holds already has that name (a node holds one room of a name,
+    // so that names her work). A rename that clashes is not refused: carol, in
     // bob's room extra, sees both rooms by their ids once bob calls it work, and says why once;
     // when he renames it again, the names come back. alice, not in extra, never sees the clash.
     let made_home = vox(
@@ -798,11 +800,11 @@ fn a_local_name_reaches_the_node_it_names() {
     );
     assert!(
         !join_work.0
-            && join_work.2.contains(&format!(
-                "the room is called work, and the room {work} on this node already is"
-            )),
-        "PRODUCT: alice holds work, and joining bob's room called work must be refused, naming \
-         her room that holds the name: {join_work:?}"
+            && join_work
+                .2
+                .contains("a room this node holds already has that name"),
+        "PRODUCT: alice holds work, and joining bob's room called work must be refused, saying \
+         that a room she holds already has that name: {join_work:?}"
     );
     assert!(
         to_work.0 && to_spare.0,

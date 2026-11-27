@@ -59,7 +59,8 @@ extension NodeModel {
         let several = sessionsOpenPaged || sessionsOpenNext != nil
             || openSessions.filter { $0.nodeFingerprint == session.nodeFingerprint }.count > 1
         guard includeName || several else { return alias }
-        let name = session.name.flatMap { $0.isEmpty ? nil : $0 } ?? session.sessionId
+        // Without a name, the id as the FFI shows it (escaped); `sessionId` stays what selects it.
+        let name = session.name.flatMap { $0.isEmpty ? nil : $0 } ?? session.shownId
         return "\(alias) · \(name)"
     }
 

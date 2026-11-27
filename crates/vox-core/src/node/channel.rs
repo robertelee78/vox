@@ -6460,11 +6460,11 @@ impl ChannelState {
     /// whose **live** drive key it holds (SC-2). The author's signed Session floors announce its
     /// generation even when this node is forbidden from receiving the new step bodies. For an
     /// older author without floors, the newest retained drive-sealed entry is the fallback.
-    /// A member whose key was rotated away (SC-2b) drops out when the new generation arrives,
-    /// unless a
-    /// key-package from that author for this node waits to be opened (until the end of the sync
-    /// session that brought it, when the node opens it): before that, nothing here can tell the key
-    /// changed, and the session's node is the authority on whom it lets drive (DR-2).
+    /// A member whose key was rotated away (SC-2b) drops out when the new generation is announced;
+    /// one the author's signed floor names at that generation stays in while its release travels.
+    /// A key-package waiting to be opened does not count by itself: it may carry a generation the
+    /// author has since changed away from this node. The session's node is the authority on whom
+    /// it lets drive (DR-2).
     ///
     /// Refuses while any held author's Session control effects are still refreshing here; a
     /// read that can answer per author uses [`Self::drive_from_known`] instead.
@@ -7942,9 +7942,12 @@ impl ChannelState {
     /// its join — this node's own, or the notice it keeps of another's — and only failing those the
     /// first of its entries this node holds. A member that has written nothing still joined when it
     /// was witnessed: taking its time from its writing made a node that never wrote offered no one
-    /// who joined after it. `None` when nothing here says.
+    /// who joined after it. A member whose last statement held here is its leave is a member again
+    /// only by an admission newer than that leave ([`Self::has_left`]), before its statement that
+    /// it is back arrives: its membership starts at the next place in its feed, when that admission
+    /// was witnessed, never where the membership it left started. `None` when nothing here says.
     fn admission(&self, author: &Digest32) -> (u64, Option<u64>) {
-        let back = self.presence.get(author).and_then(|presence| presence.back);
+        let presence = self.presence.get(author).map(|p| (p.last, p.back));
         let feed = self.dag.feed(author);
         let witnessed = || {
             if *author == self.me() {
@@ -7958,9 +7961,10 @@ impl ChannelState {
                 self.board_kept.notices.get(author).map(|(at, _)| *at)
             }
         };
-        match back {
-            Some((seq, ms)) => (seq, Some(ms).or_else(witnessed)),
-            None => (
+        match presence {
+            Some(((left, false), _)) => (left.saturating_add(1), witnessed()),
+            Some((_, Some((seq, ms)))) => (seq, Some(ms).or_else(witnessed)),
+            _ => (
                 0,
                 witnessed().or_else(|| feed.and_then(crate::log::feed::Feed::first_claimed_ms)),
             ),

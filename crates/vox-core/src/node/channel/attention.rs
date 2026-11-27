@@ -337,6 +337,7 @@ impl ChannelState {
                     Reply::Resolved {
                         through: ledger.cursor(&recipient)?,
                         notice_pending: ledger.notice_pending(&recipient)?,
+                        woke: ledger.woke(&recipient)?,
                         recipient: recipient.clone(),
                     }
                 }
@@ -408,6 +409,10 @@ impl ChannelState {
                     ledger.observed(&receipt, now)?;
                     Reply::Done
                 }
+                Operation::Replied { source, .. } => {
+                    ledger.replied(&recipient, &source)?;
+                    Reply::Done
+                }
             })
         };
         Ok(self.attention_write(
@@ -467,6 +472,7 @@ impl ChannelState {
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut answered = Vec::new();
+        let mut replied = Vec::new();
         let mut audience_result = None;
         let owner_text = crate::node::link::b32_encode(&owner);
         let participant = |row: &crate::node::api::MessageRow| {
@@ -542,13 +548,19 @@ impl ChannelState {
                 let Ok(env) = Envelope::parse(&row.text) else {
                     continue;
                 };
-                if row.author == owner && env.from == recipient.session && env.kind == "answer" {
+                // The Session's own reply, of any type, answers the wake it names (V210-121);
+                // only an `answer` answers a request (RA-7). The post path settled the wake as
+                // it accepted the reply (`Operation::Replied`); this settles any it could not.
+                if row.author == owner && env.from == recipient.session {
                     if let Some(source) = env
                         .re
                         .as_deref()
                         .and_then(|re| crate::node::link::b32_decode(re, "answer").ok())
                     {
-                        answered.push((source, row.entry_hash));
+                        replied.push(source);
+                        if env.kind == "answer" {
+                            answered.push((source, row.entry_hash));
+                        }
                     }
                 }
                 let addressed = !env.to.is_empty()
@@ -598,6 +610,9 @@ impl ChannelState {
             }
             for (source, answer) in answered {
                 ledger.answered(&recipient, source, answer, now)?;
+            }
+            for source in &replied {
+                ledger.replied(&recipient, source)?;
             }
             ledger.scanned(&recipient, through, audience_after)?;
             Ok(Reply::Done)

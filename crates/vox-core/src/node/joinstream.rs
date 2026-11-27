@@ -1304,7 +1304,9 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists. An
 /// `Err` is an admission that did not happen: the joiner is refused instead of accepted —
 /// [`JoinFrame::Full`] for a room already full, [`JoinReject::NotAdmitted`] otherwise, never the
-/// refusal a wrong passphrase gets — and the exchange returns that error. An `Ok` carries the
+/// refusal a wrong passphrase gets — and the exchange returns that error. The one exception is
+/// [`Error::JoinAdmissionUnsettled`], an admission saved or perhaps saved and not confirmed: no
+/// refusal is sent for it, so the joiner reports it as uncertain. An `Ok` carries the
 /// room's shared name, which the acceptance tells the joiner (ADR-028 R-1).
 /// A domain-separated proposal of the exact witness fields is sent first; its signature cannot
 /// authorize membership. The authenticated initiator must acknowledge durable rollback
@@ -1411,17 +1413,25 @@ where
                 Ok(_) => {}
                 Err(e) => {
                     let refusal = match e {
-                        Error::RoomFull { members } => JoinFrame::Full { members },
-                        Error::SeatTaken => JoinFrame::Taken,
-                        Error::JoinRoomEnded => JoinFrame::Rejected(JoinReject::RoomEnded),
-                        Error::JoinResponderLeft => JoinFrame::Rejected(JoinReject::ResponderLeft),
-                        Error::SeatNotAgreed { member, unanswered } => {
-                            JoinFrame::NotAgreed { member, unanswered }
+                        Error::RoomFull { members } => Some(JoinFrame::Full { members }),
+                        Error::SeatTaken => Some(JoinFrame::Taken),
+                        Error::JoinRoomEnded => Some(JoinFrame::Rejected(JoinReject::RoomEnded)),
+                        Error::JoinResponderLeft => {
+                            Some(JoinFrame::Rejected(JoinReject::ResponderLeft))
                         }
-                        // The passphrase was accepted: never the refusal that reads as a wrong one.
-                        _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
+                        Error::SeatNotAgreed { member, unanswered } => {
+                            Some(JoinFrame::NotAgreed { member, unanswered })
+                        }
+                        // Saved, or may have been: no refusal, which would be false. The joiner
+                        // keeps the outcome uncertain and withdraws, as for a lost answer.
+                        Error::JoinAdmissionUnsettled => None,
+                        // Nothing was saved and the passphrase was accepted: never the refusal
+                        // that reads as a wrong one.
+                        _ => Some(JoinFrame::Rejected(JoinReject::NotAdmitted)),
                     };
-                    let _ = send_frame(&mut send, &refusal).await;
+                    if let Some(refusal) = refusal {
+                        let _ = send_frame(&mut send, &refusal).await;
+                    }
                     let _ = send.finish();
                     return Err(e);
                 }

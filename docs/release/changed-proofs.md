@@ -93,7 +93,8 @@ fixer-green replay is required or claimed.
 The targeted release proofs use private profiles and the shipped `vox` executable.
 `update_proof` takes `VOX_PROOF_NEXT_BINARY`, a genuinely compiled `test-knobs`
 `vox` with the workspace version's first character replaced by `9`; binary string
-patches are not a release fixture. Its two selected functions are:
+patches are not a release fixture. Its two selected functions are optional proofs
+(docs/release/optional-proofs.md), so they also need `--features optional-proofs`:
 
 - `a_client_uses_another_package_version_with_the_same_control_protocol`
 - `a_claim_is_still_held_after_the_package_version_changes`

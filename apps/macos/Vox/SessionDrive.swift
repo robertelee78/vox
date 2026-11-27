@@ -317,14 +317,16 @@ struct RequestView: View {
         return VStack(alignment: .leading, spacing: Space.s8 * scale) {
             ForEach(parts.indices, id: \.self) { i in
                 VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                    if showsQuestionText { Text(parts[i].text) }
+                    // Shown as the FFI reveals them; the raw text and label are what the answer sends.
+                    if showsQuestionText { Text(parts[i].shownText) }
                     HStack(spacing: Space.s8 * scale) {
                         ForEach(parts[i].options.indices, id: \.self) { n in
                             let option = parts[i].options[n]
-                            Button(option) { pick(part: i, option) }
+                            let shown = parts[i].shownOptions[n]
+                            Button(shown) { pick(part: i, option) }
                                 .selectionMark(chosen[i] == option)
                                 .accessibilityIdentifier("request-option-\(request.reference)-\(offsets[i] + n + 1)")
-                                .accessibilityLabel("\(option), answer to \(parts[i].text)")
+                                .accessibilityLabel("\(shown), answer to \(parts[i].shownText)")
                                 .accessibilityAddTraits(chosen[i] == option ? .isSelected : [])
                         }
                     }

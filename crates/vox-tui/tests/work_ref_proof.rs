@@ -43,7 +43,7 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use support::{post_raw, resource, Out, Worker};
+use support::{post_raw, register_sending_session, resource, Out, Worker};
 
 /// The key shape of the work-accountability tracker, under a scheme.
 const KEY: &str = "gwa:robertelee78/vox:adr-021:m21.3";
@@ -101,6 +101,11 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
     let room_id = room.id.clone();
     let alice = &room.workers[0];
     let r = room_id.as_str();
+    // Every Session that posts here is registered as a person's agent's hook registers it.
+    for session in ["other", "holder", "bystander"] {
+        register_sending_session(alice, r, session);
+    }
+    register_sending_session(&room.workers[1], r, "retrying");
 
     // ---- (1) the tracker's own key, colons and all, is carried unchanged ----
     let ok = post(alice, "other", r, &["--work", KEY], "reading the ADR");
@@ -957,7 +962,15 @@ try:
     tui.key('\x12', .2)
     tui.key('TUI-REPLY-WITHOUT-TAGS', .2)
     tui.key('\r', .5)
-    tui.key('\x1b[F', .5)  # End: follow the posted reply
+    # General shows a thread's replies only under its opened starting message (ADR-033 TH-2,
+    # 1d045a63e): as its summary says, the reply is seen by opening the thread.
+    tui.until(lambda: '1 reply' in tui.text(), 30)
+    for _ in range(6):
+        if any(re.search(r'┌Timeline[^┐]*\[focus\]', line) for line in tui.display()): break
+        tui.key('\t', .2)
+    tui.key('\x1b[F', .2)
+    tui.key('\x1b[A', .2)
+    tui.key('\r', .5)  # Enter: open thread
     need(tui.until(lambda: 'you: TUI-REPLY-WITHOUT-TAGS' in tui.text(), 30), 'TUI did not show its posted reply')
     print('thread-tags PASS: TUI posted its reply'); code = 0
 except Product as e:

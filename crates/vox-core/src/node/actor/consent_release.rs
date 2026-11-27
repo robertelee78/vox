@@ -39,6 +39,12 @@ struct Owed {
     wake: Arc<tokio::sync::Notify>,
 }
 
+/// Passes a person waits for (`vox trust add`) whose room was held by its own save when they
+/// reached it, by room. A save admits no other in its room until it ends, so each is taken up
+/// again when that save ends ([`Node::resume_parked_consents`]), not refused.
+#[derive(Default)]
+pub(super) struct ParkedConsents(std::collections::BTreeMap<Digest32, Vec<Cursor>>);
+
 pub(super) struct Offline {
     attempt: u64,
     source_room: Digest32,
@@ -457,6 +463,31 @@ impl Node {
         }
     }
 
+    /// Take up the passes parked on `room` once its own save has ended (see
+    /// `refresh_consent_selection`): each selects its target again. One that finds the room
+    /// held again, by a save this one started or another, parks again for that save's end.
+    pub(super) async fn resume_parked_consents(&mut self, room: Digest32) {
+        if self.pending_posts.contains_key(&room) {
+            return;
+        }
+        let Some(parked) = self.parked_consents.0.remove(&room) else {
+            return;
+        };
+        for cursor in parked {
+            self.advance_owned_owed_consents(cursor).await;
+        }
+    }
+
+    /// The node is locking: a parked pass ends as one under way does, with the lock.
+    pub(super) fn retire_parked_consents(&mut self) {
+        for cursor in std::mem::take(&mut self.parked_consents.0)
+            .into_values()
+            .flatten()
+        {
+            self.finish_owned_consent_cursor(&cursor, Err(Error::AtRestLocked));
+        }
+    }
+
     async fn refresh_consent_selection(
         &mut self,
         room: Digest32,
@@ -464,6 +495,23 @@ impl Node {
         asked: bool,
         cursor: Cursor,
     ) {
+        // **A room held by its own save is waited for, not refused** (the rule joins use): the
+        // selection below is a save of that room, which is refused at once while another holds
+        // it, and a person's `vox trust add` was then told its change "made no change" although
+        // the trust was saved. A pass a person waits for keeps its place, `target` first, until
+        // the room's save ends; a background pass is retried by the redelivery as before.
+        if self.pending_posts.contains_key(&room) {
+            let mut owed = cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owed.terminal.is_some() && !owed.stopped {
+                owed.room = Some(room);
+                owed.targets.push_front(target);
+                drop(owed);
+                self.parked_consents.0.entry(room).or_default().push(cursor);
+                return;
+            }
+        }
         let Some(instance) = self.channels.get(&room).cloned() else {
             self.finish_owned_consent_cursor(&cursor, Err(Error::Profile("consent room changed")));
             return;

@@ -473,10 +473,12 @@ fn wait_for_log_delivery(k: &Cast, a: &Daemon, c: &Daemon, verdict: &str) {
                 .find(|member| member["id"].as_str() == Some(k.fps[0].as_str()))?;
             let renewed = probe["reach"].as_array()?.first()?["you_trust"].as_bool()?;
             let through = a_room["own_feed_through"].as_u64()?;
+            // C's authenticated position in A's feed: `verified_through` since 1edf35498, which
+            // gave `holds_through` the latest message C can show.
             Some(
                 renewed
                     && b["key_delivery_pending"] == false
-                    && a_at_c["holds_through"].as_u64()? >= through,
+                    && a_at_c["verified_through"].as_u64()? >= through,
             )
         })() == Some(true);
         if probe_ok && a_ok && c_ok && ready {

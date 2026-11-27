@@ -1,26 +1,17 @@
 //! ADR-023 M23.6 / PRD-001 R1, R6 — checkpoints, driven through the **shipped `vox` binary**.
 //!
-//! A room that keeps messages for a while still kept every signed skeleton forever, and the
-//! composite signature is 3,373 bytes of each. Now each author, once enough of its own entries
-//! have expired, posts a checkpoint on its own feed naming the position below which they are
-//! past retention; a node holding it drops those entries' signatures and keeps their hashes and
-//! links, so the chain still verifies up to the signed checkpoint.
+//! Each author, once enough of its own entries have expired, posts a checkpoint on its own feed
+//! naming the position below which they are past retention. A v2 entry keeps its signature after
+//! its body expires (ADR-036, `4f7f95041`: a later entry may cite any earlier header as a parent
+//! receipt), so a checkpoint sheds no signature in this release; what it still owes is below.
 //!
 //! One room, one author, 100 messages, then a disappearing retention:
-//! - **The bytes go.** Alice's store is measured stopped, before the retention and after the
-//!   expiry: every page at or below the checkpoint becomes smaller than a signature alone, and
-//!   the room's log shrinks by at least 3,373 bytes for each (sizes printed).
-//! - **A restart still opens the room**, from the shed store.
-//! - **A cold joiner syncs it**: signed from the checkpoint onward, and hash-chained skeletons
-//!   below it (its own store is measured the same way). The order it prints with
-//!   `vox room read --hashes` is identical to alice's.
+//! - **A restart still opens the room** once they expired.
+//! - **A cold joiner syncs it**: the order it prints with `vox room read --hashes` is identical
+//!   to alice's.
 //! - **V030-10: a newcomer after an expiry reads the author on.** The expired skeletons are taken,
 //!   bob reckons them expired himself (none shows as "not received yet", none is shown), and
 //!   alice's next message reaches him.
-//!
-//! **Measured, not driven, in this process:** the page sizes. No `vox` command reports them, and
-//! the store file does not shrink when a page does (redb reuses its pages), so the claim that the
-//! bytes go is read from the stopped node's store. Nothing here acts as a participant.
 //!
 //! **Moved:** a forged entry below the checkpoint, refused as pre-checkpoint and never raised as a
 //! fork, was offered here to a stopped node's room in this process. It is proved through the
@@ -28,14 +19,12 @@
 //! the author's own key is offered over a real sync session to a running member, whose
 //! `vox status --json` must count it refused below the checkpoint and freeze nobody.
 //!
-//! Mutations (each run, each red): shedding disabled; v0.2.10's Withheld rule (a payload-less
-//! entry set aside) — "bob never caught up"; expiry never reckoned by the receiver — bob shows
-//! the expired ones as not received yet.
+//! Mutations (each run, each red): v0.2.10's Withheld rule (a payload-less entry set aside) —
+//! "bob never caught up"; expiry never reckoned by the receiver — bob shows the expired ones as
+//! not received yet.
 
 #![cfg(unix)]
 
-#[path = "support/test_knobs.rs"]
-mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -48,9 +37,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-use vox_core::atrest::store::SegmentKind;
-use vox_core::hash::COMPOSITE_SIG_LEN;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// What `vox room read` prints for a message whose body is still owed (V030-10).
@@ -146,14 +132,8 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
 /// checkpoint batch is closed anyway (production: ten minutes).
 const IDLE_ENV: &str = "VOX_TEST_CHECKPOINT_IDLE_SECS";
 
-/// Start `vox daemon` on `dir` at `listen`, optionally with a short checkpoint idle time.
-fn daemon(
-    dir: &Path,
-    tag: &str,
-    listen: &str,
-    stdin_lines: &str,
-    idle_secs: Option<u64>,
-) -> Daemon {
+/// Start `vox daemon` on `dir` at `listen`.
+fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
     let mut cmd = Command::new(VOX);
@@ -166,10 +146,6 @@ fn daemon(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    if let Some(idle) = idle_secs {
-        test_knobs::require(&[IDLE_ENV]);
-        cmd.env(IDLE_ENV, idle.to_string());
-    }
     let mut child = cmd.spawn().expect("spawn vox daemon");
     let mut pipe = child.stdin.take().expect("daemon stdin");
     pipe.write_all(stdin_lines.as_bytes()).unwrap();
@@ -261,53 +237,16 @@ fn members(tmp: &Path, names: &[&str]) -> Vec<PathBuf> {
     dirs
 }
 
-/// The sizes of every log page in a **stopped** node's store, in page order.
-fn log_pages(dir: &Path) -> Vec<usize> {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let profile = loop {
-        match vox_core::node::profile::Profile::open(paths.clone()) {
-            Ok(p) => break p,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => panic!("CANNOT MEASURE: the stopped node's store did not open: {e:?}"),
-        }
-    };
-    let store = profile.store();
-    let cid = store.channels().unwrap()[0];
-    store
-        .segments(&cid, SegmentKind::LogDb)
-        .unwrap()
-        .into_iter()
-        .map(|(_, page)| page.ciphertext.len())
-        .collect()
-}
-
-/// `(pages, total bytes, pages smaller than a signature alone)`.
-fn page_stats(pages: &[usize]) -> (usize, usize, usize) {
-    (
-        pages.len(),
-        pages.iter().sum(),
-        pages.iter().filter(|p| **p < COMPOSITE_SIG_LEN).count(),
-    )
-}
-
 #[test]
 #[ignore = "two real vox daemons and real seconds (about two minutes); CI runs it in release"]
-fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it() {
+fn a_disappearing_room_reopens_and_a_newcomer_syncs_it() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dirs = members(tmp.path(), &["alice", "bob"]);
     let (alice, bob) = (&dirs[0], &dirs[1]);
 
     // ---- alice alone: a room and 100 messages --------------------------------------------
-    let alice_d = daemon(
-        alice,
-        "alice",
-        "127.0.0.1:0",
-        &format!("{IDENTITY}\n"),
-        None,
-    );
+    let alice_d = daemon(alice, "alice", "127.0.0.1:0", &format!("{IDENTITY}\n"));
     attached(alice, "alice");
     let (ok, _, err) = vox(
         alice,
@@ -329,12 +268,6 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         "alice shows her 100"
     );
     stop_all(vec![alice_d]);
-    let before = log_pages(alice);
-    let (b_pages, b_bytes, b_small) = page_stats(&before);
-    println!(
-        "before: {b_pages} log pages, {b_bytes} bytes, {b_small} smaller than a signature \
-         ({COMPOSITE_SIG_LEN} bytes)"
-    );
 
     // ---- the room disappears after 20 s --------------------------------------------------
     // Set once all 100 are already older than it, so one sweep expires them together and one
@@ -346,7 +279,6 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         "alice-2",
         "127.0.0.1:0",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        None,
     );
     attached(alice, "alice");
     let (ok, out, err) = vox(
@@ -364,26 +296,9 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         assert!(Instant::now() < deadline, "the 100 never expired");
         std::thread::sleep(Duration::from_millis(500));
     }
-    // The checkpoint and the shedding run on the sweep that pruned them; a few ticks more.
+    // A few ticks more, for the sweep that pruned them to finish.
     std::thread::sleep(Duration::from_secs(3));
     stop_all(vec![alice_d]);
-    let after = log_pages(alice);
-    let (a_pages, a_bytes, a_small) = page_stats(&after);
-    let shed = a_small.saturating_sub(b_small);
-    println!(
-        "after: {a_pages} log pages, {a_bytes} bytes, {a_small} smaller than a signature; the \
-         log shrank by {} bytes for {shed} shed signatures ({shed} × {COMPOSITE_SIG_LEN} = {})",
-        b_bytes.saturating_sub(a_bytes),
-        shed * COMPOSITE_SIG_LEN
-    );
-    assert!(
-        shed >= POSTS,
-        "only {shed} of alice's {POSTS} expired entries shed their signature"
-    );
-    assert!(
-        b_bytes.saturating_sub(a_bytes) >= shed * COMPOSITE_SIG_LEN,
-        "the log shrank by less than the signatures shed"
-    );
 
     // ---- a restart opens the room; a cold joiner syncs it --------------------------------
     let alice_d = daemon(
@@ -391,15 +306,14 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         "alice-3",
         "127.0.0.1:0",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        None,
     );
     let listed = attached(alice, "alice");
     println!("after the restart: `room list` says {listed:?}");
     assert!(
         !listed.contains("[closed]"),
-        "a room with shed signatures must reopen: {listed:?}"
+        "a room whose messages expired must reopen: {listed:?}"
     );
-    let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
+    let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"));
     attached(bob, "bob");
     let (ok, link, err) = vox(alice, &["room", "link", &room], None);
     assert!(ok, "vox room link: {err}");
@@ -479,144 +393,4 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     }
     println!("bob reads alice's next message: {next:?}");
     stop_all(vec![alice_d, bob_d]);
-    let joined = log_pages(bob);
-    let (j_pages, j_bytes, j_small) = page_stats(&joined);
-    println!(
-        "bob's store: {j_pages} log pages, {j_bytes} bytes, {j_small} smaller than a signature"
-    );
-    assert!(
-        j_small >= POSTS,
-        "the newcomer received {j_small} unsigned skeletons for {POSTS} checkpointed entries"
-    );
-}
-
-/// A room of one: alice creates it on a fresh daemon and posts `n` messages `"old <i>"`.
-/// Returns the running daemon and the room id.
-fn room_with_posts(alice: &Path, n: usize, idle_secs: Option<u64>) -> (Daemon, String) {
-    let alice_d = daemon(
-        alice,
-        "alice",
-        "127.0.0.1:0",
-        &format!("{IDENTITY}\n"),
-        idle_secs,
-    );
-    attached(alice, "alice");
-    let (ok, _, err) = vox(
-        alice,
-        &["room", "create", "--passphrase-file", "-", "--name", "r"],
-        Some(&format!("{ROOMPASS}\n")),
-    );
-    assert!(ok, "vox room create: {err}");
-    let room = attached(alice, "alice")
-        .split_whitespace()
-        .next()
-        .expect("a room id")
-        .to_owned();
-    for i in 1..=n {
-        post(alice, &room, &format!("old {i}"));
-    }
-    (alice_d, room)
-}
-
-/// Poll `vox room read` until none of the `"old "` messages is shown.
-fn until_expired(alice: &Path, room: &str, secs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while texts(&read(alice, room))
-        .iter()
-        .any(|t| t.starts_with("old "))
-    {
-        assert!(Instant::now() < deadline, "the old messages never expired");
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// Fewer expired entries than a checkpoint batch (32) are still checkpointed once nothing new
-/// has expired for the idle time — a **closing** checkpoint — so none keeps its signature
-/// indefinitely. The idle time is the test-only 15 s instead of production's ten minutes; the
-/// gate first shows that nothing is shed before it passes.
-#[test]
-#[ignore = "one real vox daemon and real seconds (about a minute); CI runs it in release"]
-fn a_backlog_under_a_batch_is_checkpointed_once_the_room_goes_quiet() {
-    const FEW: usize = 10;
-    const IDLE: u64 = 15;
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
-    let alice = &members(tmp.path(), &["alice"])[0];
-    let (alice_d, room) = room_with_posts(alice, FEW, Some(IDLE));
-    std::thread::sleep(Duration::from_secs(RETENTION + 2));
-    let (ok, _, err) = vox(
-        alice,
-        &["room", "retention", &room, &RETENTION.to_string()],
-        None,
-    );
-    assert!(ok, "vox room retention: {err}");
-    until_expired(alice, &room, 60);
-    stop_all(vec![alice_d]);
-    let (_, _, before) = page_stats(&log_pages(alice));
-    println!("just after the {FEW} expired: {before} pages smaller than a signature");
-    assert_eq!(
-        before, 0,
-        "a backlog under a batch was checkpointed before the room went quiet"
-    );
-
-    let alice_d = daemon(
-        alice,
-        "alice-2",
-        "127.0.0.1:0",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        Some(IDLE),
-    );
-    attached(alice, "alice");
-    std::thread::sleep(Duration::from_secs(IDLE + 5));
-    stop_all(vec![alice_d]);
-    let (pages, bytes, after) = page_stats(&log_pages(alice));
-    println!(
-        "{} s quiet: {pages} log pages, {bytes} bytes, {after} smaller than a signature",
-        IDLE + 5
-    );
-    assert_eq!(after, FEW, "the closing checkpoint did not shed all {FEW}");
-}
-
-/// A backlog that expired while the room still kept everything (a node's own shorter limit
-/// pruned it, and a room that keeps everything is never checkpointed) is checkpointed as soon as
-/// the room starts disappearing, and after a restart, **without another prune**: nothing is left
-/// to prune.
-#[test]
-#[ignore = "one real vox daemon and real seconds (about a minute); CI runs it in release"]
-fn an_expired_backlog_is_checkpointed_without_waiting_for_another_prune() {
-    const MANY: usize = 40;
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
-    let alice = &members(tmp.path(), &["alice"])[0];
-    // The node keeps 20 s; the room keeps everything.
-    std::fs::write(
-        alice.join("cfg").join("retention"),
-        format!("default {RETENTION}\n"),
-    )
-    .unwrap();
-    let (alice_d, room) = room_with_posts(alice, MANY, None);
-    until_expired(alice, &room, 90);
-    // Nothing more can expire now; the room starts disappearing only afterwards.
-    let (ok, out, err) = vox(alice, &["room", "retention", &room, "1w"], None);
-    assert!(ok, "vox room retention 1w: {err}");
-    println!("{}", out.trim());
-    stop_all(vec![alice_d]);
-    let alice_d = daemon(
-        alice,
-        "alice-2",
-        "127.0.0.1:0",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        None,
-    );
-    attached(alice, "alice");
-    std::thread::sleep(Duration::from_secs(5));
-    stop_all(vec![alice_d]);
-    let (pages, bytes, shed) = page_stats(&log_pages(alice));
-    println!(
-        "after the restart: {pages} log pages, {bytes} bytes, {shed} smaller than a signature"
-    );
-    assert_eq!(
-        shed, MANY,
-        "the expired backlog was not checkpointed without another prune"
-    );
 }

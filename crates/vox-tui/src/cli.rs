@@ -657,7 +657,7 @@ pub struct RoomMemberArgs {
     pub profile: NodeArgs,
     /// The room name, ID, or unique ID prefix.
     pub room: String,
-    /// The verified full 52-character node fingerprint, not its name or a prefix.
+    /// The node's full 52-character fingerprint, not its name or a prefix.
     pub fingerprint: String,
 }
 
@@ -812,7 +812,7 @@ pub struct ShareArgs {
     /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
-    /// The entry hash this share answers.
+    /// The entry hash this share answers. A session woken by one message answers it without.
     #[arg(long)]
     pub re: Option<String>,
     /// A note, carried in the share itself.
@@ -1414,6 +1414,8 @@ pub struct RoomSessionArgs {
     #[arg(long)]
     pub details: bool,
     /// Print saved records without joining multipart activities. Pages remain bounded.
+    /// Their text is the Session's bytes as stored, not made safe to show: send it to a file or a
+    /// program, not to a terminal.
     #[arg(long, conflicts_with = "details")]
     pub raw: bool,
     /// Print one JSON object per line instead.
@@ -1545,7 +1547,7 @@ pub struct RoomPostArgs {
     /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
-    /// The entry hash this replies to.
+    /// The entry hash this replies to. A session woken by one message answers it without.
     #[arg(long)]
     pub re: Option<String>,
     /// The entry hash of the conversation root.
@@ -2546,9 +2548,10 @@ enum Cmd {
     /// It stops the daemon and Vox.app, unregisters Vox's login item and LAN helper (on a Mac),
     /// removes the Keychain items it stored for kept nodes, the `vox agent hook` entries, plugin
     /// and skill it installed for Claude Code, Codex, OpenCode and Oh My Pi (only what is still as it wrote
-    /// it; anything edited is named and left), the shell completions and startup-file block, and
-    /// Vox.app or the `vox` binary with its link. Your nodes, their keys and rooms are kept, and
-    /// it says where; a node has no backup. `--purge` removes them too.
+    /// it; anything edited is named and left), the shell completions and the lines
+    /// `vox shell-setup` added to startup files, and Vox.app or the `vox` binary with its link.
+    /// Your nodes, their keys and rooms are kept, and it says where; a node has no backup.
+    /// `--purge` removes them too.
     Uninstall {
         /// List everything it would do, and change nothing.
         #[arg(long)]

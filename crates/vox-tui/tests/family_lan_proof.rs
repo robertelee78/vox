@@ -1151,8 +1151,9 @@ fn lan_up_without_a_helper_refuses_and_creates_nothing() {
 
     // On a Mac, a `vox` inside Vox.app (as install.sh lays it out) points at the app's helper, which
     // replaces `sudo vox lan helper` there (ADR-014 M-10). The default socket is the app helper's.
-    // It names the app's own control, the room's FAMILY LAN switch "On this room's LAN" (#578), and
-    // where in System Settings to allow the helper; the "Allow the LAN Helper" button it once
+    // It names the app's own control, the Room menu's "Turn On Family LAN" (#578; moved from the
+    // room's FAMILY LAN switch to the menu by `20c456db6`, #842), and where in System Settings to
+    // allow the helper; the "Allow the LAN Helper" button it once
     // named is gone. Mutants: `lan_cli::vox_app` returns None, red as PRODUCT, it still says sudo;
     // the message naming "Allow the LAN Helper" again, red as PRODUCT on the same assert.
     #[cfg(target_os = "macos")]
@@ -1180,7 +1181,7 @@ fn lan_up_without_a_helper_refuses_and_creates_nothing() {
         eprintln!("[Vox.app's vox lan up] exit {:?}: {err}", out.status.code());
         assert!(
             !out.status.success()
-                && err.contains("turn on \"On this room's LAN\" under FAMILY LAN")
+                && err.contains("choose Room › Turn On Family LAN")
                 && err.contains("Login Items & Extensions")
                 && err.contains("\"Allow in the Background\", turn on Vox")
                 && !err.contains("Allow the LAN Helper")

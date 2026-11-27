@@ -18,9 +18,10 @@
 //!   a generation was minted reads that generation whole, one that gained drive (or was admitted)
 //!   later reads from that moment. Owed again at every new generation, retried on the tick. The
 //!   cause of every release is that keyring entry (ADR-020 3.3).
-//! - **Rotation** (SC-2b): when a member it was released to no longer has drive (downgraded to
-//!   read, or untrusted), a new chain with fresh keys, released to the members that still have
-//!   drive. The member keeps what it read and reads nothing sealed afterwards.
+//! - **Rotation** (SC-2b): when a member it was released or promised (marked owed, its floor
+//!   signed) no longer has drive (downgraded to read, or untrusted), a new chain with fresh keys,
+//!   released to the members that still have drive. The member keeps what it read and reads
+//!   nothing sealed afterwards.
 //! - **Receiving**: a drive key is taken only from a node this node trusts (V210-118), as the sender
 //!   key is.
 //!
@@ -255,14 +256,18 @@ impl DriveState {
         }
     }
 
-    /// The members released this node's drive key that `drive` no longer names: each one is why
-    /// the key must change (SC-2b).
+    /// The members released or promised this node's live drive key that `drive` no longer names:
+    /// each one is why the key must change (SC-2b). A promised member's signed floor names it at
+    /// the live generation before its release is sent, and only a new generation withdraws that.
     #[must_use]
     pub fn lost(&self, drive: &BTreeSet<Digest32>) -> Vec<Digest32> {
         self.delivered
             .keys()
+            .chain(self.marks.keys())
             .filter(|m| !drive.contains(*m))
             .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 

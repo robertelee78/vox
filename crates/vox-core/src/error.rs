@@ -467,9 +467,18 @@ pub enum Error {
     /// The member answering a join accepted the passphrase, and then could not admit the joiner:
     /// it was locked or closing mid-join, its store would not take the write, or it already holds
     /// another key under the joiner's fingerprint (V210-128). Not [`Error::JoinRefused`], which a
-    /// joiner reads as a wrong passphrase: this one was checked, and accepted.
+    /// joiner reads as a wrong passphrase: this one was checked, and accepted. Sent only when
+    /// nothing was saved, so the joiner reads it as a definite refusal.
     #[error("a member accepted the passphrase but could not admit this identity")]
     JoinNotAdmitted,
+
+    /// The member answering a join saved its admission, or may have, and then could not confirm
+    /// it: the room was detached or closed after the save, or the node stopped before the save's
+    /// answer came. Not [`Error::JoinNotAdmitted`], which the joiner reads as a definite refusal:
+    /// the responder sends no refusal for this one, so the joiner keeps the outcome uncertain and
+    /// withdraws on its own.
+    #[error("the member may have saved the joiner's admission, but could not confirm it")]
+    JoinAdmissionUnsettled,
 
     /// The member was busy and took no step for this joiner: every one of its join slots was held,
     /// so it refused before the exchange began (V210-92), or it was saving the room for longer

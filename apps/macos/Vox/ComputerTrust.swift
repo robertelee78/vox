@@ -412,7 +412,7 @@ struct ComputerTrustView: View {
                     .secondaryText()
             }
             if expired(conflict.expiresMs) {
-                Text("This proposal has expired. Close it on the inviting computer and review a fresh invitation before replacing this group.")
+                Text("This proposal has expired. Close it on the computer that made the pairing code and review a fresh pairing code before replacing this group.")
                     .secondaryText()
                 Button("Copy Close Command for \(conflict.peer.name)") {
                     copy(shellCommand(words: ["vox", "computer", "cancel", conflict.operationId]),
@@ -420,8 +420,8 @@ struct ComputerTrustView: View {
                 }
                 .focused($focused, equals: .conflictCloseCommand)
                 .id(ComputerTrustFocus.conflictCloseCommand)
-                Button("Copy Fresh Invitation Command") {
-                    copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied.")
+                Button("Copy Command for a Fresh Pairing Code") {
+                    copy(shellCommand(words: ["vox", "computer", "pair"]), said: "Pairing command copied.")
                 }
                 .focused($focused, equals: .conflictFreshCommand)
                 .id(ComputerTrustFocus.conflictFreshCommand)
@@ -439,7 +439,7 @@ struct ComputerTrustView: View {
             .accessibilityIdentifier("computer-conflict-close")
             .focused($focused, equals: .closeConflict)
             .id(ComputerTrustFocus.closeConflict)
-            Text("This closes the review only on this computer. It cannot withdraw an invitation or signature recorded on \(conflict.peer.name).")
+            Text("This closes the review only on this computer. It cannot withdraw a pairing code or signature recorded on \(conflict.peer.name).")
                 .secondaryText()
             TextField("Pairing code to review again", text: $link)
                 .textFieldStyle(.roundedBorder)
@@ -570,15 +570,15 @@ struct ComputerTrustView: View {
             .id(ComputerTrustFocus.preview)
         }
         if let handoff, status.state == "individual" {
-            Text("On \(handoff.peer.name), \(handoff.inviterApproved && !expired(handoff.expiresMs) ? "wait until the signed proposal expires, then " : "")close the old proposal and create a fresh invitation. If it was signed after review, wait for expiry before closing. Bring the fresh invitation here and approve on both computers. Closing cannot withdraw a signature already recorded elsewhere.")
+            Text("On \(handoff.peer.name), \(handoff.inviterApproved && !expired(handoff.expiresMs) ? "wait until the signed proposal expires, then " : "")close the old proposal and create a fresh pairing code. If it was signed after review, wait for expiry before closing. Bring the fresh pairing code here and approve on both computers. Closing cannot withdraw a signature already recorded elsewhere.")
                 .fixedSize(horizontal: false, vertical: true)
             Button("Copy Command to Close Old Proposal") {
                 copy(shellCommand(words: ["vox", "computer", "cancel", handoff.operationId]), said: "Close command copied for \(handoff.peer.name).")
             }
             .focused($focused, equals: .handoffClose)
             .id(ComputerTrustFocus.handoffClose)
-            Button("Copy Command to Create Fresh Invitation") {
-                copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied for \(handoff.peer.name).")
+            Button("Copy Command to Create a Fresh Pairing Code") {
+                copy(shellCommand(words: ["vox", "computer", "pair"]), said: "Pairing command copied for \(handoff.peer.name).")
             }
             .focused($focused, equals: .handoffInvite)
             .id(ComputerTrustFocus.handoffInvite)

@@ -513,6 +513,7 @@ fn empty_passphrase_refusals(root: &Path, bob: &str, carol: &str) {
 }
 
 #[test]
+#[ignore = "real daemons and production Argon2id; CI runs it in release"]
 fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     watchdog::arm();
     test_knobs::require(&[KNOB, DELAY_KNOB]);
@@ -723,7 +724,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     if !matches!(&none, Frame::Error { reason } if reason == needed)
         || !refused(&wrong)
         || after_refusals.contains(&carol)
-        || right != Frame::Ok
+        || !matches!(right, Frame::Ok | Frame::TrustedKeyPending)
         || !after_right.contains(&carol)
     {
         kill(daemon);

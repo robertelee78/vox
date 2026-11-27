@@ -62,6 +62,9 @@ pub(crate) struct CompletedReceived {
     consent: bool,
     governance_changed: bool,
     contiguous: Option<(Digest32, entry_store::sparse::ContiguousAdvance)>,
+    /// The entry's author and the drive-key generation its floor raised the author's announced
+    /// one to (`observe_public`).
+    announced: Option<(Digest32, u64)>,
     poisoned: bool,
 }
 
@@ -403,6 +406,7 @@ impl ChannelState {
             consent,
             governance_changed,
             contiguous,
+            announced,
             poisoned,
         } = completed;
         let PendingReceived {
@@ -476,6 +480,25 @@ impl ChannelState {
                 if let Some((author, progress)) = contiguous {
                     self.note_contiguous_advance(author, progress)?;
                 }
+                // The author announced a drive key this node does not hold, after one it held:
+                // it changed its key away from this node, and this node's drive over the
+                // author's Sessions is gone (SC-2b). The Session entry it writes to say so is a
+                // private record this node may no longer pull, so this public floor is all it
+                // hears. Said once as Session news for the room, as a drive key accepted is
+                // (`apply_attempt_effect`), so a client that keeps the room's Sessions reads
+                // them again.
+                if let Some((author, generation)) = announced {
+                    if author != self.me()
+                        && !self.drive.receivers.contains_key(&(author, generation))
+                        && !self.key_packages.pending_from(&author)
+                        && self.drive.holds_from(&author)
+                        && self.drive.told_unheld.insert(author)
+                    {
+                        self.drive
+                            .news
+                            .push(crate::node::drive::KEY_CHANGED.to_owned());
+                    }
+                }
                 Ok(())
             })();
             if let Err(error) = projection_result.and(install) {
@@ -532,6 +555,7 @@ impl PendingReceived {
         let mut consent = false;
         let mut governance_changed = false;
         let mut contiguous = None;
+        let mut announced = None;
         let mut newly_available = false;
         let mut poisoned = false;
         let weak = self.sek.clone();
@@ -698,9 +722,10 @@ impl PendingReceived {
                             batch.ruled();
                         }
                     }
-                    session_projection::private_index::observe_public(
+                    announced = session_projection::private_index::observe_public(
                         &mut batch, sek, &self.room, entry, self.epoch,
-                    )?;
+                    )?
+                    .map(|generation| (author, generation));
                     if matches!(
                         kind,
                         SignedEntryKind::Governance | SignedEntryKind::StepPolicy
@@ -914,6 +939,7 @@ impl PendingReceived {
             consent,
             governance_changed,
             contiguous,
+            announced,
             poisoned,
         }
     }

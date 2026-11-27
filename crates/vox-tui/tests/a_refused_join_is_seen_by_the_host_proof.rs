@@ -208,10 +208,7 @@ fn foreground_daemon(p: &Person, err: &Path) -> Proc {
     .expect("APPARATUS: could not start vox daemon");
     let daemon = Proc(child);
     let t0 = Instant::now();
-    while !run(&p.dir, &["node", "list"])
-        .1
-        .contains("default attached")
-    {
+    while !run(&p.dir, &["node", "list"]).1.contains("default Ready") {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
             "PRODUCT (staging): alice's daemon never attached her node: {}",

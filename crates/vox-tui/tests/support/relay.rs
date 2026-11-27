@@ -150,7 +150,7 @@ impl Anchor {
                 }
                 assert!(
                     t0.elapsed() < FIRST_REPORT,
-                    "CANNOT MEASURE: the anchor printed no `vox node: … peer(s) connected, … \
+                    "CANNOT MEASURE: the anchor printed no `vox node: … peer(s) connected [ … ], \
                      circuit(s) carried` report in {:?}, so how many circuits it carries is \
                      unknown. It said:\n{}",
                     t0.elapsed(),
@@ -181,7 +181,8 @@ impl Anchor {
             .iter()
             .filter_map(|l| {
                 let rest = l.strip_prefix("vox node: ")?;
-                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                let (_, after) = rest.split_once(" peer(s) connected [")?;
+                let (_, after) = after.split_once("], ")?;
                 after.split_whitespace().next()?.parse::<usize>().ok()
             })
             .max()
@@ -210,7 +211,8 @@ impl Anchor {
             .iter()
             .filter_map(|l| {
                 let rest = l.strip_prefix("vox node: ")?;
-                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                let (_, after) = rest.split_once(" peer(s) connected [")?;
+                let (_, after) = after.split_once("], ")?;
                 after.split_whitespace().next()?.parse::<usize>().ok()
             })
             .max()
@@ -221,7 +223,8 @@ impl Anchor {
     fn last_report(&self) -> Option<usize> {
         self.proc.seen.iter().rev().find_map(|l| {
             let rest = l.strip_prefix("vox node: ")?;
-            let (_, after) = rest.split_once(" peer(s) connected, ")?;
+            let (_, after) = rest.split_once(" peer(s) connected [")?;
+            let (_, after) = after.split_once("], ")?;
             after.split_whitespace().next()?.parse().ok()
         })
     }

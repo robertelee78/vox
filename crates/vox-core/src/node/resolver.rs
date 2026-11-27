@@ -213,7 +213,8 @@ impl VoxResolver {
         for o in &snap.open {
             names.add_room(o.channel_id, o.name.as_deref(), &o.members);
         }
-        for (fp, petname) in &snap.trusted {
+        // Names only: a keyring not known gives none, and every member is named by fingerprint.
+        for (fp, petname) in snap.keyring.known().map_or(&[][..], |k| &k.trusted[..]) {
             names.name(*fp, petname);
         }
         names

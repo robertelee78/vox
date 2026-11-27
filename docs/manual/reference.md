@@ -50,7 +50,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
 | Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | a Ready node |
 | A room's local network | `vox lan up` | the LAN helper |
-| Pair your computers | `vox computer status`, `invite`, `pair`, `approve`, `personal`, `remove` | operator approval on each computer; actual invitation/operation |
+| Pair your computers | `vox computer status`, `pair`, `approve`, `personal`, `remove` | operator approval on each computer; actual pairing code/operation |
 | Room anchors | `vox room anchors`, `vox room create --room-anchor` | room creator/admin; actual anchor identity/address |
 | Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | actual harness; known `--node` where required |
 | Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | Drive for private activity and controls |
@@ -85,9 +85,9 @@ passphrase in a constructed command.
 ## Pairing your computers
 
 Computer pairing is an operator action on **both** computers. On the first, run
-`vox computer invite` or open Settings → Add Computer… in Vox. Transfer its one-time link
+`vox computer pair` or open Settings → Add Computer… in Vox. Transfer its one-time link
 privately to the other computer. There, run the complete `vox computer pair` command printed
-with the invitation, review the authenticated computer identity and policy, and answer `yes`
+with the pairing code, review the authenticated computer identity and policy, and answer `yes`
 only if they are correct. In the app, review the computer in My Computers and use
 **Trust This Computer**. On the first computer, `vox computer status` shows the authenticated
 proposal and the exact `vox computer approve` command to run there. Both approvals are required;
@@ -267,10 +267,10 @@ lapses and deletes each one when it stops. `vox status --json` carries the same,
 network change under `network_changed`.
 
 A room's or member's `last sync` is when a sync last saved room history this node did not hold
-before: an entry, a header or body, a signed head, a proof or a room context. It does not say that
-a message arrived. In a room of the current history format the member is the one whose connection
-brought it: an answer its loop got that saved any of these, or an entry from that answer the room
-then admitted. A room reads `not receiving` when a connected member has stayed at least 20 live
+before: an entry, a header or body, a signed head, a proof or its verification, or a room context.
+It does not say that a message arrived. In a room of the current history format the member is the
+one whose connection brought it: an answer its loop got that saved any of these, or an entry from
+that answer the room then admitted. A room reads `not receiving` when a connected member has stayed at least 20 live
 entries behind for over 60 seconds with no progress seen between status samples; the line under
 `UNHEALTHY` names the member and how many of its live entries are missing now. Behind is the
 newest position of its own feed the member told this node on its current connection, less what

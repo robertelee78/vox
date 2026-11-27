@@ -181,7 +181,7 @@ impl Root {
             let (_, out, _) = self.run(&["node", "list"]);
             if out
                 .lines()
-                .any(|l| l.split_whitespace().take(2).eq([node, "attached"]))
+                .any(|l| l.split_whitespace().take(2).eq([node, "Ready"]))
             {
                 return;
             }

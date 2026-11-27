@@ -129,8 +129,13 @@ fn session_pages_show_complete_activities_after_late_results() {
         &["room", "session", &room.id, SESSION, "--json", "--details"],
     );
     let shown = newest.ndjson();
-    assert!(newest.ok && shown.len() == 200 && shown.iter().any(|v| v["ref"] == "tool-219"),
-        "PRODUCT: the newest Session page lost its visible activities behind completion records: {newest:?}");
+    // One read shows the whole current turn (ADR-029 DR-1.1, 358505f2b): it follows older pages
+    // until the turn's prompt or the Session's start. These 220 tools have no prompt, so the
+    // read is every one of them, in order, each once, and none hidden behind its completion.
+    let refs: Vec<&str> = shown.iter().filter_map(|v| v["ref"].as_str()).collect();
+    let every: Vec<String> = (0..220).map(|n| format!("tool-{n:03}")).collect();
+    assert!(newest.ok && shown.len() == every.len() && refs == every,
+        "PRODUCT: the Session read lost its visible activities behind completion records: {newest:?}");
     for row in &shown {
         let reference = row["ref"]
             .as_str()
@@ -309,9 +314,14 @@ fn a_large_sessions_list_and_a_hook_name_arrive_whole() {
     });
     let name = format!("LONG-NAME-{}", "n".repeat(300 * 1024));
     let transcript = tmp.path().join("large-name.jsonl");
+    // A Claude Code transcript is JSON lines, each ended by a newline; the title reader takes a
+    // line only once it is ended (a line without one may still be being written).
     std::fs::write(
         &transcript,
-        serde_json::json!({"type":"custom-title","customTitle":name}).to_string(),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"custom-title","customTitle":name})
+        ),
     )
     .expect("APPARATUS: transcript title");
     let payload = serde_json::json!({"session_id":SESSION,"hook_event_name":"UserPromptSubmit",
@@ -327,7 +337,32 @@ fn a_large_sessions_list_and_a_hook_name_arrive_whole() {
         hooked.ok && hooked.stderr.trim().is_empty(),
         "PRODUCT: the hook could not register its 300 KiB Session name: {hooked:?}"
     );
-    let cli = alice.vox(None, &["room", "sessions", &room.id, "--json"]);
+    // A listing answers at once from the Sessions this node has folded and says when that fold
+    // is still behind the room (ADR-037 R4: "MUST answer the locally applied data"); the hook's
+    // own Session opens in the background after its registration. So the first answer, right
+    // after the hook, is either the whole list or says it is provisional; the whole list is then
+    // read once the node has folded every Session: 2003 rows that no longer say provisional (a
+    // provisional listing may hold a row whose name has not been folded yet).
+    let first = alice.vox(None, &["room", "sessions", &room.id, "--json"]);
+    assert!(
+        first.ok
+            && (first.ndjson().len() == 2003
+                || first.stderr.contains("this listing is provisional")),
+        "PRODUCT: the CLI listed {} of 2003 Sessions without saying the list is provisional: {}",
+        first.ndjson().len(),
+        first.stderr
+    );
+    let cli = support::until(
+        alice,
+        None,
+        "the CLI to list all 2003 Sessions, no longer provisional",
+        &["room", "sessions", &room.id, "--json"],
+        |out| {
+            !out.ok
+                || (out.ndjson().len() == 2003
+                    && !out.stderr.contains("this listing is provisional"))
+        },
+    );
     let sessions = cli.ndjson();
     assert!(
         cli.ok && sessions.len() == 2003,
@@ -468,11 +503,11 @@ fn delayed_app_reply(fault: AppReplyFault) {
                     other => panic!("PRODUCT: the daemon refused a Session entry: {other:?}"),
                 }
             }
-            let resolved=serde_json::json!({"kind":"resolved","ref":"older-request","outcome":"allowed","by":"terminal"}).to_string();
+            let resolved=serde_json::json!({"kind":"resolved","ref":"older-request","of":"approval","outcome":"allowed","by":"terminal"}).to_string();
             assert!(matches!(c.request(&Request::AppendSession{channel_id:room.cid,session_id:SESSION.to_owned(),body:resolved}).await,Ok(Frame::Appended{..})),
                 "PRODUCT: the older approval could not be resolved");
             let answer=c.request(&Request::SessionEntries {channel_id:room.cid}).await;
-            assert!(matches!(&answer,Ok(Frame::Error{reason}) if reason.contains("SessionEntries")),
+            assert!(matches!(&answer,Ok(Frame::Error{reason}) if reason.contains("Session entries require SessionPage")),
                 "PRODUCT: a legacy whole-history reply did not name the oversized request: {answer:?}");
             assert!(matches!(c.request(&Request::Ping).await,Ok(Frame::Ok)),
                 "PRODUCT: the same connection failed after the oversized history was refused");
@@ -1245,7 +1280,7 @@ fn a_seventy_member_room_opens_with_every_read_mark_and_trust() {
             for (j,target) in fingerprints.iter().enumerate().filter(|(j,_)|*j!=i) {
                 let reply = client.request(&Request::Trust { target:*target,petname:names[j].clone(),
                     identity_passphrase:zeroize::Zeroizing::new(String::new()),full_history:true,drive:false }).await;
-                assert!(matches!(reply,Ok(Frame::Ok)), "PRODUCT: {} could not trust{}: {reply:?}",names[i],names[j]);
+                assert!(matches!(reply,Ok(Frame::Ok | Frame::TrustedKeyPending)), "PRODUCT: {} could not trust{}: {reply:?}",names[i],names[j]);
             }
         }
         let rooms = clients[0].rooms().await.expect("PRODUCT: creator's room list failed");

@@ -162,6 +162,27 @@ pub(in crate::node::channel) fn floors_for(
     Ok(floors)
 }
 
+/// Whether `author`'s newest retained floor for `recipient` is at drive generation `at`:
+/// one probe below the pair's upper bound. An author mints each generation above every one it
+/// announced, under the room's current epoch, so a pair's last (epoch, generation) key is its
+/// newest generation (the continuity walk reads `FloorSelf` the same way).
+pub(in crate::node::channel) fn newest_names(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    (author, recipient): (&Digest32, &Digest32),
+    at: u64,
+) -> Result<bool> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(false);
+    };
+    let mut end = author_key(&pair(author, recipient));
+    end[32..].fill(u8::MAX);
+    Ok(read
+        .previous(Tree::Floors, Some(end))?
+        .is_some_and(|(key, _)| key[..32] == end[..32] && generation(&key).1 == at))
+}
+
 #[derive(Default, Clone, Copy)]
 pub(in crate::node::channel) struct Author {
     pub announced: Option<u64>,
@@ -308,13 +329,14 @@ pub(in crate::node::channel) fn source_after(
 /// The caller has authenticated and published the entry in this same Batch. Contiguous
 /// progress is independent of whether it contains a floor, so an absent lookup is meaningful.
 /// Fold one authenticated public entry's floor facts. Returns whether a floor or its signed
-/// source changed (the author's floor revision moved).
+/// source changed (the author's floor revision moved), and the author's announced drive-key
+/// generation when this entry raised it.
 pub(super) fn observe(
     index: &mut Write<'_, '_>,
     room: &Digest32,
     entry: &crate::log::entry::Entry,
     current_epoch: u64,
-) -> Result<bool> {
+) -> Result<(bool, Option<u64>)> {
     let author = entry.skeleton.author_id;
     let key = author_key(&author);
     let mut state = index
@@ -323,6 +345,7 @@ pub(super) fn observe(
         .transpose()?
         .unwrap_or_default();
     let old_through = state.through;
+    let old_announced = state.announced;
     if state.through.checked_add(1) == Some(entry.skeleton.seq) {
         state.through = entry.skeleton.seq;
     }
@@ -387,7 +410,10 @@ pub(super) fn observe(
     if changed || state.through != old_through {
         replace(index, Tree::FloorAuthors, key, &state.bytes())?;
     }
-    Ok(changed)
+    Ok((
+        changed,
+        state.announced.filter(|_| state.announced != old_announced),
+    ))
 }
 #[derive(Default)]
 struct FloorProof {

@@ -20,20 +20,6 @@
 //! node says nearby finds the other within seconds too, and the peer book is what is proved.
 //! Mutation: nothing persisted — it never reconverges.
 //!
-//! - (c) **a pair whose peer books were written when Vox kept times in seconds** (#562). The
-//!   fixture `fixtures/seconds-format-pair.tar.gz` is two members' data directories, alice and
-//!   bob, made by `vox` at integrate 48b1c743 (peer book version 1, times in seconds): one room,
-//!   both trusting each other, last reached directly with bob on 127.0.0.1:47613. This build
-//!   brings bob back there and alice on a new port, with no anchor and nothing said nearby
-//!   (`VOX_TEST_NO_NEARBY`, a `test-knobs` knob: on one computer, what a node says nearby finds
-//!   the other within seconds too), so the books are the only way the two find each other. Each
-//!   must read the other's new message within 10 s, and the posts from before still read.
-//!   Mutation: a version-1 book refused — they never reconverge. A version-1 book's times read
-//!   as milliseconds instead of seconds is not asserted: nothing a person sees shows a book's
-//!   times (they only spare a rewrite of an address seen again within ten minutes, and choose
-//!   whom a full book forgets). Bob's fixed port taken by another program at run time is
-//!   APPARATUS (the daemon says it cannot bind), never PRODUCT.
-//!
 //! The 10 s bar also needs the survivor to stop using its connection to the dead process as soon
 //! as the restarted one connects (`prd1/restart-probe` 582f18a). Without that, both directions
 //! measured 29.4–30.1 s: the old connection held the room's sync until `SILENCE_IS_DEATH`.
@@ -46,16 +32,20 @@
 //!   [`KEPT`] rows that bob reads, is stopped cleanly and her data directory copied; she comes
 //!   back, posts [`LOST`] more rows that bob reads, and is stopped again; the copy is put back
 //!   in her directory's place and she is started from it, on her port, with nothing said nearby.
-//!   Within [`DETECT`] her daemon says so once:
-//!   `this node's record of its own history in this room is behind what a member holds`. Her
-//!   `vox room post` is then refused, twice, with that sentence; the daemon has said it once, not
-//!   once per refusal; bob still reads every row she posted before and after the copy (nothing is
-//!   reset, nothing is taken from anyone); and she still reads what bob posts now. The copy is
-//!   taken with her daemon stopped (so it is a copy of a quiet store) and checked to have taken:
-//!   her own read after the restore shows the kept rows and none of the lost ones, else
-//!   APPARATUS. Mutation: the background detector removed (a peer's higher own head not compared
-//!   with the local own feed) — her post is accepted and signed at a taken place; red on the
-//!   refusal's assertion.
+//!   Within [`DETECT`] her daemon says once that she is behind (`this node is behind its own
+//!   history; it cannot write here until recovery completes`, the words of 926b6bd37, #1053,
+//!   which made the node recover its own history from a member by itself). A post she tries at
+//!   once is either refused with `this node's record of its own history in this room is behind
+//!   what a member holds`, or, if the recovery won that race, accepted only once her daemon has
+//!   already said `this node recovered its own history`; within [`DETECT`] it says that, and she
+//!   posts on. Bob and she both read the kept rows, the lost ones and what she posted after;
+//!   her daemon never says her history conflicts. The refusal held open while recovery cannot
+//!   finish is proven for a rejoin (`a_room_can_be_left_and_ended_proof.rs`, the held return
+//!   Presence); no switch holds a backup's recovery. The copy is taken with her daemon stopped
+//!   (so it is a copy of a quiet store) and checked to have taken: her own read after the
+//!   restore shows the kept rows and none of the lost ones, else APPARATUS. Mutation: the
+//!   background detector removed (a peer's higher own head not compared with the local own
+//!   feed): no behind note, and her post is signed at a taken place; red on the note's wait.
 
 #![cfg(unix)]
 
@@ -91,10 +81,14 @@ const DETECT: Duration = Duration::from_secs(60);
 /// before it is published, and that preparation waited on a governance refresh (measured: under
 /// 60 s in one run of two, over it in the other, before ADR-037 R2 made the fold prompt).
 const REOPENS_WITHIN: Duration = Duration::from_secs(120);
-/// (d): what the daemon says once, and every refused write says, for a room whose own history is
-/// behind what a member holds (ADR-037 R5, `Error::OwnHistoryBehind`).
+/// (d): what every refused write says for a room whose own history is behind what a member
+/// holds (ADR-037 R5, `Error::OwnHistoryBehind`).
 const BEHIND: &str =
     "this node's record of its own history in this room is behind what a member holds";
+/// (d): what the daemon says once on finding it (926b6bd37), and once it has recovered.
+const NOTED_BEHIND: &str = "this node is behind its own history";
+const RECOVERED: &str = "this node recovered its own history";
+const CONFLICT: &str = "conflicting signed history for this node";
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -441,68 +435,6 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     );
 }
 
-/// The room the pair fixture holds, as `vox` at integrate 48b1c743 made it.
-const PAIR_ROOM: &str = "alr5dektwa2b6ti7ycp4wps6gwtknwvd5qhk2gnpk7je7avttdha";
-/// Where bob listened when the fixture was made: the address alice's book holds for him.
-const PAIR_BOB_AT: &str = "127.0.0.1:47613";
-
-#[test]
-#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
-fn a_pair_whose_peer_books_were_kept_in_seconds_finds_each_other_again() {
-    watchdog::arm();
-    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/seconds-format-pair.tar.gz"
-    );
-    let unpacked = Command::new("tar")
-        .args(["-xzf", fixture, "-C"])
-        .arg(t.path())
-        .status()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run tar: {e}"));
-    assert!(
-        unpacked.success(),
-        "APPARATUS: tar could not unpack {fixture}"
-    );
-    let (alice, bob) = (t.path().join("alice"), t.path().join("bob"));
-    test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
-    let unlock = format!("{IDENTITY}\n{ROOMPASS}\n");
-    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
-    let _b = daemon(&bob, "bob", &unlock, PAIR_BOB_AT, &unheard);
-    let _a = daemon(&alice, "alice", &unlock, "127.0.0.1:0", &unheard);
-    let back_at = Instant::now();
-    for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
-        let before = format!("{who} said while times were seconds");
-        assert!(
-            read(dir, PAIR_ROOM).contains(&before),
-            "PRODUCT: {who}'s post from when times were seconds must still read on {who}'s node"
-        );
-    }
-    let (to_alice, to_bob) = (
-        "bob is back in milliseconds",
-        "alice is back in milliseconds",
-    );
-    post(&bob, PAIR_ROOM, to_alice);
-    post(&alice, PAIR_ROOM, to_bob);
-    let (a, b) = arrivals(
-        back_at,
-        (&alice, to_alice),
-        (&bob, to_bob),
-        PAIR_ROOM,
-        Duration::from_secs(60),
-    );
-    println!(
-        "[proof] a pair from when times were seconds, back with no anchor: bob's message reached \
-         alice after {a:?}, alice's reached bob after {b:?}"
-    );
-    assert!(
-        a.is_some_and(|a| a <= WITHIN) && b.is_some_and(|b| b <= WITHIN),
-        "PRODUCT: two members whose peer books were written when times were seconds must find each \
-         other again with no anchor, both ways, within {WITHIN:?} (None = never, in 60 s): bob to \
-         alice {a:?}, alice to bob {b:?}"
-    );
-}
-
 /// How many of `rows` (`"<prefix> <i>"`, `i` in `1..=n`) the texts hold.
 fn holds(texts: &[String], prefix: &str, n: usize) -> usize {
     (1..=n)
@@ -647,7 +579,7 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
     // ---- (1) her daemon learns from bob that her own history is behind, and says so ----
     let noted = loop {
         let said = daemon_said(&alice, tag);
-        if said.contains(BEHIND) {
+        if said.contains(NOTED_BEHIND) {
             break back_at.elapsed();
         }
         if back_at.elapsed() > DETECT {
@@ -655,7 +587,7 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
             panic!(
                 "PRODUCT: {DETECT:?} after coming back from an older copy of herself, with bob \
                  holding {LOST} rows of her own feed that she does not, alice's daemon never said \
-                 {BEHIND:?} (ADR-037 R5); her `vox room post` then {}: {out}{err}\n\
+                 {NOTED_BEHIND:?} (ADR-037 R5); her `vox room post` then {}: {out}{err}\n\
                  alice's daemon said:\n{said}\nbob's daemon said:\n{}",
                 if ok { "was accepted" } else { "was refused" },
                 daemon_said(&bob, "bob")
@@ -667,44 +599,87 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
         "[proof] (1) alice's daemon said her own history is behind {noted:?} after she answered"
     );
 
-    // ---- (2) every write in that room is refused with the sentence, (3) the daemon said it once ----
-    for attempt in 1..=2 {
-        let (ok, out, err) = vox(
-            &alice,
-            &[
-                "room",
-                "post",
-                &room,
-                &format!("after the restore {attempt}"),
-            ],
-            None,
-        );
-        let shown = format!("{out}{err}");
-        assert!(
-            !ok && shown.contains(BEHIND),
-            "PRODUCT: post {attempt} by a node whose own history is behind what a member holds \
-             must be refused saying {BEHIND:?}; `vox room post` {}: {shown}",
-            if ok {
-                "was accepted"
-            } else {
-                "was refused otherwise"
-            }
-        );
-        println!(
-            "[proof] (2) alice's post {attempt} refused: {}",
-            shown.trim()
-        );
-    }
-    std::thread::sleep(Duration::from_secs(2));
-    let said = daemon_said(&alice, tag);
-    let times = said.lines().filter(|l| l.contains(BEHIND)).count();
-    assert_eq!(
-        times, 1,
-        "PRODUCT: the daemon must say {BEHIND:?} once, not once per refusal or never; it said it \
-         {times} time(s):\n{said}"
+    // ---- (2) a write at once: refused while behind, or taken only after the recovery ----
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &room, "after the restore 1"],
+        None,
+    );
+    let when_answered = daemon_said(&alice, tag);
+    let shown = format!("{out}{err}");
+    assert!(
+        if ok {
+            when_answered.contains(RECOVERED)
+        } else {
+            shown.contains(BEHIND)
+        },
+        "PRODUCT: a post by a node whose own history is behind what a member holds must be \
+         refused saying {BEHIND:?}, or taken only once the node has recovered that history; \
+         `vox room post` {}: {shown}\nher daemon had said:\n{when_answered}",
+        if ok {
+            "was accepted before the daemon said it had recovered"
+        } else {
+            "was refused otherwise"
+        }
+    );
+    println!(
+        "[proof] (2) alice's post at once: {}",
+        if ok {
+            "accepted, after her daemon said it recovered".to_owned()
+        } else {
+            format!("refused: {}", shown.trim())
+        }
     );
 
-    // ---- (4) nothing is reset: bob holds every row she posted, she holds the kept ones ----
+    // ---- (3) the recovery is said, she posts on, and the daemon said each once, no conflict ----
+    let recovered = loop {
+        let said = daemon_said(&alice, tag);
+        if said.contains(RECOVERED) {
+            break back_at.elapsed();
+        }
+        assert!(
+            back_at.elapsed() <= DETECT,
+            "PRODUCT: {DETECT:?} after coming back, with bob online and holding her {LOST} lost \
+             rows, alice's daemon never said {RECOVERED:?}:\n{said}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    println!("[proof] (3) alice's daemon said it recovered her own history {recovered:?} after she answered");
+    let mine = if ok { 2 } else { 1 };
+    let (posted, out, err) = vox(
+        &alice,
+        &["room", "post", &room, &format!("after the restore {mine}")],
+        None,
+    );
+    assert!(
+        posted,
+        "PRODUCT: once her daemon said it recovered her own history, alice's post was refused: \
+         {out}{err}"
+    );
+    let said = daemon_said(&alice, tag);
+    let times = said.lines().filter(|l| l.contains(NOTED_BEHIND)).count();
+    assert_eq!(
+        times, 1,
+        "PRODUCT: the daemon must say {NOTED_BEHIND:?} once, not once per refusal or never; it \
+         said it {times} time(s):\n{said}"
+    );
+    assert!(
+        !said.contains(CONFLICT),
+        "PRODUCT: alice's daemon found her own history in conflict after the restore:\n{said}"
+    );
+
+    // ---- (4) nothing is reset or forked: both read every row she posted, before and after ----
+    assert!(
+        until_holds(
+            &bob,
+            &room,
+            "after the restore",
+            mine,
+            Duration::from_secs(60)
+        ),
+        "PRODUCT: bob never read alice's {mine} post(s) after her recovery: he reads {:?}",
+        read(&bob, &room)
+    );
     let bobs = read(&bob, &room);
     assert!(
         holds(&bobs, "kept", KEPT) == KEPT && holds(&bobs, "lost", LOST) == LOST,
@@ -713,12 +688,11 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
     );
     let hers = read(&alice, &room);
     assert!(
-        holds(&hers, "kept", KEPT) == KEPT,
-        "PRODUCT: alice must still read her own {KEPT} kept rows; she reads {hers:?}"
-    );
-    assert!(
-        !hers.iter().any(|t| t.starts_with("after the restore")),
-        "PRODUCT: a refused post of alice's is in her own room: {hers:?}"
+        holds(&hers, "kept", KEPT) == KEPT
+            && holds(&hers, "lost", LOST) == LOST
+            && holds(&hers, "after the restore", mine) == mine,
+        "PRODUCT: alice, recovered, must read her {KEPT} kept rows, the {LOST} the copy lacked \
+         and her {mine} new post(s); she reads {hers:?}"
     );
 
     // ---- (5) she still reads what bob posts now ----
@@ -727,12 +701,12 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
     let posted = Instant::now();
     assert!(
         until_reads(&alice, &room, from_bob, Duration::from_secs(60)),
-        "PRODUCT: alice, writing nothing because her own history is behind, must still read what \
-         bob posts; within 60 s she did not read {from_bob:?}: {:?}",
+        "PRODUCT: alice, recovered from an older copy of herself, must still read what bob \
+         posts; within 60 s she did not read {from_bob:?}: {:?}",
         read(&alice, &room)
     );
     println!(
-        "[proof] (5) alice read bob's new post {:?} after it was posted, while writing nothing",
+        "[proof] (5) alice read bob's new post {:?} after it was posted",
         posted.elapsed()
     );
 }

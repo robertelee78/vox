@@ -386,6 +386,17 @@ fn a_returner_reads_while_own_history_is_unavailable() {
     room.workers[2]
         .vox(None, &["room", "leave", &id])
         .expect_ok("carol leaves");
+    // The leave answers once the departure is written; carol's node keeps the room, named in
+    // `vox status` as leaving, and keeps telling members until one has it (ADR-023 RL-8.1a).
+    // Alice, the only member up, must have it before she stops: otherwise carol's node tells
+    // bob when he restarts, and bob then holds the very history this act needs him to lack.
+    until(
+        &room.workers[2],
+        None,
+        "alice takes carol's departure",
+        &["status", "--json"],
+        |o| o.ok && o.stdout.contains("\"leaving\":[]"),
+    );
     room.stop(0);
     // Simulate the admitting peer holding an authenticated entry but being unable to
     // supply its signed head; the real proposal must carry and honor kind 2.

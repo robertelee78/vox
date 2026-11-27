@@ -6,11 +6,18 @@
 //! call with what it returned, the reply, the end of each turn, the prompt typed at the terminal
 //! or in Vox, approvals and questions with who answered them, files either way. Each line keeps
 //! its entry's full input and output for Details, a split entry joined whole.
+//!
+//! **What a step says is the Session's own text, shown revealed.** A transcript holds whatever an
+//! agent or its tools printed, carried unchecked to every member trusted with drive; [`lines`]
+//! shows each line (`step_line`) and each Details body (`step_body`) the way a message's text is
+//! shown (#331), so an escape sequence, a forged line or a bidi override in a step never reaches
+//! a reader's terminal as itself. `vox room session --raw` stays the records as written.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 use vox_agentcomms::activity::one_line;
+use vox_agentcomms::envelope::reveal_keeping;
 
 use crate::hash::Digest32;
 use crate::node::drive::SessionRow;
@@ -165,10 +172,12 @@ pub struct RequestLine {
     pub reference: String,
     /// A question, rather than an approval.
     pub is_question: bool,
-    /// A question's parts, each its text and its options' labels; none for an approval.
+    /// A question's parts, each its text and its options' labels, as the session wrote them: what
+    /// an answer names (shown, they are `shell::arg`'s or revealed by the client); none for an
+    /// approval.
     pub questions: Vec<(String, Vec<String>)>,
     /// `None` while it is open and may be answered from Vox; otherwise what became of it, in the
-    /// line's own words ("approved here", "not answerable from Vox: …").
+    /// line's own words ("approved here", "not answerable from Vox: …"), revealed as the line is.
     pub state: Option<String>,
 }
 
@@ -180,6 +189,20 @@ pub trait Names {
     fn is_me(&self, by: &str) -> bool;
     /// The alias of the node `by` names (a whole fingerprint in base32), or `by` cut short.
     fn alias_b32(&self, by: &str) -> String;
+}
+
+/// A line of a Session as a reader is shown it: whole, on one line, every control character, line
+/// or paragraph separator, bidi control or hidden character as `⟨U+XXXX⟩` ([`reveal_keeping`], the
+/// rule a message's text is shown by, #331).
+fn step_line(text: &str) -> String {
+    reveal_keeping(text, |_| false)
+}
+
+/// A Details body as a reader is shown it: as [`step_line`], keeping only its newlines and tabs,
+/// the two a message's body keeps (`vox room read`, the TUI, the app), so a multi-line body is
+/// still laid out as its lines.
+fn step_body(text: &str) -> String {
+    reveal_keeping(text, |c| c == '\n' || c == '\t')
 }
 
 /// An entry's author, carrying where its first part is: compared by the author alone, so the
@@ -447,6 +470,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
         let mut presentation = None;
         let mut media = None;
         let mut waiting = None;
+        // A line about the Session itself names it by `label`, already shown safely
+        // (`session_label`): it goes in after the rest of the line is revealed, whose escapes
+        // would otherwise be escaped a second time.
+        let mut about = None;
         let text = match b.kind() {
             "user" => {
                 let text = if b.fields.get("omp").and_then(Value::as_bool) == Some(true) {
@@ -681,14 +708,16 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                         "" => String::new(),
                         by => format!(" from {}", names.alias_b32(by)),
                     };
+                    about = Some("file to");
                     match b.str("path") {
-                        "" => format!("file to {label}: {what}{from}"),
-                        path => format!("file to {label}: {what}{from}, at {path}"),
+                        "" => format!("{what}{from}"),
+                        path => format!("{what}{from}, at {path}"),
                     }
                 } else {
+                    about = Some("file from");
                     match b.str("note").trim() {
-                        "" => format!("file from {label}: {what}"),
-                        note => format!("file from {label}: {what} — {}", one_line(note)),
+                        "" => what,
+                        note => format!("{what} — {}", one_line(note)),
                     }
                 }
             }
@@ -798,7 +827,8 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 if b.fields.get("ok").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
-                format!("not delivered to {label}: {}", b.str("why"))
+                about = Some("not delivered to");
+                b.str("why").to_owned()
             }
             "omp-reset" => b.str("text").to_owned(),
             "omp-disclosure" => {
@@ -829,15 +859,39 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             at_millis: b.author.millis,
             seq,
             kind: b.kind().to_owned(),
-            text: format!("{prefix}{text}"),
-            details,
+            text: match about {
+                None => step_line(&format!("{prefix}{text}")),
+                Some(about) => format!(
+                    "{}{about} {label}: {}",
+                    step_line(&prefix),
+                    step_line(&text)
+                ),
+            },
+            details: details
+                .into_iter()
+                .map(|(part, body)| (part, step_body(&body)))
+                .collect(),
             drive,
-            presentation,
+            presentation: presentation.map(|p| PresentationLine {
+                heading: step_line(&p.heading),
+                status: step_line(&p.status),
+                body: step_body(&p.body),
+                job: p.job.map(|j| JobLine {
+                    id: step_line(&j.id),
+                    kind: step_line(&j.kind),
+                    ..j
+                }),
+            }),
             media,
             reference: b.reference().to_owned(),
             waiting,
             file,
-            request,
+            // Its state is words to show (a member's `why`, an answer); its ref and questions are
+            // what an answer names, kept as written.
+            request: request.map(|q| RequestLine {
+                state: q.state.as_deref().map(step_line),
+                ..q
+            }),
         });
     }
     out
@@ -884,36 +938,47 @@ pub fn render(lines: &[Line], details: bool, answer_with: &str) -> String {
         s.push_str(&l.text);
         s.push('\n');
         // **A request waiting for an answer names how to give it** (DR-1.4, DR-1.5): the ref
-        // `--approve`, `--reject` and `--answer` take, whole, so a person can copy it.
-        match (l.waiting, l.reference.as_str()) {
-            (_, "") | (None, _) => {}
-            (Some(Waiting::Approval), r) => s.push_str(&format!(
-                "    waiting: {answer_with} --approve {}, or {answer_with} --reject {}\n",
-                vox_text::shell::arg(r),
-                vox_text::shell::arg(r)
+        // `--approve`, `--reject` and `--answer` take, whole, so a person can copy it. The ref and
+        // a question's text are the Session's own: every word is `shell::arg`'s, which writes one
+        // holding a character a terminal acts on or a reader cannot see as `printf` octal escapes,
+        // so no byte of it is shell syntax, the line holds none of them, and pasted, the command
+        // answers that very request. What no paste carries: a ref ending in a newline
+        // (`shell::arg` refuses it), and a question whose text starts or ends with white space
+        // (`--answer` trims its key) or holds `=` (`--answer` splits its pair at the first one).
+        // Such a request is answered where nothing is pasted.
+        let pairs = l.request.as_ref().map_or(Some(Vec::new()), |q| {
+            q.questions
+                .iter()
+                .map(|(text, _)| {
+                    let pair = format!("{text}=ANSWER");
+                    (text.trim() == text && !text.contains('='))
+                        .then(|| vox_text::shell::arg(&pair).map(std::borrow::Cow::into_owned))
+                        .flatten()
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        let pasted = vox_text::shell::arg(&l.reference).zip(pairs);
+        match (l.waiting, l.reference.as_str(), pasted) {
+            (_, "", _) | (None, _, _) => {}
+            (Some(_), _, None) => s.push_str(
+                "    waiting: answer it in the Vox app or TUI, or at the session's terminal: a \
+                 pasted command cannot carry its ref or a question's text whole\n",
+            ),
+            (Some(Waiting::Approval), _, Some((r, _))) => s.push_str(&format!(
+                "    waiting: {answer_with} --approve {r}, or {answer_with} --reject {r}\n"
             )),
             // A question, too, is answered by a command a person can paste (ADR-029 DR-1.5):
             // the ref whole, then one `QUESTION=ANSWER` pair per question, its text filled in and
             // the answer left to type. The earlier sentence named the flag and no command, and
             // a person reading the Session in a terminal had nothing to copy.
-            (Some(Waiting::Question), r) => {
-                let pairs = l
-                    .request
-                    .as_ref()
-                    .map(|q| {
-                        q.questions
-                            .iter()
-                            .map(|(text, _)| {
-                                vox_text::shell::arg(&format!("{text}=ANSWER")).into_owned()
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .filter(|pairs| !pairs.is_empty())
-                    .unwrap_or_else(|| vox_text::shell::arg("QUESTION=ANSWER").into_owned());
+            (Some(Waiting::Question), _, Some((r, pairs))) => {
+                let pairs = if pairs.is_empty() {
+                    "QUESTION=ANSWER".to_owned()
+                } else {
+                    pairs.join(" ")
+                };
                 s.push_str(&format!(
-                    "    waiting: {answer_with} --answer {} {pairs}\n",
-                    vox_text::shell::arg(r)
+                    "    waiting: {answer_with} --answer {r} {pairs}\n"
                 ));
             }
         }
