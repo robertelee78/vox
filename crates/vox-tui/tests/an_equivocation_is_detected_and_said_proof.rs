@@ -26,9 +26,13 @@
 //! - `vox status --json` lists eve's and frank's equivocation in this room, each with a position;
 //! - `vox room read` says it, one `! … signed two different messages at the same place …` line per
 //!   author, by the short id its rows use;
-//! - **held back**: once alice (who forked nothing and holds the first side) lists both
-//!   equivocations too, eve's original posts again, then alice posts; bob reads alice's post,
-//!   and neither bob nor carol reads eve's;
+//! - **held back**: once alice (who forked nothing) lists both equivocations too, eve's original
+//!   posts again, then alice posts; bob reads alice's post, and neither bob nor carol reads eve's;
+//! - **gone from the split** (rule F3, ledger 73; assertion changed by ruling: before it, the
+//!   staging required alice still to show eve's and frank's first-side posts): alice, bob and
+//!   carol, each holding both proofs, show none of eve's or frank's posts from the place each
+//!   split (all of them when the shared start is not proved), while alice's, bob's and carol's
+//!   own posts stay;
 //! - **kept**: with **every other node stopped** — so nobody could show either fork again
 //!   (V210-66) — carol's daemon is restarted, and `vox status --json` still lists both;
 //!   (An anchor that is not a member keeps no copy of the room, so it has nothing to hold anyone
@@ -531,14 +535,13 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 
     // ---- held back: eve's original posts again; a post of a member who forked nothing arrives ---
     // alice holds the first side, as bob does. Once she has recorded both forks she takes nothing
-    // of eve's later, so her post cites only what bob holds of eve and frank.
+    // of eve's later, so her post cites only what bob holds of eve and frank. (Under rule F3 the
+    // first side's posts are no longer shown to her once she holds the proofs: that is asserted
+    // below, not read here as her holding them.)
     let staged = Instant::now() + STAGE;
     let alice_ready = || {
         let now = listed(&alice_dir, &room_id);
-        let ready = names(&now, &eve_fp)
-            && names(&now, &frank_fp)
-            && reads(&alice_dir, &room, "EQ-EVE-A-1")
-            && reads(&alice_dir, &room, "EQ-FRANK-A-1");
+        let ready = names(&now, &eve_fp) && names(&now, &frank_fp);
         (ready, now)
     };
     let (mut ready, mut alice_lists) = alice_ready();
@@ -548,8 +551,8 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     }
     assert!(
         ready,
-        "PRODUCT (staging): alice does not both hold the first side and list both equivocations, \
-         so her post could cite what bob cannot hold: she lists {alice_lists:?}"
+        "PRODUCT (staging): alice does not list both equivocations, so her post could cite what \
+         bob cannot hold: she lists {alice_lists:?}"
     );
     stop(eve2);
     stop(frank2);
@@ -568,6 +571,47 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         );
     }
     stop(eve);
+
+    // ---- gone from the split (rule F3): every computer holding the proofs shows none of eve's or
+    // frank's posts from where each split; everyone else's posts stay ----------------------------
+    let split = [
+        "EQ-EVE-A-1",
+        "EQ-EVE-A-2",
+        "EQ-EVE-A-3",
+        "EQ-EVE-B-1",
+        "EQ-FRANK-A-1",
+        "EQ-FRANK-B-1",
+    ];
+    // What the members who forked nothing posted, which every one of them read before the split.
+    let others = [
+        format!("hello from alice r{round}"),
+        format!("hello from bob r{round}"),
+        format!("hello from carol r{round}"),
+    ];
+    for (who, d) in [
+        ("alice", &alice_dir),
+        ("bob", &bob_dir),
+        ("carol", &carol_dir),
+    ] {
+        let shown = |text: &str| reads(d, &room, text);
+        let until = Instant::now() + DETECT;
+        while split.iter().any(|tag| shown(tag)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let left: Vec<&str> = split.iter().copied().filter(|tag| shown(tag)).collect();
+        assert!(
+            left.is_empty(),
+            "PRODUCT: {who}, holding eve's and frank's fork proofs, still shows {left:?} within \
+             {DETECT:?}: their posts from the place each split must be gone:\n{}",
+            room_read(d, &room)
+        );
+        let lost: Vec<&String> = others.iter().filter(|text| !shown(text)).collect();
+        assert!(
+            lost.is_empty(),
+            "PRODUCT: {who} no longer shows {lost:?}, posted by members who forked nothing:\n{}",
+            room_read(d, &room)
+        );
+    }
 
     // ---- kept: every other node stops, so nobody could show either fork again (V210-66) ---------
     // With a live peer holding the other side, a restarted node could meet the fork again and list

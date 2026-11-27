@@ -924,12 +924,20 @@ impl<'a> View<'a> {
         Ok(if eligible { Eligible } else { Ineligible })
     }
 
-    /// Whether any authenticated removal of `target` has been accepted here (#1171).
+    /// Whether any authenticated removal of `target` has been accepted here (#1171), or a fork
+    /// proof of that member is recorded (rule F2 B's derived exclusion, which has no removal row).
     fn removal_row(&self, target: &Digest32) -> Result<bool> {
         Ok(self
             .facts
             .at_or_after(Table::MemberRemovals, hash_key(target))?
-            .is_some_and(|(key, _)| key[..32] == target[..]))
+            .is_some_and(|(key, _)| key[..32] == target[..])
+            || self.fork_boundary(target)?.is_some())
+    }
+
+    /// Rule F2: the boundary of `author`'s recorded fork proof, from which nothing that member signed
+    /// counts here.
+    fn fork_boundary(&self, author: &Digest32) -> Result<Option<u64>> {
+        self.facts.get(Table::ForkBoundary, &hash_key(author))
     }
 
     /// `target` has no accepted removal, decided only on current folded facts: every received
@@ -1248,12 +1256,18 @@ impl<'a> View<'a> {
         {
             return Err(invalid("governance share binding"));
         }
-        Ok(share.body.shared.then_some(super::super::Share {
-            host: *host,
-            name: share.body.name,
-            udp: share.body.udp,
-            kind: share.body.kind,
-        }))
+        // Rule F2 B: a proved forker's share from its boundary on is not in force here.
+        let quarantined = self
+            .fork_boundary(host)?
+            .is_some_and(|boundary| entry.skeleton.seq >= boundary);
+        Ok(
+            (share.body.shared && !quarantined).then_some(super::super::Share {
+                host: *host,
+                name: share.body.name,
+                udp: share.body.udp,
+                kind: share.body.kind,
+            }),
+        )
     }
 
     pub(in crate::node::channel) fn display(&self, genesis: &Genesis) -> Result<Display> {
@@ -1377,6 +1391,14 @@ impl<'a> View<'a> {
                     && grant.body.author_id == *author
                     && grant.body.epoch == 0 =>
             {
+                // Rule F2 B: a proved forker's grant from its boundary on confers nothing here;
+                // the register keeps only its latest statement, so no older grant stands in.
+                if self
+                    .fork_boundary(author)?
+                    .is_some_and(|boundary| entry.skeleton.seq >= boundary)
+                {
+                    return Ok(None);
+                }
                 Ok(Some(Consent::Granted(entry.skeleton.seq)))
             }
             GovBody::ConsentRevocation(revoke)
@@ -1691,9 +1713,13 @@ impl super::super::ChannelState {
         let Some(facts) = Read::from_batch_existing(batch, &self.sek, &self.channel_id)? else {
             return Ok(false);
         };
+        // Rule F2 B: a recorded fork proof is a derived exclusion with no removal row.
         Ok(facts
             .at_or_after(Table::MemberRemovals, hash_key(recipient))?
-            .is_some_and(|(key, _)| key[..32] == recipient[..]))
+            .is_some_and(|(key, _)| key[..32] == recipient[..])
+            || facts
+                .get(Table::ForkBoundary, &hash_key(recipient))?
+                .is_some())
     }
 
     /// The same decision inside the caller's open publication Batch.

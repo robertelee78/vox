@@ -1145,6 +1145,35 @@ impl Flow {
                     // node does not hold ends it, and its entries wait for that need, held by the
                     // node's frontier, which a connection's loop asks for (design §1).
                     // A proof is first built from this node's own rows (`LocalProof`, below).
+                    // Rule F2 E and rule F3: a wait on an author's fork, or on a certified
+                    // splitter's unmatched coordinate, is that need itself: nothing is asked for
+                    // it here (a connection asks a peer listing a proof of that author this node
+                    // lacks, by the fork rule, `pull::FORK_ASKS`).
+                    if let Some(LocalNeed::Fork(wait)) = &result.need {
+                        let need = match wait {
+                            super::admission::ForkWait::Fork { author, at } => {
+                                super::pull::Need::Fork {
+                                    author: *author,
+                                    at: *at,
+                                }
+                            }
+                            super::admission::ForkWait::Unmatched(owed) => {
+                                super::pull::Need::Unmatched {
+                                    author: owed.author,
+                                    seq: owed.seq,
+                                    hash: owed.hash,
+                                }
+                            }
+                        };
+                        // Under the room's lock, as a wire need: a fork recorded meanwhile meets
+                        // the need at the next plan.
+                        let room = Arc::clone(&self.shared).lock_owned().await;
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.settle_root(None, Some((need, None)), None);
+                        drop(room);
+                        return Ok(());
+                    }
                     let wire = match &result.need {
                         Some(LocalNeed::Wire(Query::Proof { .. })) => None,
                         Some(LocalNeed::Wire(query)) => Some(Some(query.clone())),
@@ -1356,6 +1385,13 @@ impl Flow {
                         operation: Operation::Governance,
                         ..task
                     })?,
+                    // Only an admission flow's frontier can hold a fork wait; elsewhere it is
+                    // refused as the mismatch was before rule F2.
+                    Some(LocalNeed::Fork(_)) => {
+                        return Err(Error::MalformedBundle(
+                            "cross-author reference contradicts this node's record of its author",
+                        ));
+                    }
                     None => {}
                 }
             }

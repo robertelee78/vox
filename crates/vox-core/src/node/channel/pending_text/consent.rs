@@ -142,7 +142,9 @@ impl ChannelState {
             .collect();
         for target in targets {
             let removals = view.validated_member_removals(&target)?;
-            if removals.is_empty() {
+            // Rule F2 B: a proved forker is removed with no signed removal row; its boundary is
+            // this sender's rotation itself (no observation cut to read).
+            if removals.is_empty() && !view.is_member_removed(&target)? {
                 continue;
             }
             let mut cut = None;

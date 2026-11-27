@@ -420,6 +420,12 @@ impl Dag {
         self.frozen.contains_key(author)
     }
 
+    /// Whether any author is frozen by a fork proof (no allocation; the common path's test).
+    #[must_use]
+    pub fn any_frozen(&self) -> bool {
+        !self.frozen.is_empty()
+    }
+
     /// Every author frozen by a fork proof, sorted.
     #[must_use]
     pub fn frozen_authors(&self) -> Vec<Digest32> {

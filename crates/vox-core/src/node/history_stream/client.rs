@@ -1283,6 +1283,10 @@ pub(crate) enum LocalNeed {
         effects: bool,
     },
     Governance,
+    /// Rule F2 E and rule F3: a wait on an author's fork or on a certified splitter's unmatched
+    /// coordinate (`admission::ForkWait`), held by the frontier (`pull::Need::Fork`,
+    /// `Need::Unmatched`).
+    Fork(super::admission::ForkWait),
 }
 pub(crate) struct LocalResult {
     pub(crate) next: Option<LocalStep>,
@@ -1628,6 +1632,9 @@ impl Receiver {
                         };
                         LocalResult::wait(resume, LocalNeed::Wire(query))
                     }
+                    admission::EntryStart::Fork(wait) => {
+                        LocalResult::wait(step, LocalNeed::Fork(wait))
+                    }
                     admission::EntryStart::Busy => LocalResult::busy(step),
                 }
             }
@@ -1661,6 +1668,9 @@ impl Receiver {
                             effects,
                         },
                     ),
+                    admission::Preflight::Fork(wait) => {
+                        LocalResult::wait(step, LocalNeed::Fork(wait))
+                    }
                     admission::Preflight::Busy => LocalResult::busy(step),
                 }
             }
@@ -1688,6 +1698,9 @@ impl Receiver {
                     }
                     admission::EntryAdvanced::ControlSource { head, seq } => {
                         LocalResult::wait(step, LocalNeed::Entry { head, seq })
+                    }
+                    admission::EntryAdvanced::Fork(wait) => {
+                        LocalResult::wait(step, LocalNeed::Fork(wait))
                     }
                     admission::EntryAdvanced::Busy => LocalResult::busy(step),
                 }

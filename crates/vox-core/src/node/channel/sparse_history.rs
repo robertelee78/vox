@@ -33,6 +33,8 @@ pub(crate) trait HistoryAdmissionRoom {
     fn channel_id(&self) -> Digest32;
     fn me(&self) -> Digest32;
     fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey>;
+    /// Rule F3: every proved splitter here, read now (`governance::splits`).
+    fn history_splits(&self, store: &Store) -> Result<governance::Splits>;
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>>;
     fn history_publication_busy(&self, store: &Store) -> Result<bool>;
     fn generation(&self) -> Arc<std::sync::atomic::AtomicU64>;
@@ -91,6 +93,9 @@ impl HistoryAdmissionRoom for PinnedHistory<'_> {
     fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
         ChannelState::history_author_key(self.room, author)
     }
+    fn history_splits(&self, store: &Store) -> Result<governance::Splits> {
+        ChannelState::history_splits(self.room, store)
+    }
     fn history_read<'b>(&'b self, store: &Store) -> Result<entry_store::Read<'b>> {
         ChannelState::history_read(self.room, store)
     }
@@ -119,6 +124,11 @@ pub(crate) struct PendingHistoryAdmission {
     authors: BTreeMap<Digest32, CompositePublicKey>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     authorization: Option<(Digest32, Digest32)>,
+    /// The room's creator: never eligible for the coordinate fallback (`governance::Split`).
+    root: Digest32,
+    /// Whether the room's DAG held any fork proof when these facts were taken: without one,
+    /// `history_splits` reads nothing (`governance::splits`).
+    forked: bool,
 }
 
 pub(crate) struct HistoryAdmission<'a> {
@@ -158,6 +168,15 @@ impl HistoryAdmissionRoom for HistoryAdmission<'_> {
     }
     fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
         self.pending.authors.get(author).cloned()
+    }
+    fn history_splits(&self, store: &Store) -> Result<governance::Splits> {
+        governance::splits(
+            store,
+            self.sek,
+            &self.pending.room,
+            &self.pending.root,
+            self.pending.forked,
+        )
     }
     fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
         let read = self.entries.read(store, self.sek, &self.pending.room)?;
@@ -408,6 +427,8 @@ impl ChannelState {
             authors: self.authors.clone(),
             generation: Arc::clone(&self.gen),
             authorization,
+            root: self.genesis.creator_pubkey().fingerprint(),
+            forked: self.dag.any_frozen(),
         })
     }
 
@@ -594,6 +615,17 @@ impl ChannelState {
 
     pub(crate) fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {
         self.authors.get(author).cloned()
+    }
+
+    /// Rule F3: every proved splitter here (`governance::splits`); none without a frozen author.
+    pub(crate) fn history_splits(&self, store: &Store) -> Result<governance::Splits> {
+        governance::splits(
+            store,
+            &self.sek,
+            &self.channel_id,
+            &self.genesis.creator_pubkey().fingerprint(),
+            self.dag.any_frozen(),
+        )
     }
 
     /// One history commit on the room, only under a pin of readers' view ([`PinnedHistory`]).
@@ -1250,7 +1282,10 @@ impl ChannelState {
     /// MP-9: apply two signed entries of one author at one position, found by comparing two
     /// signed heads or received from a peer, exactly as a fork found at a held position is
     /// applied: the author is frozen, the proof kept in SEG_FORKS and its boundary noted.
-    /// Returns false when the author was already frozen.
+    /// Returns false when the author was already frozen and this proof gives no lower boundary
+    /// here by rule A, decided before any signature is verified; one that does replaces the
+    /// kept proof, which is saved, and the boundary goes to 1 and is replayed (the fork rule's
+    /// two steps, `pull::FORK_ASKS`; `sec-2.md` condition 1 as amended there).
     pub(crate) fn record_history_fork(
         &mut self,
         store: &Store,
@@ -1265,25 +1300,28 @@ impl ChannelState {
         {
             return Err(Error::MalformedBundle("fork proof binding"));
         }
-        if self.dag.is_frozen(&author) {
-            return Ok(false);
-        }
         let key = self
             .authors
             .get(&author)
             .ok_or(Error::MalformedBundle("fork proof author is unknown"))?;
-        let proof = crate::log::dag::VerifiedFork::verify(
-            crate::log::dag::ForkProof {
-                author_id: author,
-                seq,
-                existing,
-                conflicting,
-            },
-            key,
-        )
-        .map_err(|_| Error::MalformedBundle("fork proof verification failed"))?;
+        let proof = crate::log::dag::ForkProof {
+            author_id: author,
+            seq,
+            existing,
+            conflicting,
+        };
+        // The cheap test before the expensive one: for an author already frozen here, a proof
+        // whose boundary (rule A: its position, or 1, from its headers and this node's accepted
+        // entry below it; no signature read) is not below the recorded one is dropped before
+        // any signature is verified. A peer repeating a proof this node holds costs a lookup.
+        let lower = self.dag.is_frozen(&author);
+        if lower && !governance::fork_proof_lowers(store, &self.sek, &self.channel_id, &proof)? {
+            return Ok(false);
+        }
+        let proof = crate::log::dag::VerifiedFork::verify(proof, key)
+            .map_err(|_| Error::MalformedBundle("fork proof verification failed"))?;
         self.dag.install_verified_fork(proof);
-        self.keep_forks(store)?;
+        self.keep_forks(store, lower)?;
         Ok(true)
     }
 

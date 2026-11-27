@@ -940,9 +940,11 @@ pub(super) fn advance(writer: &mut Write<'_, '_>, root: &Digest32) -> Result<Opt
                         || body.target_id == *root
                         || writer.get(Table::Complete, &hash_key(&hash))?.is_none()
                         || writer.get(Table::Incomplete, &hash_key(&hash))?.is_some()
-                        || !writer.fork_prefix_available(&entry)?
                     {
                         state.decide(writer, &hash, false)?;
+                        // Rule F2 C: no fork gate here. A removal its issuer validly signed keeps
+                        // its effect after a fork proof of its issuer; it is authorized only through its
+                        // own signed scope below (issuer grant, root cutoff, issuer's past).
                     } else if state.stage == 0 {
                         let query = state.query.get_or_insert_with(|| {
                             super::authority::Query::new(Scope(Some(hash)), body.issuer_id)
@@ -1018,8 +1020,13 @@ pub(super) fn advance(writer: &mut Write<'_, '_>, root: &Digest32) -> Result<Opt
                         {
                             let candidate = writer.entry(log)?;
                             state.presence_before = Some(candidate.skeleton.seq);
-                            if writer.fork_safe(&candidate)?
-                                && Scope(Some(hash)).contains(writer, &candidate)?
+                            // Rule F3 (`sec-code-4.md` P1): the issuer's own signed leaves and
+                            // returns decide whether its removal was authorized when signed, so
+                            // they are read exactly as before any split of it was known: no fork
+                            // filter here. Quarantine removes a splitter's positive current
+                            // effects, never the history that qualifies one of its exclusions; a
+                            // skipped leave would read as "no leave" and approve the removal.
+                            if Scope(Some(hash)).contains(writer, &candidate)?
                                 && matches!(
                                     GovEntry::body_bound_to(&candidate)?,
                                     GovBody::Presence(_)
@@ -1102,14 +1109,17 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
     if let Some(target) = state.target {
         if next_target != Some(target) {
             let key = hash_key(&target);
+            // Rule F2 B: a proved forker is out whatever its signed removals and readmissions
+            // say; no readmission overrides the derived exclusion.
+            let removed = state.removed || forked(writer, &target)?;
             let old = writer.get(Table::CurrentRemoved, &key)?.is_some();
-            state.changed |= old != state.removed;
+            state.changed |= old != removed;
             writer.put(
                 Table::CurrentRemoved,
                 key,
-                state.removed.then_some(state.generation),
+                removed.then_some(state.generation),
             )?;
-            let cut = if state.removed {
+            let cut = if removed {
                 RecipientCutState::Removed
             } else if let Some((_, hash)) = state.target_cut {
                 RecipientCutState::After(hash)
@@ -1125,7 +1135,7 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
             state.changed |= previous.is_some_and(|(_, previous)| previous != cut);
             let record = writer.save_record(old, &write_recipient_cut(state.generation, &cut))?;
             writer.put(Table::RecipientCuts, key, Some(record))?;
-            if !state.removed {
+            if !removed {
                 state.room_cut = state.room_cut.max(state.target_cut);
             }
             state.target = None;
@@ -1135,6 +1145,7 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
         }
     }
     let Some((key, _)) = next else {
+        derived_exclusions(writer, state)?;
         // One bounded room row: the latest cut on the creator's single chain. Containing it
         // contains every target's cut, so local authoring names one required ancestor.
         let key = super::view::ROOM_CUT_KEY;
@@ -1168,12 +1179,56 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
     Ok(())
 }
 
-/// Whether `target` has an accepted removal row (`View::removal_row`): only then does a reader
-/// of an eligibility decision about it wait for that decision (`View::never_removed`).
+/// Whether `target` has an accepted removal row (`View::removal_row`) or a recorded fork proof
+/// (rule F2 B's derived exclusion): only then does a reader of an eligibility decision about it
+/// wait for that decision (`View::never_removed`).
 fn removed_once(writer: &Write<'_, '_>, target: &Digest32) -> Result<bool> {
+    Ok(removal_row(writer, target)? || forked(writer, target)?)
+}
+
+fn removal_row(writer: &Write<'_, '_>, target: &Digest32) -> Result<bool> {
     Ok(writer
         .at_or_after(Table::MemberRemovals, hash_key(target))?
         .is_some_and(|(key, _)| key[..32] == target[..]))
+}
+
+/// Rule F2 B (ledger 73): a member this node holds a verified fork proof of.
+fn forked(writer: &Write<'_, '_>, target: &Digest32) -> Result<bool> {
+    Ok(writer
+        .get(Table::ForkBoundary, &hash_key(target))?
+        .is_some())
+}
+
+/// Rule F2 B: every proved forker with no signed removal row is removed in the current
+/// projection too (the removal rows' targets were written above). The proof is the derived
+/// exclusion's whole origin: no removal entry is made, nothing enters Frontiers or a strict-past
+/// scope, and a readmission cannot override it. Forkers are few; one pass covers them all.
+fn derived_exclusions(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Result<()> {
+    let mut after = None;
+    while let Some((key, _)) = writer.first(Table::ForkBoundary, after)? {
+        after = Some(key);
+        let target: Digest32 = key[..32]
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("derived exclusion target"))?;
+        if removal_row(writer, &target)? {
+            continue;
+        }
+        let key = hash_key(&target);
+        state.changed |= writer.get(Table::CurrentRemoved, &key)?.is_none();
+        writer.put(Table::CurrentRemoved, key, Some(state.generation))?;
+        let old = writer.get(Table::RecipientCuts, &key)?;
+        let previous = old
+            .map(|record| read_recipient_cut(&writer.record(record)?))
+            .transpose()?;
+        state.changed |=
+            previous.is_some_and(|(_, previous)| previous != RecipientCutState::Removed);
+        let record = writer.save_record(
+            old,
+            &write_recipient_cut(state.generation, &RecipientCutState::Removed),
+        )?;
+        writer.put(Table::RecipientCuts, key, Some(record))?;
+    }
+    Ok(())
 }
 
 /// Advance at most one causal eligibility decision step. Source replay has a
@@ -1255,7 +1310,18 @@ pub(super) fn advance_eligibility(
         writer.clear_cursor(Cursor::Eligibility)?;
         return Ok(true);
     }
-    if let Some(eligible) = past.advance(writer, generation)? {
+    // Rule F2 B: a proved forker's own entries from its boundary on, and every Session floor
+    // addressed to it, are ineligible here, whatever its signed removal history says.
+    let quarantined = match writer.get(Table::ForkBoundary, &hash_key(&past.target))? {
+        Some(boundary) => stage == 1 || writer.entry(log)?.skeleton.seq >= boundary,
+        None => false,
+    };
+    let decision = if quarantined {
+        Some(false)
+    } else {
+        past.advance(writer, generation)?
+    };
+    if let Some(eligible) = decision {
         let key = hash_key(&hash);
         let table = if stage == 0 {
             Table::EligibilityDecisions

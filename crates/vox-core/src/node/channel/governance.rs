@@ -96,18 +96,17 @@ pub(super) fn note_fork_in(
     let receipt = validated
         .map(|value| value.included().local_receipt())
         .transpose()?;
-    let cutoff = if proof.existing.skeleton.prev_hash == proof.conflicting.skeleton.prev_hash {
-        proof.seq
-    } else {
-        1
-    };
     let mut writer = facts::Write::open(batch, sek, room)?;
-    let key = facts::hash_key(&proof.author_id);
-    let previous = writer.get(facts::Table::ForkBoundary, &key)?;
-    let mut changed = previous.is_none_or(|old| cutoff < old);
-    if changed {
-        writer.put(facts::Table::ForkBoundary, key, Some(cutoff))?;
-    }
+    let cutoff = fork_cutoff(proof, |seq| {
+        writer
+            .get(
+                facts::Table::SourcePositions,
+                &facts::position(&proof.author_id, seq),
+            )?
+            .map(|log| writer.entry(log).map(|entry| entry.entry_hash()))
+            .transpose()
+    })?;
+    let mut changed = writer.record_fork_boundary(&proof.author_id, cutoff)?;
     // An alternate exclusion is evidence, never an accepted author-chain position.
     // A malformed or unsigned nested body confers nothing and does not poison the room.
     if let Ok(body) = crate::governance::entry::GovEntry::body_bound_to(&proof.conflicting) {
@@ -128,6 +127,151 @@ pub(super) fn note_fork_in(
         writer.authority_changed()?;
     }
     writer.seal()
+}
+
+/// Rule F2 A (ledger 73): the position from which a proved forker's own entries count for
+/// nothing here. The proof's position only when its two entries share a predecessor AND that
+/// predecessor is this node's own accepted entry of that member just below it; otherwise 1. Two other
+/// histories sharing a predecessor prove nothing about this node's prefix (`sec-1.md`).
+fn fork_cutoff(
+    proof: &crate::log::dag::ForkProof,
+    accepted_hash: impl FnOnce(u64) -> Result<Option<Digest32>>,
+) -> Result<u64> {
+    let shared = proof.existing.skeleton.prev_hash == proof.conflicting.skeleton.prev_hash;
+    if proof.seq > 1
+        && shared
+        && accepted_hash(proof.seq - 1)? == Some(proof.existing.skeleton.prev_hash)
+    {
+        Ok(proof.seq)
+    } else {
+        Ok(1)
+    }
+}
+
+/// Rule F3 (ledger 73; `rule-f3.md`, `sec-5.md`): one member this node holds a verified fork
+/// proof of, as every consumer of a signed context coordinate reads that member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Split {
+    /// Its recorded boundary (`ForkBoundary`): from it on, nothing the splitter signed counts here.
+    pub(crate) boundary: u64,
+    /// The splitter is the creator, or this node holds an authenticated, room-bound
+    /// creator-issued certificate naming it: in force, expired, revoked or policy-only alike
+    /// (`CreatorCerts`). Such a splitter is not eligible for the coordinate fallback (sec-5
+    /// condition 3). Read when the map is built and never kept past that read: the absence of a
+    /// certificate is a local decision at that moment.
+    pub(crate) certified: bool,
+}
+
+/// Every proved splitter here, read at one moment (`splits`). Empty when none is recorded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Splits(std::collections::BTreeMap<Digest32, Split>);
+
+impl Splits {
+    /// `author`'s split, when its recorded boundary is at or below `seq`.
+    pub(crate) fn reaching(&self, author: &Digest32, seq: u64) -> Option<Split> {
+        self.0
+            .get(author)
+            .copied()
+            .filter(|split| seq >= split.boundary)
+    }
+    /// `author`'s recorded boundary, if a fork proof of that member is recorded.
+    pub(crate) fn boundary(&self, author: &Digest32) -> Option<u64> {
+        self.0.get(author).map(|split| split.boundary)
+    }
+    /// Each proved splitter and its boundary.
+    pub(crate) fn boundaries(&self) -> impl Iterator<Item = (Digest32, u64)> + '_ {
+        self.0
+            .iter()
+            .map(|(author, split)| (*author, split.boundary))
+    }
+    /// No proved splitter: every consumer's coordinate path is exactly today's.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Rule F3 (sec-5 conditions 1 and 3): a signed-context coordinate that is not this node's
+    /// accepted control at its position (`matched` false) and names an ordinary proved splitter
+    /// (neither the creator nor certified) at or after its boundary is ignored: it requires no
+    /// entry, adds nothing, and is never read as authenticated ancestry. A matching coordinate
+    /// keeps today's exact path, for anyone.
+    pub(crate) fn ignores(
+        &self,
+        coordinate: &crate::log::history::EntryReference,
+        matched: bool,
+    ) -> bool {
+        !matched
+            && self
+                .reaching(&coordinate.author, coordinate.seq)
+                .is_some_and(|split| !split.certified)
+    }
+}
+
+/// Every proved splitter recorded here, with its boundary and whether it is certified
+/// (`Split`), read now from the room's governance facts. `root` is the room's creator.
+/// `forked`: whether the room's DAG holds any fork proof (`Dag::any_frozen`). A boundary is
+/// recorded only with a proof, so without one nothing is read and an honest room pays nothing
+/// for the rule; a caller whose `forked` is a published snapshot's that predates a proof reads
+/// no splitter, the exact path, which is stricter, never looser.
+pub(crate) fn splits(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    root: &Digest32,
+    forked: bool,
+) -> Result<Splits> {
+    if !forked {
+        return Ok(Splits::default());
+    }
+    let Some(facts) = facts::Read::open_existing(store, sek, room)? else {
+        return Ok(Splits::default());
+    };
+    let mut out = std::collections::BTreeMap::new();
+    let mut after = None;
+    while let Some((key, boundary)) = facts.first(facts::Table::ForkBoundary, after)? {
+        after = Some(key);
+        let author: Digest32 = key[..32]
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("fork boundary author"))?;
+        let certified = author == *root
+            || facts
+                .at_or_after(facts::Table::CreatorCerts, facts::hash_key(&author))?
+                .is_some_and(|(key, _)| key[..32] == author[..])
+            || crate::node::history_stream::fork_mutant_is("fallback-off");
+        out.insert(
+            author,
+            Split {
+                boundary,
+                certified,
+            },
+        );
+    }
+    Ok(Splits(out))
+}
+
+/// Whether a proof of an already frozen author gives, by rule A (`fork_cutoff`, no signature
+/// read), a lower boundary than the one recorded (rule F2 A, `sec-2.md` condition 1): then it
+/// replaces the kept proof and the boundary goes to 1 (the fork rule's two steps,
+/// `facts::Write::record_fork_boundary`). At 1 no proof lowers it.
+pub(crate) fn fork_proof_lowers(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    proof: &crate::log::dag::ForkProof,
+) -> Result<bool> {
+    let facts = facts::Read::open(store, sek, room)?;
+    let current = facts.get(
+        facts::Table::ForkBoundary,
+        &facts::hash_key(&proof.author_id),
+    )?;
+    let candidate = fork_cutoff(proof, |seq| {
+        facts
+            .get(
+                facts::Table::SourcePositions,
+                &facts::position(&proof.author_id, seq),
+            )?
+            .map(|log| facts.entry(log).map(|entry| entry.entry_hash()))
+            .transpose()
+    })?;
+    Ok(current.is_none_or(|boundary| candidate < boundary))
 }
 
 fn removal_generation_key(room: &Digest32) -> String {
@@ -360,8 +504,12 @@ fn advance_frontiers(
             Some(hash),
         )?;
         remaining -= 1;
-        // A v2 source was admitted with its exact signed parent/control closure. Its
-        // authority frontier is that immutable pre-context plus itself. Inheriting a
+        // A v2 source was admitted with its exact signed parent/control closure, less any
+        // coordinate rule F3 ignored (an ordinary proved splitter's at or after its boundary
+        // that is not the accepted control here). Its authority frontier is that immutable
+        // pre-context plus itself, kept raw; an ignored coordinate is never ancestry here,
+        // because once its author is forked every reading of it is hash-exact against this
+        // node's accepted chain (`causal_contains`, `reference_contains`). Inheriting a
         // receiver's newer parent frontier would change strict-past authorization.
         let signed_context = entry
             .skeleton
