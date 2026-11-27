@@ -1509,6 +1509,10 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
         let mut d = daemon(&account).await?;
         let forgotten = match d.request(DaemonRequest::Nodes).await {
             Ok(DaemonFrame::Nodes(nodes)) => nodes.iter().any(|n| n.name == name && !n.keep),
+            Ok(DaemonFrame::Refused(r)) => {
+                eprintln!("vox: the daemon refused to list its nodes: {r}");
+                false
+            }
             _ => false,
         };
         if !forgotten {

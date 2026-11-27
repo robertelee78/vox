@@ -135,6 +135,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(vox_core::node::actor::NODE_THREAD_STACK)
         .enable_all()
         .build()?;
     if args.detach {

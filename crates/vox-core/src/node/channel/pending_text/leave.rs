@@ -12,10 +12,15 @@ pub(crate) struct Unchanged {
     epoch: u64,
     needs_ack: bool,
     pin: Option<history::PendingHistoryRead>,
+    /// The room ended before this leave was admitted: no departure is signed.
+    ended: bool,
 }
 
 pub(crate) enum Saved {
     Installed(Departure),
+    /// The room had ended by the time the departure would have been signed: the leave takes
+    /// the ended room's path (ADR-049 LE-7), with no departure.
+    Ended,
     Detached,
 }
 
@@ -44,7 +49,14 @@ impl ChannelState {
         let needs_ack = !removed && self.members().into_iter().any(|member| member != self.me());
         // A verified newer admission makes the old final Presence(false) a prior leave,
         // not this request's departure. Recovery must finish before signing a new one.
-        if self.has_left(&self.me()) {
+        let left = self.has_left(&self.me());
+        // **An End applied before the departure is admitted is never appended over** (ADR-049
+        // LE-7): checked here, under the room lock that admits the departure. From the
+        // reservation below until the departure is installed, history publication refuses
+        // (`post_pending`), so no End can apply in between: an End this copy holds beside
+        // its departure arrived after it (ADR-023 RL-8.2's "already left").
+        let ended = !left && self.ended(now.get()).is_some();
+        if left || ended {
             let pin = self.reserve_pending_write(store, Arc::clone(&owner))?;
             return Ok(Some(Prepared::Unchanged(Unchanged {
                 owner,
@@ -52,6 +64,7 @@ impl ChannelState {
                 epoch: self.epoch,
                 needs_ack,
                 pin: Some(pin),
+                ended,
             })));
         }
         self.require_legacy_current(store)?;
@@ -143,6 +156,9 @@ impl Completed {
             }
             Self::Unchanged(unchanged) => {
                 channel.release_pending_text(&unchanged.owner, false);
+                if unchanged.ended {
+                    return Ok(Saved::Ended);
+                }
                 unchanged.needs_ack
             }
         };

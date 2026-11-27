@@ -477,6 +477,21 @@ impl Node {
         }
         let departure = match result {
             Ok(maintenance_save::Saved::Leave(Saved::Installed(saved))) => saved,
+            // The room ended before the departure was admitted: no departure was signed, and
+            // the leave deletes the ended room as one known ended at once does (ADR-049 LE-7).
+            Ok(maintenance_save::Saved::Leave(Saved::Ended)) => {
+                drop(next.transition.take());
+                self.begin_own_key_left_purge(
+                    room,
+                    Arc::clone(&next.instance),
+                    LeftPurgePurpose::Leave {
+                        replies: reply.into_iter().collect(),
+                        lifetimes: vec![lifetime],
+                    },
+                )
+                .await;
+                return;
+            }
             Ok(_) => {
                 self.reject_owned_leave(
                     room,
@@ -779,10 +794,16 @@ impl Node {
         // afterwards: who ended it and when, by its own clock; or that this identity left it,
         // at its departure's clock. A purge that precedes a rejoin remembers nothing.
         let me = channel.me();
-        let erase_continuity = channel.ended(self.now_ms().get()).is_some();
+        let room_ended = channel.ended(self.now_ms().get()).is_some();
+        // An End applied in the room erases this author's continuity; a node that had already
+        // left clears it only on verified creator End evidence at a later join (ADR-023 RL-8.2,
+        // `confirm_creator_end`), never because its hidden copy applied an End. No departure is
+        // signed in a room that has ended (ADR-049 LE-7; rechecked where the departure is
+        // admitted, `prepare_pending_leave`), so a copy that holds both had left before the End.
+        let erase_continuity = room_ended && !channel.has_left(&me);
         let ended = match &purpose {
             Some(LeftPurgePurpose::Join { .. }) => None,
-            Some(LeftPurgePurpose::Leave { .. }) if !erase_continuity => {
+            Some(LeftPurgePurpose::Leave { .. }) if !room_ended => {
                 let now = self.now_ms().get();
                 Some(Box::new(crate::node::ended_rooms::EndedRoom {
                     channel_id: room,

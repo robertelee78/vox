@@ -318,6 +318,7 @@ impl VoxNode {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("vox-node")
+            .thread_stack_size(vox_core::node::actor::NODE_THREAD_STACK)
             .enable_all()
             .build()
             .map_err(|e| failed(format!("starting the node's runtime: {e}")))?;

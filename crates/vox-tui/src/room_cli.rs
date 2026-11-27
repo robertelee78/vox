@@ -236,10 +236,15 @@ async fn room_of_readiness(
             return Ok(id);
         }
         if let Some(reason) = open_failure {
-            return Err(AppError::Usage(match client.node_name() {
-                Some(node) => format!("{reason}\n  {}", reopen_advice(node.as_str())),
-                None => reason,
-            }));
+            return Err(AppError::Usage(
+                match client
+                    .node_name()
+                    .and_then(|node| reopen_advice(&reason, node.as_str()))
+                {
+                    Some(advice) => format!("{reason}\n  {advice}"),
+                    None => reason,
+                },
+            ));
         }
         if !preparing {
             return Err(room_closed(&id, &name));
@@ -333,17 +338,21 @@ async fn ended_room_said(client: &mut IpcClient, prefix: &str) -> Option<AppErro
     )))
 }
 
-/// What a person does about a room that did not reopen on node `node`: one sentence, said on a
-/// line below the failure's reason wherever that room is shown (`vox room list`, read and post,
-/// the agent hook, `vox tui`). The address comes from outside this node, which cannot print
-/// the address of a room it does not hold open.
-pub(crate) fn reopen_advice(node: &str) -> String {
+/// What a person does about a room that did not reopen on node `node` for `reason`: one
+/// sentence, said on a line below the reason wherever that room is shown (`vox room list`, read
+/// and post, the agent hook, `vox tui`). The address comes from outside this node, which cannot
+/// print the address of a room it does not hold open. None for a room in a format this version
+/// cannot open: joining it again is refused too, and the reason already says what to do.
+pub(crate) fn reopen_advice(reason: &str, node: &str) -> Option<String> {
+    if reason.contains(vox_core::node::channel::UNSUPPORTED_ROOM_FORMAT) {
+        return None;
+    }
     let join = vox_text::shell::node_command(&["vox", "room", "join"], node);
-    format!(
+    Some(format!(
         "To reopen it once the cause above is fixed, run `{join}` with this room's address and \
          passphrase (the `vox://` address you joined with, or another member's `vox room link`, \
          gives the address)."
-    )
+    ))
 }
 
 /// What every verb says of a room the node holds closed, with a daemon or without one
@@ -413,9 +422,11 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
                 format!("  [{over}]")
             }
         );
-        if open_failure.is_some() {
+        if let Some(reason) = open_failure {
             let node = crate::client::name_of(paths)?;
-            println!("  {}", reopen_advice(node.as_str()));
+            if let Some(advice) = reopen_advice(reason, node.as_str()) {
+                println!("  {advice}");
+            }
         }
     }
     for name in &clashing {
@@ -7589,6 +7600,15 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let (channel_id, pending_only) = match room_of(&mut client, room).await {
         Ok(id) => (id, false),
         Err(error) => match b32_decode(room, "room") {
+            // A room this version cannot open cannot be left either (a leave is signed in the
+            // room): its reason is the answer, not an attempt to cancel a pending admission.
+            Ok(_)
+                if error
+                    .to_string()
+                    .contains(vox_core::node::channel::UNSUPPORTED_ROOM_FORMAT) =>
+            {
+                return Err(error)
+            }
             Ok(id) => (id, true),
             Err(_) => return Err(error),
         },

@@ -68,9 +68,11 @@
 //! 48b1c743 (#562): room `before`, written when times were seconds and before the authenticated
 //! history genesis (`8ec3e4379`), with one post. Such a room is refused on purpose
 //! (`channel.rs` `UNSUPPORTED_ROOM_FORMAT`; legacy recovery retired in `2970ba258`). What a person
-//! gets: `room list` shows it closed with the node's sentence saying it uses an unsupported format
-//! and what to do; `room read` and `room post` are refused with that sentence and show nothing
-//! of it; every record the node's store holds for the room is byte for byte unchanged after the
+//! gets: `room list` shows it closed with the node's sentence saying this version cannot open it,
+//! that its data is kept and what to do, with no advice to join it again (a rejoin is refused
+//! too); `room read`, `room post` and `room leave` are refused with that sentence and show nothing
+//! of it; `vox status` names the room with that sentence and does not call the node healthy;
+//! every record the node's store holds for the room is byte for byte unchanged after the
 //! daemon ran and stopped, so the data is still there for a version that can read it; and the
 //! node's other rooms work (a new one takes a post and reads it). Mutants: open the room by
 //! reading the old genesis anyway (red: listed open, or a read shows it); clean up the refused
@@ -1848,8 +1850,9 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
 const SECONDS_ROOM: &str = "oku2e2lomuokl6rfrzsifpq72o5i2n3ejc4kdm3bu73khltiinga";
 
 /// What the node says of a room in a format it cannot read (`channel.rs` `UNSUPPORTED_ROOM_FORMAT`).
-const UNSUPPORTED: &str =
-    "This room uses an unsupported room or history format; leave it and create a new one.";
+const UNSUPPORTED: &str = "This room was saved in a format from an older Vox that this version \
+     cannot open; its saved data is kept untouched. To go on talking, make a new room and send \
+     its link to the members.";
 
 /// Every record the node's store holds for `room` (its rows of `segments` and `small_segments`,
 /// and its `sek_wraps` entry), each with the SHA-256 of its bytes: the room's saved data. The store
@@ -1940,20 +1943,39 @@ fn a_room_in_a_retired_format_is_refused_never_misread_and_its_data_is_kept() {
         "PRODUCT: a room in a retired format must be listed as closed, saying {UNSUPPORTED:?}; \
          `vox room list` said: {list}{err}"
     );
-    // (b) Never misread: a read and a post are refused, for that reason.
+    assert!(
+        !list.contains("vox room join"),
+        "PRODUCT: `vox room list` must not advise joining again a room in a retired format, \
+         which is refused too; it said: {list}"
+    );
+    let (ok, status, err) = vox(&data, &cfg, &["status"], None);
+    println!("[proof] `vox status` said:\n{status}{err}");
+    assert!(
+        ok && status
+            .lines()
+            .any(|l| l.contains(&SECONDS_ROOM[..12]) && l.contains(UNSUPPORTED))
+            && !status.contains("healthy: nothing needs attention"),
+        "PRODUCT: `vox status` must name the room in a retired format with {UNSUPPORTED:?} and \
+         not call the node healthy; it said: {status}{err}"
+    );
+    // (b) Never misread: a read, a post and a leave are refused, for that reason.
     for (args, what) in [
         (&["room", "read", SECONDS_ROOM][..], "read"),
         (
             &["room", "post", SECONDS_ROOM, "said after the refusal"][..],
             "post",
         ),
+        (&["room", "leave", SECONDS_ROOM][..], "leave"),
     ] {
         let (ok, out, err) = vox(&data, &cfg, args, None);
         println!("[proof] `vox room {what}` said: {out}{err}");
         assert!(
-            !ok && err.contains(UNSUPPORTED) && !out.contains("said while times were seconds"),
+            !ok && err.contains(UNSUPPORTED)
+                && !out.contains("said while times were seconds")
+                && !out.contains("about to"),
             "PRODUCT: `vox room {what}` of a room in a retired format must be refused, saying \
-             {UNSUPPORTED:?}, and show nothing of it; it said: {out}{err}"
+             {UNSUPPORTED:?}, announce nothing it will not do, and show nothing of it; it said: \
+             {out}{err}"
         );
     }
 

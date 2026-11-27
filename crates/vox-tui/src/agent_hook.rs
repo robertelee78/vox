@@ -40,6 +40,7 @@
 //! stop. Failures are reported on stderr, which the harness shows the operator
 //! without feeding to the model.
 
+use std::future::Future;
 use std::io::Read as _;
 
 use vox_agentcomms::attention::CHATTER;
@@ -304,8 +305,8 @@ async fn check_omp_opening(
         let owner = client
             .me()
             .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
-        match client.rooms().await {
-            Ok(Frame::Rooms { rooms })
+        match in_turn(turn, client.rooms()).await {
+            Ok(Ok(Frame::Rooms { rooms }))
                 if rooms
                     .iter()
                     .any(|r| r.0 == recipient.room && r.2 && !r.4 && r.6.is_none()) => {}
@@ -678,12 +679,13 @@ async fn omp_prepare(
     .await
 }
 
-/// A deferred native turn still completes the existing envelope/decision exchange.
+/// A late native turn still completes the existing envelope/decision exchange.
 async fn omp_restart_deferral(
     paths: &Paths,
     daemon: &Daemon,
     format: Format,
     session: Option<&str>,
+    turn: &RestartTurn,
 ) -> Result<(), AppError> {
     let session =
         session.ok_or_else(|| AppError::Usage("OMP preparation requires a Session".into()))?;
@@ -695,7 +697,7 @@ async fn omp_restart_deferral(
     let mut input = parse_input("");
     input.session_id = session.to_owned();
     input.omp_registration = Some(saved);
-    let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
+    let words = turn.late(&input, daemon);
     omp_uncertainty_begin(paths, &input, None, None, &[])?;
     emit_receipts(format, "", &input.event, &format!("{words}\n"), "", &[]);
     std::io::Write::flush(&mut std::io::stdout())
@@ -2201,24 +2203,18 @@ pub async fn run(
     session: Option<&str>,
     mode: HookMode,
 ) -> Result<(), AppError> {
-    let began = tokio::time::Instant::now();
-    let turn = RestartTurn {
-        deadline: began + REGISTER_WITHIN,
-        restarting: std::cell::Cell::new(false),
-        published: std::cell::Cell::new(false),
-    };
     let attention_register = matches!(mode, HookMode::AttentionRegister);
     let native_attention = matches!(mode, HookMode::NativeAttention);
     if matches!(mode, HookMode::OmpPrepare) {
+        let turn = RestartTurn::begin();
         {
             let work = omp_prepare(paths, daemon, room_arg, format, session, &turn);
             tokio::pin!(work);
             tokio::select! {
                 result = &mut work => return result,
                 () = tokio::time::sleep_until(turn.deadline) => {
-                    if !turn.restarting.get() || turn.published.get() {
-                        // A restart first met after the deadline stops at its next poll (#408),
-                        // and a turn that has not published defers as below.
+                    if turn.published.get() || restart_unbounded(&turn) {
+                        // A published turn finishes its bounded work; a late turn defers below.
                         let result = work.await;
                         if result.is_ok() || !turn.restarting.get() || turn.published.get() {
                             return result;
@@ -2227,7 +2223,7 @@ pub async fn run(
                 }
             }
         }
-        return omp_restart_deferral(paths, daemon, format, session).await;
+        return omp_restart_deferral(paths, daemon, format, session, &turn).await;
     }
     let mut raw = String::new();
     // A harness always provides stdin; a person testing by hand may not — and
@@ -2522,10 +2518,21 @@ pub async fn run(
         )
         .await;
     }
+    // **One deadline for the whole turn** (#408), taken once its prompt is in hand: every wait and
+    // request below shares it. Past it, a turn that has not yet reserved or shown news stops and
+    // says its news comes next turn; nothing was consumed (cursors move only after publication).
+    let turn = RestartTurn::begin();
+    // A setup outcome or room offer is marked said when it is chosen (`first_in_session`, the
+    // daemon's `new`), so a turn that ends before it publishes says it with its own words.
+    let note_unsaid: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let with_note = |words: String| match note_unsaid.borrow_mut().take() {
+        Some(note) if !turn.published.get() => format!("{words}\n{}\n", note.trim_end()),
+        _ => format!("{words}\n"),
+    };
     let defer = || {
-        let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
+        let words = turn.late(&input, daemon);
         eprintln!("vox agent hook: {words}");
-        emit(format, &raw, &input.event, &format!("{words}\n"), "");
+        emit(format, &raw, &input.event, &with_note(words), "");
     };
     let work = async {
         let drained = match daemon.register_turn(&input, room_arg, Some(&turn)).await {
@@ -2550,6 +2557,7 @@ pub async fn run(
                         Some(&input.session_id),
                     )
                 });
+                note_unsaid.replace(note.clone());
                 drain(
                     paths,
                     (room_arg, answer.room.as_deref()),
@@ -2615,10 +2623,10 @@ pub async fn run(
                 format,
                 &raw,
                 &input.event,
-                &format!(
-                    "Vox could not read your rooms this turn: {}\n",
+                &with_note(format!(
+                    "Vox could not read your rooms this turn: {}",
                     one_line_reason(&e)
-                ),
+                )),
                 "",
             );
         }
@@ -2629,7 +2637,7 @@ pub async fn run(
         result = &mut work => result,
         () = tokio::time::sleep_until(turn.deadline) => {
             // A published (or reserved) turn finishes its bounded work, receipts included.
-            if !turn.restarting.get() || turn.published.get() {
+            if turn.published.get() || restart_unbounded(&turn) {
                 return work.await;
             }
             defer();
@@ -2774,35 +2782,96 @@ impl Unregistered {
     }
 }
 
-/// The longest a hook waits for the daemon to register its session (#408). ADR-020 states no hook
-/// latency, so this is about 10 s: more than the daemon's own bound on a detaching node
+/// The hook's one patience for a turn (#408). ADR-020 states no hook latency, so this is about
+/// 10 s: more than the daemon's own bound on a detaching node
 /// ([`vox_core::node::daemonipc::DETACHING_PATIENCE`]), so that refusal arrives first and says why.
-/// A confirmed restart shares this patience across greeting, preparation and news.
+/// Greeting, registration, a restart's preparation and the news share it.
 const REGISTER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Only a confirmed restart spends the registration patience on this whole turn.
+/// A turn's one deadline, and what it has met so far.
 struct RestartTurn {
     deadline: tokio::time::Instant,
     restarting: std::cell::Cell<bool>,
     /// Set once the turn has reserved or published news: from then it finishes its own bounded
     /// work instead of deferring, so no reservation or receipt is dropped at the deadline.
     published: std::cell::Cell<bool>,
+    /// Whether the turn has seen the login item starting the daemon, and the login item's first
+    /// run that would be this turn's replacement daemon.
+    #[cfg(target_os = "macos")]
+    login_item: std::cell::Cell<bool>,
+    #[cfg(target_os = "macos")]
+    login_run: std::cell::Cell<Option<u64>>,
+}
+
+impl RestartTurn {
+    fn begin() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + REGISTER_WITHIN,
+            restarting: std::cell::Cell::new(false),
+            published: std::cell::Cell::new(false),
+            #[cfg(target_os = "macos")]
+            login_item: std::cell::Cell::new(false),
+            #[cfg(target_os = "macos")]
+            login_run: std::cell::Cell::new(None),
+        }
+    }
+
+    /// What a turn that ran out of its patience says, once: a login item still starting the
+    /// daemon (which, if it keeps failing, the person must look at); a restart it met still
+    /// preparing the node; otherwise a daemon that did not answer in time. Each time the news
+    /// comes on a later turn and nothing was consumed.
+    fn late(&self, input: &HookInput, daemon: &Daemon) -> String {
+        #[cfg(target_os = "macos")]
+        if self.login_item.get() {
+            return "Vox's daemon is being started by its login item and did not answer within \
+                    this turn; your rooms show from a later turn. If this keeps happening, check \
+                    Keep Running in Vox.app and the daemon log."
+                .into();
+        }
+        if self.restarting.get() {
+            Unregistered::Attaching(daemon.node.clone())
+        } else {
+            Unregistered::DaemonUnanswered
+        }
+        .said(input, &daemon.account)
+    }
+}
+
+/// Whether a test asked a restarting turn to ignore its deadline (a mutant of #408's bound).
+fn restart_unbounded(turn: &RestartTurn) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if turn.restarting.get() && std::env::var_os("VOX_TEST_HOOK_RESTART_UNBOUNDED").is_some() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("test-knobs: restart loops ignore the hook deadline"));
+        return true;
+    }
+    let _ = turn;
+    false
+}
+
+/// One daemon exchange inside a turn ends at the turn's deadline, like everything else in it.
+async fn in_turn<T>(
+    turn: Option<&RestartTurn>,
+    exchange: impl Future<Output = T>,
+) -> Result<T, AppError> {
+    match turn {
+        Some(turn) if !restart_unbounded(turn) => tokio::time::timeout_at(turn.deadline, exchange)
+            .await
+            .map_err(|_| {
+                AppError::Usage(
+                    "the vox daemon did not answer within this turn; try again next turn".into(),
+                )
+            }),
+        _ => Ok(exchange.await),
+    }
 }
 
 /// Wait once more for a restart this turn has met. **Never without a bound** (#408): a restart
 /// first met after the turn's patience has passed is not waited for, and the turn defers.
 async fn restart_poll(turn: Option<&RestartTurn>) -> Result<(), AppError> {
-    let outlived = turn.is_some_and(|turn| tokio::time::Instant::now() >= turn.deadline);
-    #[cfg(feature = "test-knobs")]
-    let outlived = outlived && {
-        let ignored = std::env::var_os("VOX_TEST_HOOK_RESTART_UNBOUNDED").is_some();
-        if ignored {
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| eprintln!("test-knobs: restart loops ignore the hook deadline"));
-        }
-        !ignored
-    };
-    if outlived {
+    if turn.is_some_and(|turn| {
+        tokio::time::Instant::now() >= turn.deadline && !restart_unbounded(turn)
+    }) {
         return Err(AppError::Usage(
             "the daemon restart did not finish within this turn; try again next turn".into(),
         ));
@@ -2827,17 +2896,64 @@ async fn restart_refusal(
     }) {
         return Ok(false);
     }
-    let restarting = turn.restarting.get() || crate::daemon_client::restarting(account)?;
+    let locked = crate::daemon_client::restarting(account)?;
+    // The login item may be what this turn waits on: it is read again at each poll.
     #[cfg(target_os = "macos")]
-    let restarting = restarting || tokio::time::timeout_at(
-        turn.deadline, crate::update::restart::pending_login_item(account),
-    ).await.map_err(|_| AppError::Usage(
-        "the login-item startup check did not finish; no daemon was started; retry on the next turn".into(),
-    ))??.is_some();
+    let login_item = !locked
+        && tokio::time::Instant::now() < turn.deadline
+        && login_item_starting(account, turn).await?;
+    #[cfg(not(target_os = "macos"))]
+    let login_item = false;
+    let restarting = turn.restarting.get() || locked || login_item;
     if restarting && !turn.restarting.replace(true) {
         eprintln!("vox: waiting for the daemon restart");
     }
     Ok(restarting)
+}
+
+/// Whether the account's login item is starting its daemon. **A daemon it started that exits
+/// before it greets ends the turn's wait at once, and the turn says so** (#1372 P3-3): the same
+/// structural end as the manager's own wait, from launchd's count of runs, read within the
+/// turn's deadline; nothing is kept between turns.
+#[cfg(target_os = "macos")]
+async fn login_item_starting(
+    account: &vox_core::node::paths::Account,
+    turn: &RestartTurn,
+) -> Result<bool, AppError> {
+    let unchecked = || {
+        AppError::Usage(
+            "the login-item startup check did not finish; no daemon was started; retry on the next turn".into(),
+        )
+    };
+    let Some(manager) = tokio::time::timeout_at(
+        turn.deadline,
+        crate::update::restart::pending_login_item(account),
+    )
+    .await
+    .map_err(|_| unchecked())??
+    else {
+        return Ok(false);
+    };
+    turn.login_item.set(true);
+    let state = tokio::time::timeout_at(turn.deadline, manager.progress())
+        .await
+        .map_err(|_| unchecked())??;
+    if let Some((runs, scheduled)) = state.and_then(|state| Some((state.runs?, state.scheduled))) {
+        match turn.login_run.get() {
+            // The run after the one seen first is the replacement: a run seen at first may be
+            // the daemon that is stopping.
+            None => turn.login_run.set(runs.checked_add(1)),
+            Some(first) if runs > first || (runs == first && scheduled) => {
+                return Err(AppError::Usage(
+                    "the daemon Vox's login item started exited before it answered; see the \
+                     daemon log, then reopen Vox.app or run `vox daemon`"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(true)
 }
 
 async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcClient, AppError> {
@@ -2847,7 +2963,7 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
         if turn.is_some_and(|turn| turn.restarting.get()) {
             use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeState};
             let account = account.get_or_insert_with(|| paths.account());
-            let opened = DaemonClient::open(&account.socket()).await;
+            let opened = in_turn(turn, DaemonClient::open(&account.socket())).await?;
             if let Err(error) = &opened {
                 if restart_refusal(account, Some(error), turn).await? {
                     restart_poll(turn).await?;
@@ -2855,7 +2971,7 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
                 }
             }
             let mut daemon = opened.map_err(|e| crate::client::said(&at, e))?;
-            match daemon.request(DaemonRequest::Nodes).await? {
+            match in_turn(turn, daemon.request(DaemonRequest::Nodes)).await?? {
                 DaemonFrame::Nodes(nodes) => {
                     if nodes.iter().any(|node| {
                         node.name == at.using.node && node.state == NodeState::Attaching
@@ -2871,7 +2987,7 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
                 other => return Err(crate::client::unexpected_daemon(&other)),
             }
         }
-        match IpcClient::open_at(&at).await {
+        match in_turn(turn, IpcClient::open_at(&at)).await? {
             Ok(client) if client.me().is_none() && turn.is_some_and(|t| t.restarting.get()) => {}
             Ok(client) => return Ok(client),
             Err(error) => {
@@ -2891,7 +3007,7 @@ async fn rooms_for_turn(
     turn: Option<&RestartTurn>,
 ) -> Result<Vec<vox_core::node::ipc::RoomRow>, AppError> {
     loop {
-        let rooms = match client.rooms().await {
+        let rooms = match in_turn(turn, client.rooms()).await? {
             Ok(Frame::Rooms { rooms }) => rooms,
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(crate::client::unexpected(&other)),
@@ -2997,7 +3113,16 @@ impl Daemon {
                  no daemon was started. Try again next turn.".into(),
             ));
         }
-        let mut restarting = matches!(daemon, crate::daemon_client::HookDaemon::Restarting);
+        #[cfg(target_os = "macos")]
+        let login_item = matches!(daemon, crate::daemon_client::HookDaemon::LoginItem);
+        #[cfg(target_os = "macos")]
+        if let (true, Some(turn)) = (login_item, turn) {
+            turn.login_item.set(true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let login_item = false;
+        let mut restarting =
+            login_item || matches!(daemon, crate::daemon_client::HookDaemon::Restarting);
         if restarting {
             #[cfg(feature = "test-knobs")]
             if std::env::var_os("VOX_TEST_HOOK_RESTART_IMMEDIATE").is_some() {
@@ -3689,13 +3814,20 @@ async fn drain(
     let mut unread: Vec<String> = Vec::new();
     for (channel_id, name, open, _, preparing, _, open_failure) in rooms {
         if let Some(reason) = open_failure {
-            let advice = crate::room_cli::reopen_advice(crate::client::name_of(paths)?.as_str());
+            let advice =
+                crate::room_cli::reopen_advice(&reason, crate::client::name_of(paths)?.as_str());
             if input.native_notice.is_some() || input.omp_registration.is_some() {
-                return Err(AppError::Usage(format!("{reason}\n  {advice}")));
+                return Err(AppError::Usage(match advice {
+                    Some(advice) => format!("{reason}\n  {advice}"),
+                    None => reason,
+                }));
             }
             unread.push(format!(
-                "Vox could not read room {} this turn: {reason}\n{advice}\n",
-                room_heading(&b32_encode(&channel_id), &name)
+                "Vox could not read room {} this turn: {reason}\n{}",
+                room_heading(&b32_encode(&channel_id), &name),
+                advice
+                    .map(|advice| format!("{advice}\n"))
+                    .unwrap_or_default()
             ));
             continue;
         }
@@ -4157,7 +4289,7 @@ async fn drain(
         }
     }
     for (d, shown) in drains.iter().zip(shown_in) {
-        mark_read(&mut client, d, shown).await;
+        mark_read(&mut client, d, shown, turn).await;
     }
     Ok(())
 }
@@ -4250,8 +4382,14 @@ async fn pause_holds(paths: &Paths, room: Digest32, me: Digest32) -> Result<bool
 
 /// Tell the node which of `d`'s news were drained into this turn, so it posts a read record for
 /// them (ADR-028 RR-1). A message not received yet was not drained. Best effort, after the cursor
-/// is saved: a node that cannot take it costs the members a `read by`, never the turn.
-async fn mark_read(client: &mut IpcClient, d: &RoomDrain, shown: usize) {
+/// is saved, within the turn's deadline: a node that cannot take it in time costs the members a
+/// `read by`, never the turn.
+async fn mark_read(
+    client: &mut IpcClient,
+    d: &RoomDrain,
+    shown: usize,
+    turn: Option<&RestartTurn>,
+) {
     let Ok(channel_id) = b32_decode(&d.key, "room") else {
         return;
     };
@@ -4265,7 +4403,10 @@ async fn mark_read(client: &mut IpcClient, d: &RoomDrain, shown: usize) {
             channel_id,
             entries: chunk.to_vec(),
         };
-        match client.request(&request).await {
+        match in_turn(turn, client.request(&request))
+            .await
+            .and_then(|answer| answer.map_err(AppError::from))
+        {
             Ok(Frame::Ok) => {}
             Ok(Frame::Error { reason }) => {
                 eprintln!("vox agent hook: could not record what was read: {reason}");

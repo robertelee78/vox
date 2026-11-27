@@ -88,8 +88,11 @@ pub(crate) mod key_package_queue;
 pub(crate) mod legacy_provisional;
 
 /// Unsupported room or required history formats cannot be opened; saved data remains untouched.
-pub(crate) const UNSUPPORTED_ROOM_FORMAT: &str =
-    "This room uses an unsupported room or history format; leave it and create a new one.";
+/// Leaving such a room is refused too (a leave is signed in the room), and so is joining it again,
+/// so the sentence names neither.
+pub const UNSUPPORTED_ROOM_FORMAT: &str =
+    "This room was saved in a format from an older Vox that this version cannot open; its saved \
+     data is kept untouched. To go on talking, make a new room and send its link to the members.";
 /// A removal is applied, and the fresh sender chain it owes is not saved yet: the daemon saves
 /// it next, by itself, so a refusal for this is a change still being applied.
 pub(crate) const KEYS_ROTATING: &str = "room authorization keys are rotating";
