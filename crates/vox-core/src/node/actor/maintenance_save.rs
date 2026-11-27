@@ -519,6 +519,18 @@ impl Pending {
         matches!(next, Continuation::Roster(_))
     }
 
+    /// The consent or key delivery this save carries, if it carries one.
+    pub(super) fn consent(&self) -> Option<&consent_release::Continuation> {
+        let mut next = &self.continuation;
+        while let Continuation::AfterMigration(migration) = next {
+            next = &migration.next;
+        }
+        match next {
+            Continuation::Consent(next) => Some(next),
+            _ => None,
+        }
+    }
+
     pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
         if attachment == self.epoch && Arc::ptr_eq(instance, &self.instance) {
             self.governance_owed = true;

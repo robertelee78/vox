@@ -1,29 +1,24 @@
-//! ADR-023 M23.4 and R14 / PRD-001 R12, R14 — history per grant, and sender keys deleted
-//! once nothing needs them, driven through the **shipped `vox` binary**.
+//! ADR-023 R14 / PRD-001 R14, design-4 R6 — **an author keeps a superseded generation of its
+//! sender key only while a member still entitled to it has not taken it**, driven through the
+//! **shipped `vox` binary**. (Formerly `history_grant_proof`; its `--history full` arm is gone
+//! with the option, by the owner's ruling of 2026-11-27: nobody is given older history.)
 //!
-//! **R12.** Approving a newcomer (`vox trust add`) releases the approver's sender key. By
-//! default it releases it where it stands, so the newcomer reads from the approval onward;
-//! with `--history full` it releases every generation the approver still holds, at its origin,
-//! so the newcomer reads what was written before too. The choice covers the approver's own
-//! messages only.
+//! What runs: alice's room, with bob, carol and dave. Bob and dave trust alice and she trusts
+//! all three. Carol does not trust alice, so she never takes alice's key and is owed it.
 //!
-//! **R14.** A superseded generation's key is deleted, except while a full-history grant is
-//! still owed to somebody, because that grant is the one thing it is kept for.
+//! - Alice posts under generation 0 and bob reads it; then bob's node stops.
+//! - Alice stops trusting dave, which rotates her key (generation 1), and posts.
+//! - Carol leaves the room (`vox room leave`).
+//! - Alice trusts dave again, posts, stops trusting him again (generation 2) and posts.
+//! - Bob's node starts again.
 //!
-//! What runs:
+//! **PRODUCT:** bob, trusted before all of it and offline across both rotations, reads every
+//! post written after his trust; and once he has taken those keys alice's `vox status --json`
+//! reports **one** generation held (`key_generations`). Carol, who left, pins nothing: her
+//! untaken debt keeps no generation at alice.
 //!
-//! - (a) alice posts 10, then trusts bob with `--history full` and carol with the default, and
-//!   posts once more. Bob shows all 11; carol shows the later one and **none** of the 10.
-//! - (b) two rotations (removing and re-trusting carol, twice): alice's `vox status` reports one
-//!   generation held after each.
-//!
-//! **Not proved here:** that a generation is *kept* while a full-history grant is still owed,
-//! and released when it is delivered. An owed grant needs a member whose node is down, and on
-//! this tree trusting a member whose node is down stops the trusting node answering (reported;
-//! it is in the consent delivery path, not in this change), so that half cannot be observed yet.
-//!
-//! Mutations (each red): `--history full` releasing only the current position; pruning disabled;
-//! the grant-arrival backfill removed.
+//! Mutation (red): `VOX_TEST_FWD_MUTANT=departed-pins` (a departed member's history floor pins
+//! origins, `oldest_generation_needed`) → "alice still holds 3 generations".
 
 #![cfg(unix)]
 
@@ -101,12 +96,18 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     )
 }
 
-fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
+fn daemon(dir: &Path, tag: &str) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
         .expect("APPARATUS: daemon stdout file");
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: daemon stderr file");
-    let mut child = Command::new(VOX)
+    let mut cmd = Command::new(VOX);
+    // The run's mutant selector reaches the daemon only by name: a proof process keeps no
+    // `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
+    if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
+        cmd.env("VOX_TEST_FWD_MUTANT", mutant);
+    }
+    let mut child = cmd
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -117,7 +118,7 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
         .spawn()
         .expect("APPARATUS: spawn vox daemon");
     let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes())
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
         .expect("APPARATUS: write daemon stdin");
     drop(pipe);
     let d = Daemon(child);
@@ -156,17 +157,24 @@ fn count(texts: &[String], prefix: &str) -> usize {
     texts.iter().filter(|t| t.starts_with(prefix)).count()
 }
 
-fn until(dir: &Path, room: &str, what: &str, secs: u64, done: impl Fn(&[String]) -> bool) {
+/// Read `room` on `dir` until `done`, for at most `secs`; the last read either way.
+fn read_until(
+    dir: &Path,
+    room: &str,
+    secs: u64,
+    done: impl Fn(&[String]) -> bool,
+) -> (bool, Vec<String>) {
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut last = Vec::new();
-    while Instant::now() < deadline {
-        last = read(dir, room);
+    loop {
+        let last = read(dir, room);
         if done(&last) {
-            return;
+            return (true, last);
+        }
+        if Instant::now() >= deadline {
+            return (false, last);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("PRODUCT: timed out waiting for {what}; `room read` shows {last:?}");
 }
 
 fn post(dir: &Path, room: &str, text: &str) {
@@ -174,17 +182,9 @@ fn post(dir: &Path, room: &str, text: &str) {
     assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
 }
 
-fn trust(dir: &Path, fp: &str, name: &str, history: &str) {
-    let (ok, out, err) = vox(
-        dir,
-        &["trust", "add", fp, "--name", name, "--history", history],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT (staging): vox trust add {name} --history {history}: {err}"
-    );
-    print!("{out}");
+fn trust(dir: &Path, fp: &str, name: &str) {
+    let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+    assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
 }
 
 fn untrust(dir: &Path, fp: &str) {
@@ -202,17 +202,15 @@ fn generations(dir: &Path) -> Option<u64> {
     v["rooms"][0]["key_generations"].as_u64()
 }
 
-fn until_generations(dir: &Path, want: u64, secs: u64) -> u64 {
+/// Poll alice's generations until `want`, for at most `secs`; the last reading either way.
+fn until_generations(dir: &Path, want: u64, secs: u64) -> Option<u64> {
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut last = None;
-    while Instant::now() < deadline {
-        last = generations(dir);
-        if last == Some(want) {
-            return want;
-        }
+    let mut last = generations(dir);
+    while last != Some(want) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
+        last = generations(dir);
     }
-    panic!("PRODUCT: alice's key store never held {want} generation(s); last saw {last:?}");
+    last
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
@@ -228,30 +226,22 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
 
 #[test]
 #[ignore = "four real vox daemons and production Argon2id; CI runs it in release"]
-fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_needs_them() {
+fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
     watchdog::arm();
-    // `VOX_PROOF_KEEP=<dir>` keeps every profile and daemon log there, for diagnosis.
-    let _guard;
-    let root: PathBuf = match std::env::var("VOX_PROOF_KEEP") {
-        Ok(dir) => {
-            let p = PathBuf::from(dir);
-            std::fs::create_dir_all(&p).expect("APPARATUS: VOX_PROOF_KEEP directory");
-            p
-        }
-        Err(_) => {
-            let t = tempfile::tempdir().expect("APPARATUS: tempdir");
-            let p = t.path().to_path_buf();
-            _guard = t;
-            p
-        }
-    };
-    let tmp = root.as_path();
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
+    let tmp = tmp.path();
     let (alice, alice_fp) = identity(tmp, "alice");
     let (bob, bob_fp) = identity(tmp, "bob");
     let (carol, carol_fp) = identity(tmp, "carol");
-    let _a = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
-    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
-    let _c = daemon(&carol, "carol", &format!("{IDENTITY}\n"));
+    let (dave, dave_fp) = identity(tmp, "dave");
+    let _a = daemon(&alice, "alice");
+    let b = daemon(&bob, "bob");
+    let _c = daemon(&carol, "carol");
+    let _d = daemon(&dave, "dave");
 
     let (ok, _, err) = vox(
         &alice,
@@ -265,53 +255,80 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
         .next()
         .expect("PRODUCT (staging): `vox room list` shows no room")
         .to_owned();
-    for who in [&bob, &carol] {
+    for who in [&bob, &carol, &dave] {
         join(&alice, who, &room);
     }
-    // Trust runs one way (V210-161): bob and carol read alice only once they trust alice too.
-    trust(&bob, &alice_fp, "alice", "now");
-    trust(&carol, &alice_fp, "alice", "now");
+    // Trust runs one way: bob and dave take alice's key once they trust her; carol never does,
+    // so whatever alice owes carol stays owed.
+    trust(&bob, &alice_fp, "alice");
+    trust(&dave, &alice_fp, "alice");
+    trust(&alice, &bob_fp, "bob");
+    trust(&alice, &carol_fp, "carol");
+    trust(&alice, &dave_fp, "dave");
 
-    // Trust is per direction (v0.2.10): a node reads only members its owner trusted. Bob and
-    // carol trust alice with the default; what each reads of hers is alice's grant to them.
-    trust(&bob, &alice_fp, "alice", "now");
-    trust(&carol, &alice_fp, "alice", "now");
-
-    // ---- (a) history per grant --------------------------------------------------------
-    for i in 1..=10 {
-        post(&alice, &room, &format!("before {i}"));
+    post(&alice, &room, "p0 1");
+    for (who, name) in [(&bob, "bob"), (&dave, "dave")] {
+        let (ok, t) = read_until(who, &room, 90, |t| count(t, "p0 1") == 1);
+        assert!(
+            ok,
+            "PRODUCT (staging): {name}, trusted, never read alice's first post in 90 s: {t:?}"
+        );
     }
-    trust(&alice, &bob_fp, "bob", "full");
-    trust(&alice, &carol_fp, "carol", "now");
-    post(&alice, &room, "after");
-    until(&bob, &room, "bob to read all 11", 90, |t| {
-        count(t, "before ") == 10 && count(t, "after") == 1
-    });
-    until(&carol, &room, "carol to read the later post", 90, |t| {
-        count(t, "after") == 1
-    });
-    let (b, c) = (read(&bob, &room), read(&carol, &room));
-    println!(
-        "(a) bob (--history full) reads {} of 10 earlier + {} later; carol (default) reads {} of \
-         10 earlier + {} later",
-        count(&b, "before "),
-        count(&b, "after"),
-        count(&c, "before "),
-        count(&c, "after")
+    // Bob's node stops: he stays a member, entitled, and is owed every later generation.
+    drop(b);
+
+    // Rotation 1: dave held alice's generation 0.
+    untrust(&alice, &dave_fp);
+    post(&alice, &room, "p1 1");
+    // Carol leaves after it: she is owed alice's key from generation 0 and never took it.
+    let (ok, _, err) = vox(&carol, &["room", "leave", &room], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): carol's `vox room leave` failed: {err}"
     );
+    let short = &carol_fp[..carol_fp.len().min(16)];
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (ok, roster, _) = vox(&alice, &["room", "roster", &room], None);
+        if ok && !roster.contains(short) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice's roster still lists carol 90 s after she left: {roster}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Rotation 2: dave, trusted again, takes the live generation; removing him again rotates.
+    trust(&alice, &dave_fp, "dave");
+    post(&alice, &room, "p1 2");
+    let (ok, t) = read_until(&dave, &room, 90, |t| count(t, "p1 2") == 1);
+    assert!(
+        ok,
+        "PRODUCT (staging): dave, trusted again, never read alice's next post in 90 s: {t:?}"
+    );
+    untrust(&alice, &dave_fp);
+    post(&alice, &room, "p2 1");
+    let offline = generations(&alice);
+    println!("[proof] with bob offline and carol gone, alice holds {offline:?} generation(s)");
+
+    // Bob comes back: he reads everything written after his trust.
+    let _b = daemon(&bob, "bob-back");
+    let (ok, t) = read_until(&bob, &room, 120, |t| {
+        count(t, "p0 1") == 1 && count(t, "p1 ") == 2 && count(t, "p2 1") == 1
+    });
+    println!("[proof] bob, back, shows {t:?}");
+    assert!(
+        ok,
+        "PRODUCT: bob, trusted before and offline across two rotations, never read every post \
+         alice wrote after his trust (p0 1, p1 1, p1 2, p2 1) in 120 s: {t:?}"
+    );
+    let held = until_generations(&alice, 1, 60);
+    println!("[proof] once bob took his keys, alice holds {held:?} generation(s)");
     assert_eq!(
-        count(&c, "before "),
-        0,
-        "PRODUCT: the default grant must not reveal history"
+        held,
+        Some(1),
+        "PRODUCT: alice still holds {held:?} generations 60 s after bob took every key he was \
+         owed: carol, who left, must pin nothing (alice still holds 3 generations when she does)"
     );
-
-    // ---- (b) R14: superseded generations go, unless a full grant still needs them -------
-    let g0 = until_generations(&alice, 1, 30);
-    println!("(b) before any rotation alice holds {g0} generation");
-    for round in 1..=2 {
-        untrust(&alice, &carol_fp); // rotates: carol held a key here
-        let held = until_generations(&alice, 1, 30);
-        println!("(b) after rotation {round}: alice holds {held} generation");
-        trust(&alice, &carol_fp, "carol", "now");
-    }
 }

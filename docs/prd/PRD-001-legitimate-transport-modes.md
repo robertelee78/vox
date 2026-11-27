@@ -69,6 +69,10 @@ friction for this audience can be fixed later.
   packages travel through member nodes, not through the anchor.
 - **R12.** When approving a newcomer, the approver **must** be able to choose "from approval onward" or
   "full history" for their own messages. The default is **from approval onward**.
+  *(Amended for v0.4.31 by the owner's forward-only ruling, design forward-only R7:)* There is no
+  "full history" choice. A member reads the approver's messages from its trust point on; one trusted
+  while offline catches up on what came after its trust point. Coming back to a room starts again
+  from the return, and a deleted key is never released again.
 - **R13.** Messages **must** appear in the **same order on every node**.
   *(Amended 2026-11-25 by ADR-054 amendment 3, PL-26:)* A message starts from its author's signed
   time capped at ten minutes after this node's original first sight. At first publication, this

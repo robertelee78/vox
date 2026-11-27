@@ -26,7 +26,6 @@ pub(super) struct Continuation {
     attachment: u64,
     authority: computer::ComputerAuthority,
     secret: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
-    transition: Option<crate::node::channel::own_writer_gate::Transition>,
     lifetime: Option<Arc<maintenance_save::Lifetime>>,
 }
 impl Continuation {
@@ -112,14 +111,11 @@ enum After {
         continuation: Continuation,
         lifetime: Arc<maintenance_save::Lifetime>,
     },
-    Close {
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
-    },
+    Close,
     Undone {
         purpose: LeftPurgePurpose,
     },
     Purge {
-        transition: crate::node::channel::own_writer_gate::Transition,
         purpose: Option<LeftPurgePurpose>,
     },
 }
@@ -166,7 +162,7 @@ impl Pending {
                     let _ = reply.send(outcome);
                 }
             }
-            After::Close { .. } => {
+            After::Close => {
                 let outcome = match saved {
                     Some(NativeSaved::Close(result)) => {
                         if result.is_ok() {
@@ -382,7 +378,6 @@ impl Node {
         &mut self,
         room: Digest32,
         reply: oneshot::Sender<Outcome>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
         original_secret: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
         original_lifetime: Option<Arc<maintenance_save::Lifetime>>,
     ) {
@@ -439,7 +434,6 @@ impl Node {
             attachment: self.delivery_epoch,
             authority,
             secret,
-            transition,
             lifetime: original_lifetime,
         };
         self.begin_pending_maintenance(
@@ -468,7 +462,7 @@ impl Node {
         room: Digest32,
         result: crate::error::Result<maintenance_save::Saved>,
         lifetime: Arc<maintenance_save::Lifetime>,
-        mut next: Continuation,
+        next: Continuation,
         reply: Reply,
     ) {
         if !next.attached(self, &room) {
@@ -480,7 +474,6 @@ impl Node {
             // The room ended before the departure was admitted: no departure was signed, and
             // the leave deletes the ended room as one known ended at once does (ADR-049 LE-7).
             Ok(maintenance_save::Saved::Leave(Saved::Ended)) => {
-                drop(next.transition.take());
                 self.begin_own_key_left_purge(
                     room,
                     Arc::clone(&next.instance),
@@ -523,8 +516,6 @@ impl Node {
                 Err(error) => detail_failed(&mut channel, &error),
             }
         }
-        // As before, the physical own-key retirement ends only after the matching departure.
-        drop(next.transition.take());
         self.cancel_own_key_room(room);
         let work = NativeWork::Withdrawal {
             epoch: departure.epoch,
@@ -681,7 +672,6 @@ impl Node {
         &mut self,
         room: Digest32,
         reply: oneshot::Sender<Outcome>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
         original_secret: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
     ) {
         self.history_demand.retire_room(room);
@@ -713,7 +703,7 @@ impl Node {
                 lifetime: None,
             },
             NativeWork::Close,
-            After::Close { transition },
+            After::Close,
             Some(reply),
         );
     }
@@ -737,7 +727,6 @@ impl Node {
         &mut self,
         room: Digest32,
         instance: SharedChannel,
-        transition: crate::node::channel::own_writer_gate::Transition,
         mut channel: crate::node::channel::OwnedRoomGuard,
         purpose: Option<LeftPurgePurpose>,
         secret: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -851,10 +840,7 @@ impl Node {
                 ended,
                 erase_continuity,
             },
-            After::Purge {
-                transition,
-                purpose,
-            },
+            After::Purge { purpose },
             None,
         );
     }
@@ -952,9 +938,9 @@ impl Node {
                     }
                 }
             }
-            (After::Close { transition }, NativeSaved::Close(result)) => {
+            (After::Close, NativeSaved::Close(result)) => {
                 let outcome = match result {
-                    Ok(()) if current => self.finish_saved_close(&room, transition).await,
+                    Ok(()) if current => self.finish_saved_close(&room).await,
                     Ok(()) => Outcome::Failed(Fault::ChannelNotOpen),
                     Err(error) => Outcome::Failed(fault_of(&error)),
                 };
@@ -963,10 +949,7 @@ impl Node {
                 }
             }
             (
-                After::Purge {
-                    transition,
-                    purpose,
-                },
+                After::Purge { purpose },
                 NativeSaved::Purge {
                     retirement,
                     ended,
@@ -994,7 +977,7 @@ impl Node {
                         .or_insert(None);
                 }
                 let outcome = if current {
-                    self.finish_saved_purge(&room, transition, result).await
+                    self.finish_saved_purge(&room, result).await
                 } else {
                     result
                         .map(|_| Outcome::Done)
@@ -1064,11 +1047,7 @@ impl Node {
         }
     }
 
-    async fn finish_saved_close(
-        &mut self,
-        room: &Digest32,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
-    ) -> Outcome {
+    async fn finish_saved_close(&mut self, room: &Digest32) -> Outcome {
         if let Some(net) = self.net.as_ref() {
             net.forget_board_exchange_room(room);
         }
@@ -1088,7 +1067,6 @@ impl Node {
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         let removed = self.channels.remove(room);
         self.serving.withdraw(*room);
-        drop(transition);
         let outcome = match removed {
             Some(shared) => {
                 shared.lock().await.lock_now();
@@ -1124,7 +1102,6 @@ impl Node {
     async fn finish_saved_purge(
         &mut self,
         room: &Digest32,
-        transition: crate::node::channel::own_writer_gate::Transition,
         result: crate::error::Result<()>,
     ) -> Outcome {
         if let Some(net) = self.net.as_ref() {
@@ -1155,13 +1132,16 @@ impl Node {
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
+        // What the purged instance's own recovery deferred or waited for after the purge began
+        // (its own-key policy wait, its room-release admission) goes with it: the room joined
+        // again under this id starts its own.
+        self.cancel_own_key_room(*room);
         self.own_recovery_rooms.remove(room);
         self.governance_work.set_deadline(*room, None);
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         self.channels.remove(room);
         self.serving.withdraw(*room);
-        drop(transition);
         self.reopening.remove(room);
         if let Some(net) = self.net.as_ref() {
             net.membership().clear_channel(room);
@@ -1178,7 +1158,6 @@ impl Node {
         self.winding.remove(room);
         self.records_renew_at.remove(room);
         self.publish_failures.retain(|(r, _), _| r != room);
-        self.departed_seen.remove(room);
         self.fresh_details.remove(room);
         // Away anchors retain their exact durable withdrawal, including every assigned route.
         self.room_anchors.remove(room);
@@ -1226,16 +1205,9 @@ impl Node {
 /// Original lifecycle results, retained independently of bounded network ingress.
 /// Results retain original ownership; recovery's caller and reader stay in preparing_rooms.
 pub(super) enum Ready {
-    DonorResume(Box<own_keys::DonorResume>),
-    Donor(Box<own_keys::DonorReady>),
     LeaveMetadata(Box<Pending>),
-    Recovery {
-        room: Digest32,
-        owner: Arc<()>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
-    },
     Untrust {
-        _secret: own_keys::SecretLease,
+        _secret: SecretLease,
         owner: Arc<()>,
         admitted: bool,
         journal: Option<crate::node::computer::ComputerJournalWriter>,
@@ -1243,40 +1215,42 @@ pub(super) enum Ready {
         reply: oneshot::Sender<Outcome>,
     },
     Leave {
-        _secret: own_keys::SecretLease,
+        _secret: SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        /// The room was taken after its bounded work retired; `false` when the caller, the
+        /// room or the attachment went away first.
+        admitted: bool,
         lifetime: std::result::Result<Arc<maintenance_save::Lifetime>, Fault>,
         retired: Option<admission::RetiredRoom>,
         reply: oneshot::Sender<Outcome>,
     },
     Close {
-        _secret: own_keys::SecretLease,
+        _secret: SecretLease,
         room: Digest32,
         instance: Option<SharedChannel>,
         owner: Arc<()>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        admitted: bool,
         retired: Option<admission::RetiredRoom>,
         reply: oneshot::Sender<Outcome>,
     },
     LeftPurge {
-        _secret: own_keys::SecretLease,
+        _secret: SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        admitted: bool,
         retired: Option<admission::RetiredRoom>,
         admission_fault: Option<Fault>,
         purpose: LeftPurgePurpose,
     },
     EndedPurge {
-        _secret: own_keys::SecretLease,
+        _secret: SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        admitted: bool,
         retired: Option<admission::RetiredRoom>,
     },
 }
@@ -1286,12 +1260,9 @@ impl Ready {
     /// producer uses the same path after its completion generation has been retired.
     pub(super) fn retire(self) {
         match self {
-            Self::DonorResume(ready) => own_keys::retire_donor_resume(*ready),
-            Self::Donor(ready) => own_keys::retire_donor(*ready),
             Self::LeaveMetadata(pending) => {
                 tokio::spawn(pending.retire());
             }
-            Self::Recovery { .. } => {}
             Self::Untrust { reply, .. } => {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
@@ -1344,23 +1315,7 @@ impl Node {
     /// [`Self::complete_lifecycle`], unboxed: see [`Boxed`].
     async fn complete_lifecycle_unboxed(&mut self, ready: Ready) {
         match ready {
-            Ready::DonorResume(ready) => self.resume_own_key_donor(*ready),
-            Ready::Donor(ready) => self.finish_own_key_donor(*ready),
             Ready::LeaveMetadata(pending) => self.complete_leave_save(*pending).await,
-            Ready::Recovery {
-                room,
-                owner,
-                transition,
-            } => {
-                if let Some(prepared) = self.preparing_rooms.get_mut(&room) {
-                    if matches!(&prepared.recovery_writer_gate, Some(RecoveryWriterGate::Waiting { owner: current, .. }) if Arc::ptr_eq(current, &owner))
-                    {
-                        prepared.recovery_writer_gate = transition.map(RecoveryWriterGate::Ready);
-                        prepared.legacy_cleanup_due = None;
-                        self.preparation_after = None;
-                    }
-                }
-            }
             Ready::Untrust {
                 _secret,
                 owner,
@@ -1392,15 +1347,13 @@ impl Node {
                 room,
                 instance,
                 owner,
-                transition,
+                admitted,
                 lifetime,
                 retired,
                 reply,
             } => {
                 if let Some(retired) = retired {
-                    if let Err(error) =
-                        self.finish_bounded_room_retirement(retired, transition.is_some())
-                    {
+                    if let Err(error) = self.finish_bounded_room_retirement(retired, admitted) {
                         if self
                             .own_key_leave_pending
                             .get(&room)
@@ -1428,9 +1381,7 @@ impl Node {
                         self.publication_pending = true;
                         self.publication_again = true;
                     }
-                    if reply.is_closed() {
-                        drop(transition);
-                    } else {
+                    if !reply.is_closed() {
                         match lifetime {
                             Err(fault) => {
                                 let _ = reply.send(Outcome::Failed(fault));
@@ -1441,11 +1392,10 @@ impl Node {
                                     .get(&room)
                                     .is_some_and(|current| Arc::ptr_eq(current, &instance))
                                 {
-                                    if let Some(transition) = transition {
+                                    if admitted {
                                         self.begin_leave(
                                             room,
                                             reply,
-                                            Some(transition),
                                             Some(_secret),
                                             Some(lifetime),
                                         )
@@ -1466,14 +1416,12 @@ impl Node {
                 room,
                 instance,
                 owner,
-                transition,
+                admitted,
                 retired,
                 reply,
             } => {
                 if let Some(retired) = retired {
-                    if let Err(error) =
-                        self.finish_bounded_room_retirement(retired, transition.is_some())
-                    {
+                    if let Err(error) = self.finish_bounded_room_retirement(retired, admitted) {
                         if self
                             .own_key_leave_pending
                             .get(&room)
@@ -1501,16 +1449,15 @@ impl Node {
                         self.publication_pending = true;
                         self.publication_again = true;
                     }
-                    if reply.is_closed() {
-                        drop(transition);
-                    } else if instance.as_ref().is_none_or(|instance| {
-                        self.channels
-                            .get(&room)
-                            .is_some_and(|current| Arc::ptr_eq(current, instance))
-                            && transition.is_some()
-                    }) {
-                        self.begin_owned_close(room, reply, transition, Some(_secret))
-                            .await;
+                    if !reply.is_closed()
+                        && instance.as_ref().is_none_or(|instance| {
+                            self.channels
+                                .get(&room)
+                                .is_some_and(|current| Arc::ptr_eq(current, instance))
+                                && admitted
+                        })
+                    {
+                        self.begin_owned_close(room, reply, Some(_secret)).await;
                     } else {
                         let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                     }
@@ -1521,15 +1468,13 @@ impl Node {
                 room,
                 instance,
                 owner,
-                transition,
+                admitted,
                 retired,
                 admission_fault,
                 purpose,
             } => {
                 if let Some(retired) = retired {
-                    if let Err(error) =
-                        self.finish_bounded_room_retirement(retired, transition.is_some())
-                    {
+                    if let Err(error) = self.finish_bounded_room_retirement(retired, admitted) {
                         if self
                             .own_key_ended_pending
                             .get(&room)
@@ -1566,7 +1511,7 @@ impl Node {
                     .is_some_and(|current| Arc::ptr_eq(current, &owner))
                 {
                     purpose.fail(Fault::ChannelNotOpen);
-                } else if let Some(transition) = transition {
+                } else if admitted {
                     if !self
                         .channels
                         .get(&room)
@@ -1576,15 +1521,14 @@ impl Node {
                         purpose.fail(Fault::ChannelNotOpen);
                     } else {
                         match Arc::clone(&instance).try_lock_owned() {
-                            Err(_) => self.wait_own_key_left_room(
-                                room, instance, owner, transition, purpose, _secret,
-                            ),
+                            Err(_) => {
+                                self.wait_own_key_left_room(room, instance, owner, purpose, _secret)
+                            }
                             Ok(channel)
                                 if !channel.has_left(&channel.me())
                                     && channel.ended(self.now_ms().get()).is_none() =>
                             {
                                 drop(channel);
-                                drop(transition);
                                 self.own_key_ended_pending.remove(&room);
                                 self.sched_rooms.insert(room);
                                 self.discover_rooms.insert(room);
@@ -1595,7 +1539,6 @@ impl Node {
                                 self.begin_owned_purge(
                                     room,
                                     instance,
-                                    transition,
                                     channel,
                                     Some(purpose),
                                     _secret,
@@ -1622,13 +1565,11 @@ impl Node {
                 room,
                 instance,
                 owner,
-                transition,
+                admitted,
                 retired,
             } => {
                 if let Some(retired) = retired {
-                    if let Err(error) =
-                        self.finish_bounded_room_retirement(retired, transition.is_some())
-                    {
+                    if let Err(error) = self.finish_bounded_room_retirement(retired, admitted) {
                         if self
                             .own_key_ended_pending
                             .get(&room)
@@ -1647,7 +1588,7 @@ impl Node {
                     .get(&room)
                     .is_some_and(|current| Arc::ptr_eq(current, &owner))
                 {
-                    if let Some(transition) = transition {
+                    if admitted {
                         if self
                             .channels
                             .get(&room)
@@ -1686,22 +1627,19 @@ impl Node {
                                                 members: members.len(),
                                             });
                                             self.begin_owned_purge(
-                                                room, instance, transition, channel, None, _secret,
+                                                room, instance, channel, None, _secret,
                                             )
                                             .await;
                                             return;
                                         }
                                     }
                                     drop(channel);
-                                    drop(transition);
                                     self.own_key_ended_pending.remove(&room);
                                     self.sched_rooms.insert(room);
                                     self.discover_rooms.insert(room);
                                 }
                                 Err(_) => {
-                                    self.wait_own_key_ended_room(
-                                        room, instance, owner, transition, _secret,
-                                    );
+                                    self.wait_own_key_ended_room(room, instance, owner, _secret);
                                 }
                             }
                         } else {

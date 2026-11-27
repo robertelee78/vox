@@ -51,8 +51,13 @@ use crate::pairwise::message::Message;
 use crate::pairwise::session::Session;
 use crate::wire::{frame, parse_frame, StructTag};
 
-/// The body version of a key-package.
-const KEY_PACKAGE_VERSION: u64 = 1;
+/// The body version of a key-package this node produces and opens. Version 2 is sealed under
+/// the forward-only key policy (v0.4.31).
+const KEY_PACKAGE_VERSION: u64 = 2;
+/// Version 1 was sealed under the policy that released older history. It is still parsed, so
+/// the signed log entries that carry it validate and own-feed recovery reads them, and it is
+/// never opened, installed or counted as delivered.
+const KEY_PACKAGE_V1: u64 = 1;
 
 /// The largest key-package this node will parse: an SKDM and a PQXDH opening message, with
 /// room to spare. A bound, because the bytes come from another member's log entry.
@@ -61,6 +66,8 @@ pub(crate) const MAX_KEY_PACKAGE: usize = 64 * 1024;
 /// One sealed sender-key message for one member, as it sits in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPackage {
+    /// Its body version: [`KEY_PACKAGE_VERSION`], or 1 for a package parsed for structure only.
+    pub version: u64,
     /// Who it is for.
     pub recipient: Digest32,
     /// The PQXDH opening message (`InitialMessage::to_wire`) against the recipient's
@@ -93,6 +100,7 @@ impl KeyPackage {
         )?;
         let sealed = skdm.seal_into(&mut session)?.to_wire();
         Ok(Self {
+            version: KEY_PACKAGE_VERSION,
             recipient,
             initial: initial.to_wire(),
             sealed,
@@ -107,13 +115,25 @@ impl KeyPackage {
         InitialMessage::from_wire(&self.initial)
     }
 
+    /// Whether this package may be opened: it is version 2. A version-1 package is never opened.
+    #[must_use]
+    pub fn opens(&self) -> bool {
+        self.version == KEY_PACKAGE_VERSION
+    }
+
     /// Open the sealed SKDM with the one-shot `session` the recipient built from
     /// [`Self::initial_message`] and its own prekeys. Still unverified: the channel verifies
     /// it against its author's admitted key.
     ///
     /// # Errors
-    /// If the message does not parse or does not decrypt under `session`.
+    /// If it is a version-1 package, or the message does not parse or does not decrypt under
+    /// `session`.
     pub fn open(&self, session: &mut Session, now_ms: u64) -> Result<Skdm> {
+        if !self.opens() {
+            return Err(Error::MalformedBundle(
+                "key-package version 1 is not opened",
+            ));
+        }
         let message = Message::from_wire(&self.sealed)?;
         Skdm::open_from(session, &message, now_ms)
     }
@@ -131,6 +151,11 @@ impl KeyPackage {
         ctx: &JoinContext,
         now_ms: u64,
     ) -> Result<Skdm> {
+        if !self.opens() {
+            return Err(Error::MalformedBundle(
+                "key-package version 1 is not opened",
+            ));
+        }
         let init = self.initial_message()?;
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
         if let Some(id) = init.one_time_prekey_id {
@@ -175,7 +200,7 @@ impl KeyPackage {
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(4)
-            .uint(KEY_PACKAGE_VERSION)
+            .uint(self.version)
             .bytes(&self.recipient)
             .bytes(&self.initial)
             .bytes(&self.sealed);
@@ -198,7 +223,8 @@ impl KeyPackage {
         if d.array()? != 4 {
             return Err(Error::MalformedBundle("key-package arity"));
         }
-        if d.uint()? != KEY_PACKAGE_VERSION {
+        let version = d.uint()?;
+        if version != KEY_PACKAGE_VERSION && version != KEY_PACKAGE_V1 {
             return Err(Error::MalformedBundle("key-package version"));
         }
         let recipient: Digest32 = d
@@ -209,6 +235,7 @@ impl KeyPackage {
         let sealed = d.bytes()?.to_vec();
         d.finish()?;
         Ok(Self {
+            version,
             recipient,
             initial,
             sealed,

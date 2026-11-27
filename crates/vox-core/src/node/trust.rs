@@ -129,18 +129,6 @@ impl Capability {
     }
 }
 
-/// What a consent releases of **this node's own** messages to a trusted identity
-/// (PRD-001 R12, ADR-023 decision 5): chosen by the approver, per grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HistoryGrant {
-    /// From approval onward: the sender key at its current position. The default.
-    #[default]
-    Now,
-    /// Everything this node still holds a key for: iteration 0 of each retained
-    /// generation, so the newcomer reads this node's messages from before approval too.
-    Full,
-}
-
 /// Most identities one node will ever trust. A bound, not a target: it keeps a
 /// corrupt or hostile blob from forcing an unbounded allocation on load.
 pub const MAX_TRUSTED: usize = 1024;
@@ -194,8 +182,10 @@ pub fn trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keyring {
     entries: BTreeMap<Digest32, String>,
-    /// The identities granted full history; everyone else gets [`HistoryGrant::Now`].
-    full_history: BTreeSet<Digest32>,
+    /// Identities a build before v0.4.31 trusted with older history (keyring column 1). Nothing
+    /// releases older history to them: the forward-only migration (R9) reads this to keep each
+    /// one's post-trust catch-up, and it is cleared once every stored room has migrated.
+    legacy_full: BTreeSet<Digest32>,
     /// The identities trusted with drive (ADR-028 K-14); everyone else has [`Capability::Read`].
     drive: BTreeSet<Digest32>,
     /// A person's removals and explicit read-only choices forbid automatic local widening.
@@ -220,28 +210,16 @@ impl Keyring {
     /// control characters — it is displayed in a terminal and used to address
     /// members by name.
     pub fn trust(&mut self, fingerprint: Digest32, petname: &str) -> Result<()> {
-        self.trust_with(fingerprint, petname, HistoryGrant::Now)
-    }
-
-    /// [`Keyring::trust`], choosing what the consent releases of this node's own
-    /// history (PRD-001 R12). Re-trusting replaces the choice.
-    pub fn trust_with(
-        &mut self,
-        fingerprint: Digest32,
-        petname: &str,
-        history: HistoryGrant,
-    ) -> Result<()> {
         let capability = self.capability(&fingerprint).unwrap_or_default();
-        self.trust_as(fingerprint, petname, history, capability)
+        self.trust_as(fingerprint, petname, capability)
     }
 
-    /// [`Keyring::trust_with`], choosing what the entry grants (ADR-028 K-14). Re-trusting
+    /// [`Keyring::trust`], choosing what the entry grants (ADR-028 K-14). Re-trusting
     /// replaces the choice.
     pub fn trust_as(
         &mut self,
         fingerprint: Digest32,
         petname: &str,
-        history: HistoryGrant,
         capability: Capability,
     ) -> Result<()> {
         let name = petname.trim();
@@ -256,10 +234,6 @@ impl Keyring {
         }
         self.entries.insert(fingerprint, name.to_owned());
         self.local_removals.remove(&fingerprint);
-        match history {
-            HistoryGrant::Full => self.full_history.insert(fingerprint),
-            HistoryGrant::Now => self.full_history.remove(&fingerprint),
-        };
         match capability {
             Capability::ReadDrive => self.drive.insert(fingerprint),
             Capability::Read => self.drive.remove(&fingerprint),
@@ -304,14 +278,20 @@ impl Keyring {
         self.entries.contains_key(fingerprint) && self.drive.contains(fingerprint)
     }
 
-    /// What a consent to `fingerprint` releases of this node's history.
+    /// The identities a build before v0.4.31 trusted with older history ([`Self::legacy_full`]
+    /// field): what the forward-only migration reads.
     #[must_use]
-    pub fn history(&self, fingerprint: &Digest32) -> HistoryGrant {
-        if self.full_history.contains(fingerprint) {
-            HistoryGrant::Full
-        } else {
-            HistoryGrant::Now
-        }
+    pub fn legacy_full(&self) -> &BTreeSet<Digest32> {
+        &self.legacy_full
+    }
+
+    /// Clear every legacy full-history flag: column 1 is written 0 from then on. Called only
+    /// once every stored room holds the forward-only migration marker. Returns whether any was
+    /// set.
+    pub fn clear_legacy_full(&mut self) -> bool {
+        let any = !self.legacy_full.is_empty();
+        self.legacy_full.clear();
+        any
     }
 
     /// Stop trusting `fingerprint`. Returns whether it was trusted.
@@ -328,7 +308,7 @@ impl Keyring {
     /// has. It stops them reading what comes *next*. ADR-007's enforcement honesty
     /// applies and nothing here can say otherwise.
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
-        self.full_history.remove(fingerprint);
+        self.legacy_full.remove(fingerprint);
         self.drive.remove(fingerprint);
         let removed = self.entries.remove(fingerprint).is_some();
         if removed {
@@ -395,7 +375,7 @@ impl Keyring {
         self.entries.is_empty()
     }
 
-    /// Canonical CBOR body: `[version, [[fingerprint, petname, full_history, drive], ..]]`.
+    /// Canonical CBOR body: `[version, [[fingerprint, petname, legacy_full, drive], ..]]`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
@@ -404,7 +384,7 @@ impl Keyring {
             e.array(4)
                 .bytes(fp)
                 .text(name)
-                .uint(u64::from(self.full_history.contains(fp)))
+                .uint(u64::from(self.legacy_full.contains(fp)))
                 .uint(u64::from(self.drive.contains(fp)));
         }
         e.array(self.local_removals.len());
@@ -439,7 +419,7 @@ impl Keyring {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         let mut entries = BTreeMap::new();
-        let mut full_history = BTreeSet::new();
+        let mut legacy_full = BTreeSet::new();
         let mut drive = BTreeSet::new();
         for _ in 0..n {
             let pair = d
@@ -466,7 +446,7 @@ impl Keyring {
             {
                 0 => {}
                 1 => {
-                    full_history.insert(fp);
+                    legacy_full.insert(fp);
                 }
                 _ => return Err(Error::MalformedAtRest("keyring history")),
             }
@@ -520,7 +500,7 @@ impl Keyring {
             .map_err(|_| Error::MalformedAtRest("keyring trailing"))?;
         Ok(Self {
             entries,
-            full_history,
+            legacy_full,
             drive,
             local_removals,
             local_history_imported,

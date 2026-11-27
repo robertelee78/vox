@@ -4045,7 +4045,6 @@ impl CoreHandle for DaemonCore {
                 target,
                 petname: petname.clone(),
                 identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
-                full_history: false,
                 drive,
             }) {
                 CommandStatus::Done => CommandStatus::Said(format!(
@@ -4071,7 +4070,6 @@ impl CoreHandle for DaemonCore {
                 target,
                 petname: petname.clone(),
                 identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
-                full_history: false,
                 drive: false,
             }) {
                 CommandStatus::Done => CommandStatus::Said(format!(

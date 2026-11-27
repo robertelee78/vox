@@ -44,9 +44,11 @@ impl ChannelState {
             &self.channel_id,
             removal_generation,
         )?;
+        self.require_key_target(store, &target)?;
         let forward_only = !self
             .validated_member_removals(store, &target, crate::time::Ms(self.now_hint))?
-            .is_empty();
+            .is_empty()
+            || self.key_returned(&target);
         if forward_only && candidate.body.chain_id != self.sender.chain_id() {
             return Err(Error::Profile(governance::REFRESHING));
         }

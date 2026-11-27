@@ -786,6 +786,12 @@ impl PendingReceived {
                                 index.seal()?;
                                 presence = Some((author, state));
                             }
+                            // Reconciled on every Presence fact, also when the folded state is
+                            // unchanged: a departure learned late can move a return's
+                            // incarnation without moving its start.
+                            governance::apply_presence_transition(
+                                &mut batch, sek, &self.room, &self.me, &author, old, state,
+                            )?;
                         }
                     }
                     if kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me) {

@@ -466,12 +466,9 @@ impl SemanticProjection {
             });
             // No receiver of this own generation here (a node recovering its own history, or
             // one that never held it): the entry is published as any unreadable entry is,
-            // whether or not the own-history fence is already up. The fence's readability audit
-            // (`own_history.rs`) then names the missing key (`OwnReadability::KeyDebt`) and the
-            // loops ask it (OwnRelease); recovery completes only once it opens. Answering
-            // `Unavailable` here instead kept the entry unpublished, so the audit never reached
-            // it to name the key, and the entry was fetched again and again for a body that
-            // could not change.
+            // whether or not the own-history fence is already up. No key is asked of the network
+            // and recovery does not wait for it. Answering `Unavailable` here instead would keep
+            // the entry unpublished and fetched again and again for a body that cannot change.
             let Some(chain) = chain else {
                 return Ok(PreparedOutcome::Applied);
             };

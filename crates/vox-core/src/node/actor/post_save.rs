@@ -546,7 +546,7 @@ impl Node {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .is_some_and(|arm| {
                 let fields: Vec<_> = arm.trim_end().split('\t').collect();
-                (fields.len() == 2 || matches!(fields.as_slice(), [_, _, "pause-older", _]))
+                fields.len() == 2
                     && self
                         .paths
                         .profile_dir
@@ -556,26 +556,6 @@ impl Node {
                     && fields.get(1).copied()
                         == Some(crate::node::link::b32_encode(&channel_id).as_str())
             });
-        #[cfg(feature = "test-knobs")]
-        if force_rotation {
-            if let Some(peer) = std::env::var_os("VOX_TEST_FX28_ROTATE_AFTER_POST")
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .and_then(|arm| {
-                    let fields: Vec<_> = arm.trim_end().split('\t').collect();
-                    match fields.as_slice() {
-                        [_, _, "pause-older", peer] => {
-                            crate::node::link::b32_decode(peer, "FX-28 paused re-key peer").ok()
-                        }
-                        _ => None,
-                    }
-                })
-            {
-                let pair = (channel_id, peer);
-                if self.older.get(&pair) == Some(&false) {
-                    self.fx28_rekey_pause = Some(pair);
-                }
-            }
-        }
         #[cfg(not(feature = "test-knobs"))]
         let force_rotation = false;
         let result = Arc::new(std::sync::Mutex::new(Completion::new()));
@@ -1169,19 +1149,6 @@ impl Node {
                     .ok()
                     .map(Some)
             }
-            [_, _, "pause-older", peer] if exact => {
-                if let Ok(peer) = crate::node::link::b32_decode(peer, "FX-28 paused re-key peer") {
-                    let pair = (room, peer);
-                    if self.older.get(&pair) == Some(&false) {
-                        self.fx28_rekey_pause = Some(pair);
-                        Some(None)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
             _ => None,
         };
         let Some(peer) = action else {
@@ -1198,18 +1165,13 @@ impl Node {
             );
             return;
         }
-        // Release only the matching settlement batch; all alternate pair routes stay paused.
-        let released_paused = peer.is_some_and(|peer| {
-            let pair = (room, peer);
-            if self.fx28_rekey_pause == Some(pair) && self.older.get(&pair) == Some(&false) {
-                true
-            } else {
-                crate::node::computer::publish_proof_fault(
-                    &marker.with_extension("fault"),
-                    "exact paused re-key selection did not survive",
-                );
-                false
-            }
+        // No older-peer settlement batch can be selected.
+        let released_paused = peer.is_some_and(|_| {
+            crate::node::computer::publish_proof_fault(
+                &marker.with_extension("fault"),
+                "exact paused re-key selection did not survive",
+            );
+            false
         });
         self.fx28_post_rekey.insert(
             room,

@@ -27,8 +27,8 @@
 //!
 //! **Not driven here:** a room with a retention setting, whose hold is that retention.
 //!
-//! **Mutation:** take the hold out of `oldest_generation_needed` (keep until joined, as 1d06e9b
-//! did) and this goes red at +31 days, still holding 2.
+//! **Mutation:** `VOX_TEST_FWD_MUTANT=hold-off` takes the hold out of `oldest_generation_needed`
+//! (keep until joined, as 1d06e9b did) and this goes red at +31 days, still holding 2.
 
 #![cfg(unix)]
 
@@ -135,6 +135,11 @@ fn daemon(dir: &Path, tag: &str, step_ms: i64) -> Daemon {
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: create the daemon's stderr log");
     let mut cmd = Command::new(VOX);
+    // The run's mutant selector reaches the daemon only by name: a proof process keeps no
+    // `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
+    if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
+        cmd.env("VOX_TEST_FWD_MUTANT", mutant);
+    }
     cmd.args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -224,7 +229,11 @@ fn readings_over(dir: &Path, secs: u64) -> Vec<Option<u64>> {
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
     let (alice, alice_fp) = identity(tmp.path(), "alice");
     let (bob, bob_fp) = identity(tmp.path(), "bob");
     // Dave is an identity and nothing more: no daemon, never joins.

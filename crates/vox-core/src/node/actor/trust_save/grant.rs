@@ -5,7 +5,6 @@ pub(crate) enum GrantChange {
     Trust {
         target: Digest32,
         petname: String,
-        history: HistoryGrant,
         capability: Option<Capability>,
     },
     Capability {
@@ -56,7 +55,6 @@ pub(super) fn run(
     match change {
         GrantChange::Trust {
             petname,
-            history,
             capability,
             ..
         } => {
@@ -65,7 +63,7 @@ pub(super) fn run(
                 .unwrap_or_default();
             let narrowed =
                 was && capability == Capability::Read && trust.local_removals().contains(&target);
-            trust.trust_as(target, &petname, history, capability)?;
+            trust.trust_as(target, &petname, capability)?;
             if narrowed {
                 trust.set_capability(&target, Capability::Read);
             }
@@ -79,9 +77,8 @@ pub(super) fn run(
             let capability = trust
                 .capability(&target)
                 .ok_or(Error::Profile("identity is not trusted"))?;
-            let history = trust.history(&target);
             let narrowed = trust.local_removals().contains(&target);
-            trust.trust_as(target, &petname, history, capability)?;
+            trust.trust_as(target, &petname, capability)?;
             if narrowed {
                 trust.set_capability(&target, Capability::Read);
             }
@@ -106,12 +103,7 @@ pub(super) fn run(
                 });
             }
             let name = trust.petname(&target).unwrap_or(&name).to_owned();
-            let history = if was {
-                trust.history(&target)
-            } else {
-                HistoryGrant::Now
-            };
-            trust.trust_as(target, &name, history, capability)?;
+            trust.trust_as(target, &name, capability)?;
         }
     }
     // The stamp and keyring cannot be separated by a crash. Read order and locks only AFTER

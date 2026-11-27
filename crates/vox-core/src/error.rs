@@ -534,9 +534,10 @@ pub enum Error {
     #[error("computer peer refused the request: {0}")]
     ComputerRefused(String),
 
-    /// An own-key response must physically retire before a narrowing policy can commit.
-    #[error("waiting for an own-history response to retire")]
-    OwnKeyWriterDrainRequired(Vec<crate::hash::Digest32>),
+    /// Headless startup found the Computer's publication transition held: by a Computer change
+    /// or by an ordinary publication still reading it.
+    #[error("the computer's publication transition was busy")]
+    ComputerTransitionBusy,
 
     /// An accepted local policy application lost ownership to a newer exact revision or expiry
     /// state. This is follower control flow, not a storage or authorization fault.

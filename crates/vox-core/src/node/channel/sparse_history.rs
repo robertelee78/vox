@@ -683,9 +683,10 @@ impl ChannelState {
     /// Positions held below a gap do not count: the run merges with them when it reaches them, so
     /// no hole is ever left behind. An author is complete when its run reaches position 1. The
     /// lowest post of each run is read as its row is ([`Self::key_opens`]): one no key held here
-    /// opens is counted (`keys_awaited`) and its walk goes on, since nothing this node holds
-    /// says it was written before its author trusted this node. An author already owed a page
-    /// (`fetching`) gets no second one. Authors whose run ends at the newest row are served
+    /// opens is counted (`unreadable`), this node's own runs too, and its walk goes on, since
+    /// nothing this node holds says it was written before its author trusted this node. An author
+    /// already owed a page (`fetching`) gets no second one. Authors whose run ends at the newest
+    /// row are served
     /// first, at most `limit` of them (the requests this node may still keep); the others are
     /// counted (`left_out`). The row named (`before`) is where the person reads; it does not
     /// decide what is selected.
@@ -716,7 +717,6 @@ impl ChannelState {
         let render = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
-        let me = self.me();
         let mut page = OlderPage::default();
         // Per author with something below its run: when the run's lowest row shows, its head,
         // the author and that lowest position.
@@ -738,8 +738,8 @@ impl ChannelState {
                 continue;
             }
             let lowest = run_lowest(row);
-            if *author != me && self.oldest_unreadable(&read, &render, row, author, lowest)? {
-                page.keys_awaited += 1;
+            if self.oldest_unreadable(&read, &render, row, author, lowest)? {
+                page.unreadable += 1;
             }
             if lowest <= 1 {
                 continue;
@@ -936,9 +936,9 @@ pub(crate) struct OlderPage {
     pub(crate) owed: Vec<(Digest32, Digest32, u64, u64)>,
     /// Members whose walk still owes this node posts: they are still arriving.
     pub(crate) arriving: usize,
-    /// Members whose oldest post held here has no row because no key for it has reached this
-    /// node.
-    pub(crate) keys_awaited: usize,
+    /// Members, this node included, whose oldest post held here has no row because no key held
+    /// here opens it.
+    pub(crate) unreadable: usize,
     /// Members with older posts to fetch that got no page: this node already keeps as many
     /// older-history requests as it may.
     pub(crate) left_out: usize,
@@ -1689,10 +1689,6 @@ impl ChannelState {
 }
 
 impl ChannelState {
-    pub(crate) fn role_owed(&self) -> std::sync::Arc<super::role_owed::BoardOwner> {
-        std::sync::Arc::clone(&self.role_owed)
-    }
-
     pub(super) fn note_contiguous_advance(
         &mut self,
         author: Digest32,

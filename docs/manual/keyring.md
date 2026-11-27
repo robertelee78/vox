@@ -170,15 +170,23 @@ vox: trusting f7l2q44g56mzd62nsvck7mofib as "ann": read
      `vox trust remove` undoes it and changes the lock everywhere
 ```
 
-Trust covers every room you share with the node, including rooms you share later. `--history full`
-also releases your own earlier messages that you still hold a key for. The default, `now`, releases
-only what you write from now on. Neither releases anyone else's messages.
-In a room that removed this identity, readmission does not restore earlier history, even with
-`--history full`. Previously readable messages remain readable. Undelivered messages from before
-removal and messages sent during removal stay unavailable, including messages on an old key chain
-the node already held. After readmission, new messages are available subject to each sender's
-trust and consent. Peers cannot enforce a removal they have not received; previously disclosed
-messages and keys cannot be recalled.
+Trust covers every room you share with the node, including rooms you share later. It releases
+what you write from the moment you trust the node on, and it never releases anyone else's
+messages. A node you trusted while it was offline catches up on what you wrote after that moment
+when it comes online. Nothing written before the trust point is released, and no option does it:
+`vox trust add --history` is gone (`error: unexpected argument '--history' found`).
+In a room that removed this identity, readmission does not restore earlier history. Previously
+readable messages remain readable. Undelivered messages from before removal and messages sent
+during removal stay unavailable, including messages on an old key chain the node already held.
+After readmission, new messages are available subject to each sender's trust and consent. The
+same holds when a node leaves a room and joins again: it is a new start, and it reads what is
+written from its return on. Peers cannot enforce a removal or a departure they have not received;
+previously disclosed messages and keys cannot be recalled.
+
+Each node deletes another member's key once it has shown everything sealed under it and holds a
+newer one. A deleted key stays deleted on that node: no member can give it back to it, and the
+messages it opened stay shown there where they were already read. Copies that already hold the
+key or the readable messages, a backup made earlier among them, are not affected.
 Trust grants already saved by the daemon wait for current room permissions before releasing
 keys. A room still reading its permissions does not undo that grant or turn it into a trust
 withdrawal.

@@ -1581,7 +1581,7 @@ fn finish_connection(
     let peer_id = proven.peer;
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
-    let (group, own_recovery) = confirm_handshake(&connection)?;
+    let group = confirm_handshake(&connection)?;
     let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
@@ -1601,7 +1601,6 @@ fn finish_connection(
         peer_id,
         peer_process,
         session,
-        own_recovery,
         via_circuit,
         circuit_origin: None,
         router: DatagramRouter::start(connection.clone(), overflow),
@@ -1613,6 +1612,7 @@ fn finish_connection(
         dropped: None,
         tracked: None,
         introduced: Mutex::new(std::collections::BTreeSet::new()),
+        other_version: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -1630,7 +1630,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
 /// defence in depth beneath the provider, which offers no other group
 /// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
-fn confirm_handshake(connection: &Connection) -> Result<(u16, bool)> {
+fn confirm_handshake(connection: &Connection) -> Result<u16> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1638,15 +1638,14 @@ fn confirm_handshake(connection: &Connection) -> Result<(u16, bool)> {
         return Err(Error::SignatureInvalid);
     };
     match &hd.protocol {
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), false))
-        }
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_OWN_RECOVERY_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), true))
-        }
-        // The retired availability ALPN remains accepted and is never reused.
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_AVAILABILITY_ALPN => {
-            Ok((u16::from(hd.negotiated_key_exchange_group), true))
+        // The retired own-recovery and availability ALPNs remain accepted and are never reused:
+        // no own key is asked for over any connection.
+        Some(p)
+            if p.as_slice() == crate::transport::provider::VOX_ALPN
+                || p.as_slice() == crate::transport::provider::VOX_OWN_RECOVERY_ALPN
+                || p.as_slice() == crate::transport::provider::VOX_AVAILABILITY_ALPN =>
+        {
+            Ok(u16::from(hd.negotiated_key_exchange_group))
         }
         _ => Err(Error::ProtocolMismatch),
     }
@@ -1669,7 +1668,6 @@ pub struct VoxConnection {
     /// certificate (see [`Self::peer_process`]).
     peer_process: Digest32,
     session: SessionEstablishment,
-    own_recovery: bool,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
     /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
@@ -1693,6 +1691,8 @@ pub struct VoxConnection {
     /// The rooms whose request streams the peer has answered on this connection: it knows this
     /// node there, so later requests open without this node's board record (ledger 91).
     introduced: Mutex<std::collections::BTreeSet<Digest32>>,
+    /// The peer opened a history stream here with another Vox version's preamble (R10).
+    other_version: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for VoxConnection {
@@ -2284,9 +2284,23 @@ impl VoxConnection {
         }
     }
 
-    /// Whether this exact authenticated TLS connection negotiated own-key recovery.
-    pub(crate) fn supports_own_recovery(&self) -> bool {
-        self.own_recovery
+    /// The peer opened a history stream on this connection with another Vox version's preamble
+    /// (R10).
+    pub(crate) fn note_other_version(&self) {
+        self.other_version
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// The peer completed a current-version exchange on this connection: what it spoke before
+    /// no longer explains a later failure (R11).
+    pub(crate) fn retire_other_version(&self) {
+        self.other_version
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether the peer spoke another Vox version's history preamble on this connection: what
+    /// this node's failed exchanges with it then come to (R11).
+    pub(crate) fn other_version(&self) -> bool {
+        self.other_version
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The TLS key-exchange group this session negotiated, as rustls observed it in the

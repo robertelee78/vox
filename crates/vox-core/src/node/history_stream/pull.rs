@@ -274,20 +274,18 @@ impl PeerAuthor {
 /// 64-member room's 64 rows without body runs take at most 64 × (256 + 4 × 8 KiB heads + 512
 /// proof and control runs × 16 B) = 2,637,824 B on a connection; two connections at once (one
 /// displacing the other, each told everything) with their records take 2 × (2,637,824 +
-/// 230,400) = 5,736,448 B, leaving 11,040,768 B, some 690,000 body runs, about 5,390 per author
-/// on each connection (three at once: about 2,660). An honest holder's body runs of an author
+/// 1,024) = 5,277,696 B, leaving 11,499,520 B, some 718,000 body runs, about 5,610 per author
+/// on each connection (three at once: about 2,880). An honest holder's body runs of an author
 /// break only where it lacks a body between two it holds: sealed packages for other members
 /// (one break per stretch of them, a stretch per key rotation of the author, split at most once
 /// more by the package this holder opens), and bodies whose lifetime ended between controls and
-/// packages it keeps. 5,390 runs per author takes some 2,700 such stretches by every member of
+/// packages it keeps. 5,610 runs per author takes some 2,800 such stretches by every member of
 /// the room; a history with more passes it, and the connection that would pass it is closed.
 const HAVE_KEPT_BYTES: usize = 16 * 1024 * 1024;
 
 /// What a connection's record keeps besides its rows, charged when it is made: the record, its
-/// watch and private anchor (a fixed 1 KiB) and room for its whole own-release section
-/// (`MAX_RECEIVER_CHAINS` entries of author, key epoch, chain and earliest iteration, 56 B
-/// each), so the section never adds to its charge: 230,400 B.
-const RECORD_KEPT_BYTES: usize = 1024 + crate::node::channel::MAX_RECEIVER_CHAINS * (32 + 3 * 8);
+/// watch and private anchor (a fixed 1 KiB).
+const RECORD_KEPT_BYTES: usize = 1024;
 
 fn covers(runs: &[(u64, u64)], lo: u64, hi: u64) -> bool {
     runs.iter().any(|&(a, b)| a <= lo && hi <= b)
@@ -349,9 +347,6 @@ struct Peer {
     /// The connection's quinn handle: a record of a closed one is removed before the peer's
     /// bound in the room is read ([`Holdings::others`]).
     quinn: quinn::Connection,
-    /// The peer's own-release section (`Frame::Releases`): per (author, key epoch, chain) of
-    /// the sender releases it retains, the earliest iteration. Only this node's are asked.
-    releases: BTreeMap<(Digest32, u64, u64), u64>,
     version: tokio::sync::watch::Sender<u64>,
     /// The peer's private Session anchor as its last Have that carried one told it (only a
     /// peer that found a record it may serve this node, `Frame::PrivateHolding`), with how many
@@ -363,6 +358,10 @@ struct Peer {
     /// served the peer on this connection: what ends the tell-only loop toward a departed
     /// author once it covers its departure ([`standing`]).
     receipt_served: u64,
+    /// The room epoch of the last version-3 preamble exchange on this connection: a request
+    /// of this node's that the peer answered, or one of the peer's this node authorized. A room
+    /// key goes on this connection, or is taken from it, only at that epoch (R10).
+    exchanged: Option<u64>,
     /// The fork rule's allowance ([`FORK_ASKS`]): per room author, how many fork proofs this
     /// connection was asked for. Only ever grows; at most one entry per room author.
     fork_asks: BTreeMap<Digest32, u8>,
@@ -435,10 +434,10 @@ impl Holdings {
                     authors: BTreeMap::new(),
                     kept: RECORD_KEPT_BYTES,
                     quinn: quinn.clone(),
-                    releases: BTreeMap::new(),
                     version: tokio::sync::watch::Sender::new(0),
                     private: None,
                     receipt_served: 0,
+                    exchanged: None,
                     fork_asks: BTreeMap::new(),
                 })
             }
@@ -531,57 +530,33 @@ impl Holdings {
         version
     }
 
-    /// The peer's own-release section on connection `conn`: news for that connection's loop,
-    /// like its Have, when it changes a release this node knows the peer retains. Only entries
-    /// naming this node (`me`, checked by the reader) are asked.
-    pub(crate) fn merge_releases(
+    /// A version-3 preamble exchange for `room` at `epoch` completed on connection `conn`
+    /// with `peer` ([`Peer::exchanged`]).
+    pub(crate) fn exchanged(
         self: &Arc<Self>,
         room: Digest32,
         peer: Digest32,
         conn: &VoxConnection,
-        releases: &[super::ReleaseHave],
+        epoch: u64,
     ) {
-        let mut peers = lock(&self.peers);
-        let Some((entry, _)) = self.entry(&mut peers, room, peer, conn) else {
-            return;
-        };
-        let mut news = false;
-        for release in releases {
-            let key = (release.author, release.epoch, release.chain);
-            // Bounded as the holder's own retained releases are; a longer section is not kept.
-            if entry.releases.len() < crate::node::channel::MAX_RECEIVER_CHAINS
-                || entry.releases.contains_key(&key)
-            {
-                news |= entry.releases.insert(key, release.earliest) != Some(release.earliest);
-            }
-        }
-        if news {
-            entry.version.send_modify(|at| *at = at.wrapping_add(1));
+        if let Some((entry, _)) = self.entry(&mut lock(&self.peers), room, peer, conn) {
+            entry.exchanged = Some(epoch);
         }
     }
 
-    /// Whether the peer told on connection `serial` that it retains `author`'s release of
-    /// (`epoch`, `chain`) from an iteration no later than `iteration`.
-    fn releases(
+    /// Whether connection `serial` to `peer` completed a version-3 preamble exchange for
+    /// `room` at `epoch`: the one condition under which a room key is written to it or taken
+    /// from it. A connection's record goes with its close, so a new connection exchanges again.
+    pub(crate) fn exchanged_at(
         &self,
         room: Digest32,
         peer: Digest32,
         serial: u64,
-        key: (Digest32, u64, u64),
-        iteration: u64,
+        epoch: u64,
     ) -> bool {
         lock(&self.peers)
             .get(&(room, peer, serial))
-            .and_then(|p| p.releases.get(&key))
-            .is_some_and(|earliest| *earliest <= iteration)
-    }
-
-    /// The peer answered that it does not hold that release after all: its section is
-    /// corrected here, as an answer's corrected Have is.
-    fn unrelease(&self, room: Digest32, peer: Digest32, serial: u64, key: (Digest32, u64, u64)) {
-        if let Some(entry) = lock(&self.peers).get_mut(&(room, peer, serial)) {
-            entry.releases.remove(&key);
-        }
+            .is_some_and(|p| p.exchanged == Some(epoch))
     }
 
     /// The private Session anchor peer `peer` last told on connection `serial`, if any, and how
@@ -1234,6 +1209,71 @@ struct FrontierInner {
     /// entry was made ready there and the room's private news did not move. A failed
     /// admission of a room still quiet waits for news ([`Frontier::failed_admission_news`]).
     quiet: BTreeSet<Digest32>,
+    /// `VOX_TEST_HOLD_INCOMING_CONSENT_FILE`: the consent a proof holds, out of its room's ready
+    /// set until the hold file is gone ([`held_consent`]).
+    #[cfg(feature = "test-knobs")]
+    held_consents: Vec<(Digest32, Ready)>,
+}
+
+impl FrontierInner {
+    /// The held consents whose hold is gone go back to their room's ready set; whether any did.
+    #[cfg(feature = "test-knobs")]
+    fn release_held_consents(&mut self) -> bool {
+        let held = std::mem::take(&mut self.held_consents);
+        let before = held.len();
+        for (room, item) in held {
+            if consent_hold(&item.entry).is_some() {
+                self.held_consents.push((room, item));
+            } else {
+                self.ready.entry(room).or_default().push(item, true);
+            }
+        }
+        self.held_consents.len() < before
+    }
+}
+
+/// `VOX_TEST_HOLD_INCOMING_CONSENT_FILE` (the retained-row journey): while the file names
+/// `entry`'s room, author and target, that signed consent stays out of its room's ready set, so
+/// it is not admitted while every other entry is (the room's one admission is never held).
+/// Returns the file and what it names.
+#[cfg(feature = "test-knobs")]
+fn consent_hold(entry: &Entry) -> Option<(std::path::PathBuf, String)> {
+    let path = std::env::var_os("VOX_TEST_HOLD_INCOMING_CONSENT_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())?;
+    let Ok(crate::governance::entry::GovBody::ConsentGrant(consent)) =
+        crate::governance::entry::GovEntry::body_bound_to(entry)
+    else {
+        return None;
+    };
+    let encode = crate::node::link::b32_encode;
+    let scope = format!(
+        "{} {} {}",
+        encode(&entry.skeleton.channel_id),
+        encode(&entry.skeleton.author_id),
+        encode(&consent.body.target_id)
+    );
+    (std::fs::read_to_string(&path).ok().as_deref() == Some(scope.as_str()))
+        .then_some((path, scope))
+}
+
+/// [`consent_hold`] for an entry the room's admission would take: when held, its `.entered`
+/// marker says which consent is held (`room author target hash`), written whole by a rename.
+#[cfg(feature = "test-knobs")]
+fn held_consent(entry: &Entry) -> bool {
+    let Some((path, scope)) = consent_hold(entry) else {
+        return false;
+    };
+    let temporary = path.with_extension(format!("entered.{}.tmp", std::process::id()));
+    let marker = format!(
+        "{scope} {}",
+        crate::node::link::b32_encode(&entry.entry_hash())
+    );
+    if std::fs::write(&temporary, marker).is_ok() {
+        let _ = std::fs::rename(&temporary, path.with_extension("entered"));
+    }
+    true
 }
 
 /// The positions a saved archive intent covers: `lo` to `hi` of `author` in `room`, its original
@@ -1666,58 +1706,6 @@ fn context_bytes(context: &crate::log::history::ControlContext) -> usize {
     64 + context.coordinates.len() * std::mem::size_of::<crate::log::history::EntryReference>()
 }
 
-/// OwnRelease (ADR-054 adoption step 5): one of this node's own earlier sender keys its native
-/// readability audit lacks (`OwnReadability::KeyDebt`), by key epoch, chain and the iteration it
-/// must open. A fact about a key, not about a head: the recovery target is only the request's
-/// provenance (per-head audit items 21 to 23).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OwnKeyDebt {
-    pub(crate) epoch: u64,
-    pub(crate) chain: u64,
-    pub(crate) iteration: u64,
-}
-
-/// A loop's request for the actor's current checks before one OwnRelease exchange: the
-/// connection's peer is trusted and still this room's connection, this node is unlocked, its
-/// policy is current, and the peer's prekey bundle opens a fresh request-owned session
-/// (`actor/own_keys.rs` `grant_own_release`). `None`: not now; a later audit asks again.
-pub(crate) struct OwnReleaseAsk {
-    pub(crate) room: Digest32,
-    pub(crate) peer: Digest32,
-    pub(crate) node: Digest32,
-    pub(crate) epoch: u64,
-    pub(crate) conn: Arc<VoxConnection>,
-    pub(crate) shared: Arc<crate::node::channel::RoomLock>,
-    pub(crate) reply: OwnReleaseReply,
-}
-
-/// What a loop asks of the actor: the grant to open an exchange, or, before installing its
-/// answer, whether the same peer, connection, room instance and node are all still current.
-pub(crate) enum OwnReleaseReply {
-    Open(tokio::sync::oneshot::Sender<Option<OwnReleaseGrant>>),
-    Install(tokio::sync::oneshot::Sender<bool>),
-}
-
-/// The install step's publication under the node's Computer authority.
-type OwnReleasePublish = dyn Fn(&mut dyn FnMut()) -> bool + Send + Sync;
-
-/// What the actor grants one OwnRelease exchange: the prekey ring and the peer's delivery
-/// bundle for the fresh one-shot session, the node's secret lease (held until the release is
-/// installed or dropped), its clock, and its current Computer authority for the install.
-pub(crate) struct OwnReleaseGrant {
-    pub(crate) ring: Arc<tokio::sync::Mutex<crate::node::prekeys::PrekeyRing>>,
-    pub(crate) bundle: crate::identity::keyagreement::PrekeyBundlePublic,
-    pub(crate) secret: crate::node::actor::own_keys::SecretLease,
-    pub(crate) clock: crate::time::Clock,
-    /// The node's lock (pairwise epoch) and the room's own-key cancellation: either ends the
-    /// exchange and drops the secret lease.
-    pub(crate) cancel: (
-        tokio::sync::watch::Receiver<u64>,
-        tokio::sync::watch::Receiver<bool>,
-    ),
-    pub(crate) publish: Box<OwnReleasePublish>,
-}
-
 /// A checked exact receipt of this node's own feed from one peer (ruling (d)): the peer's
 /// role-complete head of this node, answered to `Query::Head(self)` under Control after the
 /// peer flushed, staged here as any own head is. The actor routes it, under the same room
@@ -1762,17 +1750,6 @@ pub(crate) struct Frontier {
     /// Exact receipts the loops checked since the actor last took them; woken by
     /// `advanced_wake`.
     receipts: StdMutex<Vec<LoopReceipt>>,
-    /// OwnRelease (ADR-054 adoption step 5): per room, the own sender key this node's native
-    /// readability check lacks, with the audit that named it. Nothing here records who asks it:
-    /// every connection whose peer advertises the release asks it independently, at once (its
-    /// own-key debt has no other work of its priority class to prefer, so the non-exclusive
-    /// in-flight preference of `ruling-in-flight.md` reduces to asking), once per audit and
-    /// per Have of that peer.
-    own_keys: StdMutex<BTreeMap<Digest32, (OwnKeyDebt, u64)>>,
-    own_key_audits: std::sync::atomic::AtomicU64,
-    /// Loops' requests for the actor's current checks before an OwnRelease exchange; woken by
-    /// `advanced_wake`.
-    own_release_asks: StdMutex<Vec<OwnReleaseAsk>>,
     /// Private Session debt (`PrivateDebt`); what ended is woken by `advanced_wake`.
     private: StdMutex<PrivateDebt>,
 }
@@ -1967,8 +1944,20 @@ impl Frontier {
         taken
     }
 
-    /// The next growth of any room's ready set (a stored permit: none is lost).
+    /// The next growth of any room's ready set (a stored permit: none is lost). With a consent
+    /// a proof holds (`test-knobs`), also its release: it is then ready again.
     pub(crate) async fn handed(&self) {
+        #[cfg(feature = "test-knobs")]
+        while !lock(&self.inner).held_consents.is_empty() {
+            tokio::select! {
+                () = self.handed.notified() => return,
+                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    if lock(&self.inner).release_held_consents() {
+                        return;
+                    }
+                }
+            }
+        }
         self.handed.notified().await;
     }
 
@@ -2045,11 +2034,24 @@ impl Frontier {
     /// rotation over authors ([`ReadySet`]).
     pub(crate) fn take(&self, room: Digest32) -> Option<Ready> {
         let mut inner = lock(&self.inner);
+        #[cfg(feature = "test-knobs")]
+        inner.release_held_consents();
         let ready = inner.ready.get_mut(&room)?;
         let item = ready.take();
+        // `VOX_TEST_HOLD_INCOMING_CONSENT_FILE`: a held consent leaves the ready set instead of
+        // being admitted; the admission takes the next entry (`FrontierInner::held_consents`).
+        #[cfg(feature = "test-knobs")]
+        let (mut item, mut held) = (item, Vec::new());
+        #[cfg(feature = "test-knobs")]
+        while let Some(consent) = item.take_if(|item| held_consent(&item.entry)) {
+            held.push((room, consent));
+            item = ready.take();
+        }
         if ready.is_empty() {
             inner.ready.remove(&room);
         }
+        #[cfg(feature = "test-knobs")]
+        inner.held_consents.extend(held);
         item
     }
 
@@ -2158,60 +2160,6 @@ impl Frontier {
     /// The receipts checked since the last take (see [`Self::receipt`]).
     pub(crate) fn take_receipts(&self) -> Vec<LoopReceipt> {
         std::mem::take(&mut *lock(&self.receipts))
-    }
-
-    /// The room's native readability audit (`actor/recovery_save.rs`): the own sender key it
-    /// lacks, or none. An audit naming a debt is news for the loops, which ask it of a peer
-    /// whose own-release section says it can release it ([`own_release`]).
-    pub(crate) fn owe_own_key(&self, room: Digest32, debt: Option<OwnKeyDebt>) {
-        {
-            let mut keys = lock(&self.own_keys);
-            match debt {
-                Some(debt) => {
-                    let audit = self
-                        .own_key_audits
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    keys.insert(room, (debt, audit));
-                }
-                None => {
-                    if keys.remove(&room).is_none() {
-                        return;
-                    }
-                }
-            }
-        }
-        self.change();
-    }
-
-    /// The room's own-key debt and the audit that named it, when `held` (given both) says this
-    /// peer can release it. Reads only: no connection's ask excludes or delays another's.
-    fn own_key(
-        &self,
-        room: Digest32,
-        held: impl Fn(&OwnKeyDebt, u64) -> bool,
-    ) -> Option<(OwnKeyDebt, u64)> {
-        lock(&self.own_keys)
-            .get(&room)
-            .filter(|(debt, audit)| held(debt, *audit))
-            .copied()
-    }
-
-    /// The release was installed: the debt is paid until the next audit names another.
-    fn own_key_paid(&self, room: Digest32, debt: OwnKeyDebt) {
-        let mut keys = lock(&self.own_keys);
-        if keys.get(&room).is_some_and(|(was, _)| *was == debt) {
-            keys.remove(&room);
-        }
-    }
-
-    fn ask_own_release(&self, ask: OwnReleaseAsk) {
-        lock(&self.own_release_asks).push(ask);
-        self.advanced_wake.notify_one();
-    }
-
-    /// The loops' requests for the actor's OwnRelease checks (see [`OwnReleaseAsk`]).
-    pub(crate) fn take_own_release_asks(&self) -> Vec<OwnReleaseAsk> {
-        std::mem::take(&mut *lock(&self.own_release_asks))
     }
 
     /// A loop checked an answer that brought `need`, or found every position it named admitted
@@ -2537,8 +2485,8 @@ pub(crate) enum LocalWait {
 }
 
 /// What a parked connection waits to change: the version of the peer's Have on this connection,
-/// raised only by what changes what this node knows the peer holds (a Have page, own-release
-/// entry or private section, [`Holdings::merge`]; a page told again unchanged raises nothing),
+/// raised only by what changes what this node knows the peer holds (a Have page or private
+/// section, [`Holdings::merge`]; a page told again unchanged raises nothing),
 /// and this node's own standing in the room as published (its epoch, whether it is an author,
 /// whether it has left, its recovery standing). Unrelated local publications change neither.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2639,6 +2587,11 @@ impl Connection {
     /// `vox status`, which also ends a standing failure (#1401). `brought`: it saved history
     /// this node did not hold (`last sync`).
     pub(super) fn answered(&self, reason: crate::node::status::RoundReason, brought: bool) {
+        // The peer answered a version-3 request: the exchange the room's keys need (R10). The
+        // connection's evidence of another version is retired: a later failure is its own.
+        self.holdings
+            .exchanged(self.room, self.peer, &self.conn, self.epoch);
+        self.conn.retire_other_version();
         crate::node::status::SyncBook::with(&self.book, self.room, self.peer, |counts| {
             counts.note_fetched(reason, brought);
             if brought {
@@ -2651,13 +2604,24 @@ impl Connection {
     }
 
     /// The peer's last failure, with the product's sentence, shown while it stands; `counted`:
-    /// the loop ended with it, one `failed`.
+    /// the loop ended with it, one `failed`. With a computer of another Vox version, any failed
+    /// exchange is that (R10, R11): it opened here with another version's preamble, or it refused
+    /// this node's.
     fn failure(&self, error: &Error, counted: bool) {
+        let why = if self.conn.other_version()
+            || matches!(
+                error,
+                Error::PeerRefused(crate::wire::WireError::ProtocolVersionUnsupported)
+            ) {
+            super::OTHER_VERSION.to_owned()
+        } else {
+            error.to_string()
+        };
         crate::node::status::SyncBook::with(&self.book, self.room, self.peer, |counts| {
             if counted {
                 counts.failed += 1;
             }
-            counts.note_failure(error.to_string());
+            counts.note_failure(why);
         });
     }
 
@@ -2978,9 +2942,6 @@ async fn tell(c: &Connection) -> Result<()> {
     let mut told: BTreeMap<(Digest32, u64), AuthorHave> = BTreeMap::new();
     // The record and the peer's Have version last compared: neither changed, nothing to tell.
     let mut compared: Option<(Arc<HeldHistory>, u64)> = None;
-    // The own-release section told: per (key epoch, chain) of the peer's own releases, the
-    // earliest iteration told.
-    let mut told_releases: BTreeMap<(u64, u64), u64> = BTreeMap::new();
     loop {
         c.until_news().await?;
         let before = c.news();
@@ -3114,44 +3075,6 @@ async fn tell(c: &Connection) -> Result<()> {
                 c.frontier.handed.notify_one();
             }
         }
-        // The Have's own-release section: ONLY the peer's own retained sender releases, and
-        // only to an unfrozen member or returning author (recovery standing, `standing`);
-        // nobody else is told any of it, a departed author without it included. What changed
-        // since it was told goes; a release this node no longer retains is corrected by its
-        // answer.
-        let releases: Vec<super::ReleaseHave> = if matches!(
-            snapshot.standing(&c.peer),
-            Some(
-                crate::node::channel::Standing::Member | crate::node::channel::Standing::Returning
-            )
-        ) && !snapshot.is_frozen(&c.peer)
-        {
-            snapshot
-                .own_releases(&c.peer)
-                .iter()
-                .filter(|r| told_releases.get(&(r.epoch, r.chain)) != Some(&r.earliest))
-                .copied()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if !releases.is_empty() {
-            let sent: Result<()> = async {
-                for page in releases.chunks(super::MAX_RELEASES_PER_FRAME) {
-                    send_have(c, Frame::Releases(page.to_vec()), None).await?;
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = sent {
-                c.refused(error, before)?;
-                told.clear();
-                told_releases.clear();
-                compared = None;
-                continue;
-            }
-            told_releases.extend(releases.iter().map(|r| ((r.epoch, r.chain), r.earliest)));
-        }
         // Nothing is written while the room cannot decide: an unwritten anchor stays unsent.
         if let Some(tell) = deciding.then(|| telling.take()).flatten() {
             let have = Frame::PrivateHolding(Vec::new(), tell.anchor.clone());
@@ -3175,7 +3098,7 @@ async fn tell(c: &Connection) -> Result<()> {
     }
 }
 
-/// Send one Have page: a HOLDING, the peer's own-release section or a private section. It is
+/// Send one Have page: a HOLDING or a private section. It is
 /// built from the in-memory record and is this connection's private assembly: no job and no
 /// shared byte admission while the peer reads it. A private section (`authority`) is written
 /// only while what decided it still holds (`sessionstream::Authority::write`).
@@ -3492,8 +3415,6 @@ async fn ask(c: &Connection) -> Result<()> {
     // the frontier keeps (`Frontier::keep_partial`), or the same ask, when its answer stopped on
     // contexts.
     let mut continued: Option<(Ask, BTreeSet<Digest32>, Marked<'_>)> = None;
-    // OwnRelease: the audit and the peer's Have version of this connection's last attempt.
-    let mut tried: Option<(u64, u64)> = None;
     let mut private = super::private::Asking::default();
     loop {
         if lock(&c.parked).is_some() {
@@ -3527,17 +3448,6 @@ async fn ask(c: &Connection) -> Result<()> {
         // what this node noted it holds (ADR-028 R-6, and a leave's departure), asked once.
         if member && continued.is_none() {
             match receipt(c).await {
-                Ok(false) => {}
-                Ok(true) => continue,
-                Err(error) => {
-                    c.refused(error, before)?;
-                    continue;
-                }
-            }
-            // An own sender key the native readability audit lacks, which this peer's
-            // own-release section says it can release (OwnRelease). Asked of every such peer
-            // independently: no other connection's exchange holds it back.
-            match own_release(c, &mut tried).await {
                 Ok(false) => {}
                 Ok(true) => continue,
                 Err(error) => {
@@ -3857,218 +3767,6 @@ async fn receipt(c: &Connection) -> Result<bool> {
     });
     c.answered(crate::node::status::RoundReason::Hint, false);
     Ok(true)
-}
-
-/// OwnRelease (ADR-054 adoption step 5; adopt ruling (c)): this node's native readability audit
-/// lacks one of its own earlier sender keys (`Frontier::owe_own_key`), and this peer's
-/// own-release section names this node's release of that key epoch and chain from no later an
-/// iteration. Asked here, by this loop, like any other debt: the room step checks the accepted
-/// recovery target and the peer's membership and context; the actor checks trust, the current
-/// connection and room instance, the lock, the policy and the bundle; the sealed one-shot
-/// exchange (`actor/own_keys.rs` `ask_release`) matches every request field; the release is
-/// installed by the room's own-recovery acceptance under the Computer authority. A refusal, an
-/// unavailable answer or a rejected release parks the connection until news, like every other
-/// refusal; the section's entry is corrected by an unavailable answer. `true`: an exchange ran.
-/// `tried`: one attempt per audit and per Have of this peer, whatever its outcome. Each
-/// connection asks independently: nothing another connection's exchange does (a donor that
-/// never answers included) delays or prevents this one.
-async fn own_release(c: &Connection, tried: &mut Option<(u64, u64)>) -> Result<bool> {
-    use crate::node::actor::own_keys::{self, OwnKeyReply};
-    let me = c.node;
-    let version = c.holdings.version(c.room, c.peer, c.conn.serial());
-    let Some((debt, audit)) = c.frontier.own_key(c.room, |debt, audit| {
-        *tried != Some((audit, version))
-            && c.holdings.releases(
-                c.room,
-                c.peer,
-                c.conn.serial(),
-                (me, debt.epoch, debt.chain),
-                debt.iteration,
-            )
-    }) else {
-        return Ok(false);
-    };
-    *tried = Some((audit, version));
-    let (peer, epoch) = (c.peer, c.epoch);
-    let current = c
-        .with_room(move |room, store, _| {
-            // The accepted recovery target (`own_recovery_key`: own_behind, a Head target
-            // accepted in the record) and a current member donor in the current epoch.
-            let Some((target, _, true)) = room.own_recovery_key(store)? else {
-                return Ok(None);
-            };
-            if !room.is_member(&peer) || room.has_left(&peer) {
-                return Ok(None);
-            }
-            let context = room.join_context()?;
-            if context.epoch != epoch || debt.epoch > context.epoch {
-                return Ok(None);
-            }
-            Ok(Some((target, context)))
-        })
-        .await?;
-    let Some((target, context)) = current else {
-        return Ok(false);
-    };
-    let (reply, granted) = tokio::sync::oneshot::channel();
-    c.frontier.ask_own_release(OwnReleaseAsk {
-        room: c.room,
-        peer,
-        node: me,
-        epoch,
-        conn: Arc::clone(&c.conn),
-        shared: Arc::clone(&c.shared),
-        reply: OwnReleaseReply::Open(reply),
-    });
-    let grant = tokio::select! {
-        biased;
-        () = c.fence.retired() => return Err(gone()),
-        grant = granted => grant.map_err(|_| gone())?,
-    };
-    let Some(OwnReleaseGrant {
-        ring,
-        bundle,
-        secret,
-        clock,
-        mut cancel,
-        publish,
-    }) = grant
-    else {
-        return Ok(false);
-    };
-    let request = own_keys::Request {
-        id: crate::identity::rng::random_array::<16>()?,
-        room: c.room,
-        session_epoch: context.epoch,
-        key_epoch: debt.epoch,
-        target,
-        chain: debt.chain,
-        floor: debt.iteration,
-    };
-    let reply = own_keys::ask_release(
-        &c.conn,
-        &c.budget,
-        &c.fence,
-        me,
-        (ring, bundle),
-        &clock,
-        &secret,
-        &mut cancel,
-        request,
-        &context,
-    )
-    .await?;
-    let mut release = match reply {
-        OwnKeyReply::Available(release) => release,
-        OwnKeyReply::Unavailable => {
-            c.holdings
-                .unrelease(c.room, peer, c.conn.serial(), (me, debt.epoch, debt.chain));
-            return Err(Error::Unreachable(
-                "the peer does not hold this node's own history key",
-            ));
-        }
-        OwnKeyReply::DonorStorageFault => {
-            c.holdings
-                .unrelease(c.room, peer, c.conn.serial(), (me, debt.epoch, debt.chain));
-            return Err(Error::Unreachable(
-                "a peer could not read its retained history key due to a storage error",
-            ));
-        }
-    };
-    enum Install {
-        Done,
-        CleanupWaiting,
-        NotNow,
-        Poisoned(Error),
-        Rejected(Error),
-    }
-    let publish: Arc<OwnReleasePublish> = Arc::from(publish);
-    loop {
-        // Before every install: the donor still trusted, this connection and room instance
-        // still current, this node unlocked, exactly as when the exchange was granted.
-        let (reply, current) = tokio::sync::oneshot::channel();
-        c.frontier.ask_own_release(OwnReleaseAsk {
-            room: c.room,
-            peer,
-            node: me,
-            epoch,
-            conn: Arc::clone(&c.conn),
-            shared: Arc::clone(&c.shared),
-            reply: OwnReleaseReply::Install(reply),
-        });
-        let current = tokio::select! {
-            biased;
-            () = c.fence.retired() => return Err(gone()),
-            current = current => current.map_err(|_| gone())?,
-        };
-        if !current {
-            c.answered(crate::node::status::RoundReason::Hint, false);
-            return Ok(true);
-        }
-        // Subscribed before the step: the next audit after a cleanup wait is not missed.
-        let mut changed = c.frontier.changed.subscribe();
-        let (publish, clock, asked) = (Arc::clone(&publish), Arc::clone(&clock), context);
-        // The blocking install step holds its own clone of the secret lease and hands it back
-        // with the release it owns, so the lease is released only after that key material is
-        // disposed, wherever this exchange ends.
-        let lease = Arc::clone(&secret);
-        let (install, kept, _lease) = c
-            .with_room(move |room, store, _| {
-                // The donor still a member and the room's context the one the request was
-                // sealed under, as the old install's current check required.
-                if !room.is_member(&peer) || room.has_left(&peer) || room.join_context()? != asked {
-                    return Ok((Install::NotNow, release, lease));
-                }
-                let now = crate::time::Ms(clock());
-                let mut result = None;
-                // `false`: the Computer authority is no longer current; nothing was written.
-                let _ = publish(&mut || {
-                    result = Some(room.accept_own_recovery_release(store, &release, now));
-                });
-                let install = match result {
-                    Some(Ok(_)) => Install::Done,
-                    Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
-                        Install::CleanupWaiting
-                    }
-                    // Recovery completed, or its target is no longer accepted, meanwhile:
-                    // the next audit says what is owed.
-                    Some(Err(Error::OwnHistoryBehind)) | None => Install::NotNow,
-                    Some(Err(error)) if room.is_poisoned() => Install::Poisoned(error),
-                    Some(Err(error)) => Install::Rejected(error),
-                };
-                Ok((install, release, lease))
-            })
-            .await?;
-        release = kept;
-        match install {
-            Install::Done => {
-                c.frontier.own_key_paid(c.room, debt);
-                // The native recovery stages run again (readability, completion).
-                c.frontier.advanced(c.room, false, true);
-                c.answered(crate::node::status::RoundReason::Hint, true);
-                drop(secret);
-                return Ok(true);
-            }
-            Install::CleanupWaiting => {
-                // The release stays owned here, with its secret lease, while the room's
-                // bounded receiver-release cleanup runs; the next audit retries this exact
-                // release, never the network.
-                c.frontier.advanced(c.room, false, true);
-                tokio::select! {
-                    biased;
-                    () = c.fence.retired() => return Err(gone()),
-                    _ = cancel.0.changed() => return Err(Error::Unreachable("own-key request cancelled")),
-                    _ = cancel.1.changed() => return Err(Error::Unreachable("own-key request cancelled")),
-                    changed = changed.changed() => changed.map_err(|_| gone())?,
-                }
-            }
-            Install::NotNow => {
-                c.answered(crate::node::status::RoundReason::Hint, false);
-                return Ok(true);
-            }
-            Install::Poisoned(error) | Install::Rejected(error) => return Err(error),
-        }
-    }
 }
 
 /// What stands between this node and an author's posts, read from the record, never found by

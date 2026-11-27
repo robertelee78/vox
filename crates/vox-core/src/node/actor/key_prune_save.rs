@@ -5,7 +5,6 @@ use crate::node::store::Store;
 
 pub(super) use pending_key_prune::{Completed, Prepared, Saved};
 pub(super) struct Work {
-    full: Arc<BTreeSet<Digest32>>,
     trusted: Arc<BTreeSet<Digest32>>,
     now: crate::time::Ms,
 }
@@ -17,7 +16,7 @@ impl Work {
         owner: Arc<()>,
         _now: crate::time::Ms,
     ) -> crate::error::Result<Option<Prepared>> {
-        channel.prepare_pending_key_prune(store, owner, &self.full, &self.trusted, self.now)
+        channel.prepare_pending_key_prune(store, owner, &self.trusted, self.now)
     }
 }
 
@@ -57,15 +56,6 @@ impl Node {
         {
             return;
         }
-        let full = Arc::new(
-            self.trust
-                .trusted()
-                .into_iter()
-                .filter(|identity| {
-                    self.trust.history(identity) == crate::node::trust::HistoryGrant::Full
-                })
-                .collect::<BTreeSet<_>>(),
-        );
         let trusted = Arc::new(self.trust.trusted().into_iter().collect::<BTreeSet<_>>());
         let now = self.now_ms();
         let rooms: Vec<_> = self
@@ -78,7 +68,6 @@ impl Node {
                 continue;
             }
             let work = Work {
-                full: Arc::clone(&full),
                 trusted: Arc::clone(&trusted),
                 now,
             };

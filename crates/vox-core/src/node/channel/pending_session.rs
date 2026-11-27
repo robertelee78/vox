@@ -398,6 +398,11 @@ impl ChannelState {
         };
         if let Some(controls) = &mut controls {
             controls.fence_removal(removal_generation);
+            if let SessionWrite::Package { package, .. } = &write {
+                if let Some(back) = self.package_return(store, &package.recipient)? {
+                    controls.require_ancestor(back);
+                }
+            }
         }
         Ok(PendingSession {
             owner,

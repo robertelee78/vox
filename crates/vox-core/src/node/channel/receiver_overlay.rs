@@ -8,7 +8,7 @@ const HEADER_BYTES: usize = 512;
 const RECORD_BYTES: usize = 256;
 const STATE_BYTES: usize = crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
 type Key = [u8; 64];
-pub(super) const CLEANUP_PENDING: &str = receiver_releases::CLEANUP_PENDING;
+pub(super) const CLEANUP_PENDING: &str = "own receiver records await bounded cleanup";
 
 pub(super) struct Persistence {
     nonce: [u8; 16],
@@ -369,8 +369,8 @@ pub(super) fn wrote_drive(
     h.seal(batch, sek, room)
 }
 
-/// One own slot, original release and backfill cursor share the caller's transaction. No
-/// normal receiver-map clone/serialization is required for this install.
+/// One own slot and its backfill cursor share the caller's transaction. No normal
+/// receiver-map clone/serialization is required for this install.
 pub(super) enum Put {
     Stored,
     Busy { changed: bool },
@@ -475,40 +475,4 @@ pub(super) fn advance(
     }
     h.seal(batch, sek, room)?;
     Ok(Some((h.cleanup, retry_ready)))
-}
-
-/// Scalar only: keep an already-sealed cleanup cursor owed when the release GC used this turn.
-pub(super) fn pending(
-    batch: &crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-) -> Result<bool> {
-    Ok(Header::load(batch, sek, room)?.cleanup)
-}
-
-/// Capacity preflight for an install that also retains a signed release. Neither auxiliary
-/// object may commit alone when the other index is full. The caller holds this same Batch.
-pub(super) fn capacity(
-    batch: &mut crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    chain: u64,
-) -> Result<Option<bool>> {
-    let mut h = Header::load(batch, sek, room)?;
-    if session_tree::Read::batch(batch, sek, room, KIND)
-        .find(h.root, &key(chain))?
-        .is_some()
-        || h.count < MAX_RECEIVER_CHAINS
-    {
-        return Ok(None);
-    }
-    if !h.cleanup {
-        return Err(invalid());
-    }
-    let changed = !h.retry_owed;
-    if changed {
-        h.retry_owed = true;
-        h.seal(batch, sek, room)?;
-    }
-    Ok(Some(changed))
 }

@@ -1170,7 +1170,6 @@ impl Node {
         let room = channel.channel_id();
         if lifetime
             .publish(|| {
-                self.role_wake.install(room, &channel.role_owed());
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&room);
                 }
@@ -1216,8 +1215,6 @@ impl Node {
         }
         if lifetime
             .publish(|| {
-                self.role_wake
-                    .install(parsed.channel_id, &channel.role_owed());
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&parsed.channel_id);
                 }
@@ -2681,7 +2678,6 @@ enum JournalAfter {
 }
 type JournalReturned = (
     Option<Arc<maintenance_save::Lifetime>>,
-    Option<crate::node::channel::own_writer_gate::Transition>,
     crate::error::Result<JournalDelta>,
 );
 struct JournalPending {
@@ -2698,18 +2694,13 @@ struct JournalPending {
     following_withdrawal: Option<RoomWithdrawal>,
 }
 impl JournalPending {
-    async fn retire(mut self) {
+    async fn retire(self) {
         let _ = self.task.await;
         let mut returned = self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let (JournalAfter::PublicationRejected(rejected), Some((_, transition, _))) =
-            (&mut self.after, &mut returned)
-        {
-            rejected.transition = transition.take();
-        }
         let room = self.room;
         let node = self.node;
         let store = self.store;
@@ -2723,7 +2714,7 @@ impl JournalPending {
             } => {
                 let result = returned
                     .as_ref()
-                    .map(|(_, _, result)| result.as_ref().map(|_| ()).map_err(fault_of))
+                    .map(|(_, result)| result.as_ref().map(|_| ()).map_err(fault_of))
                     .unwrap_or(Err(Fault::Internal));
                 match result {
                     Ok(()) => {
@@ -2745,7 +2736,7 @@ impl JournalPending {
             JournalAfter::Joined { reply, .. } => {
                 let original = returned
                     .as_ref()
-                    .map(|(_, _, result)| match result {
+                    .map(|(_, result)| match result {
                         Ok(_) => Fault::Locked,
                         Err(error) => fault_of(error),
                     })
@@ -2754,7 +2745,7 @@ impl JournalPending {
                     let _secret = secret;
                     let completed = returned
                         .as_mut()
-                        .and_then(|(_, _, result)| result.as_mut().ok())
+                        .and_then(|(_, result)| result.as_mut().ok())
                         .and_then(|delta| delta.completed_join.take());
                     let _returned = returned;
                     match completed {
@@ -2779,7 +2770,7 @@ impl JournalPending {
                 reply: Some(reply), ..
             } => {
                 let fault = returned
-                    .map(|(_, _, result)| {
+                    .map(|(_, result)| {
                         result
                             .err()
                             .map(|error| fault_of(&error))
@@ -2790,14 +2781,14 @@ impl JournalPending {
             }
             JournalAfter::Board { ack, .. } => {
                 let error = returned
-                    .and_then(|(_, _, result)| result.err())
+                    .and_then(|(_, result)| result.err())
                     .unwrap_or(Error::AtRestLocked);
                 let _ = ack.send(Err(error));
             }
             JournalAfter::PublicationRejected(rejected) => {
                 let fault = returned
                     .as_ref()
-                    .map(|(_, _, result)| {
+                    .map(|(_, result)| {
                         result
                             .as_ref()
                             .err()
@@ -2807,7 +2798,7 @@ impl JournalPending {
                     .unwrap_or(Fault::Internal);
                 let needs_purge = returned
                     .as_ref()
-                    .is_some_and(|(_, _, result)| result.as_ref().is_ok_and(|delta| !delta.purged))
+                    .is_some_and(|(_, result)| result.as_ref().is_ok_and(|delta| !delta.purged))
                     && publication_superseded(&rejected.waiting);
                 let fault = if needs_purge {
                     let authority = rejected
@@ -2840,12 +2831,11 @@ impl JournalPending {
                 if let Some(reply) = rejected.waiting.reply {
                     let _ = reply.send(Outcome::Failed(fault));
                 }
-                drop(rejected.transition);
             }
             JournalAfter::RoomWithdrawal(withdrawal) => {
                 let result = returned
                     .as_ref()
-                    .map(|(_, _, result)| result.as_ref().map(|_| 0).map_err(fault_of))
+                    .map(|(_, result)| result.as_ref().map(|_| 0).map_err(fault_of))
                     .unwrap_or(Err(Fault::Internal));
                 withdrawal.purpose.answer(room, result);
             }
@@ -2920,7 +2910,6 @@ impl Node {
                 }
                 JournalAfter::PublicationRejected(rejected) => {
                     self.fail_room_publication(room, rejected.waiting, Fault::Locked);
-                    drop(rejected.transition);
                 }
             }
             return;
@@ -2952,7 +2941,6 @@ impl Node {
                     Arc::clone(&rejected.instance),
                     rejected.epoch,
                     authority,
-                    rejected.transition.take(),
                     self.own_key_room_watch(room),
                 ))
             }
@@ -2994,7 +2982,7 @@ impl Node {
                         *output
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some((lifetime, None, Err(Error::AtRestLocked)));
+                            Some((lifetime, Err(Error::AtRestLocked)));
                         wake.notify_one();
                         return;
                     }
@@ -3028,7 +3016,7 @@ impl Node {
                         *output
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some((None, None, Err(error)));
+                            Some((None, Err(error)));
                         wake.notify_one();
                         return;
                     }
@@ -3039,44 +3027,19 @@ impl Node {
                 } else {
                     (lifetime, None)
                 };
-            let (transition, fence) = if let Some((
-                instance,
-                expected_epoch,
-                authority,
-                provided,
-                mut room_cancel,
-            )) = rejection
+            let fence = if let Some((instance, expected_epoch, authority, mut room_cancel)) =
+                rejection
             {
-                let mut transition = provided;
                 let acquired = async {
                     if *room_cancel.borrow() || *attachment.borrow() != epoch || !authority_superseded(&authority) {
                         return Err(Error::ComputerPolicySuperseded);
                     }
-                    let gate = tokio::select! {
+                    tokio::select! {
                         biased;
                         _ = room_cancel.changed() => return Err(Error::AtRestLocked),
                         _ = attachment.changed() => return Err(Error::AtRestLocked),
                         channel = instance.lock() => {
                             if channel.epoch() != expected_epoch { return Err(Error::AtRestLocked); }
-                            transition.is_none().then(|| Arc::clone(&channel.own_writer_gate))
-                        }
-                    };
-                    if let Some(gate) = gate {
-                        transition = Some(tokio::select! {
-                            biased;
-                            _ = room_cancel.changed() => return Err(Error::AtRestLocked),
-                            _ = attachment.changed() => return Err(Error::AtRestLocked),
-                            transition = gate.transition(None) => transition,
-                        });
-                        // The previous room owner can finish a rekey while the gate is awaited.
-                        // Recheck after acquiring it; no channel guard crosses native admission.
-                        tokio::select! {
-                            biased;
-                            _ = room_cancel.changed() => return Err(Error::AtRestLocked),
-                            _ = attachment.changed() => return Err(Error::AtRestLocked),
-                            channel = instance.lock() => {
-                                if channel.epoch() != expected_epoch { return Err(Error::AtRestLocked); }
-                            }
                         }
                     }
                     if *room_cancel.borrow() || *attachment.borrow() != epoch || !authority_superseded(&authority) {
@@ -3085,18 +3048,18 @@ impl Node {
                     Ok(())
                 }.await;
                 match acquired {
-                    Ok(()) => (transition, Some((authority, room_cancel))),
+                    Ok(()) => Some((authority, room_cancel)),
                     Err(error) => {
                         *output
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some((lifetime, transition, Err(error)));
+                            Some((lifetime, Err(error)));
                         wake.notify_one();
                         return;
                     }
                 }
             } else {
-                (None, None)
+                None
             };
             let held = lifetime.as_ref().map(Arc::clone);
             let saved = tokio::task::spawn_blocking(move || {
@@ -3181,8 +3144,7 @@ impl Node {
             .unwrap_or_else(|_| Err(Error::Profile("native join journal worker stopped")));
             *output
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((lifetime, transition, saved));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((lifetime, saved));
             wake.notify_one();
         });
         self.pending_metadata
@@ -3340,7 +3302,7 @@ impl Node {
             })
             .unwrap_or_default();
         let completed = !ready.is_empty();
-        for (room, (lifetime, transition, result)) in ready {
+        for (room, (lifetime, result)) in ready {
             let Some(mut pending) = self
                 .pending_metadata
                 .as_mut()
@@ -3349,9 +3311,6 @@ impl Node {
                 continue;
             };
             let following = pending.following_withdrawal.take();
-            if let JournalAfter::PublicationRejected(rejected) = &mut pending.after {
-                rejected.transition = transition;
-            }
             let current = pending.epoch == self.delivery_epoch
                 && match &pending.instance {
                     Some(instance) => self
@@ -3503,13 +3462,11 @@ impl Node {
                                 rejected.waiting,
                                 Fault::RoomChangePending,
                             );
-                            drop(rejected.transition);
                             self.resume_metadata_withdrawal(room, following);
                             continue;
                         }
                         Err(error) => {
                             self.fail_room_publication(room, rejected.waiting, fault_of(&error));
-                            drop(rejected.transition);
                             self.resume_metadata_withdrawal(room, following);
                             continue;
                         }
@@ -3525,7 +3482,6 @@ impl Node {
                         };
                     if !attached {
                         self.fail_room_publication(room, rejected.waiting, Fault::ChannelNotOpen);
-                        drop(rejected.transition);
                         self.resume_metadata_withdrawal(room, following);
                         continue;
                     }
@@ -3538,10 +3494,8 @@ impl Node {
                     if delta.purged {
                         self.publish().await;
                         self.fail_room_publication(room, rejected.waiting, Fault::ComputerPolicy);
-                        drop(rejected.transition);
                     } else if !publication_superseded(&rejected.waiting) {
                         self.fail_room_publication(room, rejected.waiting, Fault::ComputerPolicy);
-                        drop(rejected.transition);
                     } else {
                         // Match the former purge failure projection: narrow the live room before
                         // attempting its durable deletion, while retaining its ORIGINAL fence.
@@ -3843,7 +3797,6 @@ impl Node {
         &mut self,
         room: Digest32,
         channel: ChannelState,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         reply: Option<oneshot::Sender<Outcome>>,
         reopening: bool,
@@ -3864,7 +3817,6 @@ impl Node {
         }
         self.begin_publish_open_channel(
             channel,
-            transition,
             lifetime,
             OpenCallback {
                 reply,
@@ -4625,16 +4577,10 @@ fn queue_join_rollback(
     delta.withdrawal = Some(withdrawn.get(&room).cloned());
     delta.join = Some(None);
     delta.purged = true;
-    #[cfg(feature = "test-knobs")]
-    let durable = !crate::node::computer::fx28_mutant("withdrawal-not-durable");
-    #[cfg(not(feature = "test-knobs"))]
-    let durable = true;
-    if durable {
-        batch.put_meta(
-            PENDING_WITHDRAWALS_META_KEY,
-            &pending_withdrawals_bytes(&withdrawn)?,
-        )?;
-    }
+    batch.put_meta(
+        PENDING_WITHDRAWALS_META_KEY,
+        &pending_withdrawals_bytes(&withdrawn)?,
+    )?;
     batch.put_meta(
         PENDING_JOIN_CLEANUP_META_KEY,
         &pending_withdrawals_bytes(&unfinished)?,
@@ -4650,7 +4596,6 @@ enum PublicationRejectStage {
 }
 struct PublicationRejection {
     waiting: RoomPublication,
-    transition: Option<crate::node::channel::own_writer_gate::Transition>,
     instance: SharedChannel,
     epoch: u64,
     stage: PublicationRejectStage,
@@ -4674,7 +4619,6 @@ impl Node {
         &mut self,
         room: Digest32,
         mut waiting: RoomPublication,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
     ) {
         if !publication_superseded(&waiting) {
             self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
@@ -4736,7 +4680,6 @@ impl Node {
             work,
             JournalAfter::PublicationRejected(PublicationRejection {
                 waiting,
-                transition,
                 instance,
                 epoch,
                 stage: PublicationRejectStage::Withdraw,

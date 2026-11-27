@@ -44,6 +44,82 @@ pub(super) fn hash_key(hash: &Digest32) -> session_tree::Key {
     key
 }
 
+/// The row of `target`'s return cut in `SenderRemovalCuts` (R3): one per member, holding the
+/// cut of its current return. A removal row is keyed by its entry hash with a zero tail.
+pub(super) fn return_cut_key(target: &Digest32) -> session_tree::Key {
+    let mut preimage = Vec::with_capacity(17 + 32);
+    preimage.extend_from_slice(b"vox/return-cut/v1");
+    preimage.extend_from_slice(target);
+    hash_key(&crate::hash::sha256(&preimage))
+}
+
+/// A return cut record, version 3 of the sender cut table:
+/// `[3, target, sender, chain, next_iteration, [entitlement], departure, return_hash]`.
+pub(in crate::node::channel) struct ReturnCut {
+    pub(super) sender: Digest32,
+    pub(in crate::node::channel) chain: u64,
+    pub(super) iteration: u64,
+    pub(in crate::node::channel) entitlement: Option<(u64, u64)>,
+    /// The sequence of the member's latest departure before its return; 0 when none is held.
+    pub(super) departure: u64,
+    /// The member's signed return Presence.
+    pub(in crate::node::channel) back: Digest32,
+}
+
+impl ReturnCut {
+    pub(super) fn parse(bytes: &[u8], target: &Digest32) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 8 || d.uint()? != 3 || d.bytes()? != target {
+            return Err(invalid("return cut binding"));
+        }
+        let sender = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("return cut sender"))?;
+        let chain = d.uint()?;
+        let iteration = d.uint()?;
+        let entitlement = match d.array()? {
+            0 => None,
+            2 => Some((d.uint()?, d.uint()?)),
+            _ => return Err(invalid("return cut entitlement")),
+        };
+        let departure = d.uint()?;
+        let back = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("return cut presence"))?;
+        d.finish()?;
+        Ok(Self {
+            sender,
+            chain,
+            iteration,
+            entitlement,
+            departure,
+            back,
+        })
+    }
+
+    fn encode(&self, target: &Digest32) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(8)
+            .uint(3)
+            .bytes(target)
+            .bytes(&self.sender)
+            .uint(self.chain)
+            .uint(self.iteration);
+        match self.entitlement {
+            Some((chain, iteration)) => {
+                e.array(2).uint(chain).uint(iteration);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(self.departure).bytes(&self.back);
+        e.finish()
+    }
+}
+
 pub(super) fn position(author: &Digest32, seq: u64) -> session_tree::Key {
     let mut key = hash_key(author);
     key[32..40].copy_from_slice(&seq.to_be_bytes());
@@ -1019,6 +1095,18 @@ impl<'a, 'store> Write<'a, 'store> {
         if self.get(Table::SenderRemovalCuts, &key)?.is_some() {
             return Ok(());
         }
+        let mut e = Encoder::new();
+        e.array(6).uint(2).bytes(target);
+        self.sender_boundary(&mut e, target)?;
+        let record = self.save_record(None, &e.finish())?;
+        self.put(Table::SenderRemovalCuts, key, Some(record))?;
+        self.batch.ruled();
+        Ok(())
+    }
+
+    /// Encode this node's sender position and `target`'s entitlement, as this batch holds them:
+    /// `sender, chain, next_iteration, [entitlement]`.
+    fn sender_boundary(&self, e: &mut Encoder, target: &Digest32) -> Result<()> {
         let Some(segment) = self.batch.get_segment(
             self.room,
             SegmentKind::KeyMaterial,
@@ -1052,11 +1140,7 @@ impl<'a, 'store> Write<'a, 'store> {
             })
             .transpose()?
             .flatten();
-        let mut e = Encoder::new();
-        e.array(6)
-            .uint(2)
-            .bytes(target)
-            .bytes(&sender.author_id())
+        e.bytes(&sender.author_id())
             .uint(sender.chain_id())
             .uint(sender.next_iteration());
         match entitlement {
@@ -1067,8 +1151,38 @@ impl<'a, 'store> Write<'a, 'store> {
                 e.array(0);
             }
         }
-        let record = self.save_record(None, &e.finish())?;
+        Ok(())
+    }
+
+    /// Record `target`'s return at the entry `back` after `departure` (R3, ruling-4 §5.1), as
+    /// `reconcile_return` decided it. The return already handled — the row holds
+    /// `back` — keeps its cut and only has its departure rebound: no later cut, no second bump.
+    /// A new return records this node's sender position as its first cut and advances the
+    /// membership counter once, in this same batch.
+    pub(super) fn record_return_cut(
+        &mut self,
+        target: &Digest32,
+        departure: u64,
+        back: &Digest32,
+    ) -> Result<()> {
+        let key = return_cut_key(target);
+        let old = self.get(Table::SenderRemovalCuts, &key)?;
+        if let Some(id) = old {
+            let mut cut = ReturnCut::parse(&self.record(id)?, target)?;
+            if cut.back == *back {
+                cut.departure = departure;
+                self.save_record(Some(id), &cut.encode(target))?;
+                self.batch.ruled();
+                return Ok(());
+            }
+        }
+        let mut e = Encoder::new();
+        e.array(8).uint(3).bytes(target);
+        self.sender_boundary(&mut e, target)?;
+        e.uint(departure).bytes(back);
+        let record = self.save_record(old, &e.finish())?;
         self.put(Table::SenderRemovalCuts, key, Some(record))?;
+        self.advance_removal_generation()?;
         self.batch.ruled();
         Ok(())
     }

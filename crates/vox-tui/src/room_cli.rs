@@ -7088,7 +7088,6 @@ pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    full_history: bool,
     drive: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
@@ -7126,7 +7125,6 @@ pub async fn trust_add(
         target,
         petname: petname.to_owned(),
         identity_passphrase,
-        full_history,
         drive,
     })
     .await
@@ -7146,10 +7144,6 @@ pub async fn trust_add(
             // error, and the command exits 0.
             if answer == Frame::TrustedKeyPending {
                 println!("vox: {}", vox_core::node::api::Outcome::KEY_PENDING);
-            }
-            if full_history {
-                println!("     with full history: it may also read what you wrote before now");
-                println!("     In rooms that removed this identity, readmission does not restore earlier history.");
             }
             println!(
                 "     it may now read what you write in {} — now and later",

@@ -12,7 +12,6 @@ pub(crate) enum Work {
     Fence,
     Refresh,
     Receiver,
-    Audit,
     Ranges,
     Complete,
     Inspect,
@@ -30,29 +29,16 @@ pub(crate) enum Saved {
     Inactive,
     Fence(bool),
     Receiver(bool),
-    Audit(OwnReadability),
     Ranges,
-    Recovered(bool),
+    /// Own recovery completed (`changed`); `returned` when it completed after this node's own
+    /// departure, so this node is back in the room and reads from its return on.
+    Recovered {
+        changed: bool,
+        returned: bool,
+    },
     Inspected(Option<(Digest32, u64, bool)>),
 }
 
-pub(crate) struct Audit {
-    pub(crate) outcome: OwnReadability,
-    pub(crate) write: Option<AuditWrite>,
-}
-pub(crate) struct AuditWrite {
-    pub(crate) marker: Vec<u8>,
-    pub(crate) cursor: SealedSegment,
-    pub(crate) render_from: Option<u64>,
-}
-impl Audit {
-    pub(crate) fn unchanged(outcome: OwnReadability) -> Self {
-        Self {
-            outcome,
-            write: None,
-        }
-    }
-}
 pub(crate) struct Ranges {
     pub(crate) marker: Vec<u8>,
     pub(crate) binding: TreeBinding,
@@ -163,7 +149,6 @@ enum Operation {
     Unchanged(Saved),
     Fence(Option<PendingOwnRecovery>),
     Receiver(Box<Seed>),
-    Audit(Audit),
     Ranges(Ranges),
     LegacySettle,
 }
@@ -179,6 +164,8 @@ enum AppendMode {
         here: bool,
         settle: bool,
         recover: bool,
+        /// Set by `Work::Complete` when this node's latest own Presence says it left.
+        returned: bool,
     },
     Presence,
     Shares(Vec<(String, ServiceKind)>),
@@ -189,7 +176,14 @@ impl AppendMode {
     /// stage's completion, and its installer clears both (`own_behind` and unsettled).
     fn saved(&self, changed: bool, sparse: bool) -> Saved {
         match self {
-            Self::Rotate { recover: true, .. } => Saved::Recovered(changed),
+            Self::Rotate {
+                recover: true,
+                returned,
+                ..
+            } => Saved::Recovered {
+                changed,
+                returned: *returned,
+            },
             Self::Rotate { settle: true, .. } => Saved::Settlement {
                 changed,
                 sparse,
@@ -314,19 +308,31 @@ impl ChannelState {
             }
             Work::Refresh => Operation::Fence(self.prepare_own_recovery(store)?),
             Work::Inspect => Operation::Unchanged(Saved::Inspected(self.own_recovery_key(store)?)),
-            Work::Audit => Operation::Audit(self.prepare_own_readability(store, now)?),
             Work::Ranges => Operation::Ranges(self.prepare_own_append_ranges(store)?),
             Work::Receiver => {
                 let me = self.me();
                 let slot = (me, self.sender.chain_id());
-                if !self.own_behind
+                // `test-knobs` mutant `VOX_TEST_FWD_MUTANT=receiver-off`: the local Receiver stage
+                // installs nothing, so own posts this copy lacks are not readable from local keys.
+                #[cfg(feature = "test-knobs")]
+                let receiver_off =
+                    std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("receiver-off");
+                #[cfg(not(feature = "test-knobs"))]
+                let receiver_off = false;
+                let skip = !self.own_behind
                     || !matches!(self.own_recovery, Recovery::Head(_))
                     || !self.origins.has(&self.channel_id, self.epoch, slot.1)
                     || self
                         .receivers
                         .get(&slot)
-                        .is_some_and(|chain| chain.recovers_own_sender(&self.sender))
-                {
+                        .is_some_and(|chain| chain.recovers_own_sender(&self.sender));
+                if receiver_off && !skip {
+                    eprintln!(
+                        "test-knobs: receiver-off mutant engaged: own sender chain {:?} not installed",
+                        slot.1
+                    );
+                }
+                if receiver_off || skip {
                     Operation::Unchanged(Saved::Receiver(false))
                 } else {
                     if !self.receivers.contains_key(&slot)
@@ -394,6 +400,7 @@ impl ChannelState {
                                 here: true,
                                 settle: true,
                                 recover: false,
+                                returned: false,
                             },
                             now,
                         )
@@ -414,7 +421,10 @@ impl ChannelState {
                     }
                 }
                 if !self.own_behind {
-                    Operation::Unchanged(Saved::Recovered(false))
+                    Operation::Unchanged(Saved::Recovered {
+                        changed: false,
+                        returned: false,
+                    })
                 } else {
                     self.require_own_recovery_complete(store)?;
                     let retained = super::super::own_history::load_continuity(
@@ -447,6 +457,7 @@ impl ChannelState {
                                 here: true,
                                 settle: !self.settled,
                                 recover: true,
+                                returned: self.said_left(&self.me()),
                             },
                             now,
                         )
@@ -499,6 +510,7 @@ impl ChannelState {
                                 here: !self.said_left(&me),
                                 settle: false,
                                 recover: false,
+                                returned: false,
                             },
                             now,
                         )
@@ -713,29 +725,6 @@ impl Prepared {
                         delta = Delta::Receiver(slot, Box::new(candidate));
                         Ok(Saved::Receiver(true))
                     }),
-                    Operation::Audit(audit) => {
-                        if let Some(write) = audit.write {
-                            capsule.sek.with(|sek| {
-                                let mut batch = store.batch()?;
-                                check_marker(&batch, sek, &capsule.room, &write.marker)?;
-                                if let Some(seq) = write.render_from {
-                                    let entries = entry_store::EntryIndex::default();
-                                    let mut index =
-                                        entries.write(&mut batch, sek, &capsule.room)?;
-                                    index.queue_backfill(signer.fingerprint(), Some(seq))?;
-                                    index.seal()?;
-                                }
-                                batch.put_segment(
-                                    &capsule.room,
-                                    SegmentKind::KeyMaterial,
-                                    SEG_OWN_READABILITY,
-                                    &write.cursor,
-                                )?;
-                                batch.commit()
-                            })?;
-                        }
-                        Ok(Saved::Audit(audit.outcome))
-                    }
                     Operation::Ranges(ranges) => capsule.sek.with(|sek| {
                         let mut batch = store.batch()?;
                         check_marker(&batch, sek, &capsule.room, &ranges.marker)?;
@@ -769,6 +758,7 @@ impl Prepared {
                             here,
                             settle,
                             recover,
+                            ..
                         } => {
                             let next = SenderChain::new(
                                 &append.pending.room,

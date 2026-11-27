@@ -237,10 +237,14 @@ The terminal interface shows `[locked — not shared with you]` for a message yo
 
 **Check:** both of you run `vox trust list` and `vox room roster family`, and compare whole
 fingerprints, not names. Then run `vox status`: each member's line says whether it is `trusted`
-and `connected`, and when it last synced.
+and `connected`, and when it last synced. If the `sync, per room and peer` line for the other
+member says `last failure: that computer runs another Vox version; this computer exchanges no
+history or keys with it until both run the same version`, nothing is exchanged with that computer
+until it runs the same Vox as yours.
 
-**Fix:** if a trust decision is missing, make it on the right side. If trust is right, get both
-nodes online and let them sync. Do not remove and add trust again.
+**Fix:** if a trust decision is missing, make it on the right side. If the versions differ, update
+the older computer. If trust is right, get both nodes online and let them sync. Do not remove and
+add trust again.
 
 **Confirm:** post a new message and see it on the other node, then the other way round.
 
@@ -321,16 +325,26 @@ until it verifies the missing prefix and recovers the content and sender state n
 safely. Held messages and incoming peer messages remain readable during recovery.
 
 **Check:** run `vox status --node <name>` for the affected node. A connected member's held
-position is not a promise that it still has every missing body or historical key.
+position is not a promise that it still has every missing body.
 
-**Fix:** keep a trusted room member that retains the missing entries and keys online and reachable.
+**Fix:** keep a trusted room member that retains the missing entries online and reachable.
 Recovery runs automatically, including gaps older than the live window, and resumes after restart.
-Do not remove trust, leave and rejoin, erase the profile, or run another copy of the same node
-to bypass the refusal. Missing data cannot be recreated if no member retains it.
+It needs the entries only: no key is asked for over the network, and your node opens its own
+recovered messages with the keys it still holds. Do not remove trust, leave and rejoin, erase the
+profile, or run another copy of the same node to bypass the refusal. Missing data cannot be
+recreated if no member retains it.
 
-**Confirm:** the daemon says `this node recovered its own history; it can write here again`.
-`vox room read` shows the recovered messages as this node's own, and another member reads its
-next new post.
+**Confirm:** the daemon says `this node recovered its own history; it can write here again`, or,
+after joining a room again, `this node is back in this room: it reads what is written from now on
+and can write here again`. `vox room read` shows the recovered messages this node still holds keys
+for as its own, and another member reads its next new post.
+
+If an older-history request says `The oldest posts held here of N member(s) cannot be read with
+the keys this node retains. Coming back to a room does not restore earlier keys.`, no key this
+node holds opens those posts now. For posts written before this node was trusted or before it
+came back, and for posts under a key it has deleted, that is final: no member is asked for them.
+A key a member still owes this node, for posts written while it was offline, can still arrive;
+those posts are shown when it does.
 
 If `vox room join` says `this room was not joined: a member holds signed history of this node in
 it that this node cannot reconcile with its own record`, the join added nothing to this node, so

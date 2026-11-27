@@ -341,7 +341,10 @@ impl Node {
             return;
         };
         if let Work::Create(created) = &parked.work {
-            if self.room_named(&created.name).is_some() {
+            // The create reserved its own name when it began; only another room's hold on it
+            // refuses, and the search leaves this create out so its reservation hides none.
+            if self.name_held_by_other(&created.name, &parked.room) {
+                self.join_name_reservations.remove(&parked.room);
                 let _ = parked.reply.send(Outcome::Failed(Fault::RoomNameTaken));
                 return;
             }

@@ -1,7 +1,6 @@
 //! Own recovery and settlement advance only from the retained native stage's real result.
 use super::*;
 use crate::node::channel::pending_text::recovery;
-use crate::node::channel::OwnReadability;
 use crate::node::store::Store;
 
 use recovery::Work as Step;
@@ -36,7 +35,6 @@ enum Stage {
     Shares,
     Fence,
     Receiver,
-    Audit,
     Ranges,
     Complete,
     Inspect,
@@ -56,8 +54,9 @@ pub(super) struct Continuation {
     back: bool,
     changed: bool,
     completed: bool,
+    /// The completion came after this node's own departure: it is back in the room.
+    returned: bool,
     receiver_changed: bool,
-    audit: OwnReadability,
     now: crate::time::Ms,
 }
 impl Continuation {
@@ -81,8 +80,8 @@ impl Continuation {
             back: false,
             changed: false,
             completed: false,
+            returned: false,
             receiver_changed: false,
-            audit: OwnReadability::Waiting,
             now,
         }
     }
@@ -197,7 +196,6 @@ impl Node {
             Stage::Shares => Step::Shares,
             Stage::Fence => Step::Fence,
             Stage::Receiver => Step::Receiver,
-            Stage::Audit => Step::Audit,
             Stage::Ranges => Step::Ranges,
             Stage::Complete => Step::Complete,
             Stage::Inspect => Step::Inspect,
@@ -313,21 +311,21 @@ impl Node {
                 if matches!(continuation.stage, Stage::Receiver)
                     && matches!(error, Error::OwnHistoryBehind)
                 {
-                    continuation.stage = Stage::Audit;
+                    // No local receiver covers the own sender: nothing is asked of the
+                    // network; the feed fence decides at Ranges and Complete.
+                    continuation.stage = Stage::Ranges;
                     self.continue_recovery_stage(room, continuation, reply)
                         .await;
                 } else if matches!(continuation.stage, Stage::Receiver)
                     && ChannelState::receiver_release_cleanup_waiting(&error)
                 {
                     self.governance_work.wake_room(room);
-                    continuation.audit = OwnReadability::Waiting;
                     continuation.stage = Stage::Inspect;
                     self.continue_recovery_stage(room, continuation, reply)
                         .await;
                 } else if matches!(continuation.stage, Stage::Ranges | Stage::Complete)
                     && matches!(error, Error::OwnHistoryBehind)
                 {
-                    continuation.audit = OwnReadability::Waiting;
                     continuation.stage = Stage::Inspect;
                     self.continue_recovery_stage(room, continuation, reply)
                         .await;
@@ -404,19 +402,13 @@ impl Node {
             }
             (Stage::Receiver, Saved::Receiver(changed)) => {
                 continuation.receiver_changed |= changed;
-                Stage::Audit
-            }
-            (Stage::Audit, Saved::Audit(audit)) => {
-                continuation.audit = audit;
-                if audit == OwnReadability::Complete {
-                    Stage::Ranges
-                } else {
-                    Stage::Inspect
-                }
+                Stage::Ranges
             }
             (Stage::Ranges, Saved::Ranges) => Stage::Complete,
-            (Stage::Complete, Saved::Recovered(completed)) => {
-                continuation.completed |= completed;
+            (Stage::Complete, Saved::Recovered { changed, returned }) => {
+                continuation.completed |= changed;
+                continuation.returned |= changed && returned;
+                let completed = changed;
                 // Own history recovered (and the room settled, when this rotation also settled
                 // it): what waited for either (`OwnHistoryBehind`, `RoomNotSynced`) goes on.
                 if completed {
@@ -492,31 +484,11 @@ impl Node {
         key: Option<(Digest32, u64, bool)>,
     ) {
         let shared = &continuation.instance;
-        let audit = continuation.audit;
-        if audit == OwnReadability::Runnable {
-            self.governance_work.wake_room(room);
-        }
         // A missing own body (BodyDebt) or a readable own body whose effect has not settled
         // (EffectReady) is not a walked position: the connections' loops owe it, the room's
         // admission settles it, and each admission wakes these stages again (`actor.rs`,
-        // after `room_advanced`).
-        // An own sender key the audit lacks is the loops' debt (OwnRelease, `pull::own_release`):
-        // asked of a peer whose own-release section says it can release it. Any other audit
-        // result clears it: the next contiguous position comes first.
-        let key_debt = match audit {
-            OwnReadability::KeyDebt {
-                epoch,
-                chain,
-                iteration,
-                ..
-            } => Some(crate::node::history_stream::pull::OwnKeyDebt {
-                epoch,
-                chain,
-                iteration,
-            }),
-            _ => None,
-        };
-        self.history_frontier.owe_own_key(room, key_debt);
+        // after `room_advanced`). A new own receiver makes held posts readable: the room
+        // renders them.
         if continuation.receiver_changed {
             self.governance_work.wake_room(room);
         }
@@ -532,7 +504,9 @@ impl Node {
             }
         }
         if continuation.changed || continuation.completed {
-            let note = if continuation.completed {
+            let note = if continuation.completed && continuation.returned {
+                "this node is back in this room: it reads what is written from now on and can write here again"
+            } else if continuation.completed {
                 "this node recovered its own history; it can write here again"
             } else if shared
                 .try_lock()

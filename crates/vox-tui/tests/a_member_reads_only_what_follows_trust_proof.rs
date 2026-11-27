@@ -129,7 +129,13 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .expect("APPARATUS: create a staging file");
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: create a staging file");
-    let mut child = Command::new(VOX)
+    let mut cmd = Command::new(VOX);
+    // The run's forward-only mutant selector reaches the daemon only by name: a proof process
+    // keeps no `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
+    if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
+        cmd.env("VOX_TEST_FWD_MUTANT", mutant);
+    }
+    let mut child = cmd
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -350,7 +356,12 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
 #[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; optional, run it in release"]
 fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    // A run that keeps its daemons' directories shows a mutant's engaged line in their logs.
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {

@@ -256,8 +256,7 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
                     .unwrap_or_default();
                 let default = hint.as_deref().or(presented.as_deref());
                 let name = trust_name(&a, default)?;
-                crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
-                    .await
+                crate::room_cli::trust_add(&paths, target, &name, a.drive).await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
@@ -2186,11 +2185,6 @@ pub struct TrustAddArgs {
     /// and there is a terminal.
     #[arg(long)]
     pub name: Option<String>,
-    /// What trusting it releases of **your own** messages: `now`,
-    /// the default, from now on; or `full`, everything you still hold a key
-    /// for, so it also reads what you wrote before. Your messages only — nobody else's.
-    #[arg(long, value_parser = ["now", "full"], default_value = "now")]
-    pub history: String,
     /// Grant read + drive: it may also drive this node's Sessions. Without it
     /// the entry grants read, the default.
     #[arg(long)]

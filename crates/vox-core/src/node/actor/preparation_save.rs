@@ -85,7 +85,7 @@ impl State {
 }
 
 /// A queued policy writer fences fresh ingress, not the continuation which owns the
-/// publication reader that writer is waiting to retire. Keep the existing due/gate checks.
+/// publication reader that writer is waiting to retire. Keep the existing due check.
 pub(super) fn turn_eligible(
     prepared: &RoomPreparation,
     now: std::time::Instant,
@@ -93,10 +93,6 @@ pub(super) fn turn_eligible(
 ) -> bool {
     !prepared.save.is_pending()
         && (allow_fresh || prepared.save.has_lifetime())
-        && !matches!(
-            prepared.recovery_writer_gate,
-            Some(RecoveryWriterGate::Waiting { .. })
-        )
         && prepared.legacy_cleanup_due.is_none_or(|due| now >= due)
 }
 

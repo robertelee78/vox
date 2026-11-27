@@ -9,8 +9,6 @@ use maintenance_save::{Lifetime, Saved, Work};
 mod outbound;
 mod rekeys;
 pub(super) use rekeys::RekeyAfter;
-#[cfg(feature = "test-knobs")]
-pub(super) use rekeys::Target as HeldRekeyTarget;
 
 type Cursor = Arc<std::sync::Mutex<Owed>>;
 type Reply = Option<oneshot::Sender<Outcome>>;
@@ -52,10 +50,7 @@ pub(super) struct Offline {
 }
 
 enum Route {
-    Online {
-        conn: Arc<VoxConnection>,
-        modern: bool,
-    },
+    Online { conn: Arc<VoxConnection> },
     Offline(Offline),
 }
 
@@ -74,11 +69,6 @@ enum Stage {
         queue: mpsc::OwnedPermit<PairwiseJob>,
         job: PairwiseJob,
     },
-    Legacy {
-        conn: Arc<VoxConnection>,
-        queue: mpsc::OwnedPermit<PairwiseJob>,
-        credit: PairwiseCredit,
-    },
     Offline {
         route: Offline,
         posted_as: Digest32,
@@ -91,10 +81,7 @@ enum Stage {
         posted_as: Digest32,
     },
     Delivered(Offline),
-    Acknowledged {
-        history: bool,
-        whole_history: bool,
-    },
+    Acknowledged,
 }
 
 pub(super) struct Continuation {
@@ -103,7 +90,6 @@ pub(super) struct Continuation {
     lifetime: Option<Arc<Lifetime>>,
     target: Digest32,
     asked: bool,
-    history: crate::node::trust::HistoryGrant,
     decision: Option<crate::node::consent_order::Stamp>,
     plan: Option<ReleasePlan>,
     cursor: Option<Cursor>,
@@ -139,9 +125,7 @@ impl Continuation {
                 .is_some_and(|current| Arc::ptr_eq(current, &self.instance))
     }
     fn trusted(&self, node: &Node) -> bool {
-        node.trust.is_trusted(&self.target)
-            && node.trust.history(&self.target) == self.history
-            && node.trust_decision(&self.target) == self.decision
+        node.trust.is_trusted(&self.target) && node.trust_decision(&self.target) == self.decision
     }
     fn rekey_authorized(&self, node: &Node, lifetime: &Lifetime) -> crate::error::Result<()> {
         let guard = self.cursor.as_ref().and_then(|cursor| {
@@ -167,7 +151,6 @@ impl Node {
         room: Digest32,
         target: Digest32,
         generation: u64,
-        history: bool,
         removal_generation: u64,
         whole_history: bool,
     ) {
@@ -183,15 +166,11 @@ impl Node {
             lifetime: None,
             target,
             asked: false,
-            history: self.trust.history(&target),
             decision: self.trust_decision(&target),
             plan: None,
             cursor: None,
             prekey: None,
-            stage: Stage::Acknowledged {
-                history,
-                whole_history,
-            },
+            stage: Stage::Acknowledged,
         };
         self.begin_pending_maintenance(
             room,
@@ -529,7 +508,6 @@ impl Node {
             lifetime,
             target,
             asked,
-            history: self.trust.history(&target),
             decision: self.trust_decision(&target),
             plan: None,
             cursor: Some(cursor),
@@ -590,18 +568,27 @@ impl Node {
                 return Err(Fault::NotAdmitted.into());
             }
         }
+        // A member that came back takes room keys only by return-bound log package (R4): its
+        // consent goes the offline way, never on a connection.
+        let returned = instance.lock().await.key_returned(&target);
+        if returned {
+            self.begin_owned_offline_consent(room, target, 0, room, asked)
+                .await;
+            return Err(Fault::Unreachable.into());
+        }
+        // A connection without a version-3 exchange for the room carries no key (R10): the
+        // consent stays owed, as for a member out of reach.
         let conn = self
             .reach_member(&room, target, asked)
             .await
+            .filter(|conn| self.key_connection(&room, conn).is_some())
             .ok_or(Fault::Unreachable)?;
         // The frame selects and reserves its bundle once. A probe here would reset the
         // signed-prekey grace before that selection and make it wait again.
-        let modern = !matches!(self.older.get(&(room, target)), Some(false));
-        let history = self.trust.history(&target);
         let decision = self.trust_decision(&target);
         let (skdm, plan, hold) = {
             let channel = instance.lock().await;
-            self.prepare_owned_consent_key(&channel, target, history, decision)?
+            self.prepare_owned_consent_key(&channel, target, decision)?
         };
         let continuation = Continuation {
             instance,
@@ -609,12 +596,11 @@ impl Node {
             lifetime,
             target,
             asked,
-            history,
             decision,
             plan,
             cursor: Some(cursor),
             prekey: None,
-            stage: Stage::Hold(Route::Online { conn, modern }),
+            stage: Stage::Hold(Route::Online { conn }),
         };
         if hold {
             Ok(self
@@ -640,7 +626,6 @@ impl Node {
         &self,
         channel: &ChannelState,
         target: Digest32,
-        history: crate::node::trust::HistoryGrant,
         decision: Option<crate::node::consent_order::Stamp>,
     ) -> std::result::Result<(Skdm, Option<ReleasePlan>, bool), Fault> {
         let profile = self.profile.as_ref().ok_or(Fault::UnknownChannel)?;
@@ -677,30 +662,46 @@ impl Node {
             // whose selection refresh would retake the room before its rotation can be saved.
             return Err(Fault::GovernanceRefreshing);
         }
-        // A creator readmission is a new forward boundary regardless of the
-        // retained global trust history setting or an old pending SKDM.
+        if channel.key_departed(&target) {
+            return Err(Fault::NotAdmitted);
+        }
+        // A consent delivers from the entitlement already held (R5): a returned or readmitted
+        // member's floor is its rotation's fresh chain, and re-issued consent keeps its floor.
+        // A key at the current position is never evidence that earlier iterations went.
+        if let Some((generation, iteration)) = channel.entitled_from(&target) {
+            let live = channel.sender_generation();
+            let key = if generation == live {
+                channel.release_generation(profile, &target, generation, iteration)
+            } else if generation < live {
+                // The live generation at its origin; the consent save owes the older ones from
+                // the merged floor.
+                channel.rekey_skdm(profile, &target)
+            } else {
+                Err(Error::MalformedAtRest(
+                    "entitlement past the live generation",
+                ))
+            };
+            return key
+                .map(|key| (key, None, true))
+                .map_err(|error| fault_of(&error));
+        }
+        // A creator readmission or a return is a new forward boundary regardless of an old
+        // pending SKDM or trust mark.
         let once_removed = !channel
             .validated_member_removals(profile.store(), &target, self.now_ms())
             .map_err(|error| fault_of(&error))?
             .is_empty();
-        #[cfg(feature = "test-knobs")]
-        let once_removed = once_removed
-            && std::env::var("VOX_TEST_FX62_MUTANT").as_deref() != Ok("readmission-full-plan");
-        if once_removed {
+        if once_removed || channel.key_returned(&target) {
             return channel
-                .skdm_for_consent(profile)
+                .skdm_for_consent(profile, &target)
                 .map(|key| (key, None, true))
                 .map_err(|error| fault_of(&error));
         }
         let selected = (|| -> crate::error::Result<_> {
-            if history == crate::node::trust::HistoryGrant::Full {
-                let (live, plan) = channel.full_consent_release(profile)?;
-                return Ok((live, Some(plan), false));
-            }
             let plan = channel.history_plan(profile.store(), &target, decision)?;
             if let Some(&(generation, iteration)) = plan.as_ref().and_then(|plan| plan.last()) {
                 return Ok((
-                    channel.release_generation(profile, generation, iteration)?,
+                    channel.release_generation(profile, &target, generation, iteration)?,
                     plan,
                     false,
                 ));
@@ -712,7 +713,7 @@ impl Node {
                 .filter(|key| key.body.epoch == channel.epoch());
             let key = match held {
                 Some(key) => key,
-                None => channel.skdm_for_consent(profile)?,
+                None => channel.skdm_for_consent(profile, &target)?,
             };
             Ok((key, None, true))
         })();
@@ -733,11 +734,10 @@ impl Node {
         let Some(instance) = self.channels.get(&room).cloned() else {
             return;
         };
-        let history = self.trust.history(&peer);
         let decision = self.trust_decision(&peer);
         let selected = {
             let channel = instance.lock().await;
-            self.prepare_owned_consent_key(&channel, peer, history, decision)
+            self.prepare_owned_consent_key(&channel, peer, decision)
         };
         let Ok((skdm, plan, hold)) = selected else {
             return;
@@ -749,7 +749,6 @@ impl Node {
             lifetime: None,
             target: peer,
             asked,
-            history,
             decision,
             plan,
             cursor: None,
@@ -786,21 +785,7 @@ impl Node {
         reply: Reply,
     ) {
         let fault = fault_of(&error);
-        if let Stage::Acknowledged {
-            history: _history,
-            whole_history: _whole_history,
-        } = &continuation.stage
-        {
-            #[cfg(feature = "test-knobs")]
-            if continuation.attached(self, &room) {
-                self.mark_delivery_drained_for_proof(
-                    room,
-                    continuation.target,
-                    *_history,
-                    *_whole_history,
-                    false,
-                );
-            }
+        if let Stage::Acknowledged = &continuation.stage {
             if let Some(reply) = reply {
                 let _ = reply.send(Outcome::Failed(fault));
             }
@@ -971,8 +956,7 @@ impl Node {
             return;
         }
         if !continuation.attached(self, &room)
-            || (!matches!(&continuation.stage, Stage::Acknowledged { .. })
-                && !continuation.trusted(self))
+            || (!matches!(&continuation.stage, Stage::Acknowledged) && !continuation.trusted(self))
         {
             self.fail_owned_consent(
                 room,
@@ -1088,7 +1072,7 @@ impl Node {
             return;
         }
         if matches!(&continuation.stage, Stage::Outbound(_)) {
-            self.finish_owned_consent_outbound(room, saved, lifetime, continuation, reply)
+            self.finish_owned_consent_outbound(room, saved, continuation, reply)
                 .await;
             return;
         }
@@ -1102,10 +1086,7 @@ impl Node {
                 self.note_local_governance_append(&room);
             }
         }
-        if matches!(
-            &continuation.stage,
-            Stage::Online { .. } | Stage::Legacy { .. }
-        ) {
+        if matches!(&continuation.stage, Stage::Online { .. }) {
             let checked = continuation
                 .instance
                 .lock()
@@ -1119,59 +1100,6 @@ impl Node {
         }
         let stage = std::mem::replace(&mut continuation.stage, Stage::Vacant);
         match (stage, saved) {
-            (
-                Stage::Legacy {
-                    conn,
-                    queue,
-                    credit,
-                },
-                Saved::Consent(consent_save::Effect::Publication {
-                    result, release, ..
-                }),
-            ) => {
-                let history_owed = match result {
-                    Ok(ConsentSaved::Issued { history_owed, .. }) => history_owed,
-                    Err(error) => {
-                        self.fail_owned_consent(room, error, continuation, reply)
-                            .await;
-                        return;
-                    }
-                    _ => {
-                        self.fail_owned_consent(
-                            room,
-                            Error::Profile("unexpected legacy consent grant"),
-                            continuation,
-                            reply,
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                let Some(skdm) = release else {
-                    self.fail_owned_consent(
-                        room,
-                        Error::Profile("committed consent release missing"),
-                        continuation,
-                        reply,
-                    )
-                    .await;
-                    return;
-                };
-                self.continue_owned_legacy_consent(
-                    room,
-                    outbound::LegacyConsent {
-                        skdm,
-                        history_owed,
-                        conn,
-                        queue,
-                        credit,
-                    },
-                    continuation,
-                    lifetime,
-                    reply,
-                )
-                .await;
-            }
             (
                 Stage::Online { queue, job },
                 Saved::Consent(consent_save::Effect::Publication { result, .. }),
@@ -1291,22 +1219,8 @@ impl Node {
                     let _ = reply.send(Outcome::Done);
                 }
             }
-            (
-                Stage::Acknowledged {
-                    history: _history,
-                    whole_history: _whole_history,
-                },
-                Saved::Consent(consent_save::Effect::Delivered),
-            ) => {
+            (Stage::Acknowledged, Saved::Consent(consent_save::Effect::Delivered)) => {
                 self.settle_owned_key_receipt(room, &continuation).await;
-                #[cfg(feature = "test-knobs")]
-                self.mark_delivery_drained_for_proof(
-                    room,
-                    continuation.target,
-                    _history,
-                    _whole_history,
-                    true,
-                );
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Done);
                 }
@@ -1354,10 +1268,6 @@ impl Node {
         route: Offline,
         lifetime: Option<Arc<Lifetime>>,
     ) {
-        #[cfg(feature = "test-knobs")]
-        if self.fx28_rekey_pause == Some((room, peer)) {
-            return;
-        }
         let Some(instance) = self.channels.get(&room).cloned() else {
             return;
         };
@@ -1367,7 +1277,6 @@ impl Node {
             lifetime,
             target: peer,
             asked: route.asked,
-            history: self.trust.history(&peer),
             decision: self.trust_decision(&peer),
             plan: None,
             cursor: None,
@@ -1513,7 +1422,7 @@ pub(super) fn retire_detached(
     let final_delivery =
         matches!(
             &continuation.stage,
-            Stage::Delivered(_) | Stage::Acknowledged { .. }
+            Stage::Delivered(_) | Stage::Acknowledged
         ) && matches!(&result, Ok(Saved::Consent(consent_save::Effect::Delivered)));
     let result = match result {
         Err(error) => Err(error),

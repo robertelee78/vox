@@ -14,14 +14,19 @@ type Generations = Vec<(u64, Option<Stamp>)>;
 /// generation always stays. Expired bodies need no key; gaps and nonexpired missing bodies
 /// stop the prefix proof. A sender only advances generations, so no older-generation entry
 /// can arrive after the proved later-generation entry.
+///
+/// Also returns, per walked author, the first generation that is not finished: the lowest
+/// unrendered generation in the verified prefix, capped at the newest one. Every generation
+/// below it has all its entries in that prefix, rendered or expired.
 fn select_receivers(
     held: &BTreeSet<Slot>,
     feeds: &Feeds,
     read: &impl EntryRead,
     mut rendered: impl FnMut(&Digest32) -> Result<bool>,
     mut expired: impl FnMut(u64) -> bool,
-) -> Result<Vec<Slot>> {
+) -> Result<(Vec<Slot>, BTreeMap<Digest32, u64>)> {
     let mut gone = Vec::new();
+    let mut finished = BTreeMap::new();
     for (author, (feed, head)) in feeds {
         let generations: Vec<u64> = held
             .range((*author, 0)..=(*author, u64::MAX))
@@ -57,6 +62,12 @@ fn select_receivers(
         let Some(newest) = newest else {
             continue;
         };
+        finished.insert(
+            *author,
+            unrendered
+                .first()
+                .map_or(newest, |lowest| (*lowest).min(newest)),
+        );
         let last = generations.last().copied().unwrap_or(0);
         gone.extend(
             generations
@@ -65,7 +76,172 @@ fn select_receivers(
                 .map(|chain| (*author, chain)),
         );
     }
-    Ok(gone)
+    Ok((gone, finished))
+}
+
+/// The deleted-receiver tombstones within [`SegmentKind::KeyMaterial`] (R1).
+pub(super) const SEG_DELETED_RECEIVERS: u64 = 31;
+/// At most this many exact tombstones per room; at the cap a key is kept, not deleted.
+const TOMBSTONES_MAX: usize = 16_384;
+
+/// The ordinary room receivers this node deleted (R1), `[1, [[author, epoch, floor, [chain,
+/// ..]], ..]]`: per author and key epoch, every generation below `floor` and each listed
+/// `chain`. A deleted key stays deleted: a later offer of it, by any route, is answered as
+/// accepted and unchanged and installs nothing. Only this node's own committed prune writes it;
+/// Drive keys are another namespace and never read it. Absent means empty; any other format is
+/// refused, never reset.
+#[derive(Clone, Default)]
+pub(crate) struct DeletedReceivers {
+    rows: BTreeMap<(Digest32, u64), (u64, BTreeSet<u64>)>,
+    count: usize,
+}
+
+impl DeletedReceivers {
+    fn invalid() -> Error {
+        Error::MalformedAtRest("deleted receiver tombstones")
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 2 || d.uint()? != 1 {
+            return Err(Self::invalid());
+        }
+        let mut record = Self::default();
+        let mut previous: Option<(Digest32, u64)> = None;
+        for _ in 0..d.array()? {
+            if d.array()? != 4 {
+                return Err(Self::invalid());
+            }
+            let author: Digest32 = d.bytes()?.try_into().map_err(|_| Self::invalid())?;
+            let epoch = d.uint()?;
+            let floor = d.uint()?;
+            let mut chains = BTreeSet::new();
+            for _ in 0..d.array()? {
+                let chain = d.uint()?;
+                if chain < floor || chains.last().is_some_and(|last| *last >= chain) {
+                    return Err(Self::invalid());
+                }
+                chains.insert(chain);
+            }
+            if previous.is_some_and(|key| key >= (author, epoch))
+                || (floor == 0 && chains.is_empty())
+            {
+                return Err(Self::invalid());
+            }
+            previous = Some((author, epoch));
+            record.count += chains.len();
+            if record.count > TOMBSTONES_MAX {
+                return Err(Self::invalid());
+            }
+            record.rows.insert((author, epoch), (floor, chains));
+        }
+        d.finish()?;
+        Ok(record)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(2).uint(1).array(self.rows.len());
+        for ((author, epoch), (floor, chains)) in &self.rows {
+            e.array(4)
+                .bytes(author)
+                .uint(*epoch)
+                .uint(*floor)
+                .array(chains.len());
+            for chain in chains {
+                e.uint(*chain);
+            }
+        }
+        e.finish()
+    }
+
+    /// The room's record as stored: read with its receivers at open, and by the prune under
+    /// its writer.
+    pub(super) fn load(sealed: Option<SealedSegment>, sek: &Sek) -> Result<Self> {
+        match sealed {
+            Some(sealed) => Self::decode(&open_segment(
+                sek,
+                SegmentKind::KeyMaterial,
+                SEG_DELETED_RECEIVERS,
+                &sealed,
+            )?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        sek: &Sek,
+        room: &Digest32,
+    ) -> Result<()> {
+        let sealed = seal_segment(
+            sek,
+            SegmentKind::KeyMaterial,
+            SEG_DELETED_RECEIVERS,
+            &self.encode(),
+        )?;
+        batch.put_segment(
+            room,
+            SegmentKind::KeyMaterial,
+            SEG_DELETED_RECEIVERS,
+            &sealed,
+        )
+    }
+
+    /// Whether this node deleted `author`'s room receiver of `chain` in key epoch `epoch`.
+    pub(crate) fn covers(&self, author: &Digest32, epoch: u64, chain: u64) -> bool {
+        self.rows
+            .get(&(*author, epoch))
+            .is_some_and(|(floor, chains)| chain < *floor || chains.contains(&chain))
+    }
+
+    /// Collapse the tombstones below `finished` (every generation below it is finished, see
+    /// [`select_receivers`]) into the row's floor.
+    fn compact(&mut self, author: Digest32, epoch: u64, finished: u64) {
+        let Some((floor, chains)) = self.rows.get_mut(&(author, epoch)) else {
+            return;
+        };
+        let Some(highest) = chains.range(..finished).next_back().copied() else {
+            return;
+        };
+        *floor = (*floor).max(highest.saturating_add(1));
+        let kept = chains.split_off(floor);
+        self.count -= chains.len();
+        *chains = kept;
+    }
+
+    /// Record one deletion. `false`: the record is at its cap, so the key is kept.
+    fn delete(&mut self, author: Digest32, epoch: u64, chain: u64) -> bool {
+        if self.covers(&author, epoch, chain) {
+            return true;
+        }
+        if self.count >= TOMBSTONES_MAX {
+            return false;
+        }
+        // `test-knobs` mutant `VOX_TEST_FWD_MUTANT=floor-not-exact`: the deletion is recorded as
+        // "deleted through" (the floor moves past it) rather than exactly, so an older generation
+        // still to come is refused as if deleted. Never selectable without the feature.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("floor-not-exact") {
+            let (floor, chains) = self.rows.entry((author, epoch)).or_default();
+            *floor = (*floor).max(chain.saturating_add(1));
+            let kept = chains.split_off(floor);
+            self.count -= chains.len();
+            *chains = kept;
+            eprintln!(
+                "test-knobs: floor-not-exact mutant engaged: deleted through generation {chain}"
+            );
+            return true;
+        }
+        self.rows
+            .entry((author, epoch))
+            .or_default()
+            .1
+            .insert(chain);
+        self.count += 1;
+        true
+    }
 }
 
 /// The exact origin safety decision contains only a floor and nonsecret generation IDs.
@@ -106,6 +282,7 @@ impl Saved {
 pub(crate) struct Completed {
     pending: Prepared,
     removed: Vec<Slot>,
+    deleted: Option<DeletedReceivers>,
     saved: Saved,
     poison: bool,
 }
@@ -130,6 +307,9 @@ impl Completed {
             if self.saved.receivers != 0 {
                 for slot in &self.removed {
                     channel.receivers.remove(slot);
+                }
+                if let Some(deleted) = self.deleted.take() {
+                    channel.deleted_receivers = deleted;
                 }
                 if let Err(error) = channel.receiver_persistence.advance_normal() {
                     self.saved.result = Err(error);
@@ -161,7 +341,6 @@ impl ChannelState {
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
-        full: &BTreeSet<Digest32>,
         trusted: &BTreeSet<Digest32>,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
@@ -177,11 +356,10 @@ impl ChannelState {
             if self.key_generations() <= 1 {
                 return Ok(None);
             }
-            match self.owed_consents(store, full) {
-                Ok(owed) if owed.is_empty() => {}
-                Ok(_) => return Ok(None),
-                Err(error) if governance::refreshing(&error) => return Ok(None),
-                Err(error) => return Err(error),
+            // The migration reads the retained origins for the catch-up it keeps (R9): no
+            // origin is deleted before it commits.
+            if !self.forward_migrated() {
+                return Ok(None);
             }
             match self.require_governance_ready(store, crate::time::Ms(self.now_hint)) {
                 Ok(_) if self.governance_display_current(self.now_hint) => {}
@@ -190,7 +368,7 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
             let floor = self
-                .oldest_generation_needed(trusted, now)
+                .oldest_generation_needed(store, trusted, now)?
                 .unwrap_or(u64::MAX)
                 .min(self.sender.chain_id());
             let generations = self
@@ -246,12 +424,35 @@ impl ChannelState {
 impl Prepared {
     pub(crate) fn run(mut self, store: &Store, _signer: &dyn RootSigner) -> Completed {
         let mut removed = Vec::new();
+        let mut deleted = None;
+        // The retired release index (segment kind 18) held copies of signed releases that
+        // nothing reads: the first pass deletes them all, in one batch.
+        let purged = (|| -> Result<()> {
+            let releases = SegmentKind::ReceiverReleases;
+            if store
+                .snapshot()?
+                .segment_id_after(&self.room, releases, None)?
+                .is_none()
+            {
+                return Ok(());
+            }
+            let mut batch = store.batch()?;
+            while let Some(id) = batch.segment_id_after(&self.room, releases, None)? {
+                batch.delete_segment(&self.room, releases, id)?;
+            }
+            batch.commit()
+        })();
         let mut saved = Saved {
             receivers: 0,
             origins: 0,
             result: self.origin_error.take().map_or(Ok(()), Err),
         };
         let mut poison = false;
+        if let Err(error) = purged {
+            if saved.result.is_ok() {
+                saved.result = Err(error);
+            }
+        }
         let mut writing = false;
         let receiver_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.sek.with(|sek| -> Result<()> {
@@ -260,7 +461,7 @@ impl Prepared {
                     .index
                     .read_snapshot(Arc::clone(&snapshot), sek, &self.room)?;
                 let rendered = self.index.render_snapshot(snapshot, sek, &self.room)?;
-                let gone = select_receivers(
+                let (mut gone, finished) = select_receivers(
                     &self.slots,
                     &self.feeds,
                     &read,
@@ -305,6 +506,27 @@ impl Prepared {
                     return Err(Error::MalformedAtRest("key prune receiver basis changed"));
                 }
                 drop(snapshot);
+                // R1: each deletion leaves an exact tombstone in this same batch; finished
+                // generations collapse into their author's floor first. At the cap, a key is kept.
+                let mut tombstones = DeletedReceivers::load(
+                    batch.get_segment(
+                        &self.room,
+                        SegmentKind::KeyMaterial,
+                        SEG_DELETED_RECEIVERS,
+                    )?,
+                    sek,
+                )?;
+                for (author, finished) in &finished {
+                    tombstones.compact(*author, self.epoch, *finished);
+                }
+                gone.retain(|slot| {
+                    receivers
+                        .get(slot)
+                        .is_some_and(|chain| tombstones.delete(slot.0, chain.epoch(), slot.1))
+                });
+                if gone.is_empty() {
+                    return Ok(());
+                }
                 for slot in &gone {
                     receivers.remove(slot);
                 }
@@ -316,12 +538,13 @@ impl Prepared {
                     &receivers_bytes(&receivers),
                 )?;
                 receiver_overlay::rewrite(&mut batch, sek, &self.room, &segment, self.normal)?;
+                tombstones.save(&mut batch, sek, &self.room)?;
                 // Drive is not modified by receiver deletion. Its exact written stamp was checked,
                 // so retaining its durable segment avoids copying or reserializing any drive keys.
-                receiver_releases::retire(&mut batch, sek, &self.room)?;
                 batch.commit()?;
                 saved.receivers = gone.len();
                 removed = gone;
+                deleted = Some(tombstones);
                 writing = false;
                 Ok(())
             })
@@ -384,6 +607,7 @@ impl Prepared {
         Completed {
             pending: self,
             removed,
+            deleted,
             saved,
             poison,
         }

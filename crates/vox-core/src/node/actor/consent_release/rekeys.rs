@@ -42,14 +42,12 @@ enum Step {
         generation: u64,
         key_ref: Digest32,
     },
-    Initiate,
 }
 
 pub(in crate::node::actor) struct Target {
     pass: Pass,
     peer: Digest32,
     conn: Arc<VoxConnection>,
-    modern: bool,
     history: bool,
     keys: VecDeque<Skdm>,
     admitted: VecDeque<PairwiseAdmission>,
@@ -57,9 +55,6 @@ pub(in crate::node::actor) struct Target {
     live: Option<Arc<Lifetime>>,
     step: Step,
     all_sent: bool,
-    legacy_before: Option<LegacySessionRollback>,
-    #[cfg(feature = "test-knobs")]
-    generations: Vec<u64>,
 }
 
 impl Node {
@@ -302,32 +297,6 @@ impl Node {
                 .await;
                 return;
             }
-            #[cfg(feature = "test-knobs")]
-            if self.fx28_rekey_pause == Some((pass.room, peer)) {
-                let automatic_arm = std::env::var("VOX_TEST_HOLD_REKEY_ENQUEUE")
-                    .ok()
-                    .and_then(|spec| spec.split('\t').nth(1).map(str::to_owned))
-                    .and_then(|arm| std::fs::read_to_string(arm).ok());
-                let exact_pair = format!(
-                    "{}\t{}",
-                    crate::node::link::b32_encode(&peer),
-                    crate::node::link::b32_encode(&pass.room)
-                );
-                let staged = automatic_arm.as_deref().map(str::trim);
-                let automatic = matches!(pass.after, RekeyAfter::Automatic)
-                    && pass.lifetime.is_none()
-                    && staged == Some(format!("{exact_pair}\tautomatic").as_str());
-                let admitted = matches!(pass.after, RekeyAfter::Settlement { .. })
-                    && pass.lifetime.is_some()
-                    && staged == Some(exact_pair.as_str())
-                    && self
-                        .fx28_post_rekey
-                        .get(&pass.room)
-                        .is_some_and(|proof| proof.released_paused);
-                if !automatic && !admitted {
-                    continue;
-                }
-            }
             if !self.trust.is_trusted(&peer) {
                 continue;
             }
@@ -362,6 +331,32 @@ impl Node {
             {
                 continue;
             }
+            // A member that came back takes room keys only by return-bound log package (R4). It
+            // is skipped only while a delivery to it is this room's save in flight: the settling
+            // mark is not that, as it outlives a delivery that deferred or failed.
+            let returned = pass.instance.lock().await.key_returned(&peer);
+            if returned {
+                let delivering = match self.pending_posts.get(&pass.room) {
+                    Some(post_save::Pending::Maintenance(pending)) => {
+                        pending.consent().is_some_and(|next| next.target == peer)
+                    }
+                    _ => false,
+                };
+                if !delivering {
+                    self.begin_owned_log_rekeys(
+                        pass.room,
+                        peer,
+                        super::Offline {
+                            attempt: 0,
+                            source_room: pass.room,
+                            asked: pass.asked,
+                        },
+                        None,
+                    )
+                    .await;
+                }
+                continue;
+            }
             let selected = {
                 let channel = pass.instance.lock().await;
                 match self.profile.as_ref() {
@@ -387,9 +382,8 @@ impl Node {
             let Some(conn) = self.reach_member(&pass.room, peer, pass.asked).await else {
                 continue;
             };
-            let modern = !matches!(self.older.get(&pair), Some(false));
             let Some(admitted) =
-                self.reserve_key_deliveries(&pass.room, peer, &keys, modern, history)
+                self.reserve_key_deliveries(&pass.room, peer, &conn, &keys, history)
             else {
                 continue;
             };
@@ -399,7 +393,6 @@ impl Node {
                 pass,
                 peer,
                 conn,
-                modern,
                 history,
                 keys: keys.into(),
                 admitted: admitted.into(),
@@ -407,9 +400,6 @@ impl Node {
                 live,
                 step: Step::Ready,
                 all_sent: true,
-                legacy_before: None,
-                #[cfg(feature = "test-knobs")]
-                generations: Vec::with_capacity(capacity),
             };
             let Some(next) = self.advance_owned_rekey_target(target).await else {
                 return;
@@ -424,64 +414,6 @@ impl Node {
 
     async fn advance_owned_rekey_target(&mut self, mut target: Target) -> Option<Pass> {
         let room = target.pass.room;
-        if !target.modern {
-            if !self.sessions.contains_key(&(room, target.peer)) {
-                let Some(selected) = self.select_owned_legacy_session(&room, target.peer).await
-                else {
-                    target.all_sent = false;
-                    return self.enqueue_owned_rekey_target(target).await;
-                };
-                target.step = Step::Initiate;
-                self.dispatch_owned_rekey_native(target, selected.into_initiate_work())
-                    .await;
-                return None;
-            }
-            target.legacy_before = self.snapshot_legacy_session((room, target.peer), true);
-            let mut first = true;
-            while let (Some(key), Some(admission)) =
-                (target.keys.pop_front(), target.admitted.pop_front())
-            {
-                let Some((frames, hello, session)) =
-                    self.frame_owned_legacy_key(room, target.peer, &key, first)
-                else {
-                    target.all_sent = false;
-                    break;
-                };
-                first = false;
-                let opening = frames
-                    .first()
-                    .filter(|_| session.is_none())
-                    .map(|frame| crate::hash::sha256(frame));
-                #[cfg(feature = "test-knobs")]
-                target.generations.push(key.body.chain_id);
-                target.jobs.push((
-                    admission.queue,
-                    PairwiseJob {
-                        conn: Arc::clone(&target.conn),
-                        frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
-                        channel_id: room,
-                        after: AfterWrite::Key {
-                            chain_id: key.body.chain_id,
-                            opening,
-                            hello,
-                            session,
-                            history: target.history,
-                            epoch: target.pass.attachment,
-                        },
-                        credit: admission.job,
-                        prekey: hello
-                            .then(|| {
-                                self.initiated
-                                    .get(&(room, target.peer))
-                                    .and_then(|opening| opening.reservation.as_deref())
-                                    .cloned()
-                            })
-                            .flatten(),
-                    },
-                ));
-            }
-            return self.enqueue_owned_rekey_target(target).await;
-        }
         while let Some(key) = target.keys.pop_front() {
             let Some(admission) = target.admitted.pop_front() else {
                 self.fail_owned_rekey_target(target, Error::Profile("rekey admission changed"))
@@ -497,8 +429,6 @@ impl Node {
             {
                 let frame = delivery.frame.clone();
                 let opening = delivery.opening;
-                #[cfg(feature = "test-knobs")]
-                target.generations.push(key.body.chain_id);
                 target.jobs.push((
                     admission.queue,
                     PairwiseJob {
@@ -547,7 +477,6 @@ impl Node {
             lifetime: target.live.as_ref().map(Arc::clone),
             target: target.peer,
             asked: target.pass.asked,
-            history: self.trust.history(&target.peer),
             decision: self.trust_decision(&target.peer),
             plan: None,
             cursor: None,
@@ -593,17 +522,6 @@ impl Node {
             }
         };
         match (std::mem::replace(&mut target.step, Step::Ready), saved) {
-            (
-                Step::Initiate,
-                Saved::Packages(package_save::Saved::Initiated {
-                    initiated,
-                    reservation,
-                }),
-            ) => {
-                if !self.install_owned_legacy_session(room, target.peer, initiated, reservation) {
-                    target.all_sent = false;
-                }
-            }
             (
                 Step::Frame {
                     queue,
@@ -660,8 +578,6 @@ impl Node {
                     },
                 );
                 self.key_left(&room, target.peer);
-                #[cfg(feature = "test-knobs")]
-                target.generations.push(generation);
                 target.jobs.push((
                     queue,
                     PairwiseJob {
@@ -700,59 +616,10 @@ impl Node {
     }
 
     async fn enqueue_owned_rekey_target(&mut self, target: Target) -> Option<Pass> {
-        #[cfg(feature = "test-knobs")]
-        {
-            let live = target.pass.instance.lock().await.sender_generation();
-            if let Some((listener, engaged, release)) = self.hold_rekey_enqueue_for_proof(
-                target.pass.room,
-                target.peer,
-                !target.modern,
-                target.live.is_some(),
-                target.all_sent,
-                live,
-                &target.generations,
-            ) {
-                // The admitted batch owns its real reader. While it is held off actor, prevent
-                // another route for this same pair from delivering the key ahead of the batch.
-                self.fx28_rekey_pause = Some((target.pass.room, target.peer));
-                let authority = self.computer_authority();
-                let owns_reader = target.live.is_some();
-                let tx = self.net_tx.clone();
-                tokio::spawn(async move {
-                    let _ = listener.accept().await;
-                    let _ = std::fs::remove_file(engaged);
-                    let _ = std::fs::remove_file(release);
-                    let _ = tx
-                        .send(NetEvent::HeldRekey {
-                            target: Box::new(target),
-                            authority,
-                            owns_reader,
-                        })
-                        .await;
-                });
-                return None;
-            }
-        }
-        self.finish_rekey_enqueue(target, None, false).await
+        self.finish_rekey_enqueue(target).await
     }
 
-    #[cfg(feature = "test-knobs")]
-    pub(in crate::node::actor) async fn resume_held_rekey(
-        &mut self,
-        target: Target,
-        authority: Option<computer::ComputerAuthority>,
-    ) {
-        if let Some(pass) = self.finish_rekey_enqueue(target, authority, true).await {
-            self.advance_owned_rekey_pass(pass).await;
-        }
-    }
-
-    async fn finish_rekey_enqueue(
-        &mut self,
-        mut target: Target,
-        held_authority: Option<computer::ComputerAuthority>,
-        held_for_proof: bool,
-    ) -> Option<Pass> {
+    async fn finish_rekey_enqueue(&mut self, mut target: Target) -> Option<Pass> {
         if !target.all_sent {
             target.keys.clear();
             target.admitted.clear();
@@ -768,22 +635,13 @@ impl Node {
                 .insert(pair, (watched, !target.all_sent));
         }
         let jobs = std::mem::take(&mut target.jobs);
-        #[cfg(feature = "test-knobs")]
-        let bypass = crate::node::computer::fx28_mutant("stale-rekey-authority");
-        #[cfg(not(feature = "test-knobs"))]
-        let bypass = false;
-        let published = if bypass || target.live.is_some() {
+        let published = if target.live.is_some() {
             for (queue, job) in jobs {
                 queue.send(job);
             }
             true
         } else {
-            let authority = if held_for_proof {
-                held_authority
-            } else {
-                self.computer_authority()
-            };
-            authority
+            self.computer_authority()
                 .and_then(|authority| {
                     authority.publish(|| {
                         for (queue, job) in jobs {
@@ -795,7 +653,6 @@ impl Node {
                 .unwrap_or(false)
         };
         if !published {
-            self.restore_legacy_session(target.legacy_before.take());
             for _ in 0..watched {
                 self.key_landed(room, target.peer);
             }
@@ -804,10 +661,6 @@ impl Node {
             }
         } else if target.all_sent {
             target.pass.delivered += 1;
-        }
-        #[cfg(feature = "test-knobs")]
-        if held_for_proof {
-            self.mark_rekey_authority_decision_for_proof(published);
         }
         if !published && !matches!(target.pass.after, RekeyAfter::Automatic) {
             self.finish_owned_rekey_after(

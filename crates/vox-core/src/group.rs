@@ -32,7 +32,8 @@
 //! - [`state`] — [`state::SenderChain`] (encrypt + sign + scheduled rotation) and
 //!   [`state::ReceiverChain`] (bounded skip/replay window, one-way derivation).
 //! - [`history`] — per-epoch origin-key retention and the release-at-iteration
-//!   mechanism (forward-only vs full-history consent, ADR-006 §History).
+//!   mechanism (ADR-006 §History; forward releases, and the origin to this node's own local
+//!   recovery).
 //! - [`wire`] — the group-layer domain labels and canonical bindings.
 //!
 //! ## Mandatory (channelID, epoch) binding (ADR-006, eprint 2023/1385)

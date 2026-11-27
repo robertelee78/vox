@@ -5,7 +5,7 @@ case "${1-}" in
   pairwise-equality-only)
     journey=a_queued_key_and_history_debt_cannot_cross_room_removal
     verdict='PRODUCT [FX62 queued-key]:' ;;
-  old-entitlement|readmission-full-plan)
+  readmission-backfill)
     journey=a_queued_key_and_history_debt_cannot_cross_room_removal
     verdict='PRODUCT [FX62 history-debt]:' ;;
   nonadmin-remove)
@@ -17,7 +17,7 @@ case "${1-}" in
   admit-removed-fingerprint)
     journey=an_admin_removes_one_member_and_the_creator_readmits_it_forward_only
     verdict='PRODUCT [FX62 old-passphrase]:' ;;
-  *) printf 'usage: sh scripts/run-fx62-mutant.sh {pairwise-equality-only|old-entitlement|readmission-full-plan|nonadmin-remove|skip-reconnect-removal-check|admit-removed-fingerprint}\n' >&2; exit 2 ;;
+  *) printf 'usage: sh scripts/run-fx62-mutant.sh {pairwise-equality-only|readmission-backfill|nonadmin-remove|skip-reconnect-removal-check|admit-removed-fingerprint}\n' >&2; exit 2 ;;
 esac
 mutant=$1
 artifacts=${VOX_FX62_MUTANT_ARTIFACTS:-target/fx62-mutants}

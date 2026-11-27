@@ -456,7 +456,6 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str, drive: 
                 target,
                 petname: petname.to_owned(),
                 identity_passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
-                full_history: false,
                 drive,
             }),
         )

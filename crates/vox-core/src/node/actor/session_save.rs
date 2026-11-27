@@ -559,15 +559,6 @@ impl OutboundPackage {
         }
     }
 
-    pub(super) fn into_initiate_work(self) -> package_save::Work {
-        package_save::Work::Initiate {
-            ring: self.ring,
-            bundle: self.bundle,
-            context: self.context,
-            reservation: self.reservation,
-        }
-    }
-
     pub(super) fn into_frame_work(self, skdm: Box<crate::group::skdm::Skdm>) -> package_save::Work {
         package_save::Work::FrameOutbound {
             ring: self.ring,
@@ -863,20 +854,6 @@ impl Node {
         let selected = self.reserve_owned_outbound(context, bundle, target)?;
         self.one_time_waits.remove(&(*room, target));
         Some(selected)
-    }
-
-    /// Legacy session initiation has always allowed immediate signed-prekey fallback;
-    /// unlike a fresh key frame/package it does not start the one-time waiting clock.
-    pub(super) async fn select_owned_legacy_session(
-        &mut self,
-        room: &Digest32,
-        target: Digest32,
-    ) -> Option<OutboundPackage> {
-        self.net.as_ref()?;
-        let shared = self.channels.get(room).cloned()?;
-        let context = shared.lock().await.join_context().ok()?;
-        let bundle = self.delivery_bundle_or_signed(room, target).await.ok()?;
-        self.reserve_owned_outbound(context, bundle, target)
     }
 
     fn reserve_owned_outbound(

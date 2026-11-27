@@ -12,7 +12,6 @@ pub(super) enum Stage {
         route: Offline,
         posted_as: Digest32,
     },
-    InitiateConsent(LegacyConsent),
     SealLog {
         route: Offline,
         keys: VecDeque<Skdm>,
@@ -20,14 +19,6 @@ pub(super) enum Stage {
         generation: u64,
         posted_as: Digest32,
     },
-}
-
-pub(super) struct LegacyConsent {
-    pub(super) skdm: Box<Skdm>,
-    pub(super) history_owed: bool,
-    pub(super) conn: Arc<VoxConnection>,
-    pub(super) queue: mpsc::OwnedPermit<PairwiseJob>,
-    pub(super) credit: PairwiseCredit,
 }
 
 impl Node {
@@ -47,12 +38,12 @@ impl Node {
             return Err(Fault::Internal);
         };
         match route {
-            Route::Online { conn, modern } => {
+            Route::Online { conn } => {
                 let Some(admitted) = self.reserve_key_deliveries(
                     &room,
                     continuation.target,
+                    &conn,
                     std::slice::from_ref(skdm.as_ref()),
-                    modern,
                     false,
                 ) else {
                     return Err(Fault::DeliveryBusy);
@@ -63,16 +54,6 @@ impl Node {
                 else {
                     return Err(Fault::DeliveryBusy);
                 };
-                if !modern {
-                    continuation.stage = super::Stage::Legacy {
-                        conn,
-                        queue,
-                        credit,
-                    };
-                    return Ok(self
-                        .dispatch_owned_consent_issue(room, skdm, continuation, None, reply.take())
-                        .await);
-                }
                 let key_ref = crate::governance::membership::skdm_ref(&skdm);
                 let id = (room, continuation.target, skdm.body.chain_id);
                 if let Some((frame, prekey)) = self
@@ -193,8 +174,6 @@ impl Node {
             Work::Consent(consent_save::Work::Issue {
                 target: continuation.target,
                 skdm,
-                full_history: continuation.history == crate::node::trust::HistoryGrant::Full
-                    && continuation.plan.is_some(),
                 entitled_from,
                 package,
             }),
@@ -208,7 +187,6 @@ impl Node {
         &mut self,
         room: Digest32,
         saved: Saved,
-        lifetime: Arc<Lifetime>,
         mut continuation: Continuation,
         reply: Reply,
     ) {
@@ -321,25 +299,6 @@ impl Node {
                     .await;
             }
             (
-                Stage::InitiateConsent(delivery),
-                Saved::Packages(package_save::Saved::Initiated {
-                    initiated,
-                    reservation,
-                }),
-            ) => {
-                if !self.install_owned_legacy_session(
-                    room,
-                    continuation.target,
-                    initiated,
-                    reservation,
-                ) {
-                    self.wait_owned_consent(room, continuation, reply).await;
-                    return;
-                }
-                self.enqueue_owned_legacy_consent(room, delivery, continuation, lifetime, reply)
-                    .await;
-            }
-            (
                 Stage::SealLog {
                     route,
                     keys,
@@ -388,164 +347,6 @@ impl Node {
                 .await
             }
         }
-    }
-
-    pub(super) async fn continue_owned_legacy_consent(
-        &mut self,
-        room: Digest32,
-        delivery: LegacyConsent,
-        mut continuation: Continuation,
-        lifetime: Arc<Lifetime>,
-        reply: Reply,
-    ) {
-        if self.sessions.contains_key(&(room, continuation.target)) {
-            self.enqueue_owned_legacy_consent(room, delivery, continuation, lifetime, reply)
-                .await;
-            return;
-        }
-        let Some(selected) = self
-            .select_owned_legacy_session(&room, continuation.target)
-            .await
-        else {
-            self.wait_owned_consent(room, continuation, reply).await;
-            return;
-        };
-        continuation.stage = super::Stage::Outbound(Stage::InitiateConsent(delivery));
-        self.begin_pending_maintenance(
-            room,
-            Work::Packages(selected.into_initiate_work()),
-            maintenance_save::Continuation::Consent(continuation),
-            reply,
-        )
-        .await;
-    }
-
-    pub(super) fn install_owned_legacy_session(
-        &mut self,
-        room: Digest32,
-        peer: Digest32,
-        candidate: Option<(Box<InitialMessage>, Box<crate::pairwise::session::Session>)>,
-        reservation: Option<prekeys::OneTimeReservation>,
-    ) -> bool {
-        let pair = (room, peer);
-        // An inbound session accepted during native initiation is current authority. Never
-        // overwrite it with an old absent-session selection or restore a speculative ratchet.
-        if self.sessions.contains_key(&pair) {
-            return true;
-        }
-        let Some((initial, session)) = candidate else {
-            return false;
-        };
-        self.sessions.insert(pair, *session);
-        self.stamp_session(pair);
-        self.accepted_hello.remove(&pair);
-        self.initiated.insert(
-            pair,
-            Initiated {
-                initial: Some(*initial),
-                hello_delivered: false,
-                reservation: reservation.map(Arc::new),
-            },
-        );
-        true
-    }
-
-    pub(super) fn frame_owned_legacy_key(
-        &mut self,
-        room: Digest32,
-        peer: Digest32,
-        key: &Skdm,
-        announce: bool,
-    ) -> Option<(Vec<Vec<u8>>, bool, Option<u64>)> {
-        let hello = self
-            .initiated
-            .get(&(room, peer))
-            .filter(|opening| announce && !opening.hello_delivered)
-            .and_then(|opening| opening.initial.as_ref());
-        let mut frames = Vec::with_capacity(2);
-        if let Some(initial) = hello {
-            frames.push(crate::node::pairwise_stream::hello_frame(&room, initial));
-        }
-        let carries_hello = hello.is_some();
-        let session = self.sessions.get_mut(&(room, peer))?;
-        frames.push(crate::node::pairwise_stream::skdm_frame(&room, session, key).ok()?);
-        Some((
-            frames,
-            carries_hello,
-            self.session_serial.get(&(room, peer)).copied(),
-        ))
-    }
-
-    async fn enqueue_owned_legacy_consent(
-        &mut self,
-        room: Digest32,
-        delivery: LegacyConsent,
-        continuation: Continuation,
-        lifetime: Arc<Lifetime>,
-        reply: Reply,
-    ) {
-        let LegacyConsent {
-            skdm,
-            history_owed,
-            conn,
-            queue,
-            credit,
-        } = delivery;
-        #[cfg(feature = "test-knobs")]
-        if self.fx28_rekey_pause == Some((room, continuation.target)) {
-            self.wait_owned_consent(room, continuation, reply).await;
-            return;
-        }
-        let checked = continuation
-            .instance
-            .lock()
-            .await
-            .require_trust_withdrawn(&lifetime.store, lifetime.signer.as_ref());
-        if let Err(error) = checked {
-            self.fail_owned_consent(room, error, continuation, reply)
-                .await;
-            return;
-        }
-        let before = self.snapshot_legacy_session((room, continuation.target), true);
-        let Some((frames, hello, session)) =
-            self.frame_owned_legacy_key(room, continuation.target, &skdm, true)
-        else {
-            self.restore_legacy_session(before);
-            self.wait_owned_consent(room, continuation, reply).await;
-            return;
-        };
-        *self
-            .keys_in_flight
-            .entry((room, continuation.target))
-            .or_default() += 1;
-        let opening = frames
-            .first()
-            .filter(|_| session.is_none())
-            .map(|frame| crate::hash::sha256(frame));
-        queue.send(PairwiseJob {
-            conn,
-            frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
-            channel_id: room,
-            after: AfterWrite::Key {
-                chain_id: skdm.body.chain_id,
-                opening,
-                hello,
-                session,
-                history: false,
-                epoch: continuation.attachment,
-            },
-            credit,
-            prekey: hello
-                .then(|| {
-                    self.initiated
-                        .get(&(room, continuation.target))
-                        .and_then(|opening| opening.reservation.as_deref())
-                        .cloned()
-                })
-                .flatten(),
-        });
-        self.after_owned_consent_enqueue(room, history_owed, continuation, lifetime, reply)
-            .await;
     }
 }
 

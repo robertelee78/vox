@@ -28,12 +28,16 @@ enum Action {
         generation: u64,
         here: bool,
     },
+    /// The room's one forward-only migration (R9): its ledgers, the return cuts of members that
+    /// came back before the update, as `(member, return sequence)`, and its marker in one batch.
+    ForwardMigration {
+        returns: Vec<(Digest32, u64)>,
+    },
 }
 
 struct Issuance {
     target: Digest32,
     skdm: Box<Skdm>,
-    full_history: bool,
     entitled_from: (u64, u64),
     package: Option<crate::node::keypackage::KeyPackage>,
 }
@@ -42,6 +46,7 @@ pub(crate) enum ConsentSaved {
     Issued { history_owed: bool },
     Withdrawn(Option<Box<ConsentRevocation>>),
     RoomRotated,
+    Migrated,
 }
 
 pub(crate) struct CompletedConsent {
@@ -55,7 +60,6 @@ pub(crate) struct CompletedConsent {
     /// Actual committed heads, including a package committed before a failed consent.
     pub(crate) package_seq: Option<u64>,
     pub(crate) package: Option<crate::node::keypackage::KeyPackage>,
-    pub(crate) release: Option<Box<Skdm>>,
     pub(crate) consent_seq: Option<u64>,
     package_unconfirmed: bool,
     pub(crate) result: Result<ConsentSaved>,
@@ -142,9 +146,12 @@ impl ChannelState {
             .collect();
         for target in targets {
             let removals = view.validated_member_removals(&target)?;
+            // A member here again after a departure is applied like a readmission (R3): its
+            // return cut is a boundary as a removal cut is.
+            let returned = target != me && self.key_returned(&target);
             // Rule F2 B: a proved forker is removed with no signed removal row; its boundary is
             // this sender's rotation itself (no observation cut to read).
-            if removals.is_empty() && !view.is_member_removed(&target)? {
+            if removals.is_empty() && !returned && !view.is_member_removed(&target)? {
                 continue;
             }
             let mut cut = None;
@@ -162,6 +169,13 @@ impl ChannelState {
                     previous_entitlement = old;
                 }
             }
+            if returned {
+                let back = view
+                    .return_cut(&target, &me)?
+                    .ok_or(Error::Profile(governance::REFRESHING))?;
+                cut = Some(cut.map_or(back.chain, |held: u64| held.max(back.chain)));
+                had_entitlement |= back.entitlement.is_some();
+            }
             let removed = view.is_member_removed(&target)?;
             let needs_boundary = removed
                 || (had_entitlement
@@ -175,10 +189,17 @@ impl ChannelState {
                     entitled.remove(&target);
                 } else {
                     entitled.insert(target, (next_chain, 0));
+                    // `VOX_TEST_FX62_MUTANT=readmission-backfill` (with the readmission body cut
+                    // in `governance/view.rs` `recipient_cut`) undoes the readmission boundary:
+                    // the member keeps the entitlement it held when it was removed.
                     #[cfg(feature = "test-knobs")]
                     if let Some(old) = previous_entitlement.filter(|_| {
-                        std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("old-entitlement")
+                        std::env::var("VOX_TEST_FX62_MUTANT").as_deref()
+                            == Ok("readmission-backfill")
                     }) {
+                        eprintln!(
+                            "test-knobs: readmission-backfill mutant engaged: entitlement {old:?} kept at readmission"
+                        );
                         entitled.insert(target, old);
                     }
                 }
@@ -196,7 +217,7 @@ impl ChannelState {
         let mut owed = Vec::new();
         for (reader, (from, _)) in &entitled {
             if *reader == me
-                || self.has_left(reader)
+                || self.key_departed(reader)
                 || !readers.contains(reader)
                 || self.is_member_removed(store, reader)?
             {
@@ -237,22 +258,122 @@ impl ChannelState {
         }))
     }
 
-    /// Full-history consent needs positions and its live key, not a signed copy of every
-    /// retained historical key. Actual history deliveries still sign their selected keys.
-    pub(crate) fn full_consent_release(
-        &self,
-        profile: &Profile,
-    ) -> Result<(Skdm, Vec<(u64, u64)>)> {
-        let live = self.rekey_skdm(profile)?;
-        let mut plan: Vec<_> = self
-            .origins
-            .generations(&self.channel_id, self.epoch, &self.me())
-            .into_iter()
-            .filter(|(generation, _)| *generation != live.body.chain_id)
-            .map(|(generation, _)| (generation, 0))
+    /// The room's forward-only migration (v0.4.31, R9), prepared from committed state: `None`
+    /// once the room is migrated. `legacy_full` are the identities a build before v0.4.31
+    /// trusted with older history, each with its trust decision.
+    ///
+    /// 1. A legacy full row is narrowed to its trust point: its entitlement and history row are
+    ///    raised to the first position `history_plan` gives. For a member this identity once
+    ///    untrusted and trusted again, that is where this room marked the re-trust, after its
+    ///    latest revocation. A member once removed and readmitted by an admin already holds a
+    ///    forward-only entitlement (its consent and the removal rotation set it), which is kept
+    ///    with its debt. Where no trust point can be established, the member reads from the
+    ///    live position on (accepted loss O1).
+    /// 2. A member that left and came back before the update has its return applied as any
+    ///    return is (R3): its return cut and one advance of the membership counter, so the
+    ///    next rotation gives it a fresh chain and it reads from there on (accepted loss O2).
+    /// 3. Every other entitled member that is neither removed nor departed keeps its
+    ///    entitlement and is owed again, from it, every retained generation (its origins are
+    ///    kept by its history row), and its delivery ledger row is dropped so the next re-key
+    ///    delivers it again under the new policy.
+    pub(crate) fn prepare_forward_migration(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+        legacy_full: &BTreeMap<Digest32, Option<crate::node::consent_order::Stamp>>,
+        now: crate::time::Ms,
+    ) -> Result<Option<PendingConsent>> {
+        if self.forward_migrated() {
+            return Ok(None);
+        }
+        self.require_governance_ready(store, now)?;
+        let me = self.me();
+        let live = self.sender.chain_id();
+        let live_position = (live, self.sender.current_position().0);
+        let mut entitled = self.entitled.clone();
+        let mut history = self.history.clone();
+        let mut delivered = self.delivered.clone();
+        for (target, decision) in legacy_full {
+            if *target == me
+                || !self
+                    .validated_member_removals(store, target, now)?
+                    .is_empty()
+            {
+                continue;
+            }
+            // `test-knobs` mutant `VOX_TEST_FWD_MUTANT=migrate-clamp` undoes step 1's trust
+            // point: every legacy full row is clamped to the live position, as if none could be
+            // established, so the post-trust catch-up of a member offline across the update is
+            // lost.
+            #[cfg(feature = "test-knobs")]
+            let clamp = std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("migrate-clamp");
+            #[cfg(not(feature = "test-knobs"))]
+            let clamp = false;
+            #[cfg(feature = "test-knobs")]
+            if clamp {
+                eprintln!("test-knobs: migrate-clamp mutant engaged: a legacy full row is clamped to the live position");
+            }
+            let plan = if clamp {
+                None
+            } else {
+                self.history_plan(store, target, *decision)?
+            };
+            match plan {
+                Some(plan) => {
+                    let floor = plan[0];
+                    if let Some(from) = entitled.get_mut(target) {
+                        *from = (*from).max(floor);
+                    }
+                    if let Some(row) = history.get_mut(target) {
+                        *row = (*row).max(floor.0);
+                        if *row >= live {
+                            history.remove(target);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(from) = entitled.get_mut(target) {
+                        *from = live_position;
+                    }
+                    history.remove(target);
+                }
+            }
+        }
+        let returns: Vec<(Digest32, u64)> = self
+            .presence
+            .iter()
+            .filter(|(target, _)| **target != me && self.key_returned(target))
+            .filter_map(|(target, presence)| presence.back.map(|(back, _)| (*target, back)))
             .collect();
-        plan.push((live.body.chain_id, live.body.iteration));
-        Ok((live, plan))
+        let targets: Vec<_> = entitled.keys().copied().collect();
+        for target in targets {
+            if target == me || self.key_excluded(store, &target)? || self.key_returned(&target) {
+                continue;
+            }
+            let from = entitled[&target].0;
+            if from < live {
+                history
+                    .entry(target)
+                    .and_modify(|row| *row = (*row).min(from))
+                    .or_insert(from);
+            }
+            delivered.remove(&target);
+        }
+        let append = self.prepare_pending_control(store, owner, now)?;
+        Ok(Some(PendingConsent {
+            append,
+            action: Action::ForwardMigration { returns },
+            entitled,
+            history,
+            delivered: Some(delivered),
+            rotation: None,
+            ledgers_committed: false,
+            origins_committed: None,
+            held_committed: None,
+            package_seq: None,
+            package_attempted: false,
+            consent_seq: None,
+        }))
     }
 
     /// Caller retains the original ComputerPublication and exact trust revision through enqueue.
@@ -263,7 +384,6 @@ impl ChannelState {
         owner: Arc<()>,
         target: Digest32,
         skdm: Box<Skdm>,
-        full_history: bool,
         entitled_from: (u64, u64),
         package: Option<crate::node::keypackage::KeyPackage>,
         now: crate::time::Ms,
@@ -278,18 +398,23 @@ impl ChannelState {
             return Err(Error::Profile(governance::REFRESHING));
         }
         governance::check_removal_generation(store, &self.sek, &self.channel_id, generation)?;
+        self.require_key_target(store, &target)?;
         let once_removed = !self
             .validated_member_removals(store, &target, now)?
             .is_empty();
-        #[cfg(feature = "test-knobs")]
-        let once_removed = once_removed
-            && std::env::var("VOX_TEST_FX62_MUTANT").as_deref() != Ok("readmission-full-plan");
-        if once_removed
+        if (once_removed || self.key_returned(&target))
             && (skdm.body.chain_id != self.sender.chain_id()
-                || entitled_from.0 != self.sender.chain_id()
-                || full_history)
+                || entitled_from.0 != self.sender.chain_id())
         {
             return Err(Error::Profile(governance::REFRESHING));
+        }
+        // A held entitlement is the floor every later release starts from (R5): a key or a
+        // floor before it, such as a pending consent key prepared before a return, is prepared
+        // again from the entitlement.
+        if let Some(floor) = self.entitled.get(&target) {
+            if (skdm.body.chain_id, skdm.body.iteration) < *floor || entitled_from < *floor {
+                return Err(Error::Profile(governance::REFRESHING));
+            }
         }
         if !self.is_author(&target) {
             return Err(Error::MalformedGovernance(
@@ -300,12 +425,16 @@ impl ChannelState {
         let history = self.history.clone();
         let mut append = self.prepare_pending_control(store, owner, now)?;
         append.removal_fence = Some(generation);
+        if package.is_some() {
+            if let Some(back) = self.package_return(store, &target)? {
+                append.require_ancestor(back);
+            }
+        }
         Ok(PendingConsent {
             append,
             action: Action::Issue(Issuance {
                 target,
                 skdm,
-                full_history,
                 entitled_from,
                 package,
             }),
@@ -463,6 +592,9 @@ impl ChannelState {
             if let Some(origins) = origins {
                 self.origins = origins;
             }
+            if matches!(result, Ok(ConsentSaved::Migrated)) {
+                self.forward_migrated = true;
+            }
         }
         // The append result is an installation receipt; the real operation result below may
         // still be an error after an earlier durable rotation/package/grant.
@@ -495,16 +627,9 @@ impl PendingConsent {
             })
             .map(ToString::to_string);
         let hash = self.append.committed.last().map(Entry::entry_hash);
-        let (package, release) = match self.action {
-            Action::Issue(issue) => (
-                if self.package_seq.is_some() {
-                    issue.package
-                } else {
-                    None
-                },
-                result.is_ok().then_some(issue.skdm),
-            ),
-            Action::Withdraw { .. } | Action::RoomRotation { .. } => (None, None),
+        let package = match self.action {
+            Action::Issue(issue) if self.package_seq.is_some() => issue.package,
+            _ => None,
         };
         let append = CompletedText {
             pending: Some(self.append),
@@ -526,7 +651,6 @@ impl PendingConsent {
             held: self.held_committed,
             package_seq: self.package_seq,
             package,
-            release,
             consent_seq: self.consent_seq,
             package_unconfirmed: self.package_attempted
                 && self.package_seq.is_none()
@@ -546,7 +670,6 @@ impl PendingConsent {
                 let Issuance {
                     target,
                     skdm,
-                    full_history,
                     entitled_from,
                     package,
                 } = issue;
@@ -584,20 +707,17 @@ impl PendingConsent {
                     self.append.epoch,
                     *target,
                     skdm,
-                    if *full_history {
-                        HistoryMode::FullHistory
-                    } else {
-                        HistoryMode::ForwardOnly
-                    },
+                    HistoryMode::ForwardOnly,
                 )?;
                 let from = self
                     .entitled
                     .get(target)
                     .map_or(*entitled_from, |old| (*old).min(*entitled_from));
                 self.entitled.insert(*target, from);
-                let floor = entitled_from.0;
-                let history_owed =
-                    floor < skdm.body.chain_id && floor < self.append.sender.chain_id();
+                // The debt follows the merged floor, not the supplied one: a re-issued consent
+                // for an entitlement already held owes what that entitlement is owed (R5).
+                let floor = from.0;
+                let history_owed = floor < self.append.sender.chain_id();
                 let changed =
                     history_owed && self.history.get(target).is_none_or(|old| *old > floor);
                 if changed {
@@ -713,6 +833,43 @@ impl PendingConsent {
                 let here = *here;
                 self.rotate_for_withdrawal(store, signer, here, Some(generation))?;
                 Ok(ConsentSaved::RoomRotated)
+            }
+            Action::ForwardMigration { returns } => {
+                let delivered = self
+                    .delivered
+                    .as_ref()
+                    .ok_or(Error::MalformedAtRest("migration delivered state missing"))?;
+                let mut batch = store.batch()?;
+                self.append.sek.with(|sek| {
+                    // Each return is reconciled before the ledgers are written, so its cut
+                    // records the entitlement the member held before the update.
+                    for (target, back) in returns.iter() {
+                        governance::reconcile_return(
+                            &mut batch,
+                            sek,
+                            &self.append.room,
+                            target,
+                            *back,
+                        )?;
+                    }
+                    for (slot, bytes) in [
+                        (SEG_ENTITLED, positions_bytes(&self.entitled)),
+                        (SEG_HISTORY, delivered_bytes(&self.history)),
+                        (SEG_DELIVERED, delivered_bytes(delivered)),
+                        (SEG_FORWARD_MIGRATED, forward_migrated_bytes()),
+                    ] {
+                        batch.put_segment(
+                            &self.append.room,
+                            SegmentKind::KeyMaterial,
+                            slot,
+                            &seal_segment(sek, SegmentKind::KeyMaterial, slot, &bytes)?,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                batch.commit()?;
+                self.ledgers_committed = true;
+                Ok(ConsentSaved::Migrated)
             }
         }
     }

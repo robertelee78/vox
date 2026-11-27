@@ -847,7 +847,7 @@ impl RoomRemovalGuard {
             return Some(step());
         }
         self.resource
-            .with_removal_fence(&self.room, self.generation, None, step)
+            .with_removal_fence(&self.room, self.generation, None, None, step)
     }
 }
 
@@ -1341,17 +1341,13 @@ pub enum NodeCommand {
         /// Its new petname.
         petname: String,
     },
-    /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
-    /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
-    /// the default, or `Full` — every generation of this node's sender key still held,
-    /// at its origin, so the newcomer reads what was written before the approval too.
+    /// [`NodeCommand::Trust`], choosing what the entry grants. A consent releases this node's
+    /// key from the trust point forward only (v0.4.31): there is no older-history choice.
     TrustWith {
         /// The identity to trust.
         fingerprint: Digest32,
         /// What this node will call it. Local; nothing is registered.
         petname: String,
-        /// What its consents release.
-        history: crate::node::trust::HistoryGrant,
         /// What the entry grants (ADR-028 K-14); `None` keeps what it grants now, and read for a
         /// new entry.
         capability: Option<crate::node::trust::Capability>,

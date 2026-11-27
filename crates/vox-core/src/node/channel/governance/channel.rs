@@ -88,6 +88,7 @@ impl Presence {
         entries: &super::EntryIndex,
         sek: &Sek,
         room: &Digest32,
+        me: &Digest32,
         presence: &mut std::collections::BTreeMap<Digest32, Self>,
         published_through: impl Fn(&Digest32) -> u64,
     ) -> Result<()> {
@@ -125,6 +126,19 @@ impl Presence {
             index.note_presence(*author, *state)?;
         }
         index.seal()?;
+        // The repaired start can change a member's return incarnation: its key effects commit
+        // with the repair, before the room is published.
+        for (author, state) in &repaired {
+            apply_presence_transition(
+                &mut batch,
+                sek,
+                room,
+                me,
+                author,
+                presence.get(author).copied(),
+                *state,
+            )?;
+        }
         batch.commit()?;
         presence.extend(repaired);
         Ok(())
@@ -180,7 +194,10 @@ fn leave_between(facts: &facts::Read<'_>, author: &Digest32, low: u64, high: u64
 }
 
 /// The earliest held `here` after the author's latest held leave; `None` without a leave.
-fn held_return(facts: &facts::Read<'_>, author: &Digest32) -> Result<Option<(u64, u64)>> {
+pub(super) fn held_return(
+    facts: &facts::Read<'_>,
+    author: &Digest32,
+) -> Result<Option<(u64, u64)>> {
     let mut before = facts::position(author, u64::MAX);
     let mut back = None;
     while let Some((key, log)) = facts
@@ -195,6 +212,151 @@ fn held_return(facts: &facts::Read<'_>, author: &Digest32) -> Result<Option<(u64
         before = key;
     }
     Ok(None)
+}
+
+/// The sequence of the author's latest held leave before `seq`; `None` without one.
+pub(super) fn leave_before(
+    facts: &facts::Read<'_>,
+    author: &Digest32,
+    seq: u64,
+) -> Result<Option<u64>> {
+    let mut before = facts::position(author, seq);
+    while let Some((key, log)) = facts
+        .last(facts::Table::Positions, Some(before))?
+        .filter(|(key, _)| key[..32] == author[..])
+    {
+        if let Some((at, _, false)) = presence_at(facts, log)? {
+            return Ok(Some(at));
+        }
+        before = key;
+    }
+    Ok(None)
+}
+
+/// Whether the author stated a held leave after `seq`.
+pub(super) fn leave_after(facts: &facts::Read<'_>, author: &Digest32, seq: u64) -> Result<bool> {
+    let mut after = facts::position(author, seq);
+    while let Some((key, log)) = facts
+        .first(facts::Table::Positions, Some(after))?
+        .filter(|(key, _)| key[..32] == author[..])
+    {
+        if presence_at(facts, log)?.is_some_and(|(_, _, here)| !here) {
+            return Ok(true);
+        }
+        after = key;
+    }
+    Ok(false)
+}
+
+/// The incarnation of the author's return at `back`: its latest held departure before the
+/// return (0 when none is held) and the hash of its signed return Presence.
+fn return_incarnation(
+    facts: &facts::Read<'_>,
+    author: &Digest32,
+    back: u64,
+) -> Result<(u64, Digest32)> {
+    let log = facts
+        .get(facts::Table::Positions, &facts::position(author, back))?
+        .ok_or(crate::error::Error::MalformedAtRest(
+            "return presence not held",
+        ))?;
+    let entry = facts.entry(log)?;
+    let here = matches!(
+        GovEntry::body_bound_to(&entry),
+        Ok(GovBody::Presence(presence)) if presence.body.here
+    );
+    if !here || entry.skeleton.seq != back || entry.skeleton.author_id != *author {
+        return Err(crate::error::Error::MalformedAtRest(
+            "return presence position",
+        ));
+    }
+    Ok((
+        leave_before(facts, author, back)?.unwrap_or(0),
+        entry.entry_hash(),
+    ))
+}
+
+/// The key effects of one author's folded Presence (R2, R3), written into the fold's own
+/// uncommitted batch so they commit with it. A departure records the member's departure
+/// sequence, which every room-key frame sealed for it is checked against when it is written.
+/// A current return is reconciled with its return cut ([`reconcile_return`]). A rotation's
+/// `here` with no departure before it shows no return and does nothing. This node's own
+/// Presence has no key effect here.
+pub(in crate::node::channel) fn apply_presence_transition(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    me: &Digest32,
+    author: &Digest32,
+    old: Option<Presence>,
+    new: Presence,
+) -> Result<()> {
+    if author == me {
+        return Ok(());
+    }
+    if !new.last.1 {
+        if old.is_none_or(|old| old.last != new.last) {
+            batch.put_meta(
+                &super::departure_key(room, author),
+                &new.last.0.to_be_bytes(),
+            )?;
+        }
+        return Ok(());
+    }
+    match new.back {
+        Some((back, _)) => reconcile_return(batch, sek, room, author, back),
+        None => Ok(()),
+    }
+}
+
+/// Reconcile the author's return at `back` with its return cut, in `batch`: a new return
+/// takes its cut and advances the membership counter once; the return already handled keeps
+/// its cut.
+pub(in crate::node::channel) fn reconcile_return(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+    back: u64,
+) -> Result<()> {
+    let (departure, hash) = {
+        let facts = facts::Read::from_batch(batch, sek, room)?;
+        let incarnation = return_incarnation(&facts, author, back)?;
+        if let Some(id) = facts.get(
+            facts::Table::SenderRemovalCuts,
+            &facts::return_cut_key(author),
+        )? {
+            let cut = facts::ReturnCut::parse(&facts.record(id)?, author)?;
+            // The handled return stays the member's current one while none of its departures
+            // is positioned after it in its feed. An earlier return or departure learned late,
+            // a replay or a repair reuses its cut; the row records the latest departure before
+            // it. Only a departure after it, then the return the fold shows now, is a new one.
+            let handled = facts
+                .locator(&cut.back)?
+                .map(|log| facts.entry(log))
+                .transpose()?
+                .filter(|entry| entry.skeleton.author_id == *author)
+                .ok_or(crate::error::Error::MalformedAtRest(
+                    "handled return presence not held",
+                ))?
+                .skeleton
+                .seq;
+            if !leave_after(&facts, author, handled)? {
+                let departure = leave_before(&facts, author, handled)?.unwrap_or(0);
+                if departure == cut.departure {
+                    return Ok(());
+                }
+                (departure, cut.back)
+            } else {
+                incarnation
+            }
+        } else {
+            incarnation
+        }
+    };
+    let mut writer = facts::Write::open(batch, sek, room)?;
+    writer.record_return_cut(author, departure, &hash)?;
+    writer.seal()
 }
 
 /// Checked application-content eligibility at the published governance revision.
@@ -317,6 +479,60 @@ impl ChannelState {
     ) -> Result<Vec<Digest32>> {
         self.checked_governance(store, now.get())?
             .validated_member_removals(target)
+    }
+
+    /// Whether `target`'s latest authenticated Presence is a departure (R2). Only its own later
+    /// `here` Presence, its return, lifts this; an admission notice or a later entry of
+    /// another kind does not. [`Self::has_left`] keeps its wider meaning for sync and recovery.
+    pub(crate) fn key_departed(&self, target: &Digest32) -> bool {
+        self.presence.get(target).is_some_and(|p| !p.last.1)
+    }
+
+    /// Whether `target` is here again after a departure: its key ceremony is its return (R3).
+    pub(crate) fn key_returned(&self, target: &Digest32) -> bool {
+        self.presence
+            .get(target)
+            .is_some_and(|p| p.last.1 && p.back.is_some())
+    }
+
+    /// Whether no room key may be released to `target`: it is removed, or its latest Presence
+    /// is a departure (R2). Removal is checked first.
+    pub(crate) fn key_excluded(&self, store: &Store, target: &Digest32) -> Result<bool> {
+        Ok(self.is_member_removed(store, target)? || self.key_departed(target))
+    }
+
+    /// Refuse a room-key release to an excluded `target` as during a governance refresh.
+    pub(crate) fn require_key_target(&self, store: &Store, target: &Digest32) -> Result<()> {
+        if self.key_excluded(store, target)? {
+            return Err(crate::error::Error::Profile(super::view::REFRESHING));
+        }
+        Ok(())
+    }
+
+    /// The required ancestor of a room-key package for `recipient` (R4): its signed return
+    /// Presence when it came back, so the package can be opened only by its new incarnation;
+    /// `None` when it never left. A recipient that has left gets no package; a return whose cut
+    /// this node does not hold yet is the retryable REFRESHING, and the package waits.
+    pub(crate) fn package_return(
+        &self,
+        store: &Store,
+        recipient: &Digest32,
+    ) -> Result<Option<Digest32>> {
+        if self.key_excluded(store, recipient)? {
+            return Err(crate::error::Error::StreamRefused(
+                "key recipient has left the room",
+            ));
+        }
+        if !self.key_returned(recipient) {
+            return Ok(None);
+        }
+        let back = self
+            .checked_governance(store, self.now_hint)?
+            .return_cut(recipient, &self.me())?
+            .ok_or(crate::error::Error::Profile(super::view::REFRESHING))?
+            .back;
+        self.require_authored_ancestors(store, &self.me(), &[back])?;
+        Ok(Some(back))
     }
 
     /// Whether this exact member governance entry was accepted by the current fold.
@@ -897,8 +1113,9 @@ impl ChannelState {
                 if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
                     if body.verify(key).is_ok() {
                         if let GovBody::Presence(presence) = &body {
+                            let old = self.presence.get(&entry.skeleton.author_id).copied();
                             let state = Presence::fold(
-                                self.presence.get(&entry.skeleton.author_id).copied(),
+                                old,
                                 batch,
                                 &self.entries,
                                 &self.sek,
@@ -911,6 +1128,15 @@ impl ChannelState {
                                 self.entries.write(batch, &self.sek, &self.channel_id)?;
                             index.note_presence(entry.skeleton.author_id, state)?;
                             index.seal()?;
+                            apply_presence_transition(
+                                batch,
+                                &self.sek,
+                                &self.channel_id,
+                                &self.me(),
+                                &entry.skeleton.author_id,
+                                old,
+                                state,
+                            )?;
                         }
                     }
                 }

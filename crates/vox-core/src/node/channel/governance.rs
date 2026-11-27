@@ -286,6 +286,31 @@ fn removal_generation_key(room: &Digest32) -> String {
     key
 }
 
+/// Store meta holding the signed sequence of `target`'s latest departure from `room` (R2). A
+/// room-key frame sealed for `target` records it and is written only while it is unchanged, so
+/// a frame sealed before the member left is never written after its departure commits.
+fn departure_key(room: &Digest32, target: &Digest32) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(144);
+    key.push_str("room-departure/");
+    for byte in room {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key.push('/');
+    for byte in target {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// The sequence of `target`'s latest departure folded here; 0 when it has never left.
+pub(crate) fn departure(store: &Store, room: &Digest32, target: &Digest32) -> Result<u64> {
+    Ok(store
+        .get_meta_prefix::<8>(&departure_key(room, target))?
+        .map(u64::from_be_bytes)
+        .unwrap_or(0))
+}
+
 /// Durable incarnation of the validated room membership projection.
 pub(crate) fn removal_generation(store: &Store, room: &Digest32) -> Result<u64> {
     Ok(store
@@ -856,7 +881,7 @@ fn advance_source(
 }
 
 pub(crate) use channel::ContentEligibility;
-pub(super) use channel::Presence;
+pub(super) use channel::{apply_presence_transition, reconcile_return, Presence};
 pub use channel::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
 pub(super) use view::{Display, View};
 

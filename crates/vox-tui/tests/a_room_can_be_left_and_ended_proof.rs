@@ -17,10 +17,16 @@
 //!   ADR-023 RL-8.4's separate non-secret continuity checkpoint and withdrawal bookkeeping may remain.
 //! - **Rejoin.** Alice leaves, then joins again through bob with the room's address and passphrase,
 //!   as anyone joins. Within [`WITHIN`] bob's and carol's rosters name her again through her
-//!   verified admission notice. After automatic own-history recovery her posts reach both; bob's
-//!   posts reach her, and nobody reports her signing two entries at one position. Then
+//!   verified admission notice. After automatic own-history recovery all her posts reach both;
+//!   coming back is a new key ceremony, so she reads bob's and carol's posts written after her
+//!   return and none from before it (B-BEFORE, which she read before leaving; B-AWAY and C-AWAY,
+//!   written while she was away, C-AWAY by carol who had not learnt she left and offered her a
+//!   direct key), and nobody reports her signing two entries at one position. Then
 //!   she leaves again, joins again and leaves a third time (#564): each leave drops her from bob's
-//!   and carol's rosters within [`WITHIN`], as the first did.
+//!   and carol's rosters within [`WITHIN`], as the first did. The variants of design-4 §3 (a
+//!   package sealed before she left, a member offline across her absences, a replayed return,
+//!   a key taken late, a removal racing a return) are
+//!   `a_member_that_comes_back_reads_forward_from_each_return`.
 //! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
 //!   creator, makes bob and carol admins and takes carol's back; every member's `vox room admin
 //!   list` says so. Carol is then refused `vox room end`, and bob, an admin, ends the room. Within
@@ -65,7 +71,9 @@
 //! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave); a readmission
 //! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster);
 //! a post in a removal's rotation window refused as an internal error (post after removal,
-//! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`).
+//! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`); a returner that takes an unbound direct key (rejoin:
+//! alice reads C-AWAY, `VOX_MUTANT_FWD=direct-accepted`); the blocking readability audit put back
+//! (posts at once: the first post is refused, `VOX_MUTANT_FWD=audit-back`).
 
 #![cfg(unix)]
 
@@ -341,6 +349,14 @@ fn fx62_mutant() {
     }
 }
 
+/// The forward-only acts' mutant arm: the runner's `VOX_MUTANT_FWD=<value>` becomes the daemons'
+/// `VOX_TEST_FWD_MUTANT` (temp_home strips every inherited `VOX_TEST_*`).
+fn fwd_mutant() {
+    if let Ok(mutant) = std::env::var("VOX_MUTANT_FWD") {
+        std::env::set_var("VOX_TEST_FWD_MUTANT", mutant);
+    }
+}
+
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
@@ -563,27 +579,6 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         o.ok && o.stdout.contains(&carol.b32())
     });
     assert!(back, "PRODUCT: readmitted carol did not return: {roster:?}");
-    let full = setup(
-        alice,
-        &[
-            "trust",
-            "add",
-            &carol.b32(),
-            "--name",
-            "carol",
-            "--history",
-            "full",
-            "--identity-passphrase-file",
-            alice
-                .pass
-                .to_str()
-                .expect("APPARATUS: UTF-8 passphrase path"),
-        ],
-    );
-    assert!(
-        full.ok,
-        "PRODUCT: full history grant after readmission was refused: {full:?}"
-    );
     setup(alice, &["room", "post", id, "FX62-FOLD-WITNESS"]);
     erin.restart_daemon(&tmp.path().join("erin-restart.err"));
     let (synced, witness) = poll(erin, &["room", "read", id], WITHIN, |o| {
@@ -690,95 +685,6 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         "PRODUCT: old-passphrase rejoin restored the removed identity: {roster:?}"
     );
     eprintln!("[proof] FX-62: admin removal, non-admin refusal, remaining posts, forward-only readmission and old-passphrase exclusion");
-    setup(dave, &["room", "leave", id]);
-    let (left, roster) = poll(alice, &["room", "roster", id], WITHIN, |o| {
-        o.ok && !o.stdout.contains(&dave.b32())
-    });
-    assert!(
-        left,
-        "APPARATUS: never-removed history control did not leave: {roster:?}"
-    );
-    let join = dave.vox_in(
-        None,
-        &["room", "join", "--passphrase-file", "-", &link],
-        Some(support::ROOM_PASS),
-    );
-    assert!(
-        join.ok,
-        "PRODUCT [FX62 never-removed-full]: never-removed dave could not rejoin: {join:?}"
-    );
-    let (back, roster) = poll(alice, &["room", "roster", id], WITHIN, |o| {
-        o.ok && o.stdout.contains(&dave.b32())
-    });
-    assert!(
-        back,
-        "APPARATUS: full-history control rejoin did not reach its sender: {roster:?}"
-    );
-    let restart_before_post = std::env::var_os("VOX_PROOF_FX62_RESTART_REJOIN").is_some();
-    if restart_before_post {
-        dave.restart_daemon(&tmp.path().join("dave-rejoined-restart.err"));
-        eprintln!("[proof] FX62 never-removed-full: restarted rejoined dave before its first post");
-    }
-    // Own-history recovery is the #1163 prerequisite, not roster propagation; use the
-    // same patience as its existing recovery consumers rather than WITHIN's leave window.
-    let (writable, post) = poll(
-        dave,
-        &["room", "post", id, "FX62-REJOIN-CONTROL"],
-        support::TIMEOUT,
-        |o| o.ok,
-    );
-    if !restart_before_post
-        && !writable
-        && post
-            .stderr
-            .contains("this node's record of its own history in this room is behind")
-    {
-        panic!("APPARATUS [FX62 never-removed-full]: prerequisite #1163 (returning-author continuity) is unmet; the never-removed control cannot recover after same-ID leave/rejoin: {post:?}");
-    }
-    assert!(writable, "PRODUCT [FX62 never-removed-full]: rejoined control never recovered its own history: {post:?}; status={:?}; daemon:\n{}",
-        dave.vox(None, &["status", "--json"]),
-        std::fs::read_to_string(tmp.path().join("dave-restart.err")).unwrap_or_default());
-    let (ready, control) = poll(alice, &["room", "read", id], WITHIN, |o| {
-        o.ok && o.stdout.contains("FX62-REJOIN-CONTROL")
-    });
-    assert!(
-        ready,
-        "APPARATUS [FX62 never-removed-full]: prerequisite #1163 (returning-author continuity) is unmet; full-history control's reciprocal consent was not staged: {control:?}"
-    );
-    let full_control = setup(
-        alice,
-        &[
-            "trust",
-            "add",
-            &dave.b32(),
-            "--name",
-            "dave",
-            "--history",
-            "full",
-            "--identity-passphrase-file",
-            alice
-                .pass
-                .to_str()
-                .expect("APPARATUS: UTF-8 passphrase path"),
-        ],
-    );
-    assert!(
-        full_control.ok,
-        "PRODUCT [FX62 never-removed-full]: full control grant failed: {full_control:?}"
-    );
-    let (seen, history) = poll(dave, &["room", "read", id], WITHIN, |o| {
-        o.ok && o.stdout.contains("FX62-NEVER-REMOVED-HISTORY")
-    });
-    assert!(
-        seen,
-        "PRODUCT [FX62 never-removed-full]: never-removed rejoiner lost full history: {history:?}; full grant={full_control:?}; sender status={:?}; sender daemon:\n{}\nreader daemon:\n{}",
-        alice.vox(None, &["status", "--json"]),
-        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default(),
-        std::fs::read_to_string(tmp.path().join("dave-restart.err")).unwrap_or_default()
-    );
-    eprintln!(
-        "[proof] FX62 never-removed-full: never-removed dave received FX62-NEVER-REMOVED-HISTORY"
-    );
 }
 
 /// One control-socket request to `w`'s daemon; a socket the harness cannot reach is APPARATUS.
@@ -1201,7 +1107,7 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     watchdog::arm();
     fx62_mutant();
     let rt = runtime();
-    let tmp = tempfile::tempdir().expect("APPARATUS: temporary directory");
+    let tmp = support::diagnostic_tempdir();
     let mut room = room_of(&rt, tmp.path(), &["alice", "dave", "carol", "bob"]);
     let id = room.id.clone();
     let (online, offline) = room.workers.split_at_mut(3);
@@ -1211,24 +1117,48 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     let [bob] = offline else { unreachable!() };
     let id = id.as_str();
     let gate = tmp.path().join("pairwise-key.hold");
+    let bob_gate = tmp.path().join("bob-pairwise-key.hold");
     let fold = tmp.path().join("alice-fold.hold");
-    let gate_text = gate.to_str().expect("APPARATUS: UTF-8 gate path");
-    let fold_text = fold.to_str().expect("APPARATUS: UTF-8 fold path");
-    let change_trust = |sender: &Worker, full: bool| {
-        let mut args = vec!["trust", if full { "add" } else { "remove" }];
-        let target = carol.b32();
-        args.push(&target);
-        if full {
-            args.extend(["--name", "carol", "--history", "full"]);
+    let rotate = tmp.path().join("rotate-after-post");
+    let path_text = |path: &std::path::Path| {
+        path.to_str()
+            .expect("APPARATUS: UTF-8 knob path")
+            .to_owned()
+    };
+    let (gate_text, bob_gate_text, fold_text, rotate_text) = (
+        path_text(&gate),
+        path_text(&bob_gate),
+        path_text(&fold),
+        path_text(&rotate),
+    );
+    // A catch-up debt (forward only: no older history exists to owe). The sender rotates its
+    // chain after carol became entitled, the new chain's key it owes her is held at its
+    // physical writer, and it posts on that chain: dave reads the post, carol is owed it.
+    let owe_carol = |sender: &Worker, gate: &std::path::Path, tag: &str| {
+        std::fs::write(gate, carol.b32()).expect("APPARATUS: arm queued-key gate");
+        std::fs::write(&rotate, format!("default\t{id}")).expect("APPARATUS: arm rotation");
+        setup(sender, &["room", "post", id, "FX62-ROTATES"]);
+        fwd_rotated(&rotate, &sender.name);
+        setup(sender, &["room", "post", id, tag]);
+        let engaged = gate.with_extension("engaged");
+        let deadline = Instant::now() + WITHIN;
+        while !engaged.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: no actual queued key reached {}'s sender gate",
+                sender.name
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
-        args.extend([
-            "--identity-passphrase-file",
-            sender
-                .pass
-                .to_str()
-                .expect("APPARATUS: UTF-8 passphrase path"),
-        ]);
-        setup(sender, &args)
+        let (seen, read) = poll(dave, &["room", "read", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(tag)
+        });
+        assert!(seen, "APPARATUS: dave did not read {tag}: {read:?}");
+        let before = setup(carol, &["room", "read", id]);
+        assert!(
+            !before.stdout.contains(tag),
+            "APPARATUS: carol's queued key was not held: she read {tag}: {before:?}"
+        );
     };
     setup(alice, &["room", "admin", "add", id, &dave.b32()]);
     let (admin, listed) = poll(dave, &["room", "admin", "list", id], WITHIN, |o| {
@@ -1238,48 +1168,27 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
         admin,
         "APPARATUS: removal issuer's delegation was not staged: {listed:?}"
     );
-    for sender in [&*alice, &*bob] {
-        change_trust(sender, false);
-        setup(
-            sender,
-            &[
-                "room",
-                "post",
-                id,
-                if sender.fp == alice.fp {
-                    "FX62-ALICE-PRE-DEBT"
-                } else {
-                    "FX62-BOB-PRE-DEBT"
-                },
-            ],
-        );
-    }
-    let before = setup(carol, &["room", "read", id]);
-    assert!(
-        !before.stdout.contains("FX62-ALICE-PRE-DEBT")
-            && !before.stdout.contains("FX62-BOB-PRE-DEBT"),
-        "APPARATUS: undisclosed pre-removal chains were already readable: {before:?}"
+    // Bob goes offline owing carol his new chain.
+    bob.restart_daemon_as(
+        support::VOX,
+        &[
+            ("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", &bob_gate_text),
+            ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_text),
+        ],
+        &tmp.path().join("bob-gated.err"),
     );
+    owe_carol(bob, &bob_gate, "FX62-BOB-PRE-DEBT");
     bob.stop_daemon();
     alice.restart_daemon_as(
         support::VOX,
         &[
-            ("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", gate_text),
-            ("VOX_TEST_FOLD_HOLD_FILE", fold_text),
+            ("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", &gate_text),
+            ("VOX_TEST_FOLD_HOLD_FILE", &fold_text),
+            ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_text),
         ],
         &tmp.path().join("alice-gated.err"),
     );
-    std::fs::write(&gate, carol.b32()).expect("APPARATUS: arm queued-key gate");
-    change_trust(alice, true);
-    let engaged = gate.with_extension("engaged");
-    let deadline = Instant::now() + WITHIN;
-    while !engaged.is_file() {
-        assert!(
-            Instant::now() < deadline,
-            "APPARATUS: no actual queued key reached its sender gate"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    owe_carol(alice, &gate, "FX62-ALICE-PRE-DEBT");
     let (ready, status) = poll(alice, &["status", "--json"], WITHIN, |o| {
         o.ok && o.json()["governance_pending"] == false
     });
@@ -1289,18 +1198,21 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     );
     std::fs::write(&fold, b"hold").expect("APPARATUS: arm sender's governance fold hold");
     let removal = setup(dave, &["room", "remove-member", id, &carol.b32()]);
-    let hash = removal
-        .stdout
-        .split("signed entry ")
-        .nth(1)
-        .and_then(|text| text.split(';').next())
-        .expect("PRODUCT: removal result omitted its signed entry");
+    let signed = |out: &Out, what: &str| -> String {
+        out.stdout
+            .split("signed entry ")
+            .nth(1)
+            .and_then(|text| text.split(';').next())
+            .unwrap_or_else(|| panic!("PRODUCT: {what} result omitted its signed entry: {out:?}"))
+            .to_owned()
+    };
+    let hash = signed(&removal, "removal");
     // Exact authenticated source receipt is staging, not the egress verdict below.
     let (received, hashes) = poll(alice, &["room", "read", id, "--hashes"], WITHIN, |o| {
         o.ok && o
             .stdout
             .lines()
-            .any(|line| line.split_whitespace().next() == Some(hash))
+            .any(|line| line.split_whitespace().next() == Some(hash.as_str()))
     });
     assert!(
         received,
@@ -1343,7 +1255,33 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
             .contains("Readmission does not restore history"),
         "PRODUCT [FX62 disclosure]: readmission omitted its history limit: {readmit:?}"
     );
-    bob.restart_daemon(&tmp.path().join("bob-after-readmission.err"));
+    let readmission = signed(&readmit, "readmission");
+    // Bob's owed key stays held at his writer until he has folded the removal and the
+    // readmission: what he then owes carol is his decision, not a race with his catch-up.
+    std::fs::write(&bob_gate, carol.b32()).expect("APPARATUS: arm bob's queued-key gate");
+    bob.restart_daemon_as(
+        support::VOX,
+        &[("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", &bob_gate_text)],
+        &tmp.path().join("bob-after-readmission.err"),
+    );
+    let (folded, status) = poll(bob, &["room", "read", id, "--hashes"], WITHIN, |o| {
+        o.ok && o
+            .stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(readmission.as_str()))
+    });
+    assert!(
+        folded,
+        "APPARATUS: bob never received carol's readmission: {status:?}"
+    );
+    let (folded, status) = poll(bob, &["status", "--json"], WITHIN, |o| {
+        o.ok && o.json()["governance_pending"] == false
+    });
+    assert!(
+        folded,
+        "APPARATUS: bob did not fold carol's removal and readmission: {status:?}"
+    );
+    std::fs::remove_file(&bob_gate).expect("APPARATUS: release bob's queued-key writer");
     for sender in [&*alice, &*bob] {
         let (back, roster) = poll(sender, &["room", "roster", id], WITHIN, |o| {
             o.ok && o.stdout.contains(&carol.b32())
@@ -1352,7 +1290,6 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
             back,
             "APPARATUS: sender did not fold readmission: {roster:?}"
         );
-        change_trust(sender, true);
         let tag = if sender.fp == alice.fp {
             "FX62-ALICE-FRESH"
         } else {
@@ -1378,14 +1315,15 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
         assert!(!read.stdout.contains("FX62-ALICE-PRE-DEBT")
             && !read.stdout.contains("FX62-BOB-PRE-DEBT")
             && !read.stdout.contains("FX62-ALICE-DURING-DEBT"),
-            "PRODUCT [FX62 history-debt]: full grant or SEG_HISTORY backfilled undisclosed history: {read:?}");
+            "PRODUCT [FX62 history-debt]: a catch-up debt owed before the removal, or SEG_HISTORY, \
+             was paid to readmitted carol: {read:?}");
         if Instant::now() >= through {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
     eprintln!("[proof] FX62 queued-key: carol never read FX62-ALICE-PRE-DEBT while the removal fold was held");
-    eprintln!("[proof] FX62 history-debt: both separately applied and offline-fold senders delivered fresh posts without pre-removal or removal-period debt");
+    eprintln!("[proof] FX62 history-debt: both separately applied and offline-fold senders delivered fresh posts without pre-removal catch-up or removal-period debt");
 }
 
 /// A member who removes another and posts at once (ledger 77). The removal is applied by one save
@@ -4188,12 +4126,20 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn a_member_that_left_joins_again_and_is_a_member_again() {
     watchdog::arm();
+    fwd_mutant();
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
     #[allow(unused_mut)]
     let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
     #[cfg(feature = "test-knobs")]
     let return_hold = tmp.path().join("return-presence-hold");
+    // Carol stays online but does not fold governance while alice is away, so she learns
+    // neither the departure nor the return, and a post of hers rotates her sender chain: she
+    // then owes alice the new chain as a direct key, as any never-left member is owed it.
+    #[cfg(feature = "test-knobs")]
+    let carol_fold = tmp.path().join("carol-fold.hold");
+    #[cfg(feature = "test-knobs")]
+    let carol_rotate = tmp.path().join("carol-rotate-after-post");
     #[cfg(feature = "test-knobs")]
     {
         room.workers[0].restart_daemon_as(
@@ -4204,19 +4150,53 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
             )],
             &tmp.path().join("alice-return-proof.err"),
         );
-        let (ready, seen) = poll(&room.workers[0], &["room", "read", &room.id], WITHIN, |o| {
-            o.ok
-        });
-        assert!(
-            ready,
-            "APPARATUS: restarted Alice did not prepare: {seen:?}"
+        room.workers[2].restart_daemon_as(
+            support::VOX,
+            &[
+                (
+                    "VOX_TEST_FOLD_HOLD_FILE",
+                    carol_fold.to_str().expect("APPARATUS: fold hold path"),
+                ),
+                (
+                    "VOX_TEST_FX28_ROTATE_AFTER_POST",
+                    carol_rotate.to_str().expect("APPARATUS: rotation path"),
+                ),
+            ],
+            &tmp.path().join("carol-return-proof.err"),
         );
+        for index in [0, 2] {
+            let (ready, seen) = poll(
+                &room.workers[index],
+                &["room", "read", &room.id],
+                WITHIN,
+                |o| o.ok,
+            );
+            assert!(
+                ready,
+                "APPARATUS: restarted {} did not prepare: {seen:?}",
+                room.workers[index].name
+            );
+        }
     }
     let [alice, bob, carol] = &room.workers[..] else {
         unreachable!()
     };
     let id = room.id.as_str();
     let link = setup(bob, &["room", "link", id]).stdout.trim().to_owned();
+    let daemon_log =
+        |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap_or_default();
+    // B-BEFORE: a post alice reads before she leaves. Leaving deletes the room from her node,
+    // and coming back is a new key ceremony: she reads from her return on.
+    setup(bob, &["room", "post", id, "B-BEFORE"]);
+    support::until(
+        alice,
+        None,
+        "alice reads B-BEFORE before she leaves",
+        &["room", "read", id],
+        |o| o.ok && o.stdout.contains("B-BEFORE"),
+    );
+    #[cfg(feature = "test-knobs")]
+    std::fs::write(&carol_fold, b"hold").expect("APPARATUS: arm carol's fold hold");
 
     let o = alice.vox(None, &["room", "leave", id]);
     assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");
@@ -4227,7 +4207,21 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
         gone,
         "PRODUCT: {WITHIN:?} after alice left, bob's roster still names her: {o:?}"
     );
+    #[cfg(feature = "test-knobs")]
+    {
+        let roster = carol.vox(None, &["room", "roster", id]);
+        assert!(
+            roster.ok && roster.stdout.contains(&alice.b32()),
+            "APPARATUS: carol applied alice's departure although her fold was held: {roster:?}"
+        );
+    }
+    // B-AWAY: written while alice is away.
+    setup(bob, &["room", "post", id, "B-AWAY"]);
 
+    // Alice's recovery is held before she signs her return, so she joins and connects but is
+    // not yet back.
+    #[cfg(feature = "test-knobs")]
+    std::fs::write(&return_hold, b"hold").expect("APPARATUS: arm return Presence hold");
     let t = Instant::now();
     let o = alice.vox_in(
         None,
@@ -4238,9 +4232,10 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
         o.ok,
         "PRODUCT: alice, who left, was refused joining again with the room's address and \
          passphrase: {o:?}\nbob's daemon said:\n{}",
-        std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default()
+        daemon_log("bob.daemon.err")
     );
-    // RL-8.5: Carol learns recovery standing from the verified admission notice.
+    // RL-8.5: Carol learns recovery standing from the verified admission notice (while her
+    // fold is held she never dropped alice).
     for w in [bob, carol] {
         let (back, o) = poll(w, &["room", "roster", id], WITHIN, |o| {
             o.ok && o.stdout.contains(&alice.b32())
@@ -4255,16 +4250,57 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
         "[proof] rejoin: bob's and carol's rosters named alice again {:.1}s after her join began",
         t.elapsed().as_secs_f64()
     );
+    // C-AWAY: carol, who learnt neither the departure nor the return, rotates her chain and
+    // writes C-AWAY before alice is back. Alice is connected, so carol offers her the new chain
+    // as a direct key, as to any member she believes never left. A node that does not know
+    // whether it left, or came back, takes room keys only from packages bound to its return
+    // (R4): C-AWAY stays unread.
+    #[cfg(feature = "test-knobs")]
+    {
+        let engaged = return_hold.with_extension("engaged");
+        let deadline = Instant::now() + WITHIN;
+        while !engaged.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: alice did not reach recovery before her return Presence"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::write(&carol_rotate, format!("default\t{id}"))
+            .expect("APPARATUS: arm carol's rotation");
+        setup(
+            carol,
+            &["room", "post", id, "C-ROTATES before alice is back"],
+        );
+        fwd_rotated(&carol_rotate, "carol");
+        setup(carol, &["room", "post", id, "C-AWAY"]);
+        support::until(bob, None, "bob reads C-AWAY", &["room", "read", id], |o| {
+            o.ok && o.stdout.contains("C-AWAY")
+        });
+        let (leaked, o) = poll(alice, &["room", "read", id], Duration::from_secs(15), |o| {
+            o.ok && o.stdout.contains("C-AWAY")
+        });
+        assert!(
+            !leaked,
+            "PRODUCT: alice read C-AWAY, written before her return, from a direct key of carol, \
+             who had not learnt that she left: {o:?}"
+        );
+        std::fs::remove_file(&return_hold).expect("APPARATUS: release return Presence hold");
+        std::fs::remove_file(&engaged).expect("APPARATUS: clear return hold marker");
+    }
     // Rooms are forward-only (ADR-006): a member reads an author from the key the author released
     // to it, so a post made before that release stays unreadable to it, as for any member who has
     // just joined (`support::room` waits the same way). Each side keeps posting fresh messages
-    // until the other reads one.
+    // until the other reads one. Every post alice makes is kept to check that bob and carol read
+    // all of them.
+    let alice_posts = std::cell::RefCell::new(Vec::<String>::new());
     let reads = |author: &Worker, reader: &Worker, what: &str| -> (bool, Out) {
         let deadline = Instant::now() + WITHIN;
         let mut n = 0u32;
         loop {
             n += 1;
-            let o = author.vox(None, &["room", "post", id, &format!("{what} {n}")]);
+            let text = format!("{what} #{n}.");
+            let o = author.vox(None, &["room", "post", id, &text]);
             if !o.ok {
                 // ADR-023 RL-8.5 / ADR-037 R5: a rejoin may truthfully refuse writes
                 // until own-history recovery finishes, automatically and without operator action.
@@ -4277,6 +4313,9 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
                 );
                 std::thread::sleep(Duration::from_millis(250));
                 continue;
+            }
+            if author.name == "alice" {
+                alice_posts.borrow_mut().push(text);
             }
             std::thread::sleep(Duration::from_secs(1));
             let r = reader.vox(None, &["room", "read", id]);
@@ -4293,19 +4332,73 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
         read,
         "PRODUCT: within {WITHIN:?}, bob read none of what alice posted after joining again: \
          {o:?}\nalice's daemon said:\n{}\nbob's daemon said:\n{}",
-        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default(),
-        std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default()
+        daemon_log("alice-return-proof.err"),
+        daemon_log("bob.daemon.err")
     );
+    let (read, o) = reads(bob, alice, "welcome back, alice");
+    assert!(
+        read,
+        "PRODUCT: within {WITHIN:?}, alice, joined again, read none of what bob posted: {o:?}"
+    );
+    // Carol's fold is released: she learns the departure and the return at once.
+    #[cfg(feature = "test-knobs")]
+    {
+        std::fs::remove_file(&carol_fold).expect("APPARATUS: release carol's fold hold");
+        // Releasing the marker does not wake the fold; a real new governance fact does.
+        setup(alice, &["room", "rename", id, "back-again"]);
+        let (dropped_and_back, o) = poll(carol, &["status", "--json"], WITHIN, |o| {
+            o.ok && o.json()["governance_pending"] == false
+        });
+        assert!(
+            dropped_and_back,
+            "APPARATUS: carol did not fold governance after her hold was released: {o:?}"
+        );
+    }
     let (read, o) = reads(alice, carol, "alice is back, carol");
     assert!(
         read,
         "PRODUCT: within {WITHIN:?}, carol read none of what alice posted after joining again: \
          {o:?}"
     );
-    let (read, o) = reads(bob, alice, "welcome back, alice");
+    let (read, o) = reads(carol, alice, "carol after alice is back");
     assert!(
         read,
-        "PRODUCT: within {WITHIN:?}, alice, joined again, read none of what bob posted: {o:?}"
+        "PRODUCT: within {WITHIN:?}, alice, joined again, read none of what carol posted: {o:?}\n\
+         carol's daemon said:\n{}",
+        daemon_log("carol-return-proof.err")
+    );
+    // Forward only: alice does not read what was written before her return, whether she had
+    // read it before she left (B-BEFORE) or it was written while she was away (B-AWAY, C-AWAY).
+    let through = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = setup(alice, &["room", "read", id]);
+        for old in ["B-BEFORE", "B-AWAY", "C-AWAY"] {
+            assert!(
+                !read.stdout.contains(old),
+                "PRODUCT: alice read {old}, written before her return: {read:?}"
+            );
+        }
+        if Instant::now() >= through {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Bob and carol read every post alice made after her return.
+    let posted = alice_posts.borrow().clone();
+    for w in [bob, carol] {
+        let (all, o) = poll(w, &["room", "read", id], WITHIN, |o| {
+            o.ok && posted.iter().all(|text| o.stdout.contains(text.as_str()))
+        });
+        assert!(
+            all,
+            "PRODUCT: {} did not read every post alice made after her return ({posted:?}): {o:?}",
+            w.name
+        );
+    }
+    eprintln!(
+        "[proof] rejoin: alice read bob's and carol's posts after her return and none from before it; \
+         bob and carol read all {} of hers",
+        posted.len()
     );
     // `frozen` is null while a session holds the room; read until it is said.
     let frozen: Vec<String> = {
@@ -4408,6 +4501,411 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
     }
     leaves(3);
     eprintln!("[proof] rejoin: alice's second and third leaves each dropped her from both rosters");
+}
+
+/// A post armed with `VOX_TEST_FX28_ROTATE_AFTER_POST` rotated its author's sender chain: the
+/// author's daemon consumes the arm when it takes the rotation.
+fn fwd_rotated(arm: &std::path::Path, who: &str) {
+    let deadline = Instant::now() + WITHIN;
+    while arm.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: {who}'s armed post did not take the forced rotation: {}",
+            arm.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Posts `what #n.` as `author` until `reader` reads one; a refusal while the author is still
+/// recovering its own history is waited out. Returns every text it posted.
+#[cfg(feature = "test-knobs")]
+fn fwd_post_until_read(author: &Worker, reader: &Worker, id: &str, what: &str) -> Vec<String> {
+    let deadline = Instant::now() + support::TIMEOUT;
+    let mut posted = Vec::new();
+    let mut n = 0u32;
+    loop {
+        n += 1;
+        let text = format!("{what} #{n}.");
+        let o = author.vox(None, &["room", "post", id, &text]);
+        if !o.ok {
+            assert!(
+                o.stderr.contains("own history") && Instant::now() < deadline,
+                "PRODUCT: {} never accepted the post \"{what}\": {o:?}",
+                author.name
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        posted.push(text);
+        std::thread::sleep(Duration::from_secs(1));
+        let r = reader.vox(None, &["room", "read", id]);
+        if r.ok && r.stdout.contains(what) {
+            return posted;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: within {:?}, {} read none of {}'s \"{what}\": {r:?}\n{}'s status: {:?}",
+            support::TIMEOUT,
+            reader.name,
+            author.name,
+            reader.name,
+            reader.vox(None, &["status"])
+        );
+    }
+}
+
+/// For ten seconds `reader` reads none of `old`.
+#[cfg(feature = "test-knobs")]
+fn fwd_never_reads(reader: &Worker, id: &str, old: &[&str], why: &str) {
+    let through = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = reader.vox(None, &["room", "read", id]);
+        for text in old {
+            assert!(
+                !read.stdout.contains(text),
+                "PRODUCT: {} read {text}, {why}: {read:?}",
+                reader.name
+            );
+        }
+        if Instant::now() >= through {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `w`'s own feed position in the room, as `vox status --json` says it.
+#[cfg(feature = "test-knobs")]
+fn fwd_own_feed(w: &Worker, id: &str) -> u64 {
+    let status = setup(w, &["status", "--json"]).json();
+    status["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["id"] == id)
+        .and_then(|r| r["own_feed_through"].as_u64())
+        .unwrap_or_else(|| {
+            panic!(
+                "APPARATUS: {}'s status names no own feed position for the room: {status}",
+                w.name
+            )
+        })
+}
+
+/// With nobody posting, `w`'s own feed comes to rest: ten seconds without an append, within a
+/// minute. Its own feed also takes the key packages it writes for members out of reach (one per
+/// member and chain, once a reach has failed), so a single window is not enough; a rotation
+/// storm appends a Presence on every turn and never rests.
+#[cfg(feature = "test-knobs")]
+fn fwd_quiet(w: &Worker, id: &str, why: &str) -> u64 {
+    let first = fwd_own_feed(w, id);
+    let mut start = first;
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_secs(10));
+        let end = fwd_own_feed(w, id);
+        if end == start {
+            return end;
+        }
+        start = end;
+    }
+    panic!(
+        "PRODUCT: {}'s own feed went from {first} to {start} and kept growing for a minute with \
+         nobody posting, {why}",
+        w.name
+    );
+}
+
+/// Design-4 §3, the variants of [`a_member_that_left_joins_again_and_is_a_member_again`]: alice
+/// leaves and comes back, bob made the room. In turn: bob's package for alice sealed before she
+/// left does not open after her return, and she left at once after a restart, while her room was
+/// still settling; carol is offline for the whole of two absences and learns them at once; bob
+/// replays the return (a restart) and does not rotate again; bob's key for alice is taken late,
+/// after he posted on his new chain, and a second key that waited for a fresh one-time prekey is
+/// delivered; a removal racing a return leaves alice removed. Alice reads nothing written before
+/// each return. Mutant: `VOX_MUTANT_FWD=package-unbound` (alice reads B-PKG).
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; run in release"]
+fn a_member_that_comes_back_reads_forward_from_each_return() {
+    watchdog::arm();
+    fwd_mutant();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["bob", "alice", "carol"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let (b, a, c) = (0, 1, 2);
+    let packages = tmp.path().join("alice-packages.hold");
+    let packages_text = packages
+        .to_str()
+        .expect("APPARATUS: UTF-8 knob path")
+        .to_owned();
+    let rotate = tmp.path().join("bob-rotate-after-post");
+    let rotate_text = rotate
+        .to_str()
+        .expect("APPARATUS: UTF-8 knob path")
+        .to_owned();
+    let log = |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap_or_default();
+    room.workers[b].restart_daemon_as(
+        support::VOX,
+        &[("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_text)],
+        &tmp.path().join("bob-variants.err"),
+    );
+    let (ready, seen) = poll(&room.workers[b], &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(ready, "APPARATUS: restarted bob did not prepare: {seen:?}");
+    let link = setup(&room.workers[b], &["room", "link", id])
+        .stdout
+        .trim()
+        .to_owned();
+    let alice_fp = room.workers[a].b32();
+    let start_alice = |room: &mut Room, err: &str| {
+        room.workers[a].restart_daemon_as(
+            support::VOX,
+            &[("VOX_TEST_HOLD_PACKAGES_FILE", &packages_text)],
+            &tmp.path().join(err),
+        );
+    };
+    let leave = |room: &Room, n: u32| {
+        let alice = &room.workers[a];
+        let (left, o) = poll(alice, &["room", "leave", id], WITHIN, |o| {
+            o.ok || !o.stderr.contains("record of its own history")
+        });
+        assert!(
+            left && o.ok,
+            "PRODUCT: alice's leave {n} was refused: {o:?}"
+        );
+        let (gone, o) = poll(&room.workers[b], &["room", "roster", id], WITHIN, |o| {
+            o.ok && !o.stdout.contains(&alice_fp)
+        });
+        assert!(
+            gone,
+            "PRODUCT: after alice's leave {n}, bob's roster still names her: {o:?}"
+        );
+    };
+    let join = |room: &Room, n: u32| {
+        let o = room.workers[a].vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(support::ROOM_PASS),
+        );
+        assert!(o.ok, "PRODUCT: alice's join {n} was refused: {o:?}");
+        let (back, o) = poll(&room.workers[b], &["room", "roster", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&alice_fp)
+        });
+        assert!(
+            back,
+            "PRODUCT: after alice's join {n}, bob's roster does not name her: {o:?}"
+        );
+    };
+
+    // 1. A package sealed before she left. Alice is offline when bob's post rotates his chain,
+    //    so the key she is owed goes into the room's log as a key package; she comes back up
+    //    taking no key and leaves without having opened it.
+    room.workers[a].stop_daemon_cleanly();
+    std::fs::write(&rotate, format!("default\t{id}")).expect("APPARATUS: arm bob's rotation");
+    setup(&room.workers[b], &["room", "post", id, "B-ROTATES"]);
+    fwd_rotated(&rotate, "bob");
+    setup(&room.workers[b], &["room", "post", id, "B-PKG"]);
+    let deadline = Instant::now() + support::TIMEOUT;
+    while !log("bob-variants.err").contains("went into the room's log as a key package") {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: bob never put alice's key into the room's log while she was offline:\n{}",
+            log("bob-variants.err")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::fs::write(&packages, b"hold").expect("APPARATUS: arm alice's package hold");
+    start_alice(&mut room, "alice-variants.err");
+    let (ready, seen) = poll(&room.workers[a], &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        ready,
+        "APPARATUS: restarted alice did not prepare: {seen:?}"
+    );
+    let unread = room.workers[a].vox(None, &["room", "read", id]);
+    assert!(
+        !unread.stdout.contains("B-PKG"),
+        "APPARATUS: alice opened bob's package before she left: {unread:?}"
+    );
+    // Alice leaves at once, while her reopened room may still be settling: what that settlement
+    // left behind must not hold the room she joins again.
+
+    // 2. Carol is offline for the whole of both absences.
+    let carol_feed = fwd_own_feed(&room.workers[c], id);
+    room.workers[c].stop_daemon_cleanly();
+    leave(&room, 1);
+    setup(&room.workers[b], &["room", "post", id, "B-AWAY-1"]);
+    join(&room, 1);
+    std::fs::remove_file(&packages).expect("APPARATUS: release alice's package hold");
+    fwd_post_until_read(&room.workers[b], &room.workers[a], id, "B-BACK-1");
+    fwd_post_until_read(&room.workers[a], &room.workers[b], id, "A-BACK-1");
+    fwd_never_reads(
+        &room.workers[a],
+        id,
+        &["B-PKG", "B-AWAY-1"],
+        "written before her first return (B-PKG through a package sealed before she left)",
+    );
+    eprintln!(
+        "[proof] variants: bob's package sealed before alice left did not open after her return"
+    );
+
+    // 3. A replay: bob restarts, reopens the room (Presence repair) and takes alice's return
+    //    again from the others; he does not rotate for it again, and still sends her his posts.
+    let bob_feed = fwd_quiet(&room.workers[b], id, "after alice's first return");
+    room.workers[b].stop_daemon_cleanly();
+    room.workers[b].restart_daemon_as(
+        support::VOX,
+        &[("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_text)],
+        &tmp.path().join("bob-replay.err"),
+    );
+    let (ready, seen) = poll(&room.workers[b], &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        ready,
+        "APPARATUS: restarted bob did not reopen the room: {seen:?}"
+    );
+    let replayed = fwd_quiet(
+        &room.workers[b],
+        id,
+        "after his restart replayed alice's return",
+    );
+    assert!(
+        replayed == bob_feed,
+        "PRODUCT: bob's own feed went from {bob_feed} to {replayed} across a restart that replayed \
+         alice's return: he rotated for it again"
+    );
+    fwd_post_until_read(&room.workers[b], &room.workers[a], id, "B-AFTER-REPLAY");
+    eprintln!(
+        "[proof] variants: a replayed return made bob rotate no further; alice still reads him"
+    );
+
+    // 4. A second return, and bob's key for it taken late: alice takes no key until bob has
+    //    posted on the chain he rotated to for her return; she then reads those posts. Bob's
+    //    first post after it rotates his chain again, so he owes alice, online and back, a second
+    //    package at once: the one-time prekey her bundle names is the one he has just used, so
+    //    that catch-up waits for a fresh one (or the signed prekey) and is then delivered with no
+    //    new consent, rotation or restart (sec-code-1, staging 3).
+    leave(&room, 2);
+    setup(&room.workers[b], &["room", "post", id, "B-AWAY-2"]);
+    std::fs::write(&packages, b"hold").expect("APPARATUS: arm alice's package hold");
+    join(&room, 2);
+    let (recovered, o) = poll(
+        &room.workers[a],
+        &["room", "post", id, "A-BACK-2"],
+        support::TIMEOUT,
+        |o| o.ok,
+    );
+    assert!(
+        recovered,
+        "PRODUCT: alice never accepted a post after her second return: {o:?}"
+    );
+    let (folded, o) = poll(&room.workers[b], &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains("A-BACK-2")
+    });
+    assert!(
+        folded,
+        "APPARATUS: bob did not read alice's post after her second return: {o:?}"
+    );
+    std::fs::write(&rotate, format!("default\t{id}")).expect("APPARATUS: arm bob's rotation");
+    setup(&room.workers[b], &["room", "post", id, "B-ROT-1"]);
+    fwd_rotated(&rotate, "bob");
+    setup(&room.workers[b], &["room", "post", id, "B-ROT-2"]);
+    let alice_short = &alice_fp[..20];
+    let deadline = Instant::now() + support::TIMEOUT;
+    while !log("bob-replay.err").lines().any(|line| {
+        line.contains(alice_short) && line.contains("one-time prekey this node has already used")
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: bob's second key for returned alice never waited for a fresh one-time \
+             prekey:\n{}",
+            log("bob-replay.err")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let held = room.workers[a].vox(None, &["room", "read", id]);
+    assert!(
+        !held.stdout.contains("B-ROT-1"),
+        "APPARATUS: alice took bob's key while her package hold was armed: {held:?}"
+    );
+    std::fs::remove_file(&packages).expect("APPARATUS: release alice's package hold");
+    let (late, o) = poll(
+        &room.workers[a],
+        &["room", "read", id],
+        support::TIMEOUT,
+        |o| o.ok && o.stdout.contains("B-ROT-1") && o.stdout.contains("B-ROT-2"),
+    );
+    assert!(
+        late,
+        "PRODUCT: alice, who took bob's key after he posted on the chain he rotated to for her \
+         return, did not read those posts (B-ROT-1, and B-ROT-2 whose key waited for a fresh \
+         one-time prekey): {o:?}"
+    );
+    fwd_never_reads(
+        &room.workers[a],
+        id,
+        &["B-AWAY-2", "B-AWAY-1"],
+        "written before her return",
+    );
+    eprintln!(
+        "[proof] variants: after a second return alice read bob's posts from his new chain's start, \
+         and the key that waited for a fresh one-time prekey"
+    );
+
+    // 5. Carol comes back up and learns both absences and both returns at once: she rotates
+    //    once, alice reads her, and she reads alice.
+    room.workers[c].restart_daemon(&tmp.path().join("carol-after-absences.err"));
+    let (back, o) = poll(
+        &room.workers[c],
+        &["room", "roster", id],
+        support::TIMEOUT,
+        |o| o.ok && o.stdout.contains(&alice_fp),
+    );
+    assert!(
+        back,
+        "PRODUCT: carol's roster does not name alice after her returns: {o:?}"
+    );
+    fwd_post_until_read(&room.workers[c], &room.workers[a], id, "C-BACK");
+    fwd_post_until_read(&room.workers[a], &room.workers[c], id, "A-TO-CAROL");
+    let settled = fwd_quiet(&room.workers[c], id, "after she learnt alice's two returns");
+    assert!(
+        settled > carol_feed,
+        "APPARATUS: carol's own feed did not move from {carol_feed}: {settled}"
+    );
+    eprintln!("[proof] variants: carol, offline for both absences, rotated and stopped; alice and carol read each other");
+
+    // 6. A removal racing a return: carol is offline; alice leaves and joins again, and bob
+    //    removes her at once. Removal wins wherever both are learnt.
+    room.workers[c].stop_daemon_cleanly();
+    leave(&room, 3);
+    join(&room, 3);
+    let removed = unchanged_busy_retry(&room.workers[b], &["room", "remove-member", id, &alice_fp]);
+    assert!(
+        removed.ok,
+        "PRODUCT: bob, who made the room, could not remove alice: {removed:?}"
+    );
+    room.workers[c].restart_daemon(&tmp.path().join("carol-after-removal.err"));
+    for w in [b, c] {
+        let (gone, o) = poll(
+            &room.workers[w],
+            &["room", "roster", id],
+            support::TIMEOUT,
+            |o| o.ok && !o.stdout.contains(&alice_fp),
+        );
+        assert!(
+            gone,
+            "PRODUCT: a removal racing alice's return left her on {}'s roster: {o:?}",
+            room.workers[w].name
+        );
+    }
+    fwd_post_until_read(&room.workers[c], &room.workers[b], id, "C-AFTER-REMOVAL");
+    fwd_never_reads(
+        &room.workers[a],
+        id,
+        &["C-AFTER-REMOVAL"],
+        "written after her removal",
+    );
+    eprintln!("[proof] variants: a removal racing alice's return left her removed");
 }
 
 #[test]
@@ -6079,6 +6577,7 @@ fn an_unreadable_store_is_left_exactly_as_it_is() {
 #[ignore = "two real daemons and production identity work; optional, run in release"]
 fn a_node_that_left_rejoins_and_posts_at_once() {
     watchdog::arm();
+    fwd_mutant();
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
     let room = room_of(&rt, tmp.path(), &["alice", "bob"]);

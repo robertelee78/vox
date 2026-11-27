@@ -483,34 +483,6 @@ impl Queue {
             .map(|attempt| attempt.binding)
             .ok_or(Error::MalformedAtRest("key-package attempt differs"))
     }
-    pub(super) fn has_attempt(&self) -> bool {
-        self.attempt.is_some()
-    }
-
-    /// A physically available release slot and its bounded demand retry share the same
-    /// transaction. The actor finishes a selected package before entering room maintenance.
-    pub(super) fn capacity_retry(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-        sek: &Sek,
-        room: &Digest32,
-    ) -> Result<Self> {
-        if self.attempt.is_some() {
-            return Err(Error::MalformedAtRest(
-                "release cleanup crossed unfinished key-package attempt",
-            ));
-        }
-        let mut candidate = self.clone();
-        for wait in candidate.floor_wait.values_mut() {
-            wait.pending = true;
-        }
-        for overflow in candidate.floor_overflow.values_mut() {
-            overflow.pending = true;
-        }
-        candidate.queue_save(batch, sek, room)?;
-        Ok(candidate)
-    }
-
     pub(super) fn retry_retained(&mut self) {
         self.replay_requested = self.replay_requested.max(self.through);
         self.start_replay();

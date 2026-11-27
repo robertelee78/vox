@@ -1,5 +1,5 @@
-//! Lifecycle work (own-key donor continuations and the lifecycle saves that share this book)
-//! waiting for the actor, fenced by the lock's lifecycle epoch.
+//! Lifecycle work (the lifecycle saves that share this book) waiting for the actor, fenced by
+//! the lock's lifecycle epoch.
 use std::sync::Mutex;
 use tokio::sync::Notify;
 

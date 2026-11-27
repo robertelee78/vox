@@ -258,7 +258,8 @@ pub struct RoomStatus {
     /// Effective Session activity lifetime in seconds; zero means forever.
     pub step_retention: u64,
     /// How many generations of this node's own sender key it still holds here (PRD-001
-    /// R14: one, unless a full-history grant is still owed).
+    /// R14: one, unless a member that stays entitled has not yet taken an older one it is owed
+    /// as catch-up).
     pub key_generations: usize,
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
     /// receiving side: a generation read to the end is deleted).

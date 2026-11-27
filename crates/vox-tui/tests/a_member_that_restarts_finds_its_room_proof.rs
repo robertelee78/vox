@@ -46,6 +46,9 @@
 //!   restore shows the kept rows and none of the lost ones, else APPARATUS. Mutation: the
 //!   background detector removed (a peer's higher own head not compared with the local own
 //!   feed): no behind note, and her post is signed at a taken place; red on the note's wait.
+//!   Her lost rows are read from her own local keys (design-4 R7: the local Receiver stage; no
+//!   node is asked for an own key over the network). Mutation `VOX_TEST_FWD_MUTANT=receiver-off`
+//!   (that stage installs nothing): red on (4), alice, recovered, does not read the lost rows.
 
 #![cfg(unix)]
 
@@ -233,6 +236,11 @@ fn daemon(
         .stderr(Stdio::from(err));
     for (k, v) in env {
         cmd.env(k, v);
+    }
+    // The run's mutant selector reaches the daemon only by name: a proof process keeps no
+    // `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
+    if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
+        cmd.env("VOX_TEST_FWD_MUTANT", mutant);
     }
     let mut child = cmd.spawn().expect("spawn vox daemon");
     let mut pipe = child.stdin.take().expect("daemon stdin");
@@ -486,7 +494,11 @@ fn a_member_restored_from_an_older_backup_writes_nothing_until_resolved() {
     watchdog::arm();
     test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
-    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let mut t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        t.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", t.path().display());
+    }
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let alice_d = daemon(

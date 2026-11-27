@@ -966,13 +966,12 @@ FX-28's executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
 `deadline-as-storage-failure`, `join-writer-fence`, `join-outcome-refusal`, `join-policy-not-applied`,
-`withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
+`stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
-`stale-post-authority`, `constructor-terminal-refusal`, `constructor-stale-commit`,
-`stale-trust-projection`, `rekey-writer-fence`, `stale-rekey-authority`, or
-`legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
+`stale-post-authority`, `constructor-terminal-refusal`, `constructor-stale-commit` or
+`stale-trust-projection`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
 authenticated peer which fills the other daemon's bounded management slots and leaves every
@@ -982,11 +981,14 @@ its existing actor-liveness contract. `deadline-as-storage-failure` turns an exa
 causal refusal into permanent storage quarantine again. `join-writer-fence` skips the policy
 replacement's physical writer; `join-outcome-refusal` refuses the already-published held join;
 `join-policy-not-applied` discards the policy replacement after the publication reader drains.
-`stale-join-authority` admits a superseded join before its publication lease;
-`withdrawal-not-durable` drops the refused join's persisted board-withdrawal obligation before
-the joining daemon restarts.
+`stale-join-authority` admits a superseded join before its publication lease (a join the room
+accepted before the policy moved is kept as pending, says so and names the retry, and the retry
+completes under the current policy, ADR-049 N2).
 `stale-post-authority` bypasses the durable-policy fence around an
-ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
+ordinary text append (a post racing a trust revision is kept, not refused: the shipped journey
+requires it not to publish while delta's moved policy is held, then to publish under that policy
+once applied and read once on beta; the kept post is `PRODUCT [FX28 stale-post-re-admission]:`);
+`stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `constructor-terminal-refusal` makes the pre-admission supersession terminal instead
 of retaining the exact sealed Create: the shipped journey requires its original room ID to
 complete under the accepted current policy and appear in the room list. Its intended verdict is
@@ -994,16 +996,11 @@ complete under the accepted current policy and appear in the room list. Its inte
 `constructor-stale-commit` bypasses the refused constructor lease and its lease-less continuation
 checks: while delta's moved Computer policy remains held, the original create must not succeed or
 appear in the room list. Its intended verdict is `PRODUCT [FX28 constructor-stale-publication]:`.
-`rekey-writer-fence` skips the policy writer while an admitted legacy rekey holds its reader;
-the journey removes a third Computer and checks that its removal waits for the rekey.
-`stale-rekey-authority` bypasses the final fence around a separately prepared lease-free automatic
-sender-key batch after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
-the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say
-that the exact peer runs an older Vox, before the authority race is staged. Full transcripts are
-written under `target/fx28-mutants/`. That same causal route makes the authority rejection seal
-through the legacy long-lived ratchet; the normal build restores its exact unpublished session
-snapshot, while the stale-authority mutant independently makes the shipped revoked reader expose
-the forbidden post. These are
+Full transcripts are written under `target/fx28-mutants/`. The old-peer modes
+(`rekey-writer-fence`, `stale-rekey-authority`, `legacy-ended-unanswered-not-selected`) went with the
+legacy long-lived session that design-4 R10 refuses; a computer on an older Vox is now
+`nodes_of_one_daemon_proof::a_computer_on_an_older_vox_exchanges_nothing_until_it_updates`
+(mutant `VOX_MUTANT_FWD=preamble-any`). These are
 on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
 
 The former expiry-before-keyring-commit phase and the `expired-plan-drops-prepared` and
@@ -1077,7 +1074,7 @@ unknown. Ordinary text append and sender-key admission have their own use-bounda
 
 `VOX_TEST_FOLD_HOLD_FILE=<path>`: while that file exists, no room's governance fold advances in that daemon. A proof stages "received but not folded" with it, drives an egress, and removes the file to see the recovery. Only a `vox` built with `test-knobs` reads it; without it the proof stops at `CANNOT MEASURE` naming the knob.
 
-`VOX_TEST_HOLD_INCOMING_CONSENT_FILE=<path>`: the marker contains the full room, author and recipient fingerprints, separated by spaces. The exact signed consent waits before writer admission while independent sender-key delivery proceeds. An atomically published sibling, `path.with_extension("entered")`, records those fingerprints and the actual entry hash; the proof checks that hash against the author's shipped hash view. Removing the marker releases that same consent. The retained-row journey uses one render page plus one row, within the automatic live suffix, and compares `envelope.body` rather than the encoded envelope in `text`. Same `test-knobs` rule.
+`VOX_TEST_HOLD_INCOMING_CONSENT_FILE=<path>`: the marker contains the full room, author and recipient fingerprints, separated by spaces. The exact signed consent stays out of its room's ready set, so it is not admitted while every other entry (the rows before it, a key package) is, and independent sender-key delivery proceeds; it does not hold the room's one admission, so the rows arrive whether the consent reached the node before them or after. An atomically published sibling, `path.with_extension("entered")`, records those fingerprints and the actual entry hash; the proof checks that hash against the author's shipped hash view. Removing the marker makes that same consent ready again (within 20 ms). The retained-row journey uses one render page plus one row, within the automatic live suffix, and compares `envelope.body` rather than the encoded envelope in `text`. Same `test-knobs` rule.
 
 `VOX_TEST_OMP_RECEIPT_HOLD_FILE=<path>` with `VOX_TEST_OMP_RECEIPT_NODE=<node>` and
 `VOX_TEST_OMP_RECEIPT_SESSION=<session>` parks consumption of the exact enqueued Session admission's

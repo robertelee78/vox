@@ -125,6 +125,11 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         }
         _ => return Err(Error::Profile("unexpected blacklist import completion")),
     }
+    // Older-history flags go once every stored room has migrated (R9); kept otherwise, and
+    // kept when this cannot be decided, since nothing releases on them.
+    if let Err(error) = trust_save::clear_legacy_full(profile.store(), signer) {
+        eprintln!("vox: the keyring keeps its older-history flags for now: {error}");
+    }
     let accepted = metadata_save::finish_saved_accepted_joins(profile.store(), signer)?;
     let unfinished = profile
         .store()
@@ -328,7 +333,7 @@ impl Node {
                 computer
                     .try_publication_transition()
                     .map(Arc::new)
-                    .ok_or_else(|| Error::OwnKeyWriterDrainRequired(Vec::new()))
+                    .ok_or(Error::ComputerTransitionBusy)
             })
             .transpose()?;
         let name = self

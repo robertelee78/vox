@@ -672,8 +672,6 @@ impl ChannelState {
                 self.presence.insert(me, presence);
             }
             self.next_log_id = pending.next_log_id;
-            self.key_packages
-                .published(self.next_log_id.saturating_sub(1));
             self.entries.committed();
             let newest = (|| -> Result<_> {
                 let read = self.entries.read(store, &self.sek, &self.channel_id)?;
@@ -906,6 +904,14 @@ impl PendingText {
             failure,
             #[cfg(feature = "test-knobs")]
             rotated,
+        }
+    }
+
+    /// Name `hash` as a required ancestor of every append of this work (R4: a key package for
+    /// a returned member contains its return).
+    pub(crate) fn require_ancestor(&mut self, hash: Digest32) {
+        if !self.required_ancestors.contains(&hash) {
+            self.required_ancestors.push(hash);
         }
     }
 
