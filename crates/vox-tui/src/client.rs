@@ -1512,7 +1512,7 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
         };
         let Some(node) = node.filter(|n| !n.keep) else {
             eprintln!("vox: {error}");
-            return Err(AppError::Usage(format!("node {name} was not locked: its remembered state could not be forgotten, so the node is left as it was; correct the storage problem and run `vox node lock {name}` again")));
+            return Err(AppError::Usage(format!("node {name} was not locked: the daemon could not confirm that its remembered state was forgotten, so the node is left as it was; correct the error above and run `vox node lock {name}` again")));
         };
         stops_it = node.state != NodeState::Detached;
     }

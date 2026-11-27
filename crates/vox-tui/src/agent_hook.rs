@@ -1568,11 +1568,11 @@ fn preview_line(text: &str) -> String {
 pub(crate) fn addressed(
     text: &str,
     me: Option<&Digest32>,
-    trusted: &[(Digest32, String)],
+    keyring: crate::ident::Keyring<'_>,
 ) -> String {
     match vox_agentcomms::envelope::Envelope::parse(text) {
         Ok(e) if !e.to.is_empty() => {
-            format!("to {}", crate::ident::recipients(&e.to, me, trusted))
+            format!("to {}", crate::ident::recipients(&e.to, me, keyring))
         }
         _ => String::new(),
     }

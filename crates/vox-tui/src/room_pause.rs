@@ -35,7 +35,11 @@ async fn targets(
             let target = if matches!(name.as_str(), "me" | "you") {
                 Ok(selected.actor)
             } else {
-                crate::ident::resolve_member(name, &selected.members, &trusted)
+                crate::ident::resolve_member(
+                    name,
+                    &selected.members,
+                    crate::ident::Keyring::Known(&trusted),
+                )
             };
             if !targets.contains(&target) {
                 targets.push(target);

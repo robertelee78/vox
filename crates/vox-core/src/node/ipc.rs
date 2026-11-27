@@ -81,7 +81,9 @@ mod ipc_omp_media;
 /// 10: `Using` identifies the attachment incarnation; derived connections can require it.
 /// 11: stale-safe operator repository decision and replacement requests; typed registration
 /// refusals distinguish retryable mutations from invalid ownership.
-pub const PROTOCOL_VERSION: u64 = 11;
+/// 12: the node snapshot reply says whether its keyring is known (13 fields; v0.4.30 read 12), so
+/// a client of another build is refused at the handshake instead of failing to read node state.
+pub const PROTOCOL_VERSION: u64 = 12;
 
 /// Largest frame accepted in either direction.
 ///
@@ -8653,12 +8655,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::TrustList { after, .. } => {
             handle.reconcile_local_folders();
-            let view = handle.view();
-            let rows = view
-                .trusted
+            // Never an empty list for a keyring that is not known: every reader (`vox trust
+            // list` and the commands that check the keyring first, the app) says why instead.
+            let crate::node::api::Keyring { trusted, drive } = match handle.keyring() {
+                Ok(keyring) => keyring,
+                Err(unknown) => {
+                    return Frame::Error {
+                        reason: unknown.explain().into(),
+                    }
+                }
+            };
+            let rows = trusted
                 .into_iter()
                 .map(|(id, petname)| {
-                    let capability = if view.drive.contains(&id) {
+                    let capability = if drive.contains(&id) {
                         crate::node::trust::Capability::ReadDrive
                     } else {
                         crate::node::trust::Capability::Read

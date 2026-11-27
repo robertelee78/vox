@@ -47,7 +47,12 @@ struct KeyringView: View {
                 }
                 addForm
                 Hairline()
-                if model.trusted.isEmpty {
+                // An empty list the node did not give just now (it may be applying a new computer
+                // trust revision) is said to be not current; only a list it gave is said empty.
+                if model.trusted.isEmpty, let unknown = model.keyringObservationError {
+                    StateMark(kind: .attention, words: unknown)
+                        .textSelection(.enabled)
+                } else if model.trusted.isEmpty {
                     Text("This node trusts no one yet: nobody can read what you write until you "
                         + "trust them.").secondaryText()
                 }

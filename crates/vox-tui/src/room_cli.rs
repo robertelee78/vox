@@ -160,9 +160,9 @@ async fn room_of_readiness(
             "this node holds no rooms yet — join or create one first".into(),
         ));
     }
-    // A room preparing after a restart has no name here until it opens (its name is sealed in
-    // it), so a name that matches nothing yet may be one of them: wait for it inside the same
-    // patience as a preparing room, and never answer that nothing matches while one is unnamed.
+    // A preparing room has no name here until it opens (its name is sealed in it), so a name
+    // that matches nothing yet may be one of them. Wait for it before answering that nothing
+    // matches while one is unnamed; a found room has its own separate preparation wait.
     let unnamed_preparing = |rooms: &[vox_core::node::ipc::RoomRow]| {
         rooms
             .iter()
@@ -203,7 +203,7 @@ async fn room_of_readiness(
                     error
                 } else {
                     AppError::Usage(format!(
-                        "no room named so far matches {:?}, and {preparing} of this node's rooms are still preparing: a room is named once it is open; try again when `vox room list` names them",
+                        "no room named so far matches {:?}; rooms on this node still preparing: {preparing}. A room is named once it is open; try again when `vox room list` names them",
                         prefix.trim()
                     ))
                 };
@@ -402,7 +402,8 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
             println!(
                 "  To reopen it once the cause above is fixed, run `{join}` with this room's \
-                 address and passphrase (another member's `vox room link` prints the address)."
+                 address and passphrase (the `vox://` address you joined with, or another \
+                 member's `vox room link`, gives the address)."
             );
         }
     }
@@ -2040,7 +2041,7 @@ async fn open_wakes(
     Ok(woke
         .iter()
         .filter(|hash| held.iter().any(|row| row.entry_hash == **hash))
-        .map(|hash| b32_encode(hash))
+        .map(b32_encode)
         .collect())
 }
 
@@ -2805,11 +2806,16 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => {
             let presented = client.presented_names().await.unwrap_or_default();
+            // A keyring that cannot be read now is not known, never empty: no member is then
+            // marked as outside it.
             let trusted = match client.trusted("").await {
-                Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
-                _ => Vec::new(),
+                Ok(Frame::Trusted { entries }) => Some(crate::ident::names_of(entries)),
+                _ => None,
             };
-            let shown = crate::ident::display_names(&trusted, &presented);
+            let shown = crate::ident::display_names(
+                crate::ident::Keyring::of(trusted.as_deref()),
+                &presented,
+            );
             for m in members {
                 println!("{}", id(&m));
                 if let Some((_, name)) = shown.iter().find(|(fp, _)| *fp == m) {
@@ -4233,7 +4239,7 @@ pub async fn service_add(
     println!("vox: about to offer {tag:?} at {local} in {which}");
     println!(
         "     the members of it in your keyring are to reach it: {}",
-        listed(&reach, "none yet")
+        reach_listed(reach.as_deref(), "none yet")
     );
     match client
         .request(&Request::AddService {
@@ -4250,12 +4256,14 @@ pub async fn service_add(
                 "vox: offering {tag:?} at {local} in room {}",
                 crate::tunnel_cli::short_id_of(&channel_id)
             );
-            if reach.is_empty() {
-                println!(
+            match reach.as_deref() {
+                Some([]) => println!(
                     "     it is dark until you trust a member from the room's trust offers — and they join this room"
-                );
-            } else {
-                println!("     {} can reach it now", listed(&reach, ""));
+                ),
+                Some(reach) => println!("     {} can reach it now", listed(reach, "")),
+                None => println!(
+                    "     who can reach it is not known just now: this node's keyring is not known yet (`vox trust list` says why)"
+                ),
             }
             Ok(())
         }
@@ -6843,6 +6851,18 @@ pub(crate) fn listed(items: &[String], none: &str) -> String {
     }
 }
 
+/// Who a service or a file shared in a room reaches ([`trusted_in`]), as a person reads it:
+/// `none` for a known keyring that holds no member of it, and "not known just now" while the
+/// keyring is not known.
+pub(crate) fn reach_listed(reach: Option<&[String]>, none: &str) -> String {
+    match reach {
+        Some(items) => listed(items, none),
+        None => "not known just now: this node's keyring is not known yet (`vox trust list` says \
+                 why)"
+            .to_owned(),
+    }
+}
+
 /// A room as a person names it: its name, or its short id when it has none.
 fn room_said(id: &Digest32, name: &str) -> String {
     if name.is_empty() {
@@ -6881,16 +6901,23 @@ pub(crate) async fn room_named(client: &mut IpcClient, channel_id: Digest32) -> 
 }
 
 /// The members of `channel_id` in this node's keyring, by name: who a service or a file shared
-/// there reaches.
-pub(crate) async fn trusted_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
-    let names = crate::ident::names();
-    members_of(client, channel_id)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|m| names.iter().any(|(t, _)| t == *m))
-        .map(|m| crate::ident::member_name(names, m))
-        .collect()
+/// there reaches. `None` while the keyring is not known ([`crate::ident::names`]).
+pub(crate) async fn trusted_in(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Option<Vec<String>> {
+    let crate::ident::Keyring::Known(names) = crate::ident::names() else {
+        return None;
+    };
+    Some(
+        members_of(client, channel_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| names.iter().any(|(t, _)| t == *m))
+            .map(|m| crate::ident::member_name(crate::ident::Keyring::Known(names), m))
+            .collect(),
+    )
 }
 
 /// The services this node offers in `channel_id`, by tag, as `vox service list` names them.
@@ -7163,7 +7190,7 @@ pub async fn trust_rename(paths: &Paths, fingerprint: &str, name: &str) -> Resul
              `vox trust add` it first"
         ))
     })?;
-    crate::ident::check_new_name(&entries, &target, name)?;
+    crate::ident::check_new_name(crate::ident::Keyring::Known(&entries), &target, name)?;
     match keyring_change(&mut client, |identity_passphrase| Request::Rename {
         target,
         petname: name.to_owned(),

@@ -39,7 +39,7 @@ use vox_core::node::daemonipc::{
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::b32_decode;
 use vox_core::node::paths::{Account, NodeName};
-use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
+use vox_core::node::snapshot::{KeyringState, NodeSnapshot, OpenRoomSnap, TrustOf};
 use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
@@ -113,14 +113,19 @@ impl Drop for Conn {
 /// daemon starts or its port is taken, so not with every snapshot.
 const PROXY_EVERY: Duration = Duration::from_secs(5);
 
-/// One complete Session row as the currently displayed page presents it.
+/// One complete Session row as the currently displayed page presents it. Its node is named from
+/// the keyring alone, marked not in it only while the keyring is known.
 fn session_view(
     row: &vox_core::node::sessions::SessionRow,
     waiting: bool,
-    trusted: &[(Digest32, String)],
+    keyring: &KeyringState,
     me: Option<Digest32>,
 ) -> crate::viewmodel::SessionView {
-    let node_alias = crate::ident::author_for(trusted, me.as_ref(), &row.node);
+    let node_alias = crate::ident::author_for(
+        crate::ident::Keyring::of_state(keyring),
+        me.as_ref(),
+        &row.node,
+    );
     crate::viewmodel::SessionView {
         node: row.node,
         id: row.id.clone(),
@@ -484,6 +489,8 @@ struct Projected {
     verified: usize,
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
+    /// Whether the keyring was known: authors are said to be outside it only then.
+    keyring_known: bool,
     own: Own,
     /// The names the rows' addresses were written readable with (ADR-028 S-1a).
     names: vox_core::node::resolver::VoxResolver,
@@ -1329,40 +1336,54 @@ impl DaemonCore {
     /// Say that `peer` joined `room`, and which members this node trusts trust it (K-7): from the
     /// consent grants on the room's log, never adding it to any keyring.
     fn say_joined(&mut self, room: Digest32, peer: Digest32) {
-        let trusters: Vec<String> = self
-            .snapshot
-            .open
-            .iter()
-            .find(|o| o.channel_id == room)
-            .and_then(|o| o.trusted_by.iter().find(|(m, _)| *m == peer))
-            .map(|(_, by)| {
-                self.snapshot
-                    .trusted
-                    .iter()
-                    .filter(|(fp, _)| by.contains(fp))
-                    .map(|(fp, _)| self.member_name(fp))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let who = vox_text::offer::trusted_by(&trusters);
-        // Trust is offered where it matters (ADR-028 K-5), with the one action used everywhere.
-        let offer = if self.snapshot.trusted.iter().any(|(t, _)| *t == peer) {
-            String::new()
-        } else {
-            format!(" · {}", crate::ident::trust_hint(&peer))
+        let line = {
+            let ring = self.ring();
+            let shown = ring.shown();
+            let by: &[Digest32] = self
+                .snapshot
+                .open
+                .iter()
+                .find(|o| o.channel_id == room)
+                .and_then(|o| o.trusted_by.iter().find(|(m, _)| *m == peer))
+                .map_or(&[], |(_, by)| by);
+            // Who in the keyring trusts it is said only while the keyring is known.
+            let who = ring
+                .keyring
+                .known()
+                .map(|keyring| {
+                    let trusters: Vec<String> = keyring
+                        .trusted
+                        .iter()
+                        .filter(|(fp, _)| by.contains(fp))
+                        .map(|(fp, _)| ring.member_in(&shown, fp))
+                        .collect();
+                    format!(" {}", vox_text::offer::trusted_by(&trusters))
+                })
+                .unwrap_or_default();
+            // Trust is offered where it matters (ADR-028 K-5), with the one action used
+            // everywhere: to a member the known keyring does not hold.
+            let offer = match ring.trust(&peer) {
+                TrustOf::NotTrusted => format!(" · {}", crate::ident::trust_hint(&peer)),
+                TrustOf::Trusted { .. } | TrustOf::NotKnown => String::new(),
+            };
+            format!("{} joined.{who}{offer}", ring.member_in(&shown, &peer))
         };
-        let line = format!("{} joined. {who}{offer}", self.member_name(&peer));
         self.notice = Some(line.clone());
         self.joined = Some((room, peer, line));
     }
 
-    /// A member as the TUI names it: its keyring petname, else its fingerprint marked as not in
-    /// the keyring (`crate::ident`, #198).
+    /// The node's keyring as the TUI reads it for a person ([`Ring`]).
+    fn ring(&self) -> Ring<'_> {
+        Ring {
+            keyring: &self.snapshot.keyring,
+            presented: &self.presented,
+            me: self.snapshot.me,
+        }
+    }
+
+    /// A member as the TUI names it ([`Ring::member`]).
     fn member_name(&self, fp: &Digest32) -> String {
-        crate::ident::member_name(
-            &crate::ident::display_names(&self.snapshot.trusted, &self.presented),
-            fp,
-        )
+        self.ring().member(fp)
     }
 
     /// Ask for the snapshot when an event said something changed, or a second has passed.
@@ -1434,6 +1455,27 @@ impl DaemonCore {
         match answer {
             Ok(reply) => match NodeSnapshot::from_bytes(&reply) {
                 Ok(Some(s)) => {
+                    // While the node applies a new computer trust revision its keyring is not
+                    // known: the keyring held is kept, and with none held nothing is taken in.
+                    // After its trust storage failed it is not known until the daemon restarts.
+                    use vox_core::node::api::KeyringUnknown;
+                    let said = |why: KeyringUnknown| why.explain().lines().next().map(str::to_owned);
+                    let Some(s) = s.over(&self.snapshot) else {
+                        self.notice = said(KeyringUnknown::Applying);
+                        return;
+                    };
+                    // Either notice stands only while the keyring it speaks of is not known; the
+                    // suspension is said once, when it begins.
+                    let suspended = said(KeyringUnknown::Suspended);
+                    if s.keyring == KeyringState::Suspended {
+                        if self.snapshot.keyring != KeyringState::Suspended {
+                            self.notice = suspended;
+                        }
+                    } else if self.notice == said(KeyringUnknown::Applying)
+                        || self.notice == suspended
+                    {
+                        self.notice = None;
+                    }
                     let before = std::mem::replace(&mut self.snapshot, s);
                     if let Some(cid) = self.active {
                         let revision = |snapshot: &NodeSnapshot| {
@@ -1905,12 +1947,12 @@ impl DaemonCore {
     ) -> CommandStatus {
         use crate::session_drive_ui as d;
         use crate::viewmodel::DriveAct;
-        let names = SessionNames {
-            trusted: &self.snapshot.trusted,
+        let names = Ring {
+            keyring: &self.snapshot.keyring,
             presented: &self.presented,
             me: self.snapshot.me,
         };
-        let alias = names.alias_of(&node);
+        let alias = names.author(&node);
         let row = match self.lookup_session(room, node, id) {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -2359,8 +2401,8 @@ impl DaemonCore {
         // `vox room session` takes them.
         let mine = crate::session_cli::of_session(self.session_rows.clone(), &id, &node);
         let me = self.snapshot.me;
-        let names = SessionNames {
-            trusted: &self.snapshot.trusted,
+        let names = Ring {
+            keyring: &self.snapshot.keyring,
             presented: &self.presented,
             me,
         };
@@ -2369,10 +2411,10 @@ impl DaemonCore {
             .as_ref()
             .filter(|x| x.node == node && x.id == id)
             .map_or_else(
-                || vox_agentcomms::envelope::session_label(&names.alias_of(&node), None, &id),
+                || vox_agentcomms::envelope::session_label(&names.author(&node), None, &id),
                 |x| {
                     vox_agentcomms::envelope::session_label(
-                        &names.alias_of(&node),
+                        &names.author(&node),
                         x.name.as_deref(),
                         &x.id,
                     )
@@ -2709,12 +2751,17 @@ impl DaemonCore {
     fn project_timeline(
         &mut self,
         me: Option<Digest32>,
-        trusted: &[(Digest32, String)],
+        keyring: &KeyringState,
         own: &Own,
         names: &vox_core::node::resolver::VoxResolver,
         thread: bool,
     ) -> std::sync::Arc<Vec<MessageView>> {
-        let shown_names = crate::ident::display_names(trusted, &self.presented);
+        let ring = Ring {
+            keyring,
+            presented: &self.presented,
+            me,
+        };
+        let shown_names = ring.shown();
         let images = &self.images;
         let (held, projected, general) = if thread {
             let Some(t) = self.thread.as_mut() else {
@@ -2753,7 +2800,7 @@ impl DaemonCore {
             if me == Some(*author) {
                 "you".to_owned()
             } else {
-                crate::ident::member_name(&shown_names, author)
+                ring.member_in(&shown_names, author)
             }
         };
         // **One level** (ADR-028 R-9, #485): the entry `re` names, as this room holds it.
@@ -2792,7 +2839,7 @@ impl DaemonCore {
             };
             let mut names: Vec<String> = who
                 .iter()
-                .map(|fp| crate::ident::member_name(&shown_names, fp))
+                .map(|fp| ring.member_in(&shown_names, fp))
                 .collect();
             names.sort();
             if own.read_more.contains(&r.entry_hash) {
@@ -2810,7 +2857,7 @@ impl DaemonCore {
             };
             let mut names: Vec<String> = who
                 .iter()
-                .map(|fp| crate::ident::member_name(&shown_names, fp))
+                .map(|fp| ring.member_in(&shown_names, fp))
                 .collect();
             names.sort();
             if own.pulled_more.contains(&r.entry_hash) {
@@ -2832,21 +2879,26 @@ impl DaemonCore {
         let view_of = |r: &MessageRow| MessageView {
             entry_hash: r.entry_hash,
             author: r.author,
-            author_nick: if me == Some(r.author) || trusted.iter().any(|(t, _)| *t == r.author) {
-                name_of(&r.author)
-            } else {
-                // A node not in the keyring is offered the one trust action (ADR-028 K-5).
-                format!(
+            author_nick: match ring.trust(&r.author) {
+                // A node not in the known keyring is offered the one trust action (ADR-028 K-5).
+                TrustOf::NotTrusted if me != Some(r.author) => format!(
                     "{} (not in keyring · {})",
                     name_of(&r.author),
                     crate::ident::trust_hint(&r.author)
-                )
+                ),
+                TrustOf::NotTrusted | TrustOf::Trusted { .. } | TrustOf::NotKnown => {
+                    name_of(&r.author)
+                }
             },
             // The wire names addressees by fingerprint; the timeline by this node's own names.
             addressed: if r.owed {
                 String::new()
             } else {
-                crate::agent_hook::addressed(&r.text, me.as_ref(), &shown_names)
+                crate::agent_hook::addressed(
+                    &r.text,
+                    me.as_ref(),
+                    crate::ident::Keyring::of(keyring.known().map(|_| &shown_names[..])),
+                )
             },
             // Milliseconds: the timeline orders by it (a whole second put a room's change made
             // just after a post above it); only a display rounds it.
@@ -2880,6 +2932,7 @@ impl DaemonCore {
                 if p.me == me
                     && p.verified == images.len()
                     && p.trusted == shown_names
+                    && p.keyring_known == keyring.known().is_some()
                     && p.names == *names
                     && p.len <= held.len()
                     && !quoted_late(p) =>
@@ -2939,6 +2992,7 @@ impl DaemonCore {
                     verified: images.len(),
                     me,
                     trusted: shown_names.clone(),
+                    keyring_known: keyring.known().is_some(),
                     own: own.clone(),
                     names: names.clone(),
                     len: held.len(),
@@ -3175,9 +3229,15 @@ impl DaemonCore {
             } else {
                 Own::default()
             };
-            thread_replies = self.project_timeline(me, &snap.trusted, &own, &names, true);
-            Some(self.project_timeline(me, &snap.trusted, &own, &names, false))
+            thread_replies = self.project_timeline(me, &snap.keyring, &own, &names, true);
+            Some(self.project_timeline(me, &snap.keyring, &own, &names, false))
         });
+        let ring = Ring {
+            keyring: &snap.keyring,
+            presented: &self.presented,
+            me,
+        };
+        let shown = ring.shown();
         let active = self.active.and_then(|cid| {
             snap.open
                 .iter()
@@ -3212,13 +3272,7 @@ impl DaemonCore {
                                 if me == Some(n.author) {
                                     "you".to_owned()
                                 } else {
-                                    crate::ident::member_name(
-                                        &crate::ident::display_names(
-                                            &snap.trusted,
-                                            &self.presented,
-                                        ),
-                                        &n.author,
-                                    )
+                                    ring.member_in(&shown, &n.author)
                                 },
                                 n.what
                             ),
@@ -3254,28 +3308,24 @@ impl DaemonCore {
                                             })
                                         },
                                     ),
-                                capability: (!is_me && snap.trusted.iter().any(|(fp, _)| fp == m))
-                                    .then(|| {
-                                        if snap.drive.contains(m) {
-                                            vox_core::node::trust::Capability::ReadDrive
-                                        } else {
-                                            vox_core::node::trust::Capability::Read
-                                        }
+                                capability: match ring.trust(m) {
+                                    TrustOf::Trusted { drive } if !is_me => Some(if drive {
+                                        vox_core::node::trust::Capability::ReadDrive
+                                    } else {
+                                        vox_core::node::trust::Capability::Read
                                     }),
+                                    TrustOf::Trusted { .. }
+                                    | TrustOf::NotTrusted
+                                    | TrustOf::NotKnown => None,
+                                },
                                 // The members pane says "not in keyring" on the member's state
                                 // line (ADR-028 L-4), so a member without a name is its
                                 // fingerprint alone, which fits beside its trust glyph.
                                 nickname: if is_me {
                                     "you".to_owned()
                                 } else {
-                                    crate::ident::alias_of(
-                                        &crate::ident::display_names(
-                                            &snap.trusted,
-                                            &self.presented,
-                                        ),
-                                        m,
-                                    )
-                                    .unwrap_or_else(|| crate::ident::author_id(m))
+                                    crate::ident::alias_of(&shown, m)
+                                        .unwrap_or_else(|| crate::ident::author_id(m))
                                 },
                                 // Off the keyring and the room's log: this node releases its key
                                 // only to a member its keyring trusts (V210-148), and takes a
@@ -3285,13 +3335,15 @@ impl DaemonCore {
                                     let trusts_you = d.consenting.binary_search(m).is_ok();
                                     if is_me {
                                         Trust::You
-                                    } else if snap.trusted.iter().any(|(t, _)| t == m) {
-                                        Trust::Trusted {
-                                            reads_you,
-                                            trusts_you,
-                                        }
                                     } else {
-                                        Trust::NotTrusted { reads_you }
+                                        match ring.trust(m) {
+                                            TrustOf::Trusted { .. } => Trust::Trusted {
+                                                reads_you,
+                                                trusts_you,
+                                            },
+                                            TrustOf::NotTrusted => Trust::NotTrusted { reads_you },
+                                            TrustOf::NotKnown => Trust::NotKnown,
+                                        }
                                     }
                                 },
                             }
@@ -3362,17 +3414,16 @@ impl DaemonCore {
                                 } else {
                                     ""
                                 };
-                                // A sharer not in the keyring cannot be reached until each
+                                // A sharer not in the known keyring cannot be reached until each
                                 // trusts the other: the one trust action is offered (K-5).
-                                let offer = if me != Some(s.host)
-                                    && !snap.trusted.iter().any(|(t, _)| *t == s.host)
-                                {
-                                    format!(
+                                let offer = match ring.trust(&s.host) {
+                                    TrustOf::NotTrusted if me != Some(s.host) => format!(
                                         "  (not in keyring · {})",
                                         crate::ident::trust_hint(&s.host)
-                                    )
-                                } else {
-                                    String::new()
+                                    ),
+                                    TrustOf::NotTrusted
+                                    | TrustOf::Trusted { .. }
+                                    | TrustOf::NotKnown => String::new(),
                                 };
                                 let address = names.address_of(&d.channel_id, &s.host, &s.name);
                                 let line = format!("{address} by {who}  {kind}{udp}{offer}");
@@ -3453,7 +3504,7 @@ impl DaemonCore {
                                     session_view(
                                         row,
                                         summary.as_ref().is_some_and(|summary| summary.waiting > 0),
-                                        &snap.trusted,
+                                        &snap.keyring,
                                         me,
                                     )
                                 })
@@ -3477,7 +3528,7 @@ impl DaemonCore {
                                 *r == d.channel_id && *n == s.node && *id == s.id
                             })
                         })
-                        .map(|s| session_view(s, false, &snap.trusted, me)),
+                        .map(|s| session_view(s, false, &snap.keyring, me)),
                     ended_sessions: self
                         .ended_listing
                         .as_ref()
@@ -3491,7 +3542,7 @@ impl DaemonCore {
                                     session_view(
                                         row,
                                         summary.as_ref().is_some_and(|summary| summary.waiting > 0),
-                                        &snap.trusted,
+                                        &snap.keyring,
                                         me,
                                     )
                                 })
@@ -3509,13 +3560,7 @@ impl DaemonCore {
                         .cloned()
                         .into_iter()
                         .chain(d.equivocations.iter().map(|(author, seq)| {
-                            crate::ident::equivocation_notice(
-                                &crate::ident::member_name(
-                                    &crate::ident::display_names(&snap.trusted, &self.presented),
-                                    author,
-                                ),
-                                *seq,
-                            )
+                            crate::ident::equivocation_notice(&ring.member_in(&shown, author), *seq)
                         }))
                         .collect(),
                     reachability: reachability(&cid),
@@ -3553,7 +3598,7 @@ impl DaemonCore {
             has_identity: self.has_identity,
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
-            keyring: snap.trusted.clone(),
+            keyring: snap.keyring.known().map(|keyring| keyring.trusted.clone()),
             presented: self.presented.clone(),
             offers: snap.offers.clone(),
             room_asks: self.room_asks(),
@@ -3612,31 +3657,22 @@ impl DaemonCore {
         ));
         let snap = &self.snapshot;
         let me = snap.me;
-        let mut names = vox_core::node::resolver::VoxResolver::new();
-        for o in &snap.open {
-            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
-        }
-        for (fp, petname) in &snap.trusted {
-            names.name(*fp, petname);
-        }
+        let names = vox_core::node::resolver::VoxResolver::of_snapshot(snap);
         let members: Vec<Digest32> = snap
             .open
             .iter()
             .find(|o| o.channel_id == channel_id)
             .map(|o| o.members.clone())
             .unwrap_or_default();
-        let (mut can, mut cannot) = (Vec::new(), Vec::new());
+        let ring = self.ring();
+        let shown = ring.shown();
+        let (mut can, mut cannot, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
         for m in members.iter().filter(|m| Some(**m) != me) {
-            if snap.trusted.iter().any(|(t, _)| t == m) {
-                can.push(crate::ident::member_name(
-                    &crate::ident::display_names(&snap.trusted, &self.presented),
-                    m,
-                ));
-            } else {
-                cannot.push(crate::ident::member_name(
-                    &crate::ident::display_names(&snap.trusted, &self.presented),
-                    m,
-                ));
+            let name = ring.member_in(&shown, m);
+            match ring.trust(m) {
+                TrustOf::Trusted { .. } => can.push(name),
+                TrustOf::NotTrusted => cannot.push(name),
+                TrustOf::NotKnown => unknown.push(name),
             }
         }
         let address = me.map_or_else(
@@ -3649,15 +3685,17 @@ impl DaemonCore {
                 crate::tunnel_cli::listing_line(&chosen).trim_end()
             ),
             format!("as {tag}: members will reach it as {address}"),
-            format!(
+        ];
+        if ring.keyring.known().is_some() {
+            lines.push(format!(
                 "who can reach it: {}",
                 if can.is_empty() {
                     "nobody yet: you trust no member of this room".to_owned()
                 } else {
                     can.join(", ")
                 }
-            ),
-            format!(
+            ));
+            lines.push(format!(
                 "who cannot: {}",
                 if cannot.is_empty() {
                     "nobody else is in the room".to_owned()
@@ -3665,8 +3703,20 @@ impl DaemonCore {
                     // Each named as the keyring has it, which says it is not in it.
                     cannot.join(", ")
                 }
-            ),
-        ];
+            ));
+        } else {
+            // The keyring is not known now: who is in it, and so who can reach the service, is
+            // not said (`vox trust list` says why).
+            lines.push(format!(
+                "who can reach it: not known just now: this node's keyring is not known yet \
+                 (`vox trust list` says why); {}",
+                if unknown.is_empty() {
+                    "nobody else is in the room".to_owned()
+                } else {
+                    format!("members: {}", unknown.join(", "))
+                }
+            ));
+        }
         lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
         self.serve_preview = Some(crate::viewmodel::ServePreview {
             channel_id,
@@ -4160,8 +4210,8 @@ impl CoreHandle for DaemonCore {
                 let Some(conn) = self.conn.as_mut() else {
                     return CommandStatus::NotConnected;
                 };
-                let names = SessionNames {
-                    trusted: &self.snapshot.trusted,
+                let names = Ring {
+                    keyring: &self.snapshot.keyring,
                     presented: &self.presented,
                     me: self.snapshot.me,
                 };
@@ -4176,7 +4226,7 @@ impl CoreHandle for DaemonCore {
                         true,
                         |row| {
                             vox_agentcomms::envelope::session_label(
-                                &names.alias_of(&row.node),
+                                &names.author(&row.node),
                                 row.name.as_deref(),
                                 &row.id,
                             )
@@ -4414,18 +4464,12 @@ impl CoreHandle for DaemonCore {
                             )
                         }];
                         if !o.to.is_empty() {
+                            let ring = self.ring();
+                            let shown = ring.shown();
                             let names: Vec<String> =
                                 o.to.iter()
                                     .filter_map(|fp| crate::ident::recipient(fp))
-                                    .map(|fp| {
-                                        crate::ident::member_name(
-                                            &crate::ident::display_names(
-                                                &self.snapshot.trusted,
-                                                &self.presented,
-                                            ),
-                                            &fp,
-                                        )
-                                    })
+                                    .map(|fp| ring.member_in(&shown, &fp))
                                     .collect();
                             said.push(format!("for {}", names.join(", ")));
                         }
@@ -4546,34 +4590,67 @@ impl CoreHandle for DaemonCore {
     }
 }
 
-/// How the TUI names a node in a Session's lines, as `vox room session` does: "you", this node's
-/// name for it, or its fingerprint marked not in the keyring (ADR-029 CL-1).
-struct SessionNames<'a> {
-    trusted: &'a [(Digest32, String)],
+/// How the terminal app names members against its node's keyring, which may not be known (ledger
+/// 58, P2): the one way the app reads the keyring for a person. A member is said to be outside the
+/// keyring, or offered trust, only while the keyring is known; [`Ring::trust`] has three answers.
+/// As `vox room session` does, a Session's node is "you", this node's name for it, or its
+/// fingerprint (ADR-029 CL-1).
+#[derive(Clone, Copy)]
+struct Ring<'a> {
+    keyring: &'a KeyringState,
     presented: &'a [(Digest32, String)],
     me: Option<Digest32>,
 }
 
-impl SessionNames<'_> {
-    fn alias_of(&self, fp: &Digest32) -> String {
-        crate::ident::author_for(
-            &crate::ident::display_names(self.trusted, self.presented),
-            self.me.as_ref(),
-            fp,
+impl Ring<'_> {
+    fn trust(&self, fp: &Digest32) -> TrustOf {
+        self.keyring.trust(fp)
+    }
+
+    /// Every name this node has for a member, each with its fingerprint and, while the keyring is
+    /// known, whether it is in it (`crate::ident::display_names`). Display entries only.
+    fn shown(&self) -> Vec<(Digest32, String)> {
+        crate::ident::display_names(
+            crate::ident::Keyring::of_state(self.keyring),
+            self.presented,
         )
+    }
+
+    /// A member named from `shown` ([`Ring::shown`]): its name, else its fingerprint, marked not in
+    /// the keyring only while the keyring is known.
+    fn member_in(&self, shown: &[(Digest32, String)], fp: &Digest32) -> String {
+        match self.keyring.known() {
+            Some(_) => crate::ident::member_name(crate::ident::Keyring::Known(shown), fp),
+            None => {
+                crate::ident::alias_of(shown, fp).unwrap_or_else(|| crate::ident::author_id(fp))
+            }
+        }
+    }
+
+    fn member(&self, fp: &Digest32) -> String {
+        self.member_in(&self.shown(), fp)
+    }
+
+    /// [`Ring::member`], but "you" for this node.
+    fn author(&self, fp: &Digest32) -> String {
+        if self.me == Some(*fp) {
+            crate::ident::YOU.to_owned()
+        } else {
+            self.member(fp)
+        }
     }
 }
 
-impl crate::session_cli::Names for SessionNames<'_> {
+impl crate::session_cli::Names for Ring<'_> {
     fn alias(&self, fp: &Digest32) -> String {
-        self.alias_of(fp)
+        self.author(fp)
     }
     fn is_me(&self, by: &str) -> bool {
         vox_core::node::link::b32_decode(by, "fingerprint").is_ok_and(|fp| self.me == Some(fp))
     }
     fn alias_b32(&self, by: &str) -> String {
         match vox_core::node::link::b32_decode(by, "fingerprint") {
-            Ok(fp) => self.alias_of(&fp),
+            Ok(fp) => self.author(&fp),
             Err(_) => by.chars().take(12).collect(),
         }
     }

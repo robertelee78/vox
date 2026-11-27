@@ -110,6 +110,42 @@ pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 /// `vox room read` recognises them to wait for that projection turn.
 pub const HISTORY_REFRESHING: &str = "the room is refreshing saved history; retry";
 
+/// What a keyring read answers while this node applies a new computer trust revision. Its
+/// effective keyring is fenced to nobody then ([`crate::node::actor::NodeHandle::view`]); that
+/// fence is not an empty keyring, so the read says the keyring is not known instead of listing
+/// nobody. The one copy of these words: the daemon answers with them, and the clients show them.
+pub const TRUST_BEING_APPLIED: &str = "this node is applying a new computer trust revision, so who it trusts is not known yet\n       run the command again; nothing is needed from you";
+
+/// Why a node's keyring is not known now ([`crate::node::actor::NodeHandle::keyring`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyringUnknown {
+    /// It applies a new computer trust revision; asked again, it is known.
+    Applying,
+    /// Its computer's trust storage failed: trust is suspended until the storage is repaired and
+    /// the daemon restarted.
+    Suspended,
+}
+
+impl KeyringUnknown {
+    /// What a person reads: each case in its own true words.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::Applying => TRUST_BEING_APPLIED,
+            Self::Suspended => crate::node::computer::STORAGE_FAILED,
+        }
+    }
+}
+
+/// A keyring as a person is shown it ([`crate::node::actor::NodeHandle::keyring`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Keyring {
+    /// `(fingerprint, petname)`, in fingerprint order.
+    pub trusted: Vec<(Digest32, String)>,
+    /// The entries that carry drive (ADR-028 K-14); every other entry grants read.
+    pub drive: Vec<Digest32>,
+}
+
 /// Rows the view carries, oldest first, in shared chunks (V210-120): a room's timeline, and the
 /// positions of its structured posts.
 ///
@@ -1727,6 +1763,10 @@ pub enum Fault {
     /// A member holds entries of this node's own feed that this node does not (ADR-037 R5): a
     /// restored older profile. Nothing is written in that room until the person resolves it.
     OwnHistoryBehind,
+    /// A join refused because a member holds signed history of this node in the room that this
+    /// node cannot reconcile with its own record ([`Fault::OwnHistoryBehind`] at a join). The
+    /// room was not made on this node, so no room status speaks of it.
+    OwnHistoryNotJoined,
     /// A leave was overtaken: this node wrote in the room after it, or joined it again, so it is
     /// in the room again (V210-164). Not reachable from a person's post, which a left room
     /// refuses ([`Fault::RoomLeft`]); the return presence of a rejoin that settles is what
@@ -1881,7 +1921,7 @@ impl Fault {
                 "the room changed before sending; this message was not posted\n       refresh the room and try again"
             }
             Fault::RoomChangePending => {
-                "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
+                "a previous change to this room is still being applied; this request made no change\n       wait for the room's change to finish, then try again"
             }
             Fault::TrustRemovalIncomplete => {
                 "this room's trust withdrawal is incomplete; the trust change was saved\n       wait for this room to finish before posting or requesting a key"
@@ -1989,6 +2029,9 @@ impl Fault {
             }
             Fault::OwnHistoryBehind => {
                 "this node's record of its own history in this room is behind what a member holds, as after joining again or restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` says `own history recovery is pending` while this node waits to recover that history from a member that holds it: keep one online, and try again once that line is gone; it says `conflicting signed own history; writes remain frozen` when that history conflicts"
+            }
+            Fault::OwnHistoryNotJoined => {
+                "this room was not joined: a member holds signed history of this node in it that this node cannot reconcile with its own record, as when an older backup of this node or a copy of it elsewhere wrote there; nothing was added to this node, so no status line speaks of this room\n       use the copy of this node that wrote that history instead of this one, if you still have it; otherwise join with a new node (`vox node create <name>`), which the members trust separately"
             }
             Fault::LeaveUndone => {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
@@ -2180,6 +2223,7 @@ fault_names!(
     AlreadyMember,
     RoomNotSynced,
     OwnHistoryBehind,
+    OwnHistoryNotJoined,
     LeaveUndone,
     NotAServiceRoom,
     NotOffered,

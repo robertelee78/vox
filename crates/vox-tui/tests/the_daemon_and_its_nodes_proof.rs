@@ -1116,17 +1116,84 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
-    let (h1, h2) = std::thread::scope(|s| {
-        let one = s.spawn(|| a.hook("agent", "s-1", "UserPromptSubmit"));
-        let two = s.spawn(|| a.hook("agent", "s-2", "UserPromptSubmit"));
-        (one.join().unwrap(), two.join().unwrap())
-    });
-    for (n, (ok, out, err)) in [(1, &h1), (2, &h2)] {
-        eprintln!("[proof] cold hook {n}, exit ok={ok}: {out}{err}");
+    // Its node is not attached, and a hook never attaches it (ADR-028 K-13): checked after every
+    // turn, with the account's one daemon. A daemon whose start lost the lock (D-1) leaves on its
+    // own; the lock holder is the one.
+    let after_turn = |turn: usize| {
+        let settled = wait_until(Duration::from_secs(10), || {
+            a.lock_pid()
+                .is_some_and(|pid| daemons_of(&a.data) == vec![pid])
+        });
+        assert!(
+            settled,
+            "PRODUCT: after cold turn {turn}, two hooks with no daemon must have started exactly \
+             one daemon: the lock names {:?}, daemons serving the account {:?}\nlog:\n{}",
+            a.lock_pid(),
+            daemons_of(&a.data),
+            a.log()
+        );
+        assert!(
+            !a.log()
+                .lines()
+                .filter_map(|l| l.split_once(' ').map(|(_stamp, said)| said))
+                .any(|l| l.starts_with("vox daemon: node agent is Ready")),
+            "PRODUCT: after cold turn {turn}, a hook attached its node (ADR-028 K-13)\nlog:\n{}",
+            a.log()
+        );
+    };
+    // The daemon the first turns started may not have answered within a hook's bound (on a loaded
+    // machine): then a turn says exactly that, and the person's next prompt is the next turn of
+    // the same session, for a few turns at most. The turn the daemon answered says the node is
+    // not attached and the operator's command.
+    let not_answered = |out: &str| {
+        serde_json::from_str::<serde_json::Value>(out.trim()).ok()
+            == Some(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "Vox's daemon has not answered yet; try again next turn. \
+                                      This session can join node agent once it is Ready.\n"
+            }}))
+    };
+    let at_most = 8;
+    let sessions = ["s-1", "s-2"];
+    let mut said = {
+        let (h1, h2) = std::thread::scope(|s| {
+            let one = s.spawn(|| a.hook("agent", sessions[0], "UserPromptSubmit"));
+            let two = s.spawn(|| a.hook("agent", sessions[1], "UserPromptSubmit"));
+            (one.join().unwrap(), two.join().unwrap())
+        });
+        [(1, h1), (1, h2)]
+    };
+    let mut turn = 1;
+    loop {
+        for (n, (at, (ok, out, err))) in said.iter().enumerate() {
+            if *at == turn {
+                eprintln!(
+                    "[proof] cold hook {}, turn {at}, exit ok={ok}: {out}{err}",
+                    n + 1
+                );
+            }
+        }
+        after_turn(turn);
+        if turn == at_most
+            || !said
+                .iter()
+                .any(|(_, (ok, out, _))| *ok && not_answered(out))
+        {
+            break;
+        }
+        turn += 1;
+        for (session, (at, h)) in sessions.iter().zip(said.iter_mut()) {
+            if h.0 && not_answered(&h.1) {
+                *at = turn;
+                *h = a.hook("agent", session, "UserPromptSubmit");
+            }
+        }
+    }
+    for (n, (at, (ok, out, err))) in [(1, &said[0]), (2, &said[1])] {
         assert!(
             *ok && out.contains("node agent is Locked") && out.contains("vox node unlock -- agent"),
             "PRODUCT: hook {n} must exit 0 telling the agent its node is not attached and the \
-             command for the operator (ADR-028 K-13): {out}{err}\nlog:\n{}",
+             command for the operator (ADR-028 K-13); on turn {at}: {out}{err}\nlog:\n{}",
             a.log()
         );
     }
@@ -1152,7 +1219,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
     assert!(
         ok && !out.contains("Locked") && !out.contains("could not read your rooms"),
-        "PRODUCT: a session's second turn must not say again that its node is not attached \
+        "PRODUCT: a session's next turn must not say again that its node is not attached \
          (once per session): {out}{err}"
     );
     // The hook hands the notification to a detached notifier and returns without waiting for it
@@ -1174,14 +1241,14 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         notified = a.notified();
     }
     eprintln!(
-        "[proof] {} notice(s) {:?} after the third turn",
+        "[proof] {} notice(s) {:?} after session 1's next turn",
         notices(&notified),
         looking.elapsed()
     );
     assert!(
         notices(&notified) == 2,
-        "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
-         node agent needs its passphrase, with the command; notified:\n{notified}"
+        "PRODUCT: the person must be notified once per session (two sessions, every turn so far) \
+         that node agent needs its passphrase, with the command; notified:\n{notified}"
     );
     let pid = a
         .lock_pid()

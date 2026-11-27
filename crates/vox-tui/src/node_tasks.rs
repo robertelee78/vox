@@ -313,8 +313,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                         let senders: std::collections::BTreeSet<_> = authors.iter()
                             .filter(|(source, _)| attempt.sources.contains(source))
                             .map(|(_, author)| *author).collect();
+                        // While the node's keyring is not known (a revision being applied, or
+                        // failed trust storage), an author is its fingerprint, never "not in keyring".
+                        let keyring = node.keyring().ok();
+                        let keyring = crate::ident::Keyring::of(keyring.as_ref().map(|k| &k.trusted[..]));
                         let mut names: Vec<_> = senders.iter().take(8).map(|author| {
-                            vox_text::shown(&crate::ident::author_for(&view.trusted, Some(&owner), author), 128)
+                            let name = crate::ident::author_for(keyring, Some(&owner), author);
+                            vox_text::shown(&name, 128)
                         }).collect();
                         if senders.len() > names.len() {
                             names.push("additional senders omitted".into());

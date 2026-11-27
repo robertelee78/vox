@@ -279,7 +279,9 @@ pub const INVITE_LIFETIME_MS: u64 = 600_000;
 const MAX_RECORDS: usize = 4096;
 const MAX_STATE: u64 = 64 * 1024 * 1024;
 const HISTORY_FULL: &str = "computer control history is full; no authority was discarded";
-const STORAGE_FAILED: &str = "computer policy storage failed; computer trust is suspended until storage is repaired and the daemon restarted";
+/// The one copy of these words: a refusal while Computer storage has failed, and a keyring read
+/// then ([`crate::node::api::KeyringUnknown::Suspended`]).
+pub(crate) const STORAGE_FAILED: &str = "computer policy storage failed; computer trust is suspended until storage is repaired and the daemon restarted";
 const COMPUTER_COMMIT_CAUSAL_EXPIRED: &str =
     "the computer change reached its causal convergence deadline before its atomic commit";
 
@@ -2731,6 +2733,9 @@ impl AuthorityChange {
     }
 }
 
+/// One node's live room gate: the members that node may be reached by.
+type Reachers = tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>;
+
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
@@ -2755,12 +2760,7 @@ pub struct Computer {
     // Existing live room gates, weakly held with their node: a durable change closes the gates
     // of the nodes whose authority it changes (every gate for a change to every node's) before
     // exposing it. Those nodes' actors republish only after their keyring is reconciled.
-    reachers: Mutex<
-        Vec<(
-            Digest32,
-            std::sync::Weak<tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>>,
-        )>,
-    >,
+    reachers: Mutex<Vec<(Digest32, std::sync::Weak<Reachers>)>>,
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
     changed: tokio::sync::broadcast::Sender<ComputerChange>,

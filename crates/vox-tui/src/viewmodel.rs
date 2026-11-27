@@ -36,6 +36,9 @@ pub enum Trust {
         /// Whether it still holds your key here.
         reads_you: bool,
     },
+    /// Your node's keyring is not known now (it is applying a new computer trust revision, or its
+    /// trust storage failed), so whether it names the member cannot be said.
+    NotKnown,
 }
 
 /// A member as surfaced to the UI (ADR-015 member pane). Fingerprints and nicknames
@@ -468,8 +471,9 @@ pub struct ViewModel {
     pub tunnels: Vec<vox_core::transport::quic::LiveTunnel>,
     /// The tunnels that ended for a reason a person should see, with that reason (V030-11).
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
-    /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1).
-    pub keyring: Vec<(vox_core::hash::Digest32, String)>,
+    /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1); `None`
+    /// until the node has answered it (it may be applying a new computer trust revision).
+    pub keyring: Option<Vec<(vox_core::hash::Digest32, String)>>,
     /// Authenticated remote self-names, independent of keyring/drive state.
     pub presented: Vec<(vox_core::hash::Digest32, String)>,
     /// The members offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order.

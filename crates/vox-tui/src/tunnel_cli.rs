@@ -1283,9 +1283,11 @@ pub async fn serve(
     let warnings = exposure_warnings(&services, at).await;
     if picked {
         let me = held.me.as_ref().map(b32_encode).unwrap_or_default();
+        // `None` while the keyring cannot be read (the node may be applying a new computer trust
+        // revision): never said as nobody.
         let trusted = match held.client.trusted("").await {
-            Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
-            _ => Vec::new(),
+            Ok(Frame::Trusted { entries }) => Some(crate::ident::names_of(entries)),
+            _ => None,
         };
         let (_, label) = &services[0];
         println!();
@@ -1293,17 +1295,24 @@ pub async fn serve(
             "members will reach it as {}.{me}.<the new room>.vox",
             vox_core::node::channel::service_name(label)
         );
-        if trusted.is_empty() {
-            println!("who can reach it: nobody yet: you trust no node (`vox trust add`)");
-        } else {
-            let names: Vec<String> = trusted
-                .iter()
-                .map(|(fp, _)| crate::ident::name_in(&trusted, fp))
-                .collect();
-            println!(
-                "who can reach it: each node you trust, once it joins the room: {}",
-                names.join(", ")
-            );
+        match trusted {
+            None => println!(
+                "who can reach it: not known just now: this node's keyring could not be read \
+                 (`vox trust list` shows it)"
+            ),
+            Some(trusted) if trusted.is_empty() => {
+                println!("who can reach it: nobody yet: you trust no node (`vox trust add`)");
+            }
+            Some(trusted) => {
+                let names: Vec<String> = trusted
+                    .iter()
+                    .map(|(fp, _)| crate::ident::name_in(&trusted, fp))
+                    .collect();
+                println!(
+                    "who can reach it: each node you trust, once it joins the room: {}",
+                    names.join(", ")
+                );
+            }
         }
         println!("who cannot: anyone else who joins with the room link and passphrase");
         for w in &warnings {
@@ -1562,7 +1571,7 @@ async fn audience(
     };
     let trusted = match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
-        _ => Vec::new(),
+        _ => return "  (who can reach it could not be read just now)\n".to_owned(),
     };
     let (mut can, mut cannot) = (Vec::new(), Vec::new());
     for m in members.iter().filter(|m| Some(*m) != me) {

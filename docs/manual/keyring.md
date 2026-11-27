@@ -365,6 +365,18 @@ The same update then continues without another approval or manual node grants; a
 history remains available. Storage failures and changed authority remain errors, not successful
 policy application.
 
+While a node applies a new computer trust revision, it relies on no keyring entry until the
+revision is applied to it. A new revision holds every node of this computer until each has applied
+it; saving one node's own application of a revision holds only that node. For a node held so,
+`vox trust list` and commands that check its keyring first say `this node is applying a new
+computer trust revision, so who it trusts is not known yet` instead of listing nobody; run the
+command again. The terminal app and the Mac app keep showing the keyring they last had.
+
+If the trust storage of a paired computer has failed, its nodes rely on no keyring entry until the
+storage is repaired and the daemon restarted. The same commands then say `computer policy storage
+failed; computer trust is suspended until storage is repaired and the daemon restarted`, and the
+terminal app shows that line once and draws the keyring as not known.
+
 To remove a computer, review its full fingerprint and nodes in `vox computer status --details`,
 then use the exact displayed frontier:
 

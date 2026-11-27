@@ -3575,6 +3575,12 @@ final class NodeModel: ObservableObject {
         try await client.roster(room: room)
     }
 
+    /// The keyring as the node gives it now. While it applies a new computer trust revision the
+    /// node says so instead of giving a list, and that refusal is what the caller shows.
+    func currentKeyring() async throws -> [TrustedNode] {
+        try await client.trustList()
+    }
+
     /// What listens on this Mac, as one-step sharing lists it (S-4).
     func listeningHere() async throws -> ListeningServices {
         try await client.listening()

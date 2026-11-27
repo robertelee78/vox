@@ -278,7 +278,11 @@ fn select_room(tui: &mut Tui, name: &str, others: &[&str]) {
         .iter()
         .position(|cell| named(cell))
         .unwrap_or_else(|| panic!("APPARATUS: the sidebar does not list {name}:\n{screen}"));
-    let step = if wanted > selected { ":down\r" } else { ":up\r" };
+    let step = if wanted > selected {
+        ":down\r"
+    } else {
+        ":up\r"
+    };
     for _ in 0..wanted.abs_diff(selected) {
         tui.after(step, "");
     }

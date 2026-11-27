@@ -1783,6 +1783,10 @@ fn pair_computers(
     computer(b, &["personal", "remote"]);
     let ring = |account: &Account, node: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", node], "");
+        // A node applying a new computer trust revision says its keyring is not known yet.
+        if err.contains("is applying a new computer trust revision") {
+            return String::new();
+        }
         assert!(ok, "PRODUCT: {node}'s keyring was unavailable: {out}{err}");
         out
     };
@@ -2437,6 +2441,10 @@ fn enroll_third(
     preauth_discloses_no_group_history(b);
     let ring = |account: &Account, name: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
+        // A node applying a new computer trust revision says its keyring is not known yet.
+        if err.contains("is applying a new computer trust revision") {
+            return String::new();
+        }
         assert!(
             ok,
             "PRODUCT: group member {name}'s keyring unavailable: {out}{err}"
@@ -6306,14 +6314,22 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     let worker = create(&b, "worker");
     let moving = create(&b, "moving");
     create(&c, "observer");
-    let ring = |account: &Account, name: &str| {
+    // The listing a person reads, or `None` while the node says its keyring is not known yet
+    // because it applies a new computer trust revision (ledger 58, P2). A missing row counts
+    // only in a listing: a removal is seen in `listed`, never in a keyring not known.
+    let listed = |account: &Account, name: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
+        if err.contains("is applying a new computer trust revision") {
+            return None;
+        }
         assert!(
             ok,
             "PRODUCT: {name}'s effective keyring unavailable: {out}{err}"
         );
-        out
+        Some(out)
     };
+    // For rows that must be present: a keyring not known has none, so a wait reads again.
+    let ring = |account: &Account, name: &str| listed(account, name).unwrap_or_default();
     let has = |shown: &str, fp: &str, drive: bool| {
         shown
             .lines()
@@ -6670,8 +6686,9 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     );
     // Each person's alias stays theirs. Choose it through the real terminal before changing
     // the presented node name; this also supplies the required keyring passphrase premise.
-    // While a node applies a policy revision its keyring reads empty and a keyring change finds
-    // nothing to rename (ledger 58, P2): that answer is waited through, any other is a stop.
+    // While a node applies a policy revision its keyring is not known, and a keyring change says
+    // so; before the grant lands it finds nothing to rename. Both are waited through, any other
+    // answer is a stop.
     for (account, node) in [(&b, "worker"), (&a, "old-personal"), (&a, "new-personal")] {
         let mut said = String::new();
         assert!(
@@ -6682,7 +6699,8 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
                 );
                 said = format!("{out}{err}");
                 assert!(
-                    ok || said.contains("no trusted identity matches"),
+                    ok || said.contains("no trusted identity matches")
+                        || said.contains("is applying a new computer trust revision"),
                     "APPARATUS: chosen local alias: {said}"
                 );
                 ok
@@ -6713,7 +6731,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         ring(&b, "worker")
     );
     // A populated listing: the other computer's own known rows are there, so a missing row is
-    // an answer and not an empty read during a policy application.
+    // an answer and not a keyring that is not known during a policy application.
     let without =
         |shown: &str, known: &str, gone: &str| shown.contains(known) && !shown.contains(gone);
     // What A's daemon said about retiring its nodes, and any engaged mutant (last lines).
@@ -6878,7 +6896,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             .contains("computer-policy-local")),
         "APPARATUS: remote personal Session discovery before removal"
     );
-    // The transfer and A's restart moved rosters; a node reads an empty keyring while it applies
+    // The transfer and A's restart moved rosters; a node's keyring is not known while it applies
     // them (ledger 58, P2), and either end refuses a drive then. Drive once both keyrings show
     // the other end: B's personal node reads old-personal, and old-personal lets it drive.
     assert!(
@@ -6914,9 +6932,10 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         ],
     );
     assert!(
-        wait_until(Duration::from_secs(30), || !ring(&a, "old-personal")
-            .contains(&remote)
-            && !ring(&a, "new-personal").contains(&worker)),
+        wait_until(Duration::from_secs(30), || {
+            listed(&a, "old-personal").is_some_and(|shown| !shown.contains(&remote))
+                && listed(&a, "new-personal").is_some_and(|shown| !shown.contains(&worker))
+        }),
         "PRODUCT: removal preserved pre-pairing individual or group trust"
     );
     let pending = computer(&a, &["status"]);
@@ -6944,9 +6963,10 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     );
     ready(&c, "observer");
     assert!(
-        wait_until(Duration::from_secs(30), || !ring(&c, "observer")
-            .contains(&remote)
-            && !ring(&c, "observer").contains(&worker)),
+        wait_until(Duration::from_secs(30), || {
+            listed(&c, "observer")
+                .is_some_and(|shown| !shown.contains(&remote) && !shown.contains(&worker))
+        }),
         "PRODUCT: reconnect kept the removed computer's old grants"
     );
     offline_for_enrollment(&b, "removed computer");
@@ -7660,7 +7680,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         assert!(
             step == "constructor-re-admission"
                 || step == "direct-publication"
-                || step == "join-ordering",
+                || step == "join-ordering"
+                || step == "stale-authority",
             "APPARATUS: unsupported FX-28 journey step"
         );
         if step == "constructor-re-admission" {
@@ -7739,6 +7760,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         (&hold_arm, &hold_engaged, &hold_release),
         (&beta, &delta),
     );
+    if std::env::var("VOX_PROOF_STEP").as_deref() == Ok("stale-authority") {
+        return;
+    }
     let nodes_a = [
         ("alpha", alpha.as_str()),
         ("gamma", gamma.as_str()),
@@ -9902,12 +9926,24 @@ fn stale_remote_pause_is_refused(
     println!(
         "[proof] FX-28 stale-trust-projection apparatus staged: durable Computer policy moved while delta retained an unreconciled keyring projection"
     );
-    let (trust_ok, stale_trust, trust_error) = b.run(&["trust", "list", "--node", "delta"], "");
+    let (_, stale_trust, trust_error) = b.run(&["trust", "list", "--node", "delta"], "");
     assert!(
-        trust_ok
-            && stale_trust.contains("no trusted identities")
-            && !stale_trust.contains(&epsilon),
-        "PRODUCT [FX28 stale-trust-projection]: after durable Computer policy moved but before delta reconciled it, shipped `vox trust list --node delta` exposed or failed to suppress the old trusted rows: stdout {stale_trust}; stderr {trust_error}"
+        !stale_trust.contains(&epsilon) && !trust_error.contains(&epsilon),
+        "PRODUCT [FX28 stale-trust-projection]: after durable Computer policy moved but before delta reconciled it, shipped `vox trust list --node delta` exposed the old trusted rows: stdout {stale_trust}; stderr {trust_error}"
+    );
+    // Ledger 58, P2: the fence is not an empty keyring. What the person reads says that trust is
+    // being applied and to look again, never that nobody is trusted.
+    assert!(
+        trust_error.contains(
+            "this node is applying a new computer trust revision, so who it trusts is not known yet"
+        ) && trust_error.contains("run the command again")
+            && !stale_trust.contains("no trusted identities")
+            && !stale_trust.contains("nobody can read what you write"),
+        "PRODUCT [trust being applied]: while delta applies a new computer trust revision, shipped `vox trust list --node delta` did not say that trust is being applied, or said nobody is trusted: stdout {stale_trust}; stderr {trust_error}"
+    );
+    println!(
+        "[proof] while delta applies a new computer trust revision, `vox trust list` says so: {}",
+        trust_error.trim()
     );
     println!(
         "[proof] FX-28 stale-post-authority apparatus staged: durable Computer policy moved while delta's exact ordinary text append remained held at its final publication boundary"
@@ -11541,14 +11577,16 @@ fn a_refused_room_pause_names_the_node_and_command_that_can_pause() {
     // and on alpha: all three members, and no key of theirs still waiting.
     assert!(
         wait_until(RETURN_WITHIN, || {
-            [(&b, "beta"), (&a, "alpha")].into_iter().all(|(account, node)| {
-                let (ok, members, said) =
-                    account.run(&["room", "roster", full_room, "--node", node], "");
-                ok && [&alpha, &agent, &beta]
-                    .into_iter()
-                    .all(|member| members.lines().any(|line| line == member.as_str()))
-                    && !said.contains("is owed your key")
-            })
+            [(&b, "beta"), (&a, "alpha")]
+                .into_iter()
+                .all(|(account, node)| {
+                    let (ok, members, said) =
+                        account.run(&["room", "roster", full_room, "--node", node], "");
+                    ok && [&alpha, &agent, &beta]
+                        .into_iter()
+                        .all(|member| members.lines().any(|line| line == member.as_str()))
+                        && !said.contains("is owed your key")
+                })
         }),
         "APPARATUS: the two joins did not settle on beta and alpha: {:?}; {:?}",
         b.run(&["room", "roster", full_room, "--node", "beta"], ""),

@@ -5929,6 +5929,42 @@ impl NodeHandle {
         view
     }
 
+    /// The keyring a person is shown, or why it is not known: while this node applies a newer
+    /// computer policy revision, or after its computer's trust storage failed.
+    /// [`NodeHandle::view`] fences both to nobody for authorization, and that fence is not an
+    /// empty keyring: an unknown keyring cannot be listed as nobody trusted.
+    ///
+    /// # Errors
+    /// Why the keyring is not known now.
+    pub fn keyring(
+        &self,
+    ) -> std::result::Result<crate::node::api::Keyring, crate::node::api::KeyringUnknown> {
+        let (view, policy_current) = self.coherent_view();
+        if policy_current {
+            Ok(crate::node::api::Keyring {
+                trusted: view.trusted,
+                drive: view.drive,
+            })
+        } else {
+            Err(self.keyring_unknown())
+        }
+    }
+
+    /// Why the keyring is fenced: a failed Computer storage holds until it is repaired and the
+    /// daemon restarted (sticky, [`crate::node::computer::Computer::storage_ready`]); every other
+    /// fence is a revision being applied.
+    pub(crate) fn keyring_unknown(&self) -> crate::node::api::KeyringUnknown {
+        if self
+            .computer
+            .as_ref()
+            .is_some_and(|computer| computer.storage_ready().is_err())
+        {
+            crate::node::api::KeyringUnknown::Suspended
+        } else {
+            crate::node::api::KeyringUnknown::Applying
+        }
+    }
+
     /// Current Session token with actor lifetime and effective local policy. Reopening
     /// a held connection to a replacement actor cannot alias its old cached token.
     pub(crate) fn session_display_token(&self, detail: &ChannelDetail, current: bool) -> Digest32 {

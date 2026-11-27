@@ -93,10 +93,9 @@ pub struct NodeSnapshot {
     pub rooms: Vec<RoomSnap>,
     /// The open rooms' detail, in room-id order.
     pub open: Vec<OpenRoomSnap>,
-    /// The trust keyring: `(fingerprint, petname)`.
-    pub trusted: Vec<(Digest32, String)>,
-    /// The keyring entries that carry drive (ADR-028 K-14); every other entry grants read.
-    pub drive: Vec<Digest32>,
+    /// The trust keyring, or why it is not known: one value, so a keyring that is not known can
+    /// never be read as one that trusts nobody.
+    pub keyring: KeyringState,
     /// The members offered to its keyring (ADR-028 K-15 – K-18), in fingerprint order.
     pub offers: Vec<crate::node::api::Offer>,
     /// The peers it holds a connection to now, in fingerprint order.
@@ -108,6 +107,63 @@ pub struct NodeSnapshot {
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
     /// when the next one will ask for it (ADR-028 K-9).
     pub keyring_open_secs: Option<u64>,
+}
+
+/// A node's keyring as a snapshot carries it: the rows in force when the node answered, or why
+/// they are not known. Read it through [`KeyringState::trust`] (three answers) or
+/// [`KeyringState::known`] (`None` while not known); there are no empty rows standing in for it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum KeyringState {
+    /// The keyring in force when the node answered.
+    Known(crate::node::api::Keyring),
+    /// The node was applying a new computer trust revision, which fences its authorization to
+    /// nobody and is not nobody trusted.
+    Applying,
+    /// Its computer's trust storage failed, which suspends trust until the storage is repaired
+    /// and the daemon restarted ([`crate::node::api::KeyringUnknown::Suspended`]).
+    Suspended,
+    /// No node has answered this client yet.
+    #[default]
+    NotAnswered,
+}
+
+/// Whether a node trusts one fingerprint, as a client can know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustOf {
+    /// In the keyring; `drive` when its entry carries drive (ADR-028 K-14).
+    Trusted {
+        /// Its entry carries drive.
+        drive: bool,
+    },
+    /// Not in the keyring, which is known.
+    NotTrusted,
+    /// The keyring is not known now, so neither can be said.
+    NotKnown,
+}
+
+impl KeyringState {
+    /// Whether `fp` is trusted, not trusted, or not known to be either.
+    #[must_use]
+    pub fn trust(&self, fp: &Digest32) -> TrustOf {
+        match self {
+            Self::Known(keyring) if keyring.trusted.iter().any(|(t, _)| t == fp) => {
+                TrustOf::Trusted {
+                    drive: keyring.drive.contains(fp),
+                }
+            }
+            Self::Known(_) => TrustOf::NotTrusted,
+            Self::Applying | Self::Suspended | Self::NotAnswered => TrustOf::NotKnown,
+        }
+    }
+
+    /// The keyring, or `None` while it is not known.
+    #[must_use]
+    pub fn known(&self) -> Option<&crate::node::api::Keyring> {
+        match self {
+            Self::Known(keyring) => Some(keyring),
+            Self::Applying | Self::Suspended | Self::NotAnswered => None,
+        }
+    }
 }
 
 impl NodeSnapshot {
@@ -154,15 +210,16 @@ impl NodeSnapshot {
                     session_revision: handle.session_display_token(d, policy_current),
                 })
                 .collect(),
-            trusted: if policy_current {
-                nv.trusted.clone()
+            keyring: if policy_current {
+                KeyringState::Known(crate::node::api::Keyring {
+                    trusted: nv.trusted.clone(),
+                    drive: nv.drive.clone(),
+                })
             } else {
-                Vec::new()
-            },
-            drive: if policy_current {
-                nv.drive.clone()
-            } else {
-                Vec::new()
+                match handle.keyring_unknown() {
+                    crate::node::api::KeyringUnknown::Applying => KeyringState::Applying,
+                    crate::node::api::KeyringUnknown::Suspended => KeyringState::Suspended,
+                }
             },
             offers: nv.offers.clone(),
             connected_peers: nv.connected_peers.clone(),
@@ -176,11 +233,27 @@ impl NodeSnapshot {
         }
     }
 
+    /// This snapshot, to be held in place of `held`. While its keyring is being applied, `held`'s
+    /// is kept: it was this node's keyring a moment ago, and the node, not a client, authorizes.
+    /// `None` when `held` has no keyring of this node to keep either: a client then keeps what
+    /// it draws and asks again. A suspended keyring is taken in as it is: it stays so until the
+    /// daemon restarts, so nothing held is drawn as current meanwhile.
+    #[must_use]
+    pub fn over(mut self, held: &Self) -> Option<Self> {
+        if self.keyring == KeyringState::Applying {
+            if held.keyring.known().is_none() || held.me != self.me {
+                return None;
+            }
+            self.keyring = held.keyring.clone();
+        }
+        Some(self)
+    }
+
     /// Canonical CBOR body of the reply (unframed).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(12).uint(T_SNAPSHOT_REPLY);
+        e.array(13).uint(T_SNAPSHOT_REPLY);
         e.bytes(self.me.as_ref().map_or(&[][..], |d| &d[..]));
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
@@ -230,11 +303,20 @@ impl NodeSnapshot {
             }
             e.uint(o.display_revision).bytes(&o.session_revision);
         }
-        e.array(self.trusted.len());
-        for (fp, name) in &self.trusted {
+        // The keyring's rows, its drive entries, then its state: 0 being applied, 1 known,
+        // 2 suspended (trust storage failed), 3 not answered. Rows only for a known keyring.
+        let (rows, drive, state) = match &self.keyring {
+            KeyringState::Known(keyring) => (&keyring.trusted[..], &keyring.drive[..], 1),
+            KeyringState::Applying => (&[][..], &[][..], 0),
+            KeyringState::Suspended => (&[][..], &[][..], 2),
+            KeyringState::NotAnswered => (&[][..], &[][..], 3),
+        };
+        e.array(rows.len());
+        for (fp, name) in rows {
             e.array(2).bytes(fp).text(name);
         }
-        digests(&mut e, &self.drive);
+        digests(&mut e, drive);
+        e.uint(state);
         crate::node::offers::put_offers(&mut e, &self.offers);
         digests(&mut e, &self.connected_peers);
         e.array(self.tunnels.len());
@@ -273,7 +355,7 @@ impl NodeSnapshot {
     /// If it is a snapshot reply that does not decode.
     pub fn from_bytes(body: &[u8]) -> Result<Option<Self>> {
         let mut d = Decoder::new(body);
-        if !matches!((d.array(), d.uint()), (Ok(12), Ok(T_SNAPSHOT_REPLY))) {
+        if !matches!((d.array(), d.uint()), (Ok(13), Ok(T_SNAPSHOT_REPLY))) {
             return Ok(None);
         }
         let bad = |what: &'static str| move |_| Error::MalformedIpc(what);
@@ -390,6 +472,14 @@ impl NodeSnapshot {
             trusted.push((fp, name));
         }
         let drive = read_digests(&mut d)?;
+        let unknown = trusted.is_empty() && drive.is_empty();
+        let keyring = match d.uint().map_err(bad("ipc snapshot keyring state"))? {
+            1 => KeyringState::Known(crate::node::api::Keyring { trusted, drive }),
+            0 if unknown => KeyringState::Applying,
+            2 if unknown => KeyringState::Suspended,
+            3 if unknown => KeyringState::NotAnswered,
+            _ => return Err(Error::MalformedIpc("ipc snapshot keyring state")),
+        };
         let offers = crate::node::offers::read_offers(&mut d)?;
         let connected_peers = read_digests(&mut d)?;
         let mut tunnels = Vec::new();
@@ -435,8 +525,7 @@ impl NodeSnapshot {
             mlock_active,
             rooms,
             open,
-            trusted,
-            drive,
+            keyring,
             offers,
             connected_peers,
             tunnels,

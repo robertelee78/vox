@@ -26,6 +26,36 @@ pub const AUTHOR_CHARS: usize = 26;
 /// the longer "(not in your keyring)" was cut off there, which the proof caught.
 pub const NOT_IN_KEYRING: &str = "(not in keyring)";
 
+/// This node's keyring as naming reads it: its `(fingerprint, name)` rows, or not known now
+/// (ledger 58, P2: a revision being applied, failed trust storage, or no answer yet). Not known is
+/// never an empty list: a function given it names by fingerprint and never says that a node is
+/// outside the keyring, or that a name matches nobody.
+#[derive(Clone, Copy, Debug)]
+pub enum Keyring<'a> {
+    /// The rows the node gave.
+    Known(&'a [(Digest32, String)]),
+    /// The node's keyring is not known now.
+    NotKnown,
+}
+
+impl<'a> Keyring<'a> {
+    /// From what a client holds: the rows, or `None` while the keyring is not known.
+    #[must_use]
+    pub fn of(rows: Option<&'a [(Digest32, String)]>) -> Self {
+        rows.map_or(Self::NotKnown, Self::Known)
+    }
+
+    /// From a snapshot's keyring.
+    #[must_use]
+    pub fn of_state(state: &'a vox_core::node::snapshot::KeyringState) -> Self {
+        Self::of(state.known().map(|keyring| &keyring.trusted[..]))
+    }
+}
+
+/// What a name lookup says while the keyring is not known: nothing about the name itself.
+pub const KEYRING_NOT_KNOWN: &str =
+    "who this node trusts is not known yet, so a name cannot be matched to a member now";
+
 /// What a person is told wherever a node is made (ADR-028 K-8), the app's words too.
 pub use vox_text::node::NO_BACKUP;
 
@@ -73,11 +103,16 @@ pub fn alias_of(trusted: &[(Digest32, String)], fp: &Digest32) -> Option<String>
     vox_text::alias::alias_of(trusted, fp, b32_encode)
 }
 
-/// A member's name where the keyring is known: its alias ([`alias_of`]), or its fingerprint at
-/// [`AUTHOR_CHARS`] followed by [`NOT_IN_KEYRING`].
+/// A member's name against the keyring: its alias ([`alias_of`]), or its fingerprint at
+/// [`AUTHOR_CHARS`], followed by [`NOT_IN_KEYRING`] only while the keyring is known.
 #[must_use]
-pub fn member_name(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
-    alias_of(trusted, fp).unwrap_or_else(|| format!("{} {NOT_IN_KEYRING}", author_id(fp)))
+pub fn member_name(keyring: Keyring<'_>, fp: &Digest32) -> String {
+    match keyring {
+        Keyring::Known(trusted) => {
+            alias_of(trusted, fp).unwrap_or_else(|| format!("{} {NOT_IN_KEYRING}", author_id(fp)))
+        }
+        Keyring::NotKnown => author_id(fp),
+    }
 }
 
 /// This process's copy of the node's names for its members: `(fingerprint, name)`.
@@ -128,10 +163,11 @@ pub fn me() -> Option<&'static Digest32> {
     ME.get()
 }
 
-/// The names [`load_names`] read, or none.
+/// The names [`load_names`] read, or [`Keyring::NotKnown`] when it read none (the node did not
+/// answer, or said its keyring is not known yet): never an empty keyring.
 #[must_use]
-pub fn names() -> &'static [(Digest32, String)] {
-    NAMES.get().map_or(&[], Vec::as_slice)
+pub fn names() -> Keyring<'static> {
+    Keyring::of(NAMES.get().map(Vec::as_slice))
 }
 
 /// A member as the reader knows it (V210-162): [`YOU`] for this node itself, the name this node
@@ -149,11 +185,11 @@ pub fn name_of(fp: &Digest32) -> String {
 
 /// [`member_name`], but [`YOU`] for `me`: how the daemon names an author to its own agents.
 #[must_use]
-pub fn author_for(trusted: &[(Digest32, String)], me: Option<&Digest32>, fp: &Digest32) -> String {
+pub fn author_for(keyring: Keyring<'_>, me: Option<&Digest32>, fp: &Digest32) -> String {
     if me == Some(fp) {
         return YOU.to_owned();
     }
-    member_name(trusted, fp)
+    member_name(keyring, fp)
 }
 
 /// [`name_of`] against `trusted`.
@@ -166,12 +202,13 @@ pub fn name_in(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
 }
 
 /// Whether `name` may be this node's name for `target` (V210-162): on one line, and not already
-/// its name for another member, since a name is how a person addresses a member.
+/// its name for another member, since a name is how a person addresses a member. Not checked,
+/// and refused, while the keyring is not known.
 ///
 /// # Errors
-/// Saying which rule `name` breaks.
+/// Saying which rule `name` breaks, or that the keyring is not known.
 pub fn check_new_name(
-    trusted: &[(Digest32, String)],
+    keyring: Keyring<'_>,
     target: &Digest32,
     name: &str,
 ) -> Result<(), crate::app::AppError> {
@@ -182,6 +219,12 @@ pub fn check_new_name(
             vox_agentcomms::envelope::MAX_NAME
         )));
     }
+    let Keyring::Known(trusted) = keyring else {
+        return Err(crate::app::AppError::Usage(
+            "who this node trusts is not known yet, so a name cannot be checked against it now"
+                .into(),
+        ));
+    };
     match trusted
         .iter()
         .find(|(fp, n)| fp != target && n.trim() == name)
@@ -199,30 +242,35 @@ pub fn check_new_name(
 pub const MIN_PREFIX: usize = 8;
 
 /// The member of `members` that `word` names (V210-161): the reader's own name for it, or its
-/// fingerprint, whole or a unique prefix of at least [`MIN_PREFIX`] characters.
+/// fingerprint, whole or a unique prefix of at least [`MIN_PREFIX`] characters. A fingerprint
+/// names a member without the keyring; only a name needs it, so while the keyring is not known a
+/// word that is no member's fingerprint gets [`KEYRING_NOT_KNOWN`], never that nobody has it.
 ///
 /// # Errors
-/// A sentence saying why `word` names no one, or more than one, in this room.
+/// A sentence saying why `word` names no one, or more than one, in this room; or
+/// [`KEYRING_NOT_KNOWN`].
 pub fn resolve_member(
     word: &str,
     members: &[Digest32],
-    trusted: &[(Digest32, String)],
+    keyring: Keyring<'_>,
 ) -> Result<Digest32, String> {
     let w = word.trim();
-    let named: Vec<Digest32> = trusted
-        .iter()
-        .filter(|(_, n)| n.trim() == w)
-        .map(|(fp, _)| *fp)
-        .collect();
-    match named.as_slice() {
-        [fp] if members.contains(fp) => return Ok(*fp),
-        [_] => return Err(format!("{w:?} is not a member of this room")),
-        [] => {}
-        many => {
-            return Err(format!(
-                "{w:?} is your name for {} members; name one by fingerprint",
-                many.len()
-            ))
+    if let Keyring::Known(trusted) = keyring {
+        let named: Vec<Digest32> = trusted
+            .iter()
+            .filter(|(_, n)| n.trim() == w)
+            .map(|(fp, _)| *fp)
+            .collect();
+        match named.as_slice() {
+            [fp] if members.contains(fp) => return Ok(*fp),
+            [_] => return Err(format!("{w:?} is not a member of this room")),
+            [] => {}
+            many => {
+                return Err(format!(
+                    "{w:?} is your name for {} members; name one by fingerprint",
+                    many.len()
+                ))
+            }
         }
     }
     let needle = vox_core::node::link::fingerprint_input(w, "fingerprint")
@@ -234,6 +282,7 @@ pub fn resolve_member(
         .collect();
     match hits.as_slice() {
         [fp] => Ok(*fp),
+        [] if matches!(keyring, Keyring::NotKnown) => Err(KEYRING_NOT_KNOWN.to_owned()),
         [] => Err(format!(
             "no member of this room is called {w:?}. Name one by your name for it (`vox trust \
              list`) or by its fingerprint, at least {MIN_PREFIX} characters (`vox room roster`)"
@@ -252,11 +301,12 @@ pub fn resolve_member(
 /// after the alias (`@ann,`) is not part of it.
 ///
 /// # Errors
-/// A sentence saying which `@alias` names no member of the room, or more than one.
+/// A sentence saying which `@alias` names no member of the room, or more than one; or
+/// [`KEYRING_NOT_KNOWN`] for any `@alias` while the keyring is not known.
 pub fn addressed_in(
     text: &str,
     members: &[Digest32],
-    trusted: &[(Digest32, String)],
+    keyring: Keyring<'_>,
 ) -> Result<Vec<String>, String> {
     let mut to: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
@@ -267,6 +317,9 @@ pub fn addressed_in(
         if at.is_empty() {
             continue;
         }
+        let Keyring::Known(trusted) = keyring else {
+            return Err(KEYRING_NOT_KNOWN.to_owned());
+        };
         let (alias, prefix) = match at.split_once('#') {
             Some((a, p)) => (a, Some(p.to_ascii_lowercase())),
             None => (at, None),
@@ -333,13 +386,16 @@ pub fn recipient(t: &str) -> Option<Digest32> {
 /// session's short id (ADR-029 TA-1, SE-3). A recipient that is not a fingerprint (an older build
 /// addressed sessions by name) is shown as written, on one line.
 #[must_use]
-pub fn recipients(to: &[String], me: Option<&Digest32>, trusted: &[(Digest32, String)]) -> String {
+pub fn recipients(to: &[String], me: Option<&Digest32>, keyring: Keyring<'_>) -> String {
     to.iter()
         .map(|t| {
             let (node, session) = vox_agentcomms::envelope::addressee(t);
             let node = match recipient(node) {
                 Some(fp) if Some(&fp) == me => YOU.to_owned(),
-                Some(fp) => name_in(trusted, &fp),
+                Some(fp) => match keyring {
+                    Keyring::Known(trusted) => name_in(trusted, &fp),
+                    Keyring::NotKnown => author_id(&fp),
+                },
                 None => {
                     return vox_agentcomms::envelope::shown(t, vox_agentcomms::envelope::SHOWN_NAME)
                 }
@@ -422,12 +478,22 @@ impl Reading {
     }
 }
 
-/// Display entries only: remote names always retain fingerprint and trust-state text.
-/// These entries must never be used to resolve recipients or decide authority.
+/// Display entries only: remote names always retain fingerprint and, while the keyring is known,
+/// trust-state text. These entries must never be used to resolve recipients or decide authority.
 pub fn display_names(
-    trusted: &[(Digest32, String)],
+    keyring: Keyring<'_>,
     presented: &[(Digest32, String)],
 ) -> Vec<(Digest32, String)> {
+    let Keyring::Known(trusted) = keyring else {
+        // Not known: each presented name with its fingerprint, and nothing about the keyring.
+        return presented
+            .iter()
+            .map(|(fp, name)| {
+                let shown = alias_of(presented, fp).unwrap_or_else(|| name.clone());
+                (*fp, format!("{shown} · {}", author_id(fp)))
+            })
+            .collect();
+    };
     let mut entries = trusted.to_vec();
     entries.extend(
         presented

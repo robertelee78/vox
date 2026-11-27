@@ -267,10 +267,10 @@ lapses and deletes each one when it stops. `vox status --json` carries the same,
 network change under `network_changed`.
 
 A room's or member's `last sync` is when a sync last saved room history this node did not hold
-before: an entry, a header or body, a signed head, a proof or a room context. It does not say that
-a message arrived. In a room of the current history format the member is the one whose connection
-brought it: an answer its loop got that saved any of these, or an entry from that answer the room
-then admitted. A room reads `not receiving` when a connected member has stayed at least 20 live
+before: an entry, a header or body, a signed head, a proof or its verification, or a room context.
+It does not say that a message arrived. In a room of the current history format the member is the
+one whose connection brought it: an answer its loop got that saved any of these, or an entry from
+that answer the room then admitted. A room reads `not receiving` when a connected member has stayed at least 20 live
 entries behind for over 60 seconds with no progress seen between status samples; the line under
 `UNHEALTHY` names the member and how many of its live entries are missing now. Behind is the
 newest position of its own feed the member told this node on its current connection, less what

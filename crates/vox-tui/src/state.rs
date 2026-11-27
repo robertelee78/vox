@@ -706,7 +706,14 @@ impl UiState {
                         .as_ref()
                         .map(|c| c.members.iter().map(|m| m.id).collect())
                         .unwrap_or_default();
-                    let to = match crate::ident::addressed_in(&text, &members, &vm.keyring) {
+                    // `@` names come from the keyring; while it is not known, `addressed_in`
+                    // says so and matches nothing.
+                    let to = crate::ident::addressed_in(
+                        &text,
+                        &members,
+                        crate::ident::Keyring::of(vm.keyring.as_deref()),
+                    );
+                    let to = match to {
                         Ok(to) => to,
                         Err(why) => {
                             self.status_message = Some(why);
@@ -1447,10 +1454,16 @@ impl UiState {
             self.status_message = Some("that is this node".into());
             return Action::Redraw;
         }
-        if vm.keyring.iter().any(|(id, _)| *id == fp) {
+        // Said only of a keyring that is known; while it is not, the prompt opens and the node
+        // decides.
+        if let Some(keyring) = vm
+            .keyring
+            .as_deref()
+            .filter(|keyring| keyring.iter().any(|(id, _)| *id == fp))
+        {
             self.status_message = Some(format!(
                 "{} is already in your keyring",
-                crate::ident::name_in(&vm.keyring, &fp)
+                crate::ident::name_in(keyring, &fp)
             ));
             return Action::Redraw;
         }
@@ -2072,12 +2085,17 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
                 ));
             }
             let members: Vec<Digest32> = room.members.iter().map(|m| m.id).collect();
-            return Some(
-                match crate::ident::resolve_member(rest, &members, &vm.keyring) {
-                    Ok(fp) => Parsed::Trust(fp),
-                    Err(why) => Parsed::Refused(why),
-                },
+            // Names come from the keyring; while it is not known, `resolve_member` says so and
+            // matches nothing.
+            let resolved = crate::ident::resolve_member(
+                rest,
+                &members,
+                crate::ident::Keyring::of(vm.keyring.as_deref()),
             );
+            return Some(match resolved {
+                Ok(fp) => Parsed::Trust(fp),
+                Err(why) => Parsed::Refused(why),
+            });
         }
         "init" => return Some(Parsed::Prompt(PromptKind::CreateIdentity, None)),
         "new" if !rest.is_empty() => {

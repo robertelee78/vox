@@ -104,7 +104,7 @@ pub(crate) async fn offer(
     room: &str,
     path: &Path,
     opts: &ShareOpts,
-    before: impl FnOnce(&str, &str, &[String]),
+    before: impl FnOnce(&str, &str, Option<&[String]>),
 ) -> Result<Offered, AppError> {
     let session = crate::coord::posting_session(paths, None)?;
     // The daemon reads the path, from wherever it was started: it is made absolute here.
@@ -130,7 +130,7 @@ pub(crate) async fn offer(
     } else {
         base
     };
-    before(&what, &which, &reach);
+    before(&what, &which, reach.as_deref());
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
     // **A share is a post, and follows a post's hop rule** (ADR-020 §9, V210-121): it answers
     // what woke the session, and spends a hop of that budget. An urgent share with a fresh one
@@ -219,7 +219,7 @@ pub async fn share(
         println!("vox: about to share {what} in {which}");
         println!(
             "     the members of it in your keyring are to fetch it: {}",
-            crate::room_cli::listed(reach, "none yet")
+            crate::room_cli::reach_listed(reach, "none yet")
         );
     })
     .await?;

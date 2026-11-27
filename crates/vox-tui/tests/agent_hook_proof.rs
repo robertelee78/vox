@@ -449,18 +449,41 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
-    let (ok, told) = turn("k13-1");
-    let listed = node_list();
-    println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
     // The command ends its options before the node's name (a483f5f51: a printed command is
     // complete and safe for shell paste, whatever the name), so it reads `unlock -- default`.
     let want = "Vox node default is Locked; ask the operator to run `vox node unlock -- default` \
                 in a terminal outside this session.\n";
+    // The daemon this first turn started may not have answered within the hook's bound (on a
+    // loaded machine): then the turn says exactly that, and the person's next prompt is the next
+    // turn of the same session, for a few turns at most. The node stays Locked after every turn,
+    // and the turn the daemon answered says the operator's command.
+    let not_answered = "Vox's daemon has not answered yet; try again next turn. This session can \
+                        join node default once it is Ready.\n";
+    let at_most = 8;
+    let mut turns = 0;
+    let (ok, told, listed) = loop {
+        turns += 1;
+        let (ok, told) = turn("k13-1");
+        let listed = node_list();
+        println!(
+            "[proof] (7) turn {turns}: the hook told the agent: {told:?}; `vox node list`: \
+             {listed:?}"
+        );
+        assert!(
+            listed.lines().any(|l| l.starts_with("default Locked")),
+            "PRODUCT: after turn {turns} of a session, node default must still be Locked: a hook \
+             never attaches its node (ADR-028 K-13); the hook exited ok {ok}, told the agent \
+             {told:?}, and `vox node list` says {listed:?}"
+        );
+        if !(ok && told == not_answered) || turns == at_most {
+            break (ok, told, listed);
+        }
+    };
     assert!(
         ok && told == want && listed.lines().any(|l| l.starts_with("default Locked")),
         "PRODUCT: with node default Locked, the hook must leave it Locked and tell the agent \
-         {want:?} (ADR-028 K-13); it exited ok {ok}, told the agent {told:?}, and `vox node list` \
-         says {listed:?}"
+         {want:?} (ADR-028 K-13); on turn {turns} it exited ok {ok}, told the agent {told:?}, and \
+         `vox node list` says {listed:?}"
     );
     // The operator attaches it, outside the session: the next turn reads.
     let (ok, _, err) = hook(
@@ -930,9 +953,9 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     );
 
     // ---- (4) a lost cursor: from the beginning, said out loud, bounded ----
-    // A cursor naming an entry the room does not hold, written as the hook writes its cursor: the
-    // entry's 52 base32 characters and a newline (the hook reads that fixed-width line since
-    // 7bc390c74; without its newline the file is a torn one, not a lost cursor).
+    // A legacy hash cursor naming an entry the room does not hold: the entry's 52 base32
+    // characters and a newline. The hook still accepts this saved format; subsequent reads save
+    // numeric positions. Without the newline the file is torn, not a lost cursor.
     std::fs::write(
         paths.cursor_file(&room_key, "lost-session"),
         format!("{}\n", vox_core::node::link::b32_encode(&[7u8; 32])),

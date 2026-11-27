@@ -75,12 +75,14 @@ pub fn trust_label(t: Trust) -> Option<&'static str> {
         // A member untrusted after it took your key still holds it: said first.
         Trust::NotTrusted { reads_you: true } => Some("not in keyring · still reads you"),
         Trust::NotTrusted { reads_you: false } => Some("not in keyring: trust to read each other"),
+        Trust::NotKnown => Some("keyring not known yet"),
     }
 }
 
 /// A member's trust glyph and the style of its name (ADR-028 L-4): in text.primary bold, `⇄` for a
 /// node in your keyring that trusts you too and `→` for one that does not (yet); `·` in
-/// text.secondary for one not in your keyring; nothing for yourself.
+/// text.secondary for one not in your keyring; `?` in text.secondary while the keyring is not
+/// known; nothing for yourself.
 fn trust_mark(t: Trust) -> (&'static str, Style) {
     let ascii = theme::ascii();
     match t {
@@ -98,6 +100,7 @@ fn trust_mark(t: Trust) -> (&'static str, Style) {
             if ascii { ". " } else { "· " },
             theme::fg(theme::TEXT_SECONDARY),
         ),
+        Trust::NotKnown => ("? ", theme::fg(theme::TEXT_SECONDARY)),
     }
 }
 
@@ -1648,17 +1651,18 @@ fn render_members(
 /// The trust keyring (ADR-028 W-1, K-1): each node by your name for it, with its fingerprint
 /// whole and grouped and its art beside it.
 fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
-    let items: Vec<ListItem> = if vm.keyring.is_empty() {
-        vec![ListItem::new(Line::from(
+    let items: Vec<ListItem> = match &vm.keyring {
+        None => vec![ListItem::new(Line::from(
+            "  who this node trusts is not known yet; it is listed here once it is known",
+        ))],
+        Some(keyring) if keyring.is_empty() => vec![ListItem::new(Line::from(
             "  you trust no node yet (`vox trust add`)",
-        ))]
-    } else {
-        vm.keyring
+        ))],
+        Some(keyring) => keyring
             .iter()
             .map(|(fp, alias)| {
                 // An alias another differs from only by case is told apart (ADR-028 K-4).
-                let alias =
-                    crate::ident::alias_of(&vm.keyring, fp).unwrap_or_else(|| alias.clone());
+                let alias = crate::ident::alias_of(keyring, fp).unwrap_or_else(|| alias.clone());
                 let mut lines = vec![Line::from(format!("  {}", vox_text::shown(&alias, 64)))];
                 for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(fp)) {
                     lines.push(Line::from(format!("    {row}")));
@@ -1666,7 +1670,7 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
                 lines.push(Line::from(""));
                 ListItem::new(lines)
             })
-            .collect()
+            .collect(),
     };
     let list = List::new(items).block(
         Block::default()
