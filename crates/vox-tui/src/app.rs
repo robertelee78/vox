@@ -711,6 +711,7 @@ pub fn run_node(
     use vox_core::identity::composite::RootSigner;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(vox_core::node::actor::NODE_THREAD_STACK)
         .enable_all()
         .build()?;
     // **Every stop signal is a clean stop, taken first** (V210-93, V210-85): SIGINT, SIGTERM, SIGHUP

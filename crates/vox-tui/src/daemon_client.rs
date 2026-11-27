@@ -49,6 +49,10 @@ pub enum HookDaemon {
     Unanswered,
     /// A restart owns startup: the hook may wait, but must never start a daemon.
     Restarting,
+    /// This account's login item is starting the daemon: a restart the hook waits for, said as
+    /// the login item's.
+    #[cfg(target_os = "macos")]
+    LoginItem,
     /// The login-item lookup did not finish; daemon ownership is unknown.
     #[cfg(target_os = "macos")]
     StartupUnchecked,
@@ -171,7 +175,7 @@ pub async fn ensure_daemon_for_hook(
             Ok(Ok(None)) => {}
             Ok(Ok(Some(_))) => {
                 eprintln!("vox: waiting for the daemon restart");
-                return Ok(HookDaemon::Restarting);
+                return Ok(HookDaemon::LoginItem);
             }
             Err(_) => {
                 eprintln!("vox: the login-item startup check did not finish; no daemon was started; retry on the next turn");

@@ -3214,11 +3214,11 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         ok && out.contains("news across the restart"),
         "PRODUCT: the NEXT turn after bounded restart lost the other member's news: {out}{err}"
     );
-    // A turn already past its patience with no restart in sight, which then meets one: the hook
-    // still never waits for it without a bound (#408). The turn's input arrives only after the
-    // hook's own ten-second patience, so the turn runs late. A socket that accepts and closes
-    // stands where the daemon was, and the restart lock is taken once the hook has reached it,
-    // so the restart begins inside the turn, after its patience.
+    // A turn whose input is slow, which then meets a restart: the hook still never waits for it
+    // without a bound (#408). The turn's one deadline is taken once its input is in hand, so the
+    // input held past ten seconds does not shorten it, and a restart met inside it (greeting
+    // waits included) ends at that deadline. A socket that accepts and closes stands where the
+    // daemon was, and the restart lock is taken once the hook has reached it.
     let daemon_dir = a.data.join(".daemon");
     let socket = vox_core::node::paths::socket_path_in(&daemon_dir, "vox.sock");
     assert!(
@@ -3244,7 +3244,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         .unwrap();
     let mut prompt = hook.stdin.take().unwrap();
     prompt.write_all(input.as_bytes()).unwrap();
-    // Past the hook's REGISTER_WITHIN (10 s), counted from its start, before its input ends.
+    // Past ten seconds from the hook's start, before its input ends.
     std::thread::sleep(Duration::from_secs(11));
     drop(prompt);
     let t0 = Instant::now();
@@ -3272,7 +3272,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             .unwrap_or_default()
             .contains("waiting for the daemon restart")
     });
-    // Its own wait for a restart in one open is ANSWER_WITHIN (10 s); its patience is 10 s more.
+    // The turn ends at its one ten-second deadline, counted from its input.
     let returned_while_locked = wait_until(Duration::from_secs(20), || {
         hook.try_wait().unwrap().is_some()
     });

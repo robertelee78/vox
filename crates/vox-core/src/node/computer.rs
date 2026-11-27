@@ -3554,9 +3554,19 @@ impl Computer {
                 }
             }
         }
-        let owner = owner.ok_or(Error::Profile(
-            "this managed node has no authenticated binding yet",
-        ))?;
+        // A node this computer never bound, on a computer that holds no grant (removed from its
+        // group, or retired and in no group), cannot be bound: it gets the revocation-only plan
+        // the removed computer's own nodes get, with no grant. Only a computer that is still a
+        // member must have bound the node before its plan exists.
+        let owner = match owner {
+            Some(owner) => owner,
+            None if s.grant(&local).is_none() => local,
+            None => {
+                return Err(Error::Profile(
+                    "this managed node has no authenticated binding yet",
+                ))
+            }
+        };
         let mut nodes = BTreeMap::new();
         for (manager, r) in s.rosters.iter().filter(|_| group.is_some()) {
             if s.quarantined.contains(manager) {

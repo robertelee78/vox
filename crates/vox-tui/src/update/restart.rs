@@ -920,6 +920,8 @@ pub(crate) struct ManagerProgress {
     pub(crate) within: Duration,
     pub(crate) pid: Option<u32>,
     pub(crate) pending: bool,
+    /// launchd holds the job's next start: its last run has ended.
+    pub(crate) scheduled: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1018,6 +1020,7 @@ impl DaemonManager {
                             phase,
                             Some("spawn scheduled" | "spawning" | "spawn requested")
                         )),
+                scheduled: phase == Some("spawn scheduled"),
             }));
         }
         Ok(None)

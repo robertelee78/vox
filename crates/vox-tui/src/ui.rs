@@ -659,10 +659,10 @@ fn failed_room_said(vm: &ViewModel, ui: &UiState) -> Option<String> {
         .selected_room
         .and_then(|id| vm.channels.iter().find(|c| c.channel_id == id))
         .and_then(|c| c.open_failure.as_deref())?;
-    Some(format!(
-        "{reason}\n\n{}",
-        crate::room_cli::reopen_advice(&vm.node)
-    ))
+    Some(match crate::room_cli::reopen_advice(reason, &vm.node) {
+        Some(advice) => format!("{reason}\n\n{advice}"),
+        None => reason.to_owned(),
+    })
 }
 
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {

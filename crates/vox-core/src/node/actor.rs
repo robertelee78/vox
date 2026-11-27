@@ -953,8 +953,29 @@ fn net_event_name(e: &NetEvent) -> &'static str {
 /// ("thread 'tokio-rt-worker' has overflowed its stack"). Later the steps `run_loop` awaits grew,
 /// and its poll frame came to 1.7 MiB, so a debug daemon overflowed as soon as it served. Each
 /// step below is a plain fn that makes its body's future in its own frame and boxes it, so its
-/// callers hold a pointer instead.
+/// callers hold a pointer instead. That keeps the dispatchers' frames from adding up; the stack
+/// the whole chain runs on is stated by [`NODE_THREAD_STACK`].
 type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// The stack of every thread of a runtime that runs a node (`vox daemon`, `vox node`, the app's
+/// in-process node): its workers poll the actor and its blocking pool runs what the actor hands
+/// off. Stated here, never tokio's 2 MiB default.
+///
+/// A caller makes each step's future in its own poll frame before it awaits it (a debug build
+/// keeps a separate slot for every one), and the actor's steps nest a dozen deep: a third
+/// member's join ran the run loop, a pending post, maintenance, a recovery's rekeys, a prekey
+/// delivery and the bundle's ML-DSA check on one worker, and a debug daemon overflowed the 2 MiB
+/// default there. Boxing the steps that grew (above) made room twice and was outgrown twice. On
+/// that three-daemon staging a debug daemon's workers reached 2.1 MiB and a release daemon's
+/// 624 KiB; this is the budget for both, nearly four times the debug peak.
+///
+/// The deep frames are the actor's poll chain on the two workers, but tokio states one stack
+/// size for a runtime's workers and its blocking pool alike (the pool peaked at 448 KiB in
+/// release), so the pool's threads, up to tokio's default of 512, map 8 MiB each too: at full
+/// capacity about 4 GiB of stack mappings per runtime. macOS and Linux make a stack's pages
+/// resident only as deep as its thread goes, but a Linux host in strict commit mode
+/// (`vm.overcommit_memory = 2`) charges each whole mapping against its commit limit.
+pub const NODE_THREAD_STACK: usize = 8 * 1024 * 1024;
 
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
@@ -21478,6 +21499,25 @@ impl Node {
                     },
                 });
             }
+        }
+        // A room that did not reopen answers nothing but `room list`: status names it too, so it
+        // never reads as healthy beside a room that is closed (#1379).
+        for (id, why) in &self.reopen_failures {
+            if self.channels.contains_key(id)
+                || self.reopening.contains(id)
+                || self.opening_rooms.contains_key(id)
+                || self.preparing_rooms.contains_key(id)
+            {
+                continue;
+            }
+            let room = crate::node::link::b32_encode(id);
+            report.unhealthy.push(crate::node::status::Unhealthy {
+                key: format!("room-closed:{room}"),
+                message: format!(
+                    "room {} did not reopen and stays closed: {why}",
+                    room.chars().take(12).collect::<String>()
+                ),
+            });
         }
         if let Some(message) = self.prekey_maintenance_error.as_ref() {
             report.unhealthy.push(crate::node::status::Unhealthy {
