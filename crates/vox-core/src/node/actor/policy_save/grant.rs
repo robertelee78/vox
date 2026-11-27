@@ -1,7 +1,7 @@
 //! Native trust command admission and durable decision replies. Room work uses governance.
 use super::*;
 use crate::node::actor::trust_save::{GrantChange, GrantSaved};
-use crate::node::trust::{Capability, HistoryGrant};
+use crate::node::trust::Capability;
 
 pub(crate) enum GrantCommand {
     Trust,
@@ -38,7 +38,6 @@ impl Node {
                 GrantChange::Trust {
                     target: fingerprint,
                     petname,
-                    history: HistoryGrant::Now,
                     capability: None,
                 },
                 GrantCommand::Trust,
@@ -46,13 +45,11 @@ impl Node {
             NodeCommand::TrustWith {
                 fingerprint,
                 petname,
-                history,
                 capability,
             } => (
                 GrantChange::Trust {
                     target: fingerprint,
                     petname,
-                    history,
                     capability,
                 },
                 GrantCommand::Trust,

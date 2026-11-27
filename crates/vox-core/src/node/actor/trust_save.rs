@@ -7,7 +7,7 @@ use crate::node::consent_order::ConsentOrder;
 use crate::node::pending_consent::PendingConsents;
 use crate::node::pending_lock::PendingLocks;
 use crate::node::store::Store;
-use crate::node::trust::{Capability, HistoryGrant, Keyring};
+use crate::node::trust::{Capability, Keyring};
 
 mod grant;
 pub(super) use grant::{GrantChange, GrantSaved};
@@ -90,6 +90,37 @@ impl Policy {
             }
         }
     }
+}
+
+/// Write the keyring's legacy full-history column as 0 once every stored room (the store's
+/// room list, closed rooms included) holds the forward-only migration marker (R9). Writer
+/// admission comes first, so no room or keyring write lands between the check and the clear.
+/// Returns whether the column was cleared; while any stored room is unmigrated it is kept.
+pub(super) fn clear_legacy_full(
+    store: &Store,
+    signer: &VaultRootSigner,
+) -> crate::error::Result<bool> {
+    let mut batch = store.batch()?;
+    let (mut trust, _) = Keyring::load_at(store, signer)?;
+    if trust.legacy_full().is_empty() {
+        return Ok(false);
+    }
+    for room in store.channels()? {
+        if store
+            .get_segment(
+                &room,
+                crate::atrest::store::SegmentKind::KeyMaterial,
+                crate::node::channel::SEG_FORWARD_MIGRATED,
+            )?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    trust.clear_legacy_full();
+    trust.queue_save(&mut batch, signer)?;
+    batch.commit()?;
+    Ok(true)
 }
 
 /// An exact committed keyring and exact edits to actor-held pending-key metadata. Never return
@@ -186,12 +217,7 @@ impl PolicyWrite {
             }
             changed_drive.push((target, trust.has_drive(&target)));
             let name = trust.petname(&target).unwrap_or(&alias).to_owned();
-            let history = if was_trusted {
-                trust.history(&target)
-            } else {
-                HistoryGrant::Now
-            };
-            trust.trust_as(target, &name, history, capability)?;
+            trust.trust_as(target, &name, capability)?;
         }
         if pending_changed {
             pending.queue_save(&mut batch, signer)?;

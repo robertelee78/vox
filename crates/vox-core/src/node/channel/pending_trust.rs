@@ -263,7 +263,6 @@ impl PendingTrust {
                                 self.normal_next
                                     .ok_or(Error::Profile("missing receiver deletion stamp"))?,
                             )?;
-                            receiver_releases::retire(&mut batch, sek, &self.room)?;
                         }
                         if let Some(bytes) = &self.drive {
                             let filtered;

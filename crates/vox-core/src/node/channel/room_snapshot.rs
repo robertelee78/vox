@@ -39,10 +39,6 @@ pub(crate) struct RoomSnapshot {
     history: Option<Arc<held_history::HeldHistory>>,
     /// The room's generation at this publication: what a Have told from `history` credits.
     generation: u64,
-    /// Per author, the original sender releases this node retains for it (key epoch, chain,
-    /// earliest iteration; never a key): the Have's own-release section, told only to that
-    /// author while it has recovery standing (`pull::tell`). Empty once this node has left.
-    releases: BTreeMap<Digest32, Vec<crate::node::history_stream::ReleaseHave>>,
     /// The peers this room's private serve would answer now (room and peer preconditions,
     /// `ChannelState::private_have_peers`); a Have tells each of them only a position a native
     /// discovery found it may be served (`pull::tell`). Empty while this node cannot serve
@@ -154,13 +150,6 @@ impl RoomSnapshot {
     pub(crate) fn left_at(&self, author: &Digest32) -> Option<u64> {
         self.left_at.get(author).copied()
     }
-    /// What [`Self::releases`] holds for `author`: told only to that author (`pull::tell`).
-    pub(crate) fn own_releases(
-        &self,
-        author: &Digest32,
-    ) -> &[crate::node::history_stream::ReleaseHave] {
-        self.releases.get(author).map_or(&[], Vec::as_slice)
-    }
     /// An author frozen by fork evidence (MP-9a), as the room knew it at publication.
     pub(crate) fn is_frozen(&self, id: &Digest32) -> bool {
         self.frozen.contains(id)
@@ -254,7 +243,7 @@ pub(crate) enum Standing {
     /// A current member: everything a member is served and told.
     Member,
     /// A departed author with a verified admission after its departure (recovery standing):
-    /// its own public tree, its own receipt, its own row and its own releases; nothing else.
+    /// its own public tree, its own receipt and its own row; nothing else.
     Returning,
     /// A departed author: its own departure receipt and its own row; nothing else.
     Departed,
@@ -372,27 +361,6 @@ impl ChannelState {
                 })
                 .flatten(),
             generation: self.gen.load(std::sync::atomic::Ordering::Acquire),
-            // What `own_original_release` (`channel.rs`) could serve: a current receiver of the
-            // author no later than this epoch, and this node not departed. Serving checks it all
-            // again, with the retained release itself.
-            releases: if self.has_left(&self.me()) {
-                BTreeMap::new()
-            } else {
-                let mut releases: BTreeMap<Digest32, Vec<_>> = BTreeMap::new();
-                for ((author, chain), receiver) in &self.receivers {
-                    if receiver.epoch() <= self.epoch {
-                        releases.entry(*author).or_default().push(
-                            crate::node::history_stream::ReleaseHave {
-                                author: *author,
-                                epoch: receiver.epoch(),
-                                chain: *chain,
-                                earliest: receiver.history_iteration(),
-                            },
-                        );
-                    }
-                }
-                releases
-            },
             private_permission: super::session_projection::private_index::permission_generation(
                 store,
                 &self.channel_id,

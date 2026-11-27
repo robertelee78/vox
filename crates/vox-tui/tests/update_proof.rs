@@ -23,6 +23,12 @@
 //! it is compiled only with vox-tui's `optional-proofs` feature, and without it a stand-in of the
 //! same name says `OPTIONAL PROOF NOT RUN`. It blocks nothing, and it accepts no gap.
 //!
+//! [`stores_of_the_previous_release_open_and_each_member_reads_from_its_trust_point`] is the
+//! update journey for forward only (design-4 R9, R10): the published previous release
+//! (`VOX_PROOF_PREVIOUS_BINARY`, its `vox`) writes the stores, this build opens them, and the
+//! members' computers then update one at a time. Optional for the same reason; its mutant arm is
+//! `VOX_MUTANT_FWD=migrate-clamp`.
+//!
 //! The controlled macOS bundle journey uses ad-hoc fixtures with genuinely compiled helpers;
 //! it does not establish native-app or Apple trust. The separate optional native journey uses
 //! genuine signed bundles. Both controlled journeys use the existing test-knobs transport.
@@ -66,6 +72,7 @@ optional_proof::not_run!(
     an_update_restarts_its_daemon_and_uses_a_different_local_version,
     a_client_uses_another_package_version_with_the_same_control_protocol,
     a_claim_is_still_held_after_the_package_version_changes,
+    stores_of_the_previous_release_open_and_each_member_reads_from_its_trust_point,
 );
 
 use std::collections::BTreeMap;
@@ -4345,4 +4352,734 @@ fn a_published_install_updates_through_github_with_its_agent_turn() {
 #[ignore = "candidate-source test-knobs pair in a disposable guest; scripts/release/"]
 fn a_candidate_source_pair_updates_with_its_agent_turn() {
     release_journey::run("controlled-update");
+}
+
+/// What the update journey for forward only drives: one member's profile in a scratch directory,
+/// run with either program.
+#[cfg(feature = "optional-proofs")]
+mod forward {
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    pub const PASS: &str = "an identity passphrase";
+    pub const ROOMPASS: &str = "the room passphrase";
+    /// The daemon's line when a room's forward-only migration commits (R9).
+    pub const MIGRATED: &str = "this room is updated once";
+
+    pub struct Who {
+        pub root: PathBuf,
+    }
+
+    impl Who {
+        pub fn new(base: &Path, name: &str) -> Self {
+            let root = base.join(name);
+            std::fs::create_dir_all(root.join("cfg")).expect("APPARATUS: scratch profile");
+            std::fs::create_dir_all(root.join("home")).expect("APPARATUS: scratch home");
+            Self { root }
+        }
+
+        pub fn cmd(&self, bin: &Path, args: &[&str]) -> Command {
+            let mut c = Command::new(bin);
+            c.args(args)
+                .env_clear()
+                .env("HOME", self.root.join("home"))
+                .env("VOX_DATA_DIR", &self.root)
+                .env("VOX_CONFIG_DIR", self.root.join("cfg"))
+                .env("VOX_PROXY", "127.0.0.1:0")
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("TMPDIR", std::env::temp_dir())
+                .env("VOX_IDENTITY_PASSPHRASE", PASS);
+            c
+        }
+
+        /// Whether `vox <args>` succeeded, and everything it said.
+        pub fn run(&self, bin: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String) {
+            let mut c = self.cmd(bin, args);
+            c.stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = c
+                .spawn()
+                .unwrap_or_else(|e| panic!("APPARATUS: could not run {}: {e}", bin.display()));
+            if let Some(text) = stdin {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .expect("APPARATUS: vox stdin")
+                    .write_all(text.as_bytes())
+                    .expect("APPARATUS: could not write vox's stdin");
+            }
+            let out = child.wait_with_output().expect("APPARATUS: vox output");
+            (out.status.success(), super::said(&out))
+        }
+
+        pub fn ok(&self, bin: &Path, args: &[&str], stdin: Option<&str>) -> String {
+            let (ok, said) = self.run(bin, args, stdin);
+            assert!(
+                ok,
+                "PRODUCT (staging): `vox {}` failed: {said}",
+                args.join(" ")
+            );
+            said
+        }
+
+        /// A keyring change, typed at a terminal as a person does.
+        pub fn typed(&self, bin: &Path, args: &[&str]) {
+            let (ok, said) = super::typed::typed(&self.cmd(bin, args), PASS);
+            assert!(
+                ok,
+                "PRODUCT (staging): `vox {}` at a terminal failed: {said}",
+                args.join(" ")
+            );
+        }
+
+        /// Its daemon, started with `bin` and answering `vox room list`.
+        pub fn start(&self, bin: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
+            let log = self.root.join(format!("daemon-{tag}.err"));
+            let pass = self.root.join("idpass");
+            std::fs::write(&pass, format!("{PASS}\n")).expect("APPARATUS: passphrase file");
+            let mut c = self.cmd(
+                bin,
+                &["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"],
+            );
+            c.arg(&pass).env_remove("VOX_IDENTITY_PASSPHRASE");
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            let err = std::fs::File::create(&log).expect("APPARATUS: daemon log");
+            let child = c
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(err)
+                .spawn()
+                .expect("APPARATUS: could not start the daemon");
+            let mut daemon = Daemon {
+                child: Some(child),
+                log,
+            };
+            let t = Instant::now();
+            while !self.run(bin, &["room", "list"], None).0 {
+                if let Some(status) = daemon
+                    .child
+                    .as_mut()
+                    .and_then(|c| c.try_wait().ok().flatten())
+                {
+                    panic!(
+                        "PRODUCT: the daemon ended ({status}) before it answered: {}",
+                        daemon.said()
+                    );
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(300),
+                    "PRODUCT: the daemon did not answer `vox room list` within 300 s: {}",
+                    daemon.said()
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            daemon
+        }
+
+        pub fn read(&self, bin: &Path, room: &str) -> String {
+            self.run(bin, &["room", "read", room], None).1
+        }
+
+        /// Up to `secs` for the room to show every one of `texts`: whether it did, and its read.
+        pub fn shows(&self, bin: &Path, room: &str, texts: &[&str], secs: u64) -> (bool, String) {
+            let t = Instant::now();
+            loop {
+                let read = self.read(bin, room);
+                if texts.iter().all(|x| read.contains(x)) {
+                    return (true, read);
+                }
+                if t.elapsed() >= Duration::from_secs(secs) {
+                    return (false, read);
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        /// Until no room is listed as still preparing its history (at most 300 s).
+        pub fn settled(&self, bin: &Path) {
+            let t = Instant::now();
+            while self.ok(bin, &["room", "list"], None).contains("[preparing")
+                && t.elapsed() < Duration::from_secs(300)
+            {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        /// The short id `vox room list` gives the room named `name`.
+        pub fn room(&self, bin: &Path, name: &str) -> String {
+            let list = self.ok(bin, &["room", "list"], None);
+            list.lines()
+                .find_map(|l| {
+                    let mut w = l.split_whitespace();
+                    let id = w.next()?;
+                    (w.next() == Some(name)).then(|| id.to_owned())
+                })
+                .unwrap_or_else(|| panic!("PRODUCT (staging): no room {name} in {list}"))
+        }
+    }
+
+    pub struct Daemon {
+        child: Option<Child>,
+        pub log: PathBuf,
+    }
+
+    impl Daemon {
+        pub fn said(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+
+        /// SIGTERM, as a person's stop does; SIGKILL only if it is still running 60 s later.
+        pub fn stop(mut self) -> String {
+            if let Some(mut c) = self.child.take() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &c.id().to_string()])
+                    .status();
+                let t = Instant::now();
+                while c.try_wait().ok().flatten().is_none() && t.elapsed() < Duration::from_secs(60)
+                {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            self.said()
+        }
+
+        /// SIGKILL: the computer loses power.
+        pub fn kill(mut self) -> String {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            self.said()
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// Author and text of each row a plain read shows, in its order (the hash dropped).
+    pub fn rows(read: &str) -> Vec<String> {
+        read.lines()
+            .filter_map(|l| {
+                let (hash, rest) = l.split_once(' ')?;
+                (hash.len() == 52).then(|| rest.to_owned())
+            })
+            .collect()
+    }
+
+    /// The rows of `before` that `after` does not show, or not in the same order.
+    pub fn lost(before: &str, after: &str) -> Vec<String> {
+        let after = rows(after);
+        let mut shown = after.iter();
+        rows(before)
+            .into_iter()
+            .filter(|r| !shown.any(|a| a == r))
+            .collect()
+    }
+
+    /// The `vox://` link `vox room link` printed.
+    pub fn link(said: &str) -> String {
+        said.lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("vox://"))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room link` printed no link: {said}"))
+            .to_owned()
+    }
+
+    /// A copy of stopped profiles (sockets are not copied).
+    pub fn copy_tree(from: &Path, to: &Path) {
+        let _ = Command::new("cp").arg("-R").arg(from).arg(to).status();
+        assert!(
+            to.is_dir(),
+            "APPARATUS: could not copy {} to {}",
+            from.display(),
+            to.display()
+        );
+    }
+}
+
+/// **Optional** (needs the published previous release's `vox` at `VOX_PROOF_PREVIOUS_BINARY`):
+/// the update to forward only, as each person sees it (design-4 R9, R10; section 3's last row).
+///
+/// The previous release writes the stores: alice's rooms r, l and q; bob is offline from before
+/// alice trusts him with the old `--history full` until the update; fran is online when alice
+/// trusts her with it and offline from then on; both are offline across a rotation (alice
+/// untrusts dave); carol reads, closes q in the TUI, comes back to l after leaving it, and is
+/// offline across the rotation; erin reads r, is offline from then on, and alice untrusts her,
+/// posts, and trusts her again with `--history full`. This build then opens them. Asserted: fran
+/// reads her post-trust catch-up; bob reads what was written after his trust point and nothing
+/// before it; erin reads what was written after she was trusted again and nothing written while
+/// she was untrusted; carol, only offline, reads what she is owed; every post already read is
+/// still shown in the same order; the closed room migrates when it opens; a second start does
+/// not migrate again; a power loss at the first open loses nothing and the migration completes
+/// once at the next start. Then three members whose computers update one at a time: every post
+/// made while the room was mixed is shown everywhere after the last update.
+///
+/// Mutant arm `VOX_MUTANT_FWD=migrate-clamp` (handed to the daemons of this build as
+/// `VOX_TEST_FWD_MUTANT`): every legacy full row is clamped to the live position, and fran's
+/// assertion is red with "lost post-trust catch-up".
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: set VOX_PROOF_PREVIOUS_BINARY to the published v0.4.30 `vox`"]
+fn stores_of_the_previous_release_open_and_each_member_reads_from_its_trust_point() {
+    use forward::{copy_tree, lost, Who, MIGRATED, ROOMPASS};
+    use std::time::Duration;
+    watchdog::arm();
+    let old = PathBuf::from(std::env::var_os("VOX_PROOF_PREVIOUS_BINARY").expect(
+        "APPARATUS: set VOX_PROOF_PREVIOUS_BINARY to the published previous release's `vox`",
+    ));
+    let old_says = reports(&old);
+    assert!(
+        old_says.starts_with("vox "),
+        "APPARATUS: VOX_PROOF_PREVIOUS_BINARY does not report a vox version: {old_says:?}"
+    );
+    let old = old.as_path();
+    let new = Path::new(VOX);
+    let mutant = std::env::var("VOX_MUTANT_FWD").ok();
+    let menv: Vec<(&str, &str)> = mutant
+        .as_deref()
+        .map(|m| vec![("VOX_TEST_FWD_MUTANT", m)])
+        .unwrap_or_default();
+    // A short path: each daemon's socket lives under its data root.
+    let tmp = tempfile::Builder::new()
+        .prefix("vfwd")
+        .tempdir_in("/private/tmp")
+        .expect("APPARATUS: scratch directory");
+    let base = if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.keep()
+    } else {
+        tmp.path().to_owned()
+    };
+    println!(
+        "[proof] previous release {old_says}; scratch {}",
+        base.display()
+    );
+    let room_pass = format!("{ROOMPASS}\n");
+    let join = |who: &Who, bin: &Path, link: &str| {
+        who.ok(
+            bin,
+            &["room", "join", "--passphrase-file", "-", link],
+            Some(&room_pass),
+        )
+    };
+    // `vox id` prints the fingerprint; a note about backups may follow it.
+    let fp = |who: &Who| {
+        let said = who.ok(old, &["id"], None);
+        said.lines()
+            .map(str::trim)
+            .find(|l| l.len() == 52 && !l.contains(' '))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox id` printed no fingerprint: {said}"))
+            .to_owned()
+    };
+
+    // ---- 1. the previous release writes the stores ------------------------------------------
+    let staged = base.join("s");
+    let (a, b, c, d, e, f) = (
+        Who::new(&staged, "a"),
+        Who::new(&staged, "b"),
+        Who::new(&staged, "c"),
+        Who::new(&staged, "d"),
+        Who::new(&staged, "e"),
+        Who::new(&staged, "f"),
+    );
+    let (fa, fb, fc, fd, fe, ff) = (fp(&a), fp(&b), fp(&c), fp(&d), fp(&e), fp(&f));
+    let (da, db, dc, dd, de, df) = (
+        a.start(old, "old", &[]),
+        b.start(old, "old", &[]),
+        c.start(old, "old", &[]),
+        d.start(old, "old", &[]),
+        e.start(old, "old", &[]),
+        f.start(old, "old", &[]),
+    );
+    for who in [&b, &c, &d, &e, &f] {
+        who.typed(old, &["trust", "add", &fa, "--name", "alice"]);
+    }
+    a.typed(old, &["trust", "add", &fc, "--name", "carol"]);
+    a.typed(old, &["trust", "add", &fd, "--name", "dave"]);
+    a.typed(old, &["trust", "add", &fe, "--name", "erin"]);
+    let create = |name: &str| {
+        a.ok(
+            old,
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(&room_pass),
+        );
+        let id = a.room(old, name);
+        let link = forward::link(&a.ok(old, &["room", "link", &id], None));
+        (id, link)
+    };
+    // q: carol's only room when she closes it in the TUI, as a person does.
+    let (q, qlink) = create("q");
+    join(&c, old, &qlink);
+    a.ok(old, &["room", "post", &q, "Q-BEFORE-CLOSE"], None);
+    let (shown, c_q_before) = c.shows(old, &q, &["Q-BEFORE-CLOSE"], 240);
+    assert!(
+        shown,
+        "PRODUCT (staging): carol never read Q-BEFORE-CLOSE: {c_q_before}"
+    );
+    let close = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_close_room.py");
+    let mut driver = Command::new("python3");
+    driver
+        .arg(close)
+        .arg(old)
+        .arg(&c.root)
+        .arg(c.root.join("cfg"))
+        .args([forward::PASS, ROOMPASS, "close-q"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", c.root.join("home"))
+        .env("TMPDIR", std::env::temp_dir())
+        .env("VOX_PTY_BUDGET_SECS", "180");
+    if let Some(path) = std::env::var_os("PYTHONPATH") {
+        driver.env("PYTHONPATH", path);
+    }
+    let out = driver
+        .output()
+        .expect("APPARATUS: the TUI driver (python3)");
+    let closed = said(&out);
+    assert!(
+        closed.contains("the TUI said done to :close"),
+        "PRODUCT (staging): the previous release's `vox tui` did not close q: {closed}"
+    );
+    let (r, rlink) = create("r");
+    let (l, llink) = create("l");
+    for who in [&b, &c, &d, &e, &f] {
+        join(who, old, &rlink);
+    }
+    join(&c, old, &llink);
+    join(&d, old, &llink);
+    // l: carol reads, leaves, and comes back.
+    a.ok(old, &["room", "post", &l, "L-BEFORE-LEAVE"], None);
+    assert!(
+        c.shows(old, &l, &["L-BEFORE-LEAVE"], 240).0,
+        "PRODUCT (staging): carol never read L-BEFORE-LEAVE"
+    );
+    c.ok(old, &["room", "leave", &l], None);
+    a.ok(old, &["room", "post", &l, "L-WHILE-AWAY"], None);
+    std::thread::sleep(Duration::from_secs(5));
+    join(&c, old, &llink);
+    a.ok(old, &["room", "post", &l, "L-AFTER-RETURN"], None);
+    assert!(
+        c.shows(old, &l, &["L-AFTER-RETURN"], 240).0,
+        "PRODUCT (staging): carol never read L-AFTER-RETURN"
+    );
+    // r: erin reads, and is offline from then on.
+    a.ok(old, &["room", "post", &r, "E-BEFORE-UNTRUST"], None);
+    let (shown, e_r_before) = e.shows(old, &r, &["E-BEFORE-UNTRUST"], 240);
+    assert!(
+        shown,
+        "PRODUCT (staging): erin never read E-BEFORE-UNTRUST: {e_r_before}"
+    );
+    drop(de.stop());
+    // r: bob offline from before his full grant until the update.
+    drop(db.stop());
+    a.ok(old, &["room", "post", &r, "R-BEFORE-TRUST"], None);
+    assert!(
+        c.shows(old, &r, &["R-BEFORE-TRUST"], 240).0,
+        "PRODUCT (staging): carol never read R-BEFORE-TRUST"
+    );
+    a.typed(
+        old,
+        &["trust", "add", &fb, "--name", "bob", "--history", "full"],
+    );
+    // fran is online when alice trusts her with full history, and offline across the rotation.
+    a.typed(
+        old,
+        &["trust", "add", &ff, "--name", "fran", "--history", "full"],
+    );
+    a.ok(old, &["room", "post", &r, "R-AFTER-TRUST-1"], None);
+    assert!(
+        c.shows(old, &r, &["R-AFTER-TRUST-1"], 240).0,
+        "PRODUCT (staging): carol never read R-AFTER-TRUST-1"
+    );
+    let (shown, f_r_before) = f.shows(old, &r, &["R-AFTER-TRUST-1"], 240);
+    assert!(
+        shown,
+        "PRODUCT (staging): fran never read R-AFTER-TRUST-1: {f_r_before}"
+    );
+    drop(df.stop());
+    a.ok(old, &["room", "post", &q, "Q-WHILE-CLOSED"], None);
+    std::thread::sleep(Duration::from_secs(5));
+    let c_r_before = c.read(old, &r);
+    let c_l_before = c.read(old, &l);
+    drop(dc.stop());
+    // A rotation while bob and carol are offline.
+    a.typed(old, &["trust", "remove", &fd]);
+    a.ok(old, &["room", "post", &r, "R-AFTER-ROTATION"], None);
+    a.ok(old, &["room", "post", &l, "L-AFTER-ROTATION-UNTAKEN"], None);
+    // erin, offline: untrusted, a post, trusted again with full history, a post.
+    a.typed(old, &["trust", "remove", &fe]);
+    a.ok(old, &["room", "post", &r, "E-WHILE-UNTRUSTED"], None);
+    a.typed(
+        old,
+        &["trust", "add", &fe, "--name", "erin", "--history", "full"],
+    );
+    a.ok(old, &["room", "post", &r, "E-AFTER-RETRUST"], None);
+    let a_before: Vec<(String, String)> = [&r, &l, &q]
+        .iter()
+        .map(|x| ((*x).clone(), a.read(old, x)))
+        .collect();
+    drop((da.stop(), dd.stop()));
+
+    // ---- 2. this build opens copies of them ---------------------------------------------------
+    let opened = base.join("o");
+    copy_tree(&staged, &opened);
+    let (a, b, c, e, f) = (
+        Who::new(&opened, "a"),
+        Who::new(&opened, "b"),
+        Who::new(&opened, "c"),
+        Who::new(&opened, "e"),
+        Who::new(&opened, "f"),
+    );
+    let da = a.start(new, "first", &menv);
+    let dc = c.start(new, "first", &menv);
+    let db = b.start(new, "first", &menv);
+    let de = e.start(new, "first", &menv);
+    let df = f.start(new, "first", &menv);
+    let (_, fran_read) = f.shows(new, &r, &["R-AFTER-ROTATION"], 300);
+    if let Some(m) = &mutant {
+        assert!(
+            da.said().contains(&format!("{m} mutant engaged")),
+            "APPARATUS: the mutant {m} did not engage in alice's daemon: {}",
+            da.said()
+        );
+    }
+    // The arm's assertion: fran's legacy full row holds her trust point.
+    assert!(
+        fran_read.contains("R-AFTER-ROTATION"),
+        "PRODUCT: fran, trusted with older history by the previous release and offline across a \
+         rotation, lost post-trust catch-up: after the update her read of r shows:\n{fran_read}"
+    );
+    let gone = lost(&f_r_before, &fran_read);
+    assert!(gone.is_empty(), "PRODUCT: fran no longer shows, in the same order, rows she read before the update: {gone:?}");
+    let (_, bob_read) = b.shows(new, &r, &["R-AFTER-TRUST-1", "R-AFTER-ROTATION"], 300);
+    assert!(
+        bob_read.contains("R-AFTER-TRUST-1") && bob_read.contains("R-AFTER-ROTATION"),
+        "PRODUCT: bob, given older history by the previous release while he was offline from \
+         before it until the update, does not read what was written after his trust point: \
+         {bob_read}"
+    );
+    let (shown, erin_read) = e.shows(new, &r, &["E-AFTER-RETRUST"], 300);
+    assert!(
+        shown,
+        "PRODUCT: erin, untrusted and then trusted again with older history by the previous \
+         release while she was offline until the update, does not read what was written after \
+         she was trusted again: {erin_read}"
+    );
+    std::thread::sleep(Duration::from_secs(20));
+    let bob_read = b.read(new, &r);
+    assert!(
+        !bob_read.contains("R-BEFORE-TRUST"),
+        "PRODUCT: bob reads a post sealed before his trust point: {bob_read}"
+    );
+    let erin_read = e.read(new, &r);
+    assert!(
+        !erin_read.contains("E-WHILE-UNTRUSTED"),
+        "PRODUCT: erin reads a post sealed while she was untrusted: {erin_read}"
+    );
+    let gone = lost(&e_r_before, &erin_read);
+    assert!(
+        gone.is_empty(),
+        "PRODUCT: erin no longer shows, in the same order, rows she read before the update: \
+         {gone:?}\n{erin_read}"
+    );
+    println!("[proof] after the update erin reads r:\n{erin_read}");
+    let (shown, c_r) = c.shows(new, &r, &["R-AFTER-ROTATION"], 300);
+    assert!(
+        shown,
+        "PRODUCT: carol, only offline across the rotation, does not read R-AFTER-ROTATION after \
+         the update: {c_r}"
+    );
+    let c_l = c.read(new, &l);
+    for (who, before, after) in [
+        ("carol/r", &c_r_before, &c_r),
+        ("carol/l", &c_l_before, &c_l),
+    ] {
+        let gone = lost(before, after);
+        assert!(
+            gone.is_empty(),
+            "PRODUCT: {who} no longer shows, in the same order, rows read before the update: {gone:?}\n{after}"
+        );
+    }
+    for (room, before) in &a_before {
+        let after = a.read(new, room);
+        let gone = lost(before, &after);
+        assert!(
+            gone.is_empty(),
+            "PRODUCT: alice's room {room} no longer shows, in the same order: {gone:?}\n{after}"
+        );
+    }
+    println!("[proof] after the update bob reads r:\n{bob_read}\ncarol reads l:\n{c_l}");
+    a.ok(new, &["room", "post", &r, "R-AFTER-UPDATE"], None);
+    a.ok(new, &["room", "post", &l, "L-AFTER-UPDATE"], None);
+    let (shown, read) = b.shows(new, &r, &["R-AFTER-UPDATE"], 300);
+    assert!(
+        shown,
+        "PRODUCT: bob does not read alice's post after the update: {read}"
+    );
+    let (shown, read) = c.shows(new, &l, &["L-AFTER-UPDATE"], 300);
+    assert!(
+        shown,
+        "PRODUCT: carol does not read alice's post in l after the update: {read}"
+    );
+    // q, closed at carol, migrates when it opens.
+    let before_q = dc.said().matches(MIGRATED).count();
+    let reopened = join(&c, new, &qlink);
+    let (shown, c_q) = c.shows(new, &q, &["Q-WHILE-CLOSED"], 300);
+    assert!(
+        shown,
+        "PRODUCT: carol's closed room q, opened after the update ({reopened}), does not show \
+         Q-WHILE-CLOSED: {c_q}"
+    );
+    let gone = lost(&c_q_before, &c_q);
+    assert!(
+        gone.is_empty(),
+        "PRODUCT: carol's q no longer shows what she read: {gone:?}"
+    );
+    let after_q = dc.said().matches(MIGRATED).count();
+    assert!(
+        before_q == 2 && after_q == 3,
+        "PRODUCT: carol's closed room did not migrate once when opened ({before_q} rooms \
+         migrated before, {after_q} after): {}",
+        dc.said()
+    );
+    drop((db.stop(), dc.stop(), de.stop(), df.stop()));
+    let first = da.stop();
+    assert_eq!(
+        first.matches(MIGRATED).count(),
+        3,
+        "PRODUCT: alice's three rooms did not each migrate once at the first start: {first}"
+    );
+    let da = a.start(new, "second", &menv);
+    a.settled(new);
+    let second = da.stop();
+    assert!(
+        !second.contains(MIGRATED),
+        "PRODUCT: the second start migrated again: {second}"
+    );
+
+    // ---- 3. power lost at the first open -----------------------------------------------------
+    let killed = base.join("k");
+    copy_tree(&staged, &killed);
+    let a = Who::new(&killed, "a");
+    let before_loss = a
+        .start(new, "killed", &menv)
+        .kill()
+        .matches(MIGRATED)
+        .count();
+    let da = a.start(new, "resumed", &menv);
+    a.settled(new);
+    for (room, before) in &a_before {
+        let after = a.read(new, room);
+        let gone = lost(before, &after);
+        assert!(
+            gone.is_empty(),
+            "PRODUCT: after a power loss at the first open, alice's room {room} no longer shows: \
+             {gone:?}\n{after}"
+        );
+    }
+    let (ok, posted) = a.run(new, &["room", "post", &r, "R-AFTER-POWER-LOSS"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice cannot post after a power loss at the first open: {posted}"
+    );
+    let resumed = da.stop();
+    let at_restart = resumed.matches(MIGRATED).count();
+    assert_eq!(
+        before_loss + at_restart,
+        3,
+        "PRODUCT: after a power loss at the first open each room did not migrate exactly once \
+         ({before_loss} before the loss, {at_restart} at the next start):\n{resumed}"
+    );
+    println!("[proof] power loss at the first answer: {before_loss} rooms migrated before it, {at_restart} at the next start");
+
+    // ---- 4. three computers update one at a time (R10) ---------------------------------------
+    let mixed = base.join("m");
+    let names = ["x", "y", "z"];
+    let who = [
+        Who::new(&mixed, "x"),
+        Who::new(&mixed, "y"),
+        Who::new(&mixed, "z"),
+    ];
+    let fps: Vec<String> = who.iter().map(fp).collect();
+    let mut running: Vec<Option<forward::Daemon>> =
+        who.iter().map(|w| Some(w.start(old, "old", &[]))).collect();
+    for (i, w) in who.iter().enumerate() {
+        for (j, f) in fps.iter().enumerate() {
+            if i != j {
+                w.typed(old, &["trust", "add", f, "--name", names[j]]);
+            }
+        }
+    }
+    who[0].ok(
+        old,
+        &["room", "create", "--passphrase-file", "-", "--name", "s"],
+        Some(&room_pass),
+    );
+    let s = who[0].room(old, "s");
+    let slink = forward::link(&who[0].ok(old, &["room", "link", &s], None));
+    join(&who[1], old, &slink);
+    join(&who[2], old, &slink);
+    let mut bins = [old, old, old];
+    let mut posts: Vec<String> = Vec::new();
+    for (step, updated) in [
+        ("OLD", None),
+        ("MIX1", Some(0)),
+        ("MIX2", Some(1)),
+        ("NEW", Some(2)),
+    ] {
+        if let Some(i) = updated {
+            if let Some(d) = running[i].take() {
+                drop(d.stop());
+            }
+            running[i] = Some(who[i].start(new, "new", &menv));
+            bins[i] = new;
+        }
+        for (i, w) in who.iter().enumerate() {
+            let text = format!("{step}-{}", names[i]);
+            w.ok(bins[i], &["room", "post", &s, &text], None);
+            posts.push(text);
+        }
+        std::thread::sleep(Duration::from_secs(10));
+        for (i, w) in who.iter().enumerate() {
+            let program = if bins[i] == new {
+                "this build"
+            } else {
+                "the previous release"
+            };
+            println!(
+                "[proof] {step}: {} ({program}) reads s:\n{}",
+                names[i],
+                w.read(bins[i], &s)
+            );
+        }
+    }
+    let wanted: Vec<&str> = posts.iter().map(String::as_str).collect();
+    for (i, w) in who.iter().enumerate() {
+        let (shown, read) = w.shows(new, &s, &wanted, 600);
+        assert!(
+            shown,
+            "PRODUCT: after every computer updated, {} does not show every post made while the \
+             room was mixed ({wanted:?}): {read}",
+            names[i]
+        );
+    }
+    for d in running.into_iter().flatten() {
+        drop(d.stop());
+    }
 }

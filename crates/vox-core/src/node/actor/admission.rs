@@ -1167,11 +1167,12 @@ impl Node {
         }
     }
 
-    /// Only a matching physical terminal can retire its captured actor attempt token.
+    /// Only a matching physical terminal can retire its captured actor attempt token; the
+    /// room's inbound attempts are retired only when the lifecycle `admitted` the room.
     pub(super) fn finish_bounded_room_retirement(
         &mut self,
         retired: RetiredRoom,
-        gate_retired: bool,
+        admitted: bool,
     ) -> crate::error::Result<()> {
         let RetiredRoom { mut owned, result } = retired;
         let current = owned.epoch == self.delivery_epoch
@@ -1185,7 +1186,7 @@ impl Node {
             };
         if current {
             self.bounded_sync.restore_room_retirement(&mut owned.driver);
-            if result.is_ok() && gate_retired {
+            if result.is_ok() && admitted {
                 for (peer, token, _, _) in &owned.inbound {
                     if let Some(attempt) = self
                         .ports

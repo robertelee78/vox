@@ -53,7 +53,9 @@
 //! ## ADR-030 T-1: the rotated key travels in a session of its own
 //! Dave, made and joined by the shipped binary, has his daemon stopped once he reads alice in
 //! every room, and the proof takes his place with his own profile (the attacker apparatus, below):
-//! it connects to alice as dave, opens his long-lived session with her in each room (a `Hello`,
+//! it connects to alice as dave, makes in each room the version-3 history exchange dave's node
+//! makes on every connection (its Have; a room key goes only on a connection that completed one for
+//! the room and epoch), opens his long-lived session with her in each room (a `Hello`,
 //! then an `Open`) and **freezes** it. That frozen session is the attacker's pre-rotation pairwise
 //! state. It answers each delivery as dave's node does, from his prekey ring, and republishes his
 //! bundle on alice's board after each one it takes; a replay of a delivery it took is answered
@@ -400,7 +402,11 @@ impl Drop for PreservePrekeyReceipts {
 #[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
 fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others_whole() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
     let _receipts = PreservePrekeyReceipts(tmp.path().to_path_buf());
     let (_anchor, spec) = anchor(tmp.path());
     let alice = member(tmp.path(), "alice", &spec);
@@ -834,6 +840,17 @@ impl Dave {
             alice: alice_id,
         };
         d.serve();
+        // As dave's node does on every connection it makes: a version-3 history exchange in each
+        // room, without which alice's node sends no room key on this connection.
+        for room in &d.rooms {
+            let status = d.rt.block_on(exchange_history(&d.conn, room));
+            assert_eq!(
+                status,
+                Ok(0),
+                "APPARATUS: alice did not complete dave's version-3 history exchange (DONE status \
+                 0 = complete) in one of his rooms"
+            );
+        }
         d.carry_bundle_forward();
         d
     }
@@ -1163,6 +1180,69 @@ impl Dave {
     fn got(&self) -> Vec<Got> {
         self.got.lock().expect("got").clone()
     }
+}
+
+/// One version-3 history exchange with alice for `room` on dave's connection, as his node makes
+/// one: a Have (here of nothing: the stand-in tells no history), which alice answers with `HELLO`
+/// and `DONE`. Spoken byte for byte from the wire format (`history_stream.rs`: `Preamble::encode`,
+/// `Frame::encode_bytes`, `Query::encode`). Returns alice's `DONE` status.
+async fn exchange_history(conn: &VoxConnection, room: &DaveRoom) -> Result<u64, String> {
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::transport::framing::{read_frame, write_frame};
+    let frame = |tag: u8, body: &dyn Fn(&mut Encoder)| -> Vec<u8> {
+        let mut e = Encoder::new();
+        body(&mut e);
+        let mut bytes = vec![tag];
+        bytes.extend_from_slice(&e.finish());
+        bytes
+    };
+    let mut request = [0u8; 16];
+    request[..8].copy_from_slice(&wall_ms().to_be_bytes());
+    request[8..].copy_from_slice(&room.id[..8]);
+    // Version 3, the room, its epoch, the public scope, purpose Control, the request.
+    let mut e = Encoder::new();
+    e.array(6)
+        .uint(3)
+        .bytes(&room.id)
+        .uint(room.ctx.epoch)
+        .uint(0)
+        .uint(0)
+        .bytes(&request);
+    let preamble = e.finish();
+    let hello = frame(0x01, &|e| {
+        e.uint(u64::from(vox_core::wire::SYNC_MODE_BOUNDED_HISTORY));
+    });
+    // WANT of the Have query, with no head target.
+    let want = frame(0x03, &|e| {
+        e.array(3).bytes(&request);
+        e.array(1).uint(10);
+        e.array(0);
+    });
+    let holding = frame(0x0C, &|e| {
+        e.array(0);
+    });
+    let failed = |e: &dyn std::fmt::Debug| format!("{e:?}");
+    let (mut send, mut recv) = open_typed(conn, StreamKind::Sync)
+        .await
+        .map_err(|e| failed(&e))?;
+    for f in [&preamble, &hello, &want, &holding] {
+        write_frame(&mut send, f).await.map_err(|e| failed(&e))?;
+    }
+    let mut status = Err("alice ended the exchange without DONE".to_owned());
+    while let Some(f) = read_frame(&mut recv, 1 << 20)
+        .await
+        .map_err(|e| failed(&e))?
+    {
+        if f.first() == Some(&0x08) {
+            let mut d = Decoder::new(&f[1..]);
+            d.array().map_err(|e| failed(&e))?;
+            d.bytes().map_err(|e| failed(&e))?;
+            status = d.uint().map_err(|e| failed(&e));
+            break;
+        }
+    }
+    let _ = send.finish();
+    status
 }
 
 async fn connect_as(

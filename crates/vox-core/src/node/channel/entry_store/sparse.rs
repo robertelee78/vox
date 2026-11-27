@@ -3930,31 +3930,6 @@ impl Source<'_> {
     }
 }
 impl Write<'_, '_> {
-    /// The first sparse position at or after `from` that this node has accepted for `author`.
-    ///
-    /// The outer option distinguishes the end of this author's accepted positions. The inner
-    /// option is present only once that exact entry's semantic effect is settled. A key-arrival
-    /// backfill advances past an unsettled position because its effect path will render it with
-    /// the now-current key; it must not mistake a hole in the sparse feed for the end of the
-    /// accepted positions that follow it.
-    pub(crate) fn next_sparse_backfill(
-        &self,
-        author: &Digest32,
-        from: u64,
-    ) -> Result<Option<(u64, Option<Entry>)>> {
-        Source::Batch(self.batch).sparse_backfill(
-            self.sek,
-            self.channel,
-            self.directory.active,
-            author,
-            from,
-        )
-    }
-
-    pub(crate) fn sparse_enabled(&self) -> bool {
-        self.directory.active.sparse.enabled
-    }
-
     /// Retire only this request's unfinished verifier checkpoints. Accepted receipts and
     /// authority/key-body obligations have independent lifetimes and are never removed here.
     pub(crate) fn cleanup_history_verifiers(

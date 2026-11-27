@@ -73,9 +73,7 @@ struct Inbound {
     peer: Digest32,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    _conn: Arc<VoxConnection>,
-    _recovery_credit: Option<OwnedSemaphorePermit>,
-    _donor_admission: Option<PairwiseAdmission>,
+    conn: Arc<VoxConnection>,
     delivery: Option<Digest32>,
     opening: Option<Opening>,
     trusted: BTreeSet<Digest32>,
@@ -108,8 +106,6 @@ enum After {
     },
     Preparation(Box<preparation_save::Continuation>),
     Inbound(Box<Inbound>),
-    Probe(Digest32),
-    Rejoin(Digest32),
     AdoptJoin {
         peer: Digest32,
         session: Box<crate::pairwise::session::Session>,
@@ -316,11 +312,6 @@ impl Node {
                         ),
                     });
                 }
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                }
-            }
-            After::Probe(_) | After::Rejoin(_) => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
                 }
@@ -591,7 +582,7 @@ impl Node {
                         }
                         self.finish_pairwise_package_effects(lifetime, fresh).await;
                     }
-                    After::Probe(_) | After::Rejoin(_) | After::AdoptJoin { .. } => {
+                    After::AdoptJoin { .. } => {
                         unreachable!("non-package continuation has no key attempt")
                     }
                 }
@@ -827,32 +818,6 @@ impl Node {
             (Stage::Reset, CommonSaved::Packages(Saved::DeliveryReset { error })) => {
                 let fault = error.as_ref().map(fault_of);
                 match continuation.after {
-                    After::Probe(peer) => {
-                        if let Some(after) = self.older_probes.get_mut(&peer) {
-                            *after = Some(room);
-                        }
-                        if error.is_none() {
-                            Box::pin(self.begin_owned_rekeys_for(
-                                room,
-                                false,
-                                Some(Arc::clone(&lifetime)),
-                                consent_release::RekeyAfter::Automatic,
-                            ))
-                            .await;
-                        }
-                        self.drive_owned_older_probes(Some(lifetime)).await;
-                    }
-                    After::Rejoin(peer) => {
-                        if let Some(seen) = self.departed_seen.get_mut(&room) {
-                            seen.remove(&peer);
-                        }
-                        if self.ports.contains_key(&(room, peer)) {
-                            self.drop_port(&room, &peer);
-                            self.discover_rooms.insert(room);
-                            self.sched_rooms.insert(room);
-                        }
-                        self.begin_owned_rejoin_reset(room, Some(lifetime)).await;
-                    }
                     After::AdoptJoin {
                         peer,
                         session,
@@ -949,6 +914,12 @@ impl Node {
             answer_inbound(inbound, Some(Err(KeyRefusal::NotAccepted)));
             return;
         }
+        // A room key is taken only on a connection that completed a version-3 exchange for the
+        // room at its epoch (R10); refused, it stays owed at its sender.
+        if self.key_connection(&room, &inbound.conn).is_none() {
+            answer_inbound(inbound, Some(Err(KeyRefusal::NotAccepted)));
+            return;
+        }
         if !inbound.trusted.contains(&skdm.body.author_id) {
             answer_inbound(inbound, Some(Err(KeyRefusal::NotTrusted)));
             return;
@@ -956,6 +927,31 @@ impl Node {
         #[cfg(feature = "test-knobs")]
         if let Some(path) = held_packages_path() {
             note_package_hold_engaged(&path);
+            answer_inbound(inbound, Some(Err(KeyRefusal::NotAccepted)));
+            return;
+        }
+        // Test apparatus (`VOX_TEST_FWD_HOLD_KEY_FILE`): while the named file exists and names
+        // `<author fingerprint> <generation>`, this node does not take that author's room key of
+        // that generation when it is handed over directly. It answers `NotAccepted`, so its
+        // sender keeps the key owed and offers it again. Drive keys are not held. No shipped
+        // build names this knob.
+        #[cfg(feature = "test-knobs")]
+        if skdm.body.channel_id == room
+            && std::env::var_os("VOX_TEST_FWD_HOLD_KEY_FILE")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .is_some_and(|spec| {
+                    let mut fields = spec.split_whitespace();
+                    let author = crate::node::link::b32_encode(&skdm.body.author_id);
+                    fields.next().is_some_and(|named| {
+                        author.starts_with(named) || named.starts_with(&author)
+                    }) && fields.next().and_then(|g| g.parse::<u64>().ok())
+                        == Some(skdm.body.chain_id)
+                })
+        {
+            eprintln!(
+                "test-knobs: held back a room key of generation {}",
+                skdm.body.chain_id
+            );
             answer_inbound(inbound, Some(Err(KeyRefusal::NotAccepted)));
             return;
         }
@@ -1019,6 +1015,12 @@ impl Node {
             answer_inbound(inbound, key.then_some(Err(KeyRefusal::NoSession)));
             return;
         };
+        // A key sealed in the pair's long-lived session is how a Vox older than v0.4.3 sends it
+        // (ADR-030 W-4): that path is refused, and the key stays owed at its sender.
+        if key {
+            answer_inbound(inbound, Some(Err(KeyRefusal::NotAccepted)));
+            return;
+        }
         if self.pending_posts.contains_key(&room) {
             answer_inbound(inbound, key.then_some(Err(KeyRefusal::NotAccepted)));
             return;
@@ -1096,28 +1098,10 @@ impl Node {
 
     pub(super) async fn begin_inbound_package(
         &mut self,
-        mut stream: PairwiseIn,
+        stream: PairwiseIn,
         lifetime: Option<Arc<Lifetime>>,
     ) {
         use crate::node::pairwise_stream::{KeyRefusal, PairwiseFrame};
-        let lifetime = lifetime.or_else(|| stream.inherited_lifetime.take());
-        if matches!(stream.first, PairwiseFrame::RecoveryOpen { .. }) {
-            self.start_own_key_donor(stream, lifetime);
-            return;
-        }
-        #[cfg(feature = "test-knobs")]
-        if self.end_key_unanswered_for_proof(
-            stream.peer,
-            match &stream.first {
-                PairwiseFrame::RotationHello { channel_id, .. } => Some(*channel_id),
-                _ => None,
-            },
-        ) {
-            let PairwiseIn { mut send, recv, .. } = stream;
-            let _recv = recv;
-            let _ = send.finish();
-            return;
-        }
         let PairwiseIn {
             peer,
             first,
@@ -1125,8 +1109,6 @@ impl Node {
             send,
             recv,
             conn,
-            recovery_credit,
-            donor_admission,
             ..
         } = stream;
         let room = match &first {
@@ -1141,9 +1123,7 @@ impl Node {
             peer,
             send,
             recv,
-            _conn: conn,
-            _recovery_credit: recovery_credit,
-            _donor_admission: donor_admission,
+            conn,
             delivery: None,
             opening: None,
             trusted: self.trust.trusted(),
@@ -1360,110 +1340,6 @@ impl Node {
                 initial: Box::new(initial),
                 context,
                 ring,
-            }),
-            maintenance_save::Continuation::Packages(next),
-            None,
-        ))
-        .await;
-    }
-
-    /// The existing probe book is a per-peer completed-room cursor, never a second job queue.
-    pub(super) async fn owe_older_probes(&mut self) {
-        self.drive_owned_older_probes(None).await;
-    }
-
-    async fn drive_owned_older_probes(&mut self, lifetime: Option<Arc<Lifetime>>) {
-        if lifetime.is_none() && self.store_save_pending() {
-            return;
-        }
-        loop {
-            let Some((&peer, &after)) = self.older_probes.first_key_value() else {
-                return;
-            };
-            let room = self.older.keys().find_map(|(room, member)| {
-                (*member == peer && after.is_none_or(|after| *room > after)).then_some(*room)
-            });
-            let Some(room) = room else {
-                self.older_probes.remove(&peer);
-                continue;
-            };
-            if self.pending_posts.contains_key(&room) {
-                return;
-            }
-            let Some(instance) = self.channels.get(&room).cloned() else {
-                if let Some(after) = self.older_probes.get_mut(&peer) {
-                    *after = Some(room);
-                }
-                continue;
-            };
-            let next = Continuation {
-                instance,
-                attachment: self.delivery_epoch,
-                lifetime,
-                after: After::Probe(peer),
-                stage: Stage::Reset,
-                attempt: None,
-            };
-            Box::pin(self.begin_pending_maintenance(
-                room,
-                CommonWork::Packages(Work::ResetDelivery {
-                    target: peer,
-                    history: false,
-                }),
-                maintenance_save::Continuation::Packages(next),
-                None,
-            ))
-            .await;
-            return;
-        }
-    }
-
-    pub(super) async fn begin_owned_rejoin_reset(
-        &mut self,
-        room: Digest32,
-        lifetime: Option<Arc<Lifetime>>,
-    ) {
-        if (lifetime.is_none() && self.store_save_pending())
-            || self.pending_posts.contains_key(&room)
-        {
-            return;
-        }
-        let Some(instance) = self.channels.get(&room).cloned() else {
-            return;
-        };
-        let peer = {
-            let Ok(channel) = instance.try_lock() else {
-                return;
-            };
-            self.departed_seen
-                .get(&room)
-                .and_then(|seen| seen.iter().find(|peer| !channel.has_left(peer)).copied())
-        };
-        let Some(peer) = peer else {
-            if let Some(lifetime) = lifetime {
-                Box::pin(self.begin_owned_rekeys_for(
-                    room,
-                    false,
-                    Some(lifetime),
-                    consent_release::RekeyAfter::Automatic,
-                ))
-                .await;
-            }
-            return;
-        };
-        let next = Continuation {
-            instance,
-            attachment: self.delivery_epoch,
-            lifetime,
-            after: After::Rejoin(peer),
-            stage: Stage::Reset,
-            attempt: None,
-        };
-        Box::pin(self.begin_pending_maintenance(
-            room,
-            CommonWork::Packages(Work::ResetDelivery {
-                target: peer,
-                history: false,
             }),
             maintenance_save::Continuation::Packages(next),
             None,

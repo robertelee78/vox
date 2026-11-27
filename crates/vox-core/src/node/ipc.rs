@@ -83,7 +83,9 @@ mod ipc_omp_media;
 /// refusals distinguish retryable mutations from invalid ownership.
 /// 12: the node snapshot reply says whether its keyring is known (13 fields; v0.4.30 read 12), so
 /// a client of another build is refused at the handshake instead of failing to read node state.
-pub const PROTOCOL_VERSION: u64 = 12;
+/// 13: forward only (v0.4.31): a trust request carries no history choice, so a client of an
+/// older build that still offers one is refused at the handshake.
+pub const PROTOCOL_VERSION: u64 = 13;
 
 /// Largest frame accepted in either direction.
 ///
@@ -1104,8 +1106,6 @@ pub enum Request {
         petname: String,
         /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: zeroize::Zeroizing<String>,
-        /// Whether its consents release this node's full history (PRD-001 R12).
-        full_history: bool,
         /// Whether the entry carries drive as well as read (ADR-028 K-14, K-16).
         drive: bool,
     },
@@ -2142,15 +2142,13 @@ impl Request {
                 target,
                 petname,
                 identity_passphrase,
-                full_history,
                 drive,
             } => {
-                e.array(6)
+                e.array(5)
                     .uint(T_TRUST)
                     .bytes(target)
                     .text(petname)
                     .text(identity_passphrase)
-                    .uint(u64::from(*full_history))
                     .uint(u64::from(*drive));
             }
             Request::SetCapability {
@@ -2730,11 +2728,10 @@ impl Request {
                     entries,
                 })
             }
-            (T_TRUST, 6) => {
+            (T_TRUST, 5) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
-                let full_history = flag(&mut d, "ipc history")?;
                 let drive = flag(&mut d, "ipc drive")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
@@ -2742,10 +2739,15 @@ impl Request {
                     target,
                     petname,
                     identity_passphrase,
-                    full_history,
                     drive,
                 })
             }
+            // A trust request that still carries a history choice is refused, not read without
+            // it: older history is no longer released.
+            (T_TRUST, 6) => Err(Error::MalformedIpc(
+                "a trust request no longer takes a history choice: a member reads from its \
+                 trust point on",
+            )),
             (T_SET_CAPABILITY, 4) => {
                 let target = digest(&mut d)?;
                 let drive = flag(&mut d, "ipc drive")?;
@@ -8418,7 +8420,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             target,
             petname,
             identity_passphrase,
-            full_history,
             drive,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
@@ -8429,11 +8430,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         crate::node::api::NodeCommand::TrustWith {
                             fingerprint: target,
                             petname,
-                            history: if full_history {
-                                crate::node::trust::HistoryGrant::Full
-                            } else {
-                                crate::node::trust::HistoryGrant::Now
-                            },
                             capability: Some(if drive {
                                 crate::node::trust::Capability::ReadDrive
                             } else {

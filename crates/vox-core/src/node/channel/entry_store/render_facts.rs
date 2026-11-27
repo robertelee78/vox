@@ -2245,17 +2245,6 @@ impl Write<'_, '_> {
         }
         self.queue_backfill(author, Some(seq.max(1)))
     }
-    pub(crate) fn next_backfill_after(
-        &self,
-        after: Option<Digest32>,
-    ) -> Result<Option<(Digest32, u64)>> {
-        Source::Batch(self.batch).backfill_after(
-            self.sek,
-            self.channel,
-            self.render_roots()?.rendered.backfill,
-            after,
-        )
-    }
 }
 
 impl Source<'_> {

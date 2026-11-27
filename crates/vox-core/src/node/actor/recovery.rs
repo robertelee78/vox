@@ -180,7 +180,6 @@ impl Node {
                         reply: None,
                         reopening: false,
                         recovery: Some(original),
-                        recovery_writer_gate: None,
                         save: preparation_save::State::default(),
                         retry_packages: false,
                     },

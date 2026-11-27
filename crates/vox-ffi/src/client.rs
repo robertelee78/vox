@@ -5319,7 +5319,6 @@ impl VoxClient {
             target,
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
-            full_history: false,
             drive,
         };
         // A saved trust whose key is still being delivered succeeded: nothing is left to do.

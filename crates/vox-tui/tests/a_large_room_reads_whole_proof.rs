@@ -1279,7 +1279,7 @@ fn a_seventy_member_room_opens_with_every_read_mark_and_trust() {
         for (i,client) in clients.iter_mut().enumerate() {
             for (j,target) in fingerprints.iter().enumerate().filter(|(j,_)|*j!=i) {
                 let reply = client.request(&Request::Trust { target:*target,petname:names[j].clone(),
-                    identity_passphrase:zeroize::Zeroizing::new(String::new()),full_history:true,drive:false }).await;
+                    identity_passphrase:zeroize::Zeroizing::new(String::new()),drive:false }).await;
                 assert!(matches!(reply,Ok(Frame::Ok | Frame::TrustedKeyPending)), "PRODUCT: {} could not trust{}: {reply:?}",names[i],names[j]);
             }
         }

@@ -666,7 +666,7 @@ impl Node {
         &mut self,
         command: NodeCommand,
         reply: oneshot::Sender<Outcome>,
-        secret: own_keys::SecretLease,
+        secret: SecretLease,
         journal: Option<crate::node::computer::ComputerJournalWriter>,
     ) {
         if self.computer_change_refused(&command) {
@@ -838,7 +838,7 @@ impl Node {
     pub(super) async fn begin_owned_computer_policy(
         &mut self,
         work: computer::OwnKeyPolicyWork,
-        secret: own_keys::SecretLease,
+        secret: SecretLease,
         transition: crate::node::computer::ComputerPublicationTransition,
     ) {
         if self
@@ -1055,5 +1055,87 @@ async fn finish_detached_policy(returned: Returned, reply: Reply) {
             Error::Profile("policy command committed a prefix before retirement"),
             reply,
         ),
+    }
+}
+
+impl Node {
+    pub(super) fn own_key_room_watch(
+        &mut self,
+        room: Digest32,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        self.own_key_room_cancel
+            .entry(room)
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
+    }
+
+    pub(super) fn cancel_own_key_room(&mut self, room: Digest32) {
+        if let Some(profile) = self.profile.as_ref() {
+            self.bounded_sync
+                .cancel_own_recovery_admission(room, profile.fingerprint());
+        }
+        if let Some(cancel) = self.own_key_room_cancel.remove(&room) {
+            // Ends every wait of the room's own-key writers.
+            cancel.send_replace(true);
+        }
+        self.own_key_policy_waiting.remove(&room);
+    }
+
+    pub(super) fn defer_own_key_policy(&mut self, room: Digest32) {
+        if self.own_key_policy_waiting.contains_key(&room) {
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_policy_waiting.insert(room, Arc::clone(&owner));
+        let Some(authority) = self.computer_authority() else {
+            return;
+        };
+        let computer = match &authority {
+            computer::ComputerAuthority::Managed { computer, .. } => Arc::clone(computer),
+            computer::ComputerAuthority::Unmanaged => return,
+        };
+        let mut settled = computer.own_key_settled();
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = computer.storage_ready() {
+                    let _ = tx
+                        .send(NetEvent::OwnKeyPolicyFailed {
+                            room,
+                            owner,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                if !computer.own_key_authority_blocked() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => return,
+                    _ = epoch_changed.changed() => return,
+                    changed = settled.changed() => if changed.is_err() { return; },
+                }
+            }
+            if authority.current() {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => {},
+                    _ = epoch_changed.changed() => {},
+                    _ = tx.send(NetEvent::OwnKeyPolicyReady { room, owner }) => {},
+                }
+            }
+        });
+    }
+
+    pub(super) fn resume_own_key_policy_waiting(&mut self) {
+        for room in std::mem::take(&mut self.own_key_policy_waiting).into_keys() {
+            if self.channels.contains_key(&room) {
+                self.governance_work.wake_room(room);
+            }
+        }
     }
 }

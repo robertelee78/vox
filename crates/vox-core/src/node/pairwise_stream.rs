@@ -360,6 +360,13 @@ pub(crate) struct RoomSendFence {
     pub store: std::sync::Arc<crate::node::store::Store>,
     pub room: crate::hash::Digest32,
     pub generation: u64,
+    /// The room epoch the key was selected at, and where the connection's version-3 exchange
+    /// is recorded: every frame is written only while that exchange stands (R10).
+    pub epoch: u64,
+    pub holdings: std::sync::Arc<crate::node::history_stream::pull::Holdings>,
+    /// The recipient and its departure sequence when the key was sealed: a frame is written
+    /// only while the recipient has not left since (R2).
+    pub target: (crate::hash::Digest32, u64),
 }
 
 impl std::fmt::Debug for RoomSendFence {
@@ -411,6 +418,16 @@ pub(crate) async fn write_pairwise_owned(
                 let Some(fence) = fence else {
                     return poll_write();
                 };
+                if !fence.holdings.exchanged_at(
+                    fence.room,
+                    conn.peer_id(),
+                    conn.serial(),
+                    fence.epoch,
+                ) {
+                    return Poll::Ready(Err(Error::StreamRefused(
+                        "the connection has no version-3 exchange for the room",
+                    )));
+                }
                 #[cfg(feature = "test-knobs")]
                 if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("pairwise-equality-only")
                 {
@@ -434,6 +451,7 @@ pub(crate) async fn write_pairwise_owned(
                 match fence.resource.with_removal_fence(
                     &fence.room,
                     fence.generation,
+                    Some(fence.target),
                     Some(signer.as_ref()),
                     poll_write,
                 ) {
@@ -500,17 +518,11 @@ impl KeyRefusal {
     }
 }
 
-/// What is said when a key's recipient ended the stream without an answer (ADR-030 W-4), and what
-/// that costs.
-pub const ENDED_UNANSWERED: &str = "it runs a Vox older than v0.4.3, which cannot take a key \
-     delivered in a session of its own (it closed the stream without an answer); your key goes to \
-     it in the session it has always used instead, without post-compromise protection, until it \
-     updates";
-
-/// What is said beside a member that runs a Vox older than v0.4.3 (ADR-030 W-4), after its name:
-/// it is sent this node's keys as it expects them, and what that costs.
-pub const RUNS_OLDER: &str = "runs an older Vox: it reads you, but without post-compromise \
-                              protection for your keys, until it updates to v0.4.3";
+/// What is said when a key's recipient ended the stream without an answer (ADR-030 W-4): the
+/// key is not sent in the pair's long-lived session instead, and stays owed.
+pub const ENDED_UNANSWERED: &str = "it runs an older Vox, which cannot take a key delivered \
+     in a session of its own (it closed the stream without an answer); your key stays owed to it \
+     until it updates";
 
 /// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
 ///
@@ -542,8 +554,8 @@ pub async fn refusal(
         }
         // **Ended without an answer** (ADR-030 W-4): the recipient read the stream and closed it
         // without taking or refusing the key, which is what a node that predates key delivery in a
-        // session of its own does with a frame it cannot read. Its decision, so answered: its sender
-        // marks it older and sends it the key in the pair's long-lived session (W-4), never this
+        // session of its own does with a frame it cannot read. Its decision, so answered: the key
+        // is never sent in the pair's long-lived session; it stays owed and backs off, never this
         // frame again every second.
         Ok(Err(quinn::ReadExactError::FinishedEarly(_))) => {
             Some((ENDED_UNANSWERED.to_owned(), true))

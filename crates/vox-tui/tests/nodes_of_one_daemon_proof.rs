@@ -99,7 +99,7 @@ impl Drop for Account {
 
 impl Account {
     fn new() -> Self {
-        let tmp = tempfile::Builder::new()
+        let mut tmp = tempfile::Builder::new()
             .prefix("vd")
             // Short, for the socket path: macOS's /private/tmp, else /tmp (Linux).
             .tempdir_in(if cfg!(target_os = "macos") {
@@ -108,6 +108,11 @@ impl Account {
                 "/tmp"
             })
             .expect("APPARATUS: create isolated account directory");
+        // A red's daemon logs and stores stay for its trace (`VOX_PROOF_KEEP_DIRS`).
+        if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+            tmp.disable_cleanup(true);
+            println!("[proof] account kept under {}", tmp.path().display());
+        }
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).expect("APPARATUS: create isolated config directory");
@@ -875,17 +880,9 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
     );
     let started = Instant::now();
     manual(&["trust", "read", &fps[0], "--node", names[1]]);
-    // Changing the existing history grant is not an explicit grant of Drive.
+    // Reasserting ordinary trust is not an explicit grant of Drive.
     manual(&[
-        "trust",
-        "add",
-        &fps[0],
-        "--name",
-        person,
-        "--history",
-        "full",
-        "--node",
-        names[1],
+        "trust", "add", &fps[0], "--name", person, "--node", names[1],
     ]);
     for _ in 0..15 {
         let shown = ring(names[1]);
@@ -7185,9 +7182,11 @@ fn superseded_governance_resumes() {
             .is_some()),
         "APPARATUS: source did not stop cleanly"
     );
+    let mut last_status = String::new();
     assert!(
         wait_until(Duration::from_secs(10), || {
             let (ok, out, _) = member.run(&["status", "--json", "--node", "beta"], "");
+            last_status = out.clone();
             if !ok {
                 return false;
             }
@@ -7207,7 +7206,8 @@ fn superseded_governance_resumes() {
                     })
                 })
         }),
-        "APPARATUS: source/effect/native work did not drain"
+        "APPARATUS: source/effect/native work did not drain: beta's last `vox status --json`: \
+         {last_status}"
     );
     assert!(
         grant_at.elapsed() < Duration::from_secs(17),
@@ -7272,6 +7272,281 @@ fn superseded_governance_resumes() {
         ok && !out.contains(&beta)
     });
     assert!(observed, "PRODUCT: after the accepted policy superseded the only selected governance turn, `vox room admin list` did not show the expired admin role removed: {shown}");
+}
+
+/// **A computer on an older Vox exchanges nothing with this one until it updates** (design-4
+/// R10, ruling-2 #6). This restages the old-peer phases of
+/// `two_paired_computers_that_are_idle_exchange_nothing`, deleted with the legacy long-lived
+/// session they were staged through (R10 refuses it): the writer claim (a member's own writes
+/// are not held up by a computer that cannot take its key) and the stale-authority claim (a key
+/// owed to a computer is chosen under the authority in force when it is delivered, not the one in
+/// force when it became owed).
+///
+/// Four computers with one node each: alice, bob, carol and dave. Alice makes a room; bob, carol
+/// and dave join; alice and each of them trust each other; each reads alice's "READY". Then bob
+/// and dave run as an older Vox: their daemons restart with the apparatus knob
+/// `VOX_TEST_FWD_OLDER_PEER`, which makes this build speak history version 2, as v0.4.30 does
+/// (no binary of v0.4.30 is run: the knob stages the one difference R10 acts on).
+/// - **PRODUCT, alice's side:** her post "MIXED 1" is accepted and carol reads it; alice does not
+///   read bob's "OLD 1".
+/// - **PRODUCT, bob's side:** his post "OLD 1" is accepted and his own node shows it; for 30 s
+///   after carol has read "MIXED 1" he does not read it (a mixed room exchanges nothing).
+/// - Alice stops trusting dave while he is still on the older version and posts
+///   "AFTER-UNTRUST"; carol reads it.
+/// - Bob and dave update: their daemons restart without the knob.
+/// - **PRODUCT:** bob reads "MIXED 1" and "AFTER-UNTRUST" and alice reads "OLD 1": what was owed
+///   while the room was mixed stayed owed and went once both spoke version 3. Dave, updated at the
+///   same moment, reads neither "MIXED 1" nor "AFTER-UNTRUST" once bob has read both: the key
+///   owed to him under alice's trust is not delivered after she withdrew it.
+///
+/// - **PRODUCT, what each person is told** (R10, R11): while the room is mixed, alice's
+///   `vox status` says on bob's sync row, and bob's says on alice's, that the other computer runs
+///   another Vox version and that this computer exchanges no history or keys with it until both
+///   run the same version (alice's node refused bob's older preamble; bob's refused hers). Once
+///   bob has updated and they have exchanged, alice's row of bob no longer says it. What alice's
+///   `vox room roster` says of bob is printed beside it.
+///
+/// Mutation (red): `VOX_MUTANT_FWD=preamble-any` (`history_stream.rs` `Preamble::decode` takes a
+/// preamble of another version; forwarded to every daemon as `VOX_TEST_FWD_MUTANT`) → "bob, on an
+/// older Vox, read alice's MIXED 1", quoting the daemons' "preamble-any mutant engaged" lines.
+#[test]
+#[ignore = "four real vox daemons, two speaking an older Vox's history version; run in release"]
+fn a_computer_on_an_older_vox_exchanges_nothing_until_it_updates() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_FWD_OLDER_PEER", "VOX_TEST_FWD_MUTANT"]);
+    let mutant = std::env::var("VOX_MUTANT_FWD").ok();
+    let start = |acct: &Account, node: &str, older: bool| -> Daemon {
+        let mut env: Vec<(&str, &str)> = Vec::new();
+        if older {
+            env.push(("VOX_TEST_FWD_OLDER_PEER", "1"));
+        }
+        if let Some(m) = mutant.as_deref() {
+            env.push(("VOX_TEST_FWD_MUTANT", m));
+        }
+        let mut d = Daemon::start(acct, &["--node", node], &env);
+        d.expect_apparatus_event(&format!("node {node} is Ready"), |l| {
+            l.contains(&format!("{node} is Ready"))
+        });
+        d
+    };
+    let names = ["alice", "bob", "carol", "dave"];
+    let accts: Vec<Account> = names.iter().map(|_| Account::new()).collect();
+    let fps: Vec<String> = names
+        .iter()
+        .zip(&accts)
+        .map(|(n, a)| a.make_node(n))
+        .collect();
+    let mut daemons: Vec<Option<Daemon>> = names
+        .iter()
+        .zip(&accts)
+        .map(|(n, a)| Some(start(a, n, false)))
+        .collect();
+    let alice = &accts[0];
+    let run = |i: usize, args: &[&str], stdin: &str| -> (bool, String, String) {
+        let mut full = args.to_vec();
+        full.extend(["--node", names[i]]);
+        accts[i].run(&full, stdin)
+    };
+    let reads = |i: usize, room: &str, text: &str| -> bool {
+        run(i, &["room", "read", room], "").1.contains(text)
+    };
+    let other_version = "that computer runs another Vox version; this computer exchanges no \
+                         history or keys with it until both run the same version";
+    let engaged = |daemons: &[Option<Daemon>]| -> Vec<String> {
+        daemons
+            .iter()
+            .flatten()
+            .flat_map(|d| {
+                d.said()
+                    .lines()
+                    .filter(|l| l.contains("mutant engaged"))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let post = |i: usize, room: &str, text: &str| {
+        let (ok, out, err) = run(i, &["room", "post", room, text], "");
+        assert!(
+            ok,
+            "PRODUCT: {}'s `vox room post {text}` was refused: {out}{err}",
+            names[i]
+        );
+    };
+    let room = make_room(alice, "alice");
+    // `i`'s `vox status` line for the room's sync with `of` ("  room <id> peer <id>: …").
+    let sync_row = |i: usize, of: usize| -> Option<String> {
+        let (_, out, _) = run(i, &["status"], "");
+        out.lines()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("room")
+                    && words
+                        .next()
+                        .is_some_and(|r| r.starts_with(room.as_str()) || room.starts_with(r))
+                    && words.next() == Some("peer")
+                    && words
+                        .next()
+                        .is_some_and(|p| fps[of].starts_with(p.trim_end_matches(':')))
+            })
+            .map(str::to_owned)
+    };
+    let (ok, link, err) = run(0, &["room", "link", &room], "");
+    assert!(ok, "APPARATUS: alice's room link: {err}");
+    for (i, name) in names.iter().enumerate().skip(1) {
+        let (ok, out, err) = run(
+            i,
+            &["room", "join", "--passphrase-file", "-", link.trim()],
+            ROOM_PASS,
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): {name}'s `vox room join` failed: {out}{err}"
+        );
+    }
+    for (i, (name, fp)) in names.iter().zip(&fps).enumerate().skip(1) {
+        let (ok, out, err) = run(0, &["trust", "add", fp, "--name", name], "");
+        assert!(
+            ok,
+            "PRODUCT (staging): alice's `vox trust add {name}` failed: {out}{err}"
+        );
+        let (ok, out, err) = run(i, &["trust", "add", &fps[0], "--name", "alice"], "");
+        assert!(
+            ok,
+            "PRODUCT (staging): {name}'s `vox trust add alice` failed: {out}{err}"
+        );
+    }
+    post(0, &room, "READY");
+    for (i, name) in names.iter().enumerate().skip(1) {
+        assert!(
+            wait_until(RETURN_WITHIN, || reads(i, &room, "READY")),
+            "PRODUCT (staging): {name} never read alice's READY with every computer on this version"
+        );
+    }
+    let (ok, _, _) = run(1, &["room", "post", &room, "BOB-READY"], "");
+    assert!(ok, "PRODUCT (staging): bob's first post was refused");
+    assert!(
+        wait_until(RETURN_WITHIN, || reads(0, &room, "BOB-READY")),
+        "PRODUCT (staging): alice never read bob's BOB-READY with every computer on this version"
+    );
+
+    // ---- bob and dave run an older Vox ------------------------------------------------------
+    for i in [1, 3] {
+        let _ = daemons[i].take().map(Daemon::stop);
+        daemons[i] = Some(start(&accts[i], names[i], true));
+    }
+    post(0, &room, "MIXED 1");
+    post(1, &room, "OLD 1");
+    assert!(
+        reads(1, &room, "OLD 1"),
+        "PRODUCT: bob, on an older Vox, does not show his own post"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || reads(2, &room, "MIXED 1")),
+        "PRODUCT: carol, on this version, never read alice's MIXED 1 while bob and dave ran an \
+         older Vox: an older computer in the room held up this one"
+    );
+    let window = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < window {
+        for (i, text) in [(1, "MIXED 1"), (3, "MIXED 1"), (0, "OLD 1"), (2, "OLD 1")] {
+            assert!(
+                !reads(i, &room, text),
+                "PRODUCT: {}, {}, read {text} while the room was mixed (R10: a mixed room \
+                 exchanges nothing){}; daemons said {:?}",
+                names[i],
+                if i % 2 == 1 {
+                    "on an older Vox"
+                } else {
+                    "on this version"
+                },
+                if i == 1 {
+                    "; bob, on an older Vox, read alice's MIXED 1"
+                } else {
+                    ""
+                },
+                engaged(&daemons)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (_, members, said) = run(0, &["room", "roster", &room], "");
+    println!("[proof] mixed: alice's `vox room roster` says {members:?} / {said:?}");
+    println!(
+        "[proof] mixed: nothing reached bob or dave in 30 s after carol read MIXED 1, and alice \
+         and carol did not read OLD 1"
+    );
+    for (i, of) in [(0, 1), (1, 0)] {
+        let mut shown = None;
+        let told = wait_until(RETURN_WITHIN, || {
+            shown = sync_row(i, of);
+            shown
+                .as_deref()
+                .is_some_and(|row| row.contains(other_version))
+        });
+        println!(
+            "[proof] mixed: {}'s `vox status` says of {}: {shown:?}",
+            names[i], names[of]
+        );
+        assert!(
+            told,
+            "PRODUCT: {}'s `vox status` never said, on {}'s sync row, that {} runs another Vox \
+             version and nothing is exchanged with it until both run the same version (R10, \
+             R11); the row: {shown:?}",
+            names[i], names[of], names[of]
+        );
+    }
+
+    // ---- stale authority: alice withdraws dave's trust while he is on the older version ------
+    let (ok, out, err) = run(0, &["trust", "remove", &fps[3]], "");
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox trust remove dave` failed: {out}{err}"
+    );
+    post(0, &room, "AFTER-UNTRUST");
+    assert!(
+        wait_until(RETURN_WITHIN, || reads(2, &room, "AFTER-UNTRUST")),
+        "PRODUCT: carol never read alice's AFTER-UNTRUST"
+    );
+
+    // ---- bob and dave update ------------------------------------------------------------------
+    for i in [1, 3] {
+        let _ = daemons[i].take().map(Daemon::stop);
+        daemons[i] = Some(start(&accts[i], names[i], false));
+    }
+    let bob_read = wait_until(RETURN_WITHIN, || {
+        reads(1, &room, "MIXED 1") && reads(1, &room, "AFTER-UNTRUST")
+    });
+    let alice_read = wait_until(RETURN_WITHIN, || reads(0, &room, "OLD 1"));
+    let dave_shows = run(3, &["room", "read", &room], "").1;
+    println!(
+        "[proof] updated: bob read MIXED 1 and AFTER-UNTRUST: {bob_read}; alice read OLD 1: \
+         {alice_read}; dave shows {dave_shows:?}"
+    );
+    assert!(
+        bob_read,
+        "PRODUCT: bob, updated, never read alice's MIXED 1 and AFTER-UNTRUST in {RETURN_WITHIN:?}: \
+         what was owed to him while he ran an older Vox did not stay owed: {:?}",
+        run(1, &["room", "read", &room], "").1
+    );
+    assert!(
+        alice_read,
+        "PRODUCT: alice never read bob's OLD 1 in {RETURN_WITHIN:?} after he updated"
+    );
+    assert!(
+        !dave_shows.contains("MIXED 1") && !dave_shows.contains("AFTER-UNTRUST"),
+        "PRODUCT: dave, whose trust alice withdrew while he ran an older Vox, read a post of hers \
+         from that time once he updated (a key owed under withdrawn trust was delivered): \
+         {dave_shows:?}"
+    );
+    let after = sync_row(0, 1);
+    println!("[proof] updated: alice's `vox status` says of bob: {after:?}");
+    assert!(
+        !after
+            .as_deref()
+            .is_some_and(|row| row.contains(other_version)),
+        "PRODUCT: alice's `vox status` still says bob runs another Vox version after he updated \
+         and they exchanged posts: {after:?}"
+    );
 }
 
 /// **Two paired computers follow each other's changes** (ADR-038 FX-28; #1020): alpha and beta,
@@ -7349,10 +7624,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION",
         "VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION",
         "VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD",
-        "VOX_TEST_HOLD_REKEY_ENQUEUE",
-        "VOX_TEST_FX28_END_KEY_UNANSWERED_FILE",
-        "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
-        "VOX_TEST_FX28_MARK_DELIVERY_DRAINED_FILE",
         "VOX_TEST_FX28_ROTATE_AFTER_POST",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
@@ -7438,36 +7709,11 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         stale_join_engaged.display(),
         stale_join_release.display()
     );
-    let stale_rekey_arm = b.data.join("hold-delta-stale-rekey-arm");
-    let stale_rekey_engaged = b.data.join("hold-delta-stale-rekey-engaged");
-    let stale_rekey_release = b.data.join("hold-delta-stale-rekey-release.sock");
-    let stale_rekey_decision = b.data.join("hold-delta-stale-rekey-decision");
-    let stale_rekey_spec = format!(
-        "delta\t{}\t{}\t{}\t{}",
-        stale_rekey_arm.display(),
-        stale_rekey_engaged.display(),
-        stale_rekey_release.display(),
-        stale_rekey_decision.display()
-    );
-    let older_arm = a.data.join("fx28-end-key-unanswered-arm");
-    let older_marker = a.data.join("fx28-end-key-unanswered-marker");
-    let older_spec = format!(
-        "epsilon\t{}\t{}",
-        older_arm.display(),
-        older_marker.display()
-    );
     let control_partition_arm = a.data.join(FX28_CONTROL_PARTITION_ARM);
     let control_partition_spec = format!(
         "{}\t{}",
         control_partition_arm.display(),
         control_partition_arm.with_extension("marker").display()
-    );
-    let older_selected_arm = b.data.join("fx28-mark-ended-unanswered-arm");
-    let older_selected_marker = b.data.join("fx28-mark-ended-unanswered-marker");
-    let older_selected_spec = format!(
-        "delta\t{}\t{}",
-        older_selected_arm.display(),
-        older_selected_marker.display()
     );
     let status_arm = a.data.join("mark-computer-status");
     let status_accepted = a.data.join("accepted-computer-status");
@@ -7503,7 +7749,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &[
             ("VOX_LISTEN", &listen_a),
             ("VOX_TEST_ADVERTISE", &advertised),
-            ("VOX_TEST_FX28_END_KEY_UNANSWERED_FILE", &older_spec),
             (
                 "VOX_TEST_PARTITION_COMPUTER_PEER_FILE",
                 &control_partition_spec,
@@ -7527,11 +7772,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", &stale_post_spec),
             ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", &stale_create_spec),
             ("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD", &stale_join_spec),
-            ("VOX_TEST_HOLD_REKEY_ENQUEUE", &stale_rekey_spec),
-            (
-                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
-                &older_selected_spec,
-            ),
             ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_after_post_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
@@ -7638,8 +7878,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             stale_post_spec: &stale_post_spec,
             stale_create_spec: &stale_create_spec,
             stale_join_spec: &stale_join_spec,
-            stale_rekey_spec: &stale_rekey_spec,
-            older_selected_spec: &older_selected_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
         },
     );
@@ -7729,8 +7967,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             stale_post_spec: &stale_post_spec,
             stale_create_spec: &stale_create_spec,
             stale_join_spec: &stale_join_spec,
-            stale_rekey_spec: &stale_rekey_spec,
-            older_selected_spec: &older_selected_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
         },
         &stale_join_arm,
@@ -7784,27 +8020,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &hold_release,
         &forward,
     );
-    stale_rekey_is_not_delivered(
-        (&a, &da),
-        (&b, db),
-        &epsilon,
-        &listen_b,
-        &hold_spec,
-        &stale_rekey_spec,
-        &older_selected_spec,
-        &hold_arm,
-        &hold_engaged,
-        &hold_release,
-        &stale_rekey_arm,
-        &stale_rekey_engaged,
-        &stale_rekey_release,
-        &stale_rekey_decision,
-        &older_arm,
-        &older_marker,
-        &older_selected_arm,
-        &older_selected_marker,
-        &delta,
-    );
+    skewed_prejoin_is_refused((&a, &da), (&b, db), &epsilon, &listen_b, &hold_spec);
 }
 
 /// What `vox computer status --json` says of this computer's own nodes: the policy revision,
@@ -8377,8 +8593,6 @@ struct RestartComputerSide<'a> {
     stale_post_spec: &'a str,
     stale_create_spec: &'a str,
     stale_join_spec: &'a str,
-    stale_rekey_spec: &'a str,
-    older_selected_spec: &'a str,
     stopped_reader_answered: &'a str,
 }
 
@@ -8691,8 +8905,6 @@ fn held_join_serializes_with_policy(
         stale_post_spec,
         stale_create_spec,
         stale_join_spec,
-        stale_rekey_spec,
-        older_selected_spec,
         stopped_reader_answered,
     } = side;
     let c = Account::new();
@@ -9042,22 +9254,47 @@ fn held_join_serializes_with_policy(
     let refused = joining
         .wait_with_output()
         .expect("APPARATUS: collect the pre-lease join");
+    // The room accepted delta before beta's computer policy moved, so the join is kept, not
+    // undone (ADR-049 N2: an accepted join is a durable obligation the node resumes and refuses
+    // to purge; `retain_accepted_join_native`, `actor.rs`; `metadata_save.rs` "accepted join
+    // remains pending"). Nothing was published under the stale authority, and the person is told
+    // to retry; the retry, under the current policy, completes the join.
+    let refused_said = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(
-        !refused.status.success() && String::from_utf8_lossy(&refused.stderr).contains("computer trust changed while this command was being applied"),
-        "PRODUCT [FX28 stale-join-authority]: superseded join did not report a Computer-policy refusal: stdout {}; stderr {}",
-        String::from_utf8_lossy(&refused.stdout), String::from_utf8_lossy(&refused.stderr)
+        !refused.status.success()
+            && refused_said
+                .contains("the room accepted this node, but local completion is pending")
+            && refused_said.contains("retry the same join"),
+        "PRODUCT [FX28 stale-join-authority]: a join the room accepted before computer trust \
+         changed was not kept as pending with the retry named: stdout {}; stderr {refused_said}",
+        String::from_utf8_lossy(&refused.stdout)
     );
+    rollback_forward.open_and_verify();
+    let (retried, out, err) = b.run(
+        &[
+            "room",
+            "join",
+            "--node",
+            "delta",
+            "--passphrase-file",
+            "-",
+            &link,
+        ],
+        ROOM_PASS,
+    );
+    let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
     assert!(
-        wait_until(RETURN_WITHIN, || rollback_forward.dropped() > 0),
-        "APPARATUS: the closed rollback-board path dropped no datagram"
+        retried && listed && rooms.contains(&full_room[..12]),
+        "PRODUCT [FX28 stale-join-authority]: the retried join of the kept admission, under the \
+         current computer policy, did not complete: join {retried}: {out}{err}; delta lists \
+         {rooms}{list_error}"
+    );
+    println!(
+        "[proof] FX-28 stale-join-authority: the accepted join was kept as pending ({}), and the \
+         retry under the current policy completed it",
+        refused_said.trim()
     );
     let _before_restart = db.stop();
-    rollback_forward.open_and_verify();
-    assert!(
-        remote_board_serves_prejoin(&rt, anchor_address, anchor_id, rollback_room, member_id),
-        "APPARATUS: the reopened real board no longer served the prejoin while beta was stopped"
-    );
-    println!("[proof] FX-28 withdrawal-not-durable apparatus staged: the real board still serves the refused join's prejoin while beta is stopped");
     let rotate_after_post_spec = b
         .data
         .join(FX28_ROTATE_AFTER_POST_ARM)
@@ -9077,11 +9314,6 @@ fn held_join_serializes_with_policy(
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
             ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", stale_create_spec),
             ("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD", stale_join_spec),
-            ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
-            (
-                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
-                older_selected_spec,
-            ),
             ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_after_post_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
@@ -9099,12 +9331,9 @@ fn held_join_serializes_with_policy(
     }
     let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
     assert!(
-        listed && !rooms.contains(&full_room[..12]),
-        "PRODUCT [FX28 stale-join-authority]: delta listed the refused join after restart: {rooms}{list_error}"
-    );
-    assert!(
-        wait_until(RETURN_WITHIN, || !remote_board_serves_prejoin(&rt, anchor_address, anchor_id, rollback_room, member_id)),
-        "PRODUCT [FX28 withdrawal-not-durable]: after beta restarted, the real board still serves the refused join's prejoin"
+        listed && rooms.contains(&full_room[..12]),
+        "PRODUCT [FX28 stale-join-authority]: delta no longer lists the room it joined after \
+         beta restarted: {rooms}{list_error}"
     );
     computer(a, &["personal", "alpha"]);
     assert!(
@@ -9151,8 +9380,6 @@ fn a_restart_derives_nothing(
         stale_post_spec,
         stale_create_spec,
         stale_join_spec,
-        stale_rekey_spec,
-        older_selected_spec,
         stopped_reader_answered,
     } = side;
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
@@ -9181,11 +9408,6 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
             ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", stale_create_spec),
             ("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD", stale_join_spec),
-            ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
-            (
-                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
-                older_selected_spec,
-            ),
             ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_after_post_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
@@ -9883,8 +10105,10 @@ fn stale_remote_pause_is_refused(
     );
 
     // The same final-use rule covers an ordinary local post. Hold it after its room lock and all
-    // awaits, move durable policy through a shipped personal-node change, then release it. The
-    // command itself is the terminal product observation; elapsed silence is never a verdict.
+    // awaits, move durable policy through a shipped personal-node change, then release it. Since
+    // `465f2345e` a post racing a trust revision is kept, not refused: while delta's moved policy
+    // is held it must not publish, and once delta has applied that policy the same post is
+    // published under it and reads once on beta. The command is the terminal product observation.
     std::fs::write(post_arm, b"hold delta's exact text append\n")
         .expect("APPARATUS: arm the stale text-append publication hold");
     let mut post = b
@@ -9908,6 +10132,9 @@ fn stale_remote_pause_is_refused(
         Instant::now() + RETURN_WITHIN,
         "delta's ordinary text append at its final publication boundary",
     );
+    let (policy_arm, policy_engaged, policy_release) = policy_hold;
+    std::fs::write(policy_arm, b"hold delta's next policy application\n")
+        .expect("APPARATUS: arm delta's Computer policy hold");
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     computer(a, &["personal", "gamma"]);
     assert!(
@@ -9945,28 +10172,109 @@ fn stale_remote_pause_is_refused(
         "[proof] while delta applies a new computer trust revision, `vox trust list` says so: {}",
         trust_error.trim()
     );
-    println!(
-        "[proof] FX-28 stale-post-authority apparatus staged: durable Computer policy moved while delta's exact ordinary text append remained held at its final publication boundary"
-    );
     std::os::unix::net::UnixStream::connect(post_release).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: release delta's held text append at {}: {error}",
             post_release.display()
         )
     });
+    let policy_deadline = Instant::now() + RETURN_WITHIN;
+    while !policy_engaged.is_file() {
+        assert!(
+            daemon_alive(db.child.id()) && Instant::now() < policy_deadline,
+            "APPARATUS: delta's moved Computer policy application did not reach its hold"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "[proof] FX-28 stale-post-authority apparatus staged: durable Computer policy moved while delta's exact ordinary text append was held at its final publication boundary; the append is released and delta's moved policy is held"
+    );
+    let observation_end = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            policy_engaged.is_file() && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold disappeared during the held-post observation"
+        );
+        if let Some(status) = post
+            .try_wait()
+            .expect("APPARATUS: inspect the held-policy text post")
+        {
+            let output = post
+                .wait_with_output()
+                .expect("APPARATUS: collect the held-policy text post");
+            assert!(
+                !status.success(),
+                "PRODUCT [FX28 stale-post-authority]: shipped `vox room post` published and acknowledged its text while delta's moved Computer policy was still held: stdout {}; stderr {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            panic!(
+                "PRODUCT [FX28 stale-post-re-admission]: a post racing a trust revision must be kept and published under the new policy, but shipped `vox room post` was refused: stdout {}; stderr {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let (_, read, read_error) = b.run(&["room", "read", &room, "--node", "beta"], "");
+        assert!(
+            !read.contains("STALE-AUTHORITY-TEXT"),
+            "PRODUCT [FX28 stale-post-authority]: beta's shipped room read exposed delta's held text while delta's moved Computer policy was still held: {read}{read_error}"
+        );
+        if Instant::now() >= observation_end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::os::unix::net::UnixStream::connect(policy_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held Computer policy at {}: {error}",
+            policy_release.display()
+        )
+    });
+    let cleanup_deadline = Instant::now() + RETURN_WITHIN;
+    while policy_engaged.is_file() {
+        assert!(
+            Instant::now() < cleanup_deadline && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold did not clear after release"
+        );
+        std::thread::yield_now();
+    }
+    let release_deadline = Instant::now() + RETURN_WITHIN;
+    while post
+        .try_wait()
+        .expect("APPARATUS: inspect the kept text post")
+        .is_none()
+    {
+        if Instant::now() >= release_deadline {
+            let status = b.run(&["status", "--json", "--node", "delta"], "");
+            let _ = post.kill();
+            let output = post
+                .wait_with_output()
+                .expect("APPARATUS: collect the stalled text post");
+            panic!("PRODUCT [FX28 stale-post-re-admission]: the kept post was still running after delta applied its moved Computer policy; delta status {status:?}; stdout {}; stderr {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let posted = post
         .wait_with_output()
-        .expect("APPARATUS: collect the causally released text-post command");
+        .expect("APPARATUS: collect the kept text-post command");
     assert!(
-        !posted.status.success(),
-        "PRODUCT [FX28 stale-post-authority]: after durable Computer policy moved while its exact ordinary append was held, shipped `vox room post` still published and acknowledged stale-authority text: stdout {}; stderr {}",
+        posted.status.success(),
+        "PRODUCT [FX28 stale-post-re-admission]: after delta applied its moved Computer policy, the kept `vox room post` was not published: stdout {}; stderr {}",
         String::from_utf8_lossy(&posted.stdout),
         String::from_utf8_lossy(&posted.stderr)
     );
-    let (_, read, read_error) = b.run(&["room", "read", &room, "--node", "beta"], "");
+    let mut last = (false, String::new(), String::new());
     assert!(
-        !read.contains("STALE-AUTHORITY-TEXT"),
-        "PRODUCT [FX28 stale-post-authority]: beta's shipped room read exposed text appended after its author's durable Computer authority became stale: {read}{read_error}"
+        wait_until(RETURN_WITHIN, || {
+            last = b.run(&["room", "read", &room, "--node", "beta"], "");
+            last.0 && last.1.matches("STALE-AUTHORITY-TEXT").count() == 1
+        }),
+        "PRODUCT [FX28 stale-post-re-admission]: beta did not read delta's kept post exactly once after it was published under the moved policy: stdout {}; stderr {}",
+        last.1,
+        last.2
+    );
+    println!(
+        "[proof] a post held while delta's Computer policy moved was kept, not published while that policy was held, and published under it once applied; beta reads it once"
     );
     computer(a, &["personal", "alpha"]);
     assert!(
@@ -9980,7 +10288,7 @@ fn stale_remote_pause_is_refused(
                 && roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
                 && roster_current(&status, &["beta", "delta"])
         }),
-        "APPARATUS: nodes did not settle after the stale text-append refusal"
+        "APPARATUS: nodes did not settle after the kept text post"
     );
 
     constructor_re_admission(
@@ -10269,27 +10577,12 @@ fn constructor_re_admission(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stale_rekey_is_not_delivered(
+fn skewed_prejoin_is_refused(
     (a, _da): (&Account, &Daemon),
     (b, db): (&Account, Daemon),
     epsilon: &str,
     listen_b: &str,
     hold_spec: &str,
-    stale_rekey_spec: &str,
-    older_selected_spec: &str,
-    hold_arm: &Path,
-    hold_engaged: &Path,
-    hold_release: &Path,
-    rekey_arm: &Path,
-    rekey_engaged: &Path,
-    rekey_release: &Path,
-    rekey_decision: &Path,
-    older_arm: &Path,
-    older_marker: &Path,
-    older_selected_arm: &Path,
-    older_selected_marker: &Path,
-    delta: &str,
 ) {
     let status = computer(b, &["status"]);
     let delta_ready = b.run(&["node", "list"], "").1.lines().any(|line| {
@@ -10309,7 +10602,6 @@ fn stale_rekey_is_not_delivered(
     let room = room_id.as_str();
     let (ok, link, err) = a.run(&["room", "link", room, "--node", "epsilon"], "");
     assert!(ok, "APPARATUS: link epsilon's rekey room: {err}");
-    let full_room = full_room_id(&link, room);
     let (ok, out, err) = b.run(
         &[
             "room",
@@ -10339,19 +10631,6 @@ fn stale_rekey_is_not_delivered(
     // must survive. This is a causal phase boundary, not a retry of the refused join under the
     // same condition.
     let _skewed_daemon = db.stop();
-    let rotate_after_post_arm = b.data.join(FX28_ROTATE_AFTER_POST_ARM);
-    let rotate_after_post_result = rotate_after_post_arm.with_extension("result");
-    let rotate_after_post_spec = rotate_after_post_arm.to_string_lossy().into_owned();
-    let baseline_drained_arm = b.data.join("fx28-baseline-delivery-drained-arm");
-    let baseline_drained_marker = baseline_drained_arm.with_extension("marker");
-    let baseline_drained_spec = format!(
-        "delta\t{}\t{}",
-        baseline_drained_arm.display(),
-        baseline_drained_marker.display()
-    );
-    for stale in [&rotate_after_post_arm, &rotate_after_post_result] {
-        let _ = std::fs::remove_file(stale);
-    }
     let restarted = Instant::now();
     let restart_deadline = restarted + RETURN_WITHIN;
     let mut db = Daemon::start(
@@ -10360,16 +10639,6 @@ fn stale_rekey_is_not_delivered(
         &[
             ("VOX_LISTEN", listen_b),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
-            ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
-            (
-                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
-                older_selected_spec,
-            ),
-            (
-                "VOX_TEST_FX28_MARK_DELIVERY_DRAINED_FILE",
-                &baseline_drained_spec,
-            ),
-            ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_after_post_spec),
         ],
     );
     for name in ["beta", "delta"] {
@@ -10397,470 +10666,6 @@ fn stale_rekey_is_not_delivered(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    // A third Computer lets this first phase move policy without revoking the intended recipient.
-    let c = Account::new();
-    c.make_node("zeta");
-    let listen_c = format!("[::1]:{}", free_v6_udp_port());
-    let mut dc = Daemon::start(&c, &["--node", "zeta"], &[("VOX_LISTEN", &listen_c)]);
-    dc.expect_apparatus_event("node zeta is Ready", |line| line.contains("zeta is Ready"));
-    computer(&c, &["personal", "zeta"]);
-    let invited = computer(b, &["pair"]);
-    let link_c = invited["invite_link"]
-        .as_str()
-        .expect("APPARATUS: third Computer invitation has no link");
-    let preview = computer(&c, &["pair", link_c, "--preview"]);
-    let operation = preview["pairing"]["operation_id"]
-        .as_str()
-        .expect("APPARATUS: third Computer preview has no operation");
-    computer(&c, &["approve", operation]);
-    computer(b, &["approve", operation]);
-    let c_id = computer_id(&c);
-    assert!(
-        wait_until(RETURN_WITHIN, || computer(b, &["status"])["state"]
-            == "confirmed"
-            && computer(&c, &["status"])["state"] == "confirmed"),
-        "APPARATUS: third Computer did not finish pairing: beta {}; zeta {}",
-        computer(b, &["status"]),
-        computer(&c, &["status"])
-    );
-    let _ = std::fs::remove_file(&baseline_drained_marker);
-    std::fs::write(&baseline_drained_arm, format!("{epsilon}\t{full_room}\n"))
-        .expect("APPARATUS: arm delta's exact baseline-delivery drain boundary");
-    let (ok, out, err) = b.run(
-        &[
-            "room",
-            "join",
-            "--node",
-            "delta",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-        ],
-        ROOM_PASS,
-    );
-    assert!(
-        ok,
-        "PRODUCT: with both daemons on their ordinary clocks and directly reachable, delta could not join epsilon's fresh rekey room: {out}{err}\nalpha daemon:\n{}\nbeta daemon:\n{}",
-        _da.said(),
-        db.said()
-    );
-    let (ok, out, err) = b.run(
-        &["room", "post", room, "REKEY-BASELINE", "--node", "delta"],
-        "",
-    );
-    assert!(ok, "APPARATUS: post the rekey baseline: {out}{err}");
-    assert!(
-        wait_until(RETURN_WITHIN, || a
-            .run(&["room", "read", room, "--node", "epsilon"], "")
-            .1
-            .contains("REKEY-BASELINE")),
-        "APPARATUS: epsilon did not read the baseline through the staged sender-key path"
-    );
-    let baseline_drained = read_daemon_marker(
-        &baseline_drained_marker,
-        db.child.id(),
-        "delta's exact baseline sender-key delivery to drain",
-    );
-    assert_eq!(
-        baseline_drained.trim(),
-        format!("delta\t{epsilon}\t{full_room}"),
-        "APPARATUS: baseline-drain marker named another node, peer, or room"
-    );
-    // Select the compatibility route through the real protocol result which owns it. Epsilon's
-    // test-only peer apparatus closes every exact modern delivery without an answer while armed,
-    // faithfully emulating an older peer even if modern jobs overlap. Delta
-    // atomically pauses that exact pair's automatic re-key and publishes the selected route; its
-    // shipped roster must then say epsilon runs an older Vox. The target post below releases that
-    // same still-owed key into the real long-lived-session preparation and durable-policy fence.
-    let _ = std::fs::remove_file(older_marker);
-    let _ = std::fs::remove_file(older_selected_marker);
-    std::fs::write(older_arm, format!("{delta}\t{full_room}\n"))
-        .expect("APPARATUS: arm epsilon's exact legacy-peer modern-delivery behavior");
-    std::fs::write(older_selected_arm, format!("{epsilon}\t{full_room}\n"))
-        .expect("APPARATUS: arm delta's exact ENDED_UNANSWERED route selection");
-    std::fs::write(&rotate_after_post_arm, format!("delta\t{full_room}\n"))
-        .expect("APPARATUS: arm the exact legacy-route sender-key rotation");
-    let (ok, out, err) = b.run(
-        &[
-            "room",
-            "post",
-            room,
-            "LEGACY-ROUTE-BASELINE",
-            "--node",
-            "delta",
-        ],
-        "",
-    );
-    assert!(
-        ok,
-        "APPARATUS: post the key rotation which selects the older route: {out}{err}"
-    );
-    let rotation = read_daemon_marker(
-        &rotate_after_post_result,
-        db.child.id(),
-        "delta's exact forced sender-key rotation result",
-    );
-    assert!(
-        rotation.trim().starts_with(&format!(
-            "delta\t{full_room}\trotated=true\trelease_requested=false\treleased_paused=false\tcomplete_target_batches="
-        )),
-        "APPARATUS: the exact legacy-route staging post did not consume its arm and rotate: {rotation}"
-    );
-    let exact_older = read_daemon_marker(
-        older_marker,
-        _da.child.id(),
-        "epsilon's exact modern delivery ended unanswered",
-    );
-    assert_eq!(
-        exact_older.trim(),
-        format!("epsilon\t{delta}\t{full_room}"),
-        "APPARATUS: unanswered key-delivery marker named another node, sender, or room"
-    );
-    let exact_selection = read_daemon_marker(
-        older_selected_marker,
-        db.child.id(),
-        "delta's exact ENDED_UNANSWERED route selection and re-key pause",
-    );
-    assert_eq!(
-        exact_selection.trim(),
-        format!("delta\t{epsilon}\t{full_room}"),
-        "APPARATUS: ENDED_UNANSWERED route-selection marker named another node, peer, or room"
-    );
-    println!(
-        "[proof] FX-28 legacy rekey route apparatus staged: epsilon ended delta's exact modern delivery unanswered and delta paused that pair's owed re-key"
-    );
-    let (ok, roster, roster_error) = b.run(&["room", "roster", room, "--node", "delta"], "");
-    let roster_shown = format!("{roster}{roster_error}");
-    assert!(
-        ok && roster_shown.contains(epsilon) && roster_shown.contains("runs an older Vox"),
-        "PRODUCT [FX28 legacy-rekey-route]: after delta admitted epsilon's exact unanswered modern delivery, its shipped roster did not expose the selected legacy sender-key route: {roster_shown}"
-    );
-    // Stage the protected ciphertext before holding this actor at key admission. A post marks
-    // sync as owed, but sync runs on a later actor turn; holding within that same post would
-    // prevent its payload from reaching epsilon at all. The shipped hash view includes sealed
-    // entries even when their sender key is missing, so check this exact post, not a row count.
-    let (ok, posted, err) = b.run(
-        &[
-            "room",
-            "post",
-            room,
-            "ADMITTED-LEASE-REKEY",
-            "--node",
-            "delta",
-            "--json",
-        ],
-        "",
-    );
-    assert!(
-        ok,
-        "APPARATUS: append the protected ciphertext while its key is paused: {posted}{err}"
-    );
-    let posted: serde_json::Value = serde_json::from_str(posted.trim())
-        .expect("APPARATUS: protected post returned no structured receipt");
-    let protected_hash = posted["entry_hash"]
-        .as_str()
-        .expect("APPARATUS: protected post receipt has no entry hash");
-    assert!(
-        wait_until(RETURN_WITHIN, || {
-            let (ok, hashes, _) =
-                a.run(&["room", "read", room, "--node", "epsilon", "--hashes"], "");
-            ok && hashes
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(protected_hash))
-        }),
-        "APPARATUS: epsilon never held the exact protected ciphertext before sender revocation"
-    );
-    let (ok, unreadable, err) = a.run(&["room", "read", room, "--node", "epsilon"], "");
-    assert!(ok && !unreadable.contains("ADMITTED-LEASE-REKEY"),
-        "APPARATUS: the exact ciphertext was not staged unreadable while its key remained paused: {unreadable}{err}");
-    println!("[proof] epsilon holds the exact protected post through shipped read --hashes, while its ordinary room read cannot display it without the paused sender key");
-    let rekey_fault = rekey_decision.with_extension("fault");
-    for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
-        let _ = std::fs::remove_file(stale);
-    }
-    std::fs::write(rekey_arm, format!("{epsilon}\t{full_room}\n"))
-        .expect("APPARATUS: arm epsilon's exact stale rekey enqueue");
-    let _ = std::fs::remove_file(&rotate_after_post_result);
-    std::fs::write(
-        &rotate_after_post_arm,
-        format!("delta\t{full_room}\trelease-paused\t{epsilon}\n"),
-    )
-    .expect("APPARATUS: arm the target post to release the exact paused sender-key delivery");
-    let rotating_post = b
-        .cmd(&[
-            "room",
-            "post",
-            room,
-            "RELEASE-STAGED-REKEY",
-            "--node",
-            "delta",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: start the shipped post whose key remains paused for epsilon");
-    // The post may return before its owed sync reaches the actor's later turn. The exact
-    // daemon marker, not the lifetime of the post command, establishes this boundary.
-    read_daemon_marker(
-        rekey_engaged,
-        db.child.id(),
-        "epsilon's prepared sender-key batch at final queue admission",
-    );
-    let (read_ok, held_read, held_error) = a.run(&["room", "read", room, "--node", "epsilon"], "");
-    assert!(
-        read_ok && !held_read.contains("ADMITTED-LEASE-REKEY"),
-        "APPARATUS: before revocation epsilon already exposed the protected text while its exact sender-key batch was held, or its room could not be read: {held_read}{held_error}"
-    );
-    let before_serialization = computer(b, &["status"]);
-    let frontier = before_serialization["frontier"]
-        .as_str()
-        .expect("APPARATUS: beta status has no removal frontier");
-    std::fs::write(rekey_engaged.with_extension("target"), &c_id)
-        .expect("APPARATUS: arm the exact third-Computer removal writer");
-    let mut removal = b
-        .cmd(&[
-            "computer",
-            "remove",
-            &c_id,
-            "--confirm",
-            frontier,
-            "--keep-rooms",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: start third Computer removal");
-    let writer = rekey_engaged.with_extension("writer");
-    wait_for_command_marker(
-        &writer,
-        &mut removal,
-        db.child.id(),
-        Instant::now() + RETURN_WITHIN,
-        "third Computer removal reached the held rekey's publication writer",
-    );
-    println!("[proof] FX-28 rekey-writer-fence apparatus staged: the third Computer removal reached the held rekey's publication writer");
-    let observation_end = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < observation_end {
-        let status = computer(b, &["status"]);
-        assert!(
-            status["revision"] == before_serialization["revision"]
-                && removal.try_wait().expect("APPARATUS: inspect removal").is_none(),
-            "PRODUCT [FX28 rekey-writer-fence]: removal completed or beta replaced policy while the admitted rekey held its publication lease: before {before_serialization}; status {status}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::os::unix::net::UnixStream::connect(rekey_release)
-        .expect("APPARATUS: release admitted rekey");
-    let removed = removal
-        .wait_with_output()
-        .expect("APPARATUS: collect third Computer removal");
-    assert!(
-        removed.status.success(),
-        "PRODUCT [FX28 rekey-writer-fence]: removal failed after the admitted rekey released: {}{}",
-        String::from_utf8_lossy(&removed.stdout),
-        String::from_utf8_lossy(&removed.stderr)
-    );
-    assert!(
-        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
-            .as_u64()
-            > before_serialization["revision"].as_u64()),
-        "PRODUCT [FX28 rekey-writer-fence]: beta did not expose the removal after release"
-    );
-    let post_result = rotating_post
-        .wait_with_output()
-        .expect("APPARATUS: collect admitted rekey post");
-    assert!(
-        post_result.status.success(),
-        "PRODUCT [FX28 rekey-writer-fence]: the admitted post failed after release: {}{}",
-        String::from_utf8_lossy(&post_result.stdout),
-        String::from_utf8_lossy(&post_result.stderr)
-    );
-    assert!(
-        wait_until(RETURN_WITHIN, || a
-            .run(&["room", "read", room, "--node", "epsilon"], "")
-            .1
-            .contains("ADMITTED-LEASE-REKEY")),
-        "APPARATUS: the admitted legacy rekey did not establish the receiver's session"
-    );
-    assert!(
-        wait_until(RETURN_WITHIN, || computer(b, &["status"])["state"]
-            == "confirmed"
-            && grant_words(b, "delta", epsilon).is_some()),
-        "APPARATUS: the remaining Computers did not converge after third-Computer removal"
-    );
-    let _ = std::fs::remove_file(&rotate_after_post_result);
-    std::fs::write(
-        &rotate_after_post_arm,
-        format!("delta\t{full_room}\tpause-older\t{epsilon}\n"),
-    )
-    .expect("APPARATUS: re-pause the established legacy pair while rotating");
-    let (ok, out, err) = b.run(
-        &["room", "post", room, "SECOND-ROTATION", "--node", "delta"],
-        "",
-    );
-    assert!(ok, "APPARATUS: rotate the second sender key: {out}{err}");
-    let rotation = read_daemon_marker(
-        &rotate_after_post_result,
-        db.child.id(),
-        "second paused rotation",
-    );
-    assert!(rotation.trim().starts_with(&format!("delta\t{full_room}\trotated=true\trelease_requested=false\treleased_paused=false\tcomplete_target_batches=")),
-        "APPARATUS: second sender key did not rotate under the paused legacy pair: {rotation}");
-    let (ok, posted, err) = b.run(
-        &[
-            "room",
-            "post",
-            room,
-            "STALE-AUTHORITY-REKEY",
-            "--node",
-            "delta",
-            "--json",
-        ],
-        "",
-    );
-    assert!(
-        ok,
-        "APPARATUS: append the independent protected ciphertext: {posted}{err}"
-    );
-    let posted: serde_json::Value =
-        serde_json::from_str(posted.trim()).expect("APPARATUS: protected post has no JSON receipt");
-    let protected_hash = posted["entry_hash"]
-        .as_str()
-        .expect("APPARATUS: protected post has no hash");
-    assert!(
-        wait_until(RETURN_WITHIN, || {
-            let (ok, hashes, _) =
-                a.run(&["room", "read", room, "--node", "epsilon", "--hashes"], "");
-            ok && hashes
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(protected_hash))
-        }),
-        "APPARATUS: epsilon did not receive the independent protected ciphertext"
-    );
-    let (ok, unreadable, err) = a.run(&["room", "read", room, "--node", "epsilon"], "");
-    assert!(
-        ok && !unreadable.contains("STALE-AUTHORITY-REKEY"),
-        "APPARATUS: independent ciphertext was already readable: {unreadable}{err}\nsender:\n{}\nrecipient:\n{}",
-        db.said(), _da.said()
-    );
-    for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
-        let _ = std::fs::remove_file(stale);
-    }
-    std::fs::write(rekey_arm, format!("{epsilon}\t{full_room}\tautomatic\n"))
-        .expect("APPARATUS: arm the exact lease-free automatic rekey");
-    std::fs::write(hold_arm, b"hold delta's revocation policy message\n")
-        .expect("APPARATUS: arm delta's reconciliation behind the rekey decision");
-    read_daemon_marker(
-        rekey_engaged,
-        db.child.id(),
-        "the exact lease-free automatic rekey enqueue",
-    );
-    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
-    let a_id = computer_id(a);
-    let b_id = computer_id(b);
-    let receiver_before = computer(a, &["status"]);
-    let control_partition_arm = a.data.join(FX28_CONTROL_PARTITION_ARM);
-    let control_partition_marker = control_partition_arm.with_extension("marker");
-    std::fs::write(&control_partition_arm, &b_id)
-        .expect("APPARATUS: stage only the recipient's exact computer-management path loss");
-    let status = computer(b, &["status"]);
-    computer(
-        b,
-        &[
-            "remove",
-            &a_id,
-            "--confirm",
-            status["frontier"].as_str().unwrap_or_default(),
-            "--keep-rooms",
-        ],
-    );
-    assert!(
-        wait_until(RETURN_WITHIN, || {
-            computer(b, &["status"])["revision"]
-                .as_u64()
-                .is_some_and(|revision| revision > before)
-                && grant_words(b, "beta", epsilon).is_none()
-        }),
-        "APPARATUS: beta did not expose epsilon's durable revocation while delta's exact rekey was held"
-    );
-    assert!(
-        rekey_engaged.is_file(),
-        "APPARATUS: epsilon's exact rekey was not still held after durable revocation"
-    );
-    let partitioned_peer = read_daemon_marker(
-        &control_partition_marker,
-        _da.child.id(),
-        "the recipient refused the exact computer-management update before merging it",
-    );
-    assert_eq!(
-        partitioned_peer, b_id,
-        "APPARATUS: the management-path partition named a different computer peer"
-    );
-    let receiver_current = computer(a, &["status"]);
-    assert!(
-        receiver_before["state"] == "confirmed"
-            && receiver_current["state"] == "confirmed"
-            && receiver_current["revision"] == receiver_before["revision"]
-            && grant_words(a, "epsilon", delta).is_some(),
-        "APPARATUS: epsilon no longer trusts delta before the held sender-key batch is released, so receiver-side revocation would mask the sender-authority mutant; receiver computer status: {}",
-        receiver_current
-    );
-    println!(
-        "[proof] FX-28 stale-rekey-authority apparatus staged: epsilon was durably revoked while its exact prepared sender-key batch remained held at final queue admission"
-    );
-    std::os::unix::net::UnixStream::connect(rekey_release).unwrap_or_else(|error| {
-        panic!(
-            "APPARATUS: release epsilon's held rekey at {}: {error}",
-            rekey_release.display()
-        )
-    });
-    let decision = read_daemon_marker(
-        rekey_decision,
-        db.child.id(),
-        "the exact rekey authority decision",
-    );
-    if decision.trim() == "enqueued" {
-        assert!(
-            wait_until(RETURN_WITHIN, || a
-                .run(&["room", "read", room, "--node", "epsilon"], "")
-                .1
-                .contains("STALE-AUTHORITY-REKEY")),
-            "APPARATUS: the mutant enqueued epsilon's exact key but the shipped recipient never exposed its delivery; receiver grant {:?}; receiver status {}; recipient daemon {}; sender daemon {}",
-            grant_words(a, "epsilon", delta),
-            computer(a, &["status"]),
-            _da.said(),
-            db.said()
-        );
-        assert!(
-            grant_words(a, "epsilon", delta).is_some()
-                && computer(a, &["status"])["revision"] == receiver_before["revision"],
-            "APPARATUS: recipient management state moved during the isolated sender-revocation verdict"
-        );
-        panic!("PRODUCT [FX28 stale-rekey-authority]: after epsilon's durable revocation, its shipped room read exposed text unlocked by the stale sender-key batch");
-    }
-    assert_eq!(
-        decision.trim(),
-        "rejected",
-        "APPARATUS: the rekey authority boundary published an unknown decision: {decision}"
-    );
-    let read = a.run(&["room", "read", room, "--node", "epsilon"], "").1;
-    assert!(
-        !read.contains("STALE-AUTHORITY-REKEY"),
-        "PRODUCT [FX28 stale-rekey-authority]: epsilon's shipped room read exposed text whose sender key was prepared before its durable revocation: {read}"
-    );
-    read_daemon_marker(
-        hold_engaged,
-        db.child.id(),
-        "delta's held revocation reconciliation",
-    );
-    std::os::unix::net::UnixStream::connect(hold_release).unwrap_or_else(|error| {
-        panic!(
-            "APPARATUS: release delta's held revocation reconciliation at {}: {error}",
-            hold_release.display()
-        )
-    });
 }
 
 /// One node whose actor queue is held remains attached but must not claim the new trust projection;

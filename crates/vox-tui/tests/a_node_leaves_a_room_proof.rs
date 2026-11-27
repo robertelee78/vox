@@ -21,6 +21,14 @@
 //! A returner's retained Accepted may also be cancelled: its withdrawal must remove the
 //! witnessed return from the other members' rosters. The `readmission-no-withdrawal-veto`
 //! mutant must make that roster assertion red.
+//!
+//! **A returner while its own history is unavailable** (`a_returner_reads_while_own_history_is_unavailable`):
+//! with no holder of carol's prefix online, carol's status says recovery is pending and her post is
+//! refused as behind its own history; bob's post written then, before her return, stays unread
+//! (coming back is a new key ceremony). W3: bob, who admitted her, is stopped before her recovery
+//! completes; alice, the holder, comes back and learns carol's admission notice through the board
+//! exchange with carol, serves the prefix, and carol posts. Mutant: `VOX_MUTANT_FWD=notice-not-offered`
+//! (carol never posts).
 
 #![cfg(unix)]
 
@@ -361,6 +369,11 @@ fn a_node_leaves_a_room_and_the_others_see_it_gone() {
 #[ignore = "real daemons and anchor; run on demand in release"]
 fn a_returner_reads_while_own_history_is_unavailable() {
     watchdog::arm();
+    // The runner's `VOX_MUTANT_FWD=<value>` becomes the daemons' `VOX_TEST_FWD_MUTANT` (the
+    // proof's temp HOME strips every inherited `VOX_TEST_*`).
+    if let Ok(mutant) = std::env::var("VOX_MUTANT_FWD") {
+        std::env::set_var("VOX_TEST_FWD_MUTANT", mutant);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -439,36 +452,67 @@ fn a_returner_reads_while_own_history_is_unavailable() {
     );
     let fenced = carol.vox(None, &["room", "post", &id, "must wait for the prefix"]);
     assert!(
-        !fenced.ok && fenced.stderr.contains("own history"),
-        "PRODUCT: returner wrote before recovery: {fenced:?}"
+        !fenced.ok && fenced.stderr.contains("own history") && fenced.stderr.contains("behind"),
+        "PRODUCT: returner wrote before recovery, or did not say it is behind its own history: \
+         {fenced:?}"
     );
     bob.vox(
         None,
         &["room", "post", &id, "bob while recovery is pending"],
     )
     .expect_ok("bob posts while alice is offline");
-    until(
-        carol,
-        None,
-        "permitted fresh read while own recovery is pending",
-        &["room", "read", &id],
-        |o| o.ok && o.stdout.contains("bob while recovery is pending"),
-    );
+    // W3: the admitting member is stopped before carol's recovery completes. Alice, the only
+    // holder of carol's prefix, comes back and learns carol's admission notice through the
+    // board exchange with carol; she then serves the prefix and carol's writes open.
+    room.stop(1);
     room.restart(0);
     let carol = &room.workers[2];
-    until(
-        carol,
-        None,
-        "post after authenticated recovery",
-        &["room", "post", &id, "after recovered prefix"],
-        |o| o.ok,
-    );
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    loop {
+        let post = carol.vox(None, &["room", "post", &id, "after recovered prefix"]);
+        if post.ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: with bob, who admitted her, stopped, carol never accepted a post: alice did \
+             not learn her admission through the board exchange and serve her prefix: {post:?}\n\
+             status: {:?}",
+            carol.vox(None, &["status"])
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     until(
         &room.workers[0],
         None,
         "alice reads post after recovery",
         &["room", "read", &id],
         |o| o.ok && o.stdout.contains("after recovered prefix"),
+    );
+    // Forward only: carol reads what is written after her return, and not bob's post written
+    // while her recovery was pending, before her return.
+    let alice = &room.workers[0];
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    let mut n = 0;
+    let read = loop {
+        n += 1;
+        let text = format!("alice after carol is back #{n}.");
+        alice
+            .vox(None, &["room", "post", &id, &text])
+            .expect_ok("alice posts after carol's return");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let read = carol.vox(None, &["room", "read", &id]);
+        if read.ok && read.stdout.contains("alice after carol is back") {
+            break read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: carol, back, read none of alice's posts after her return: {read:?}"
+        );
+    };
+    assert!(
+        !read.stdout.contains("bob while recovery is pending"),
+        "PRODUCT: carol read bob's post written before her return: {read:?}"
     );
 }
 
@@ -620,13 +664,8 @@ fn signed_extent_above_a_restored_checkpoint_prevents_early_writes() {
         &["room", "roster", &id],
         |o| o.ok && o.stdout.contains(&carol_fp),
     );
-    until(
-        carol,
-        None,
-        "old-prefix donor returns carol's permitted history",
-        &["room", "read", &id],
-        |o| o.ok && o.stdout.contains("harness: ready carol "),
-    );
+    // The restored checkpoint was saved after leave erased Carol's room keys. Recovery of the
+    // signed extent fences writes independently of whether those old rows can be decrypted.
     std::thread::sleep(std::time::Duration::from_secs(10));
     let post = carol.vox(None, &["room", "post", &id, "must not cross signed extent"]);
     assert!(

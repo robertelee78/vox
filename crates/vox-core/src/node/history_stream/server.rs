@@ -189,6 +189,9 @@ pub(super) async fn answer(
         }
     };
     let request = preamble.request;
+    // An authorized version-3 request: this connection may carry the room's keys at this epoch
+    // in either direction (`pull::Holdings::exchanged_at`).
+    holdings.exchanged(preamble.room, source.peer, conn, preamble.epoch);
     if preamble.purpose != Purpose::History && matches!(query, Query::Page { .. }) {
         return Err(Error::MalformedBundle(
             "archive page requires history reservation",
@@ -212,12 +215,8 @@ pub(super) async fn answer(
             Frame::PrivateHolding(authors, tip) => {
                 holdings.merge(preamble.room, source.peer, conn, &authors, Some(tip));
             }
-            // The holder's own-release section: what it retains of this node's own sender
-            // releases (`pull::tell` sends it only to their author). Only an entry naming this
-            // node is ever asked (`pull::own_release`).
-            Frame::Releases(releases) => {
-                holdings.merge_releases(preamble.room, source.peer, conn, &releases);
-            }
+            // Tag 0x0D (reserved): decoded and discarded with no effect.
+            Frame::Releases => {}
             _ => return Err(Error::MalformedBundle("have expected one HOLDING")),
         }
     }

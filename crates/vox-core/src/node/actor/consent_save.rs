@@ -25,7 +25,6 @@ pub(super) enum Work {
     Issue {
         target: Digest32,
         skdm: Box<crate::group::skdm::Skdm>,
-        full_history: bool,
         entitled_from: (u64, u64),
         package: Option<crate::node::keypackage::KeyPackage>,
     },
@@ -33,6 +32,11 @@ pub(super) enum Work {
         target: Digest32,
     },
     RoomRotation,
+    /// The room's forward-only migration (R9): each legacy full-history identity with its
+    /// trust decision.
+    ForwardMigration {
+        legacy_full: BTreeMap<Digest32, Option<crate::node::consent_order::Stamp>>,
+    },
     ReceiverCleanup,
     ControlImport,
     PrivateSupport {
@@ -68,12 +72,10 @@ pub(super) enum Effect {
         package_seq: Option<u64>,
         consent_seq: Option<u64>,
         package: Option<crate::node::keypackage::KeyPackage>,
-        release: Option<Box<crate::group::skdm::Skdm>>,
     },
     Consent(ConsentSaved),
     Cleanup {
         more: bool,
-        retry_ready: bool,
         own_retry_ready: bool,
     },
     ControlImport,
@@ -116,26 +118,19 @@ impl Work {
             Self::Issue {
                 target,
                 skdm,
-                full_history,
                 entitled_from,
                 package,
             } => channel
-                .prepare_pending_consent(
-                    store,
-                    owner,
-                    target,
-                    skdm,
-                    full_history,
-                    entitled_from,
-                    package,
-                    now,
-                )
+                .prepare_pending_consent(store, owner, target, skdm, entitled_from, package, now)
                 .map(|pending| Some(Prepared::Issue(pending))),
             Self::Withdraw { target } => channel
                 .prepare_pending_withdrawal(store, owner, target, now)
                 .map(|pending| Some(Prepared::Consent(pending))),
             Self::RoomRotation => channel
                 .prepare_room_removal_rotation(store, owner, now)
+                .map(|pending| pending.map(Prepared::Consent)),
+            Self::ForwardMigration { legacy_full } => channel
+                .prepare_forward_migration(store, owner, &legacy_full, now)
                 .map(|pending| pending.map(Prepared::Consent)),
             Self::ReceiverCleanup => channel
                 .prepare_pending_receiver_cleanup(store, owner)
@@ -204,48 +199,46 @@ impl Completed {
     /// retains the original publication lease, then publishes the saved-history view.
     pub(super) fn finish(self, channel: &mut ChannelState, store: &Store) -> Receipt {
         let mut held = None;
-        let result = match self {
-            Self::Hold(completed) => channel
-                .finish_pending_held_consent(completed)
-                .map(Effect::Held),
-            Self::Delivered(completed) => channel
-                .finish_pending_consent_delivery(completed)
-                .map(|()| Effect::Delivered),
-            Self::Issue(mut completed) => {
-                held = completed.held.take();
-                let package_seq = completed.package_seq;
-                let consent_seq = completed.consent_seq;
-                let package = completed.package.take();
-                let release = completed.release.take();
-                let result = channel.finish_pending_consent(store, completed);
-                Ok(Effect::Publication {
-                    result,
-                    package_seq,
-                    consent_seq,
-                    package,
-                    release,
-                })
-            }
-            Self::Consent(mut completed) => {
-                held = completed.held.take();
-                channel
-                    .finish_pending_consent(store, completed)
-                    .map(Effect::Consent)
-            }
-            Self::Cleanup(completed) => channel.finish_pending_receiver_cleanup(completed).map(
-                |(more, retry_ready, own_retry_ready)| Effect::Cleanup {
-                    more,
-                    retry_ready,
-                    own_retry_ready,
-                },
-            ),
-            Self::Import(completed) => channel
-                .finish_pending_control_import(completed)
-                .map(|_| Effect::ControlImport),
-            Self::Support(completed) => channel
-                .finish_pending_private_support(store, completed)
-                .map(Effect::PrivateSupport),
-        };
+        let result =
+            match self {
+                Self::Hold(completed) => channel
+                    .finish_pending_held_consent(completed)
+                    .map(Effect::Held),
+                Self::Delivered(completed) => channel
+                    .finish_pending_consent_delivery(completed)
+                    .map(|()| Effect::Delivered),
+                Self::Issue(mut completed) => {
+                    held = completed.held.take();
+                    let package_seq = completed.package_seq;
+                    let consent_seq = completed.consent_seq;
+                    let package = completed.package.take();
+                    let result = channel.finish_pending_consent(store, completed);
+                    Ok(Effect::Publication {
+                        result,
+                        package_seq,
+                        consent_seq,
+                        package,
+                    })
+                }
+                Self::Consent(mut completed) => {
+                    held = completed.held.take();
+                    channel
+                        .finish_pending_consent(store, completed)
+                        .map(Effect::Consent)
+                }
+                Self::Cleanup(completed) => channel.finish_pending_receiver_cleanup(completed).map(
+                    |(more, own_retry_ready)| Effect::Cleanup {
+                        more,
+                        own_retry_ready,
+                    },
+                ),
+                Self::Import(completed) => channel
+                    .finish_pending_control_import(completed)
+                    .map(|_| Effect::ControlImport),
+                Self::Support(completed) => channel
+                    .finish_pending_private_support(store, completed)
+                    .map(Effect::PrivateSupport),
+            };
         Receipt { result, held }
     }
 
@@ -260,15 +253,13 @@ impl Completed {
                 package_seq: completed.package_seq,
                 consent_seq: completed.consent_seq,
                 package: completed.package,
-                release: completed.release,
             }),
             Self::Consent(completed) => completed.result.map(Effect::Consent),
             Self::Cleanup(completed) => {
                 completed
                     .result
-                    .map(|(more, retry_ready, own_retry_ready)| Effect::Cleanup {
+                    .map(|(more, own_retry_ready)| Effect::Cleanup {
                         more,
-                        retry_ready,
                         own_retry_ready,
                     })
             }

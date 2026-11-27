@@ -566,9 +566,7 @@ impl Receiver {
     /// governance facts over it (`PendingHistorySource::publish_in`). Then, the room's
     /// publication idle, the fold's bounded turn a governance change owes and one effect
     /// quantum, each prepared and installed under the room lock and saved off it, all under the
-    /// one pending write this step reserved; the room is published once, at the write's end. A
-    /// departure's own-key response writers are stopped before the write starts: the one wait
-    /// it needs outside the room.
+    /// one pending write this step reserved; the room is published once, at the write's end.
     pub(super) async fn admit_entry(
         &self,
         record: Arc<Record>,
@@ -579,21 +577,20 @@ impl Receiver {
         if binding.generation != self.generation {
             return Err(Error::Profile("history publication activation changed"));
         }
-        if begin {
-            self.hold_incoming_consent(&record).await?;
-        }
-        let kind = record.entry.skeleton.v2.as_ref().map(|header| header.kind);
-        // A join cannot narrow membership. If classification fails, gate conservatively until
-        // the effect verifies or rejects the body.
-        let needs_transition = kind == Some(crate::log::history::SignedEntryKind::Governance)
+        // A proof can keep a remote departure's effect pending while the leaver probes a live
+        // head; nothing else waits here.
+        #[cfg(feature = "test-knobs")]
+        let hold_effect = record.entry.skeleton.v2.as_ref().map(|header| header.kind)
+            == Some(crate::log::history::SignedEntryKind::Governance)
             && match crate::governance::entry::GovEntry::body_bound_to(&record.entry) {
                 Ok(crate::governance::entry::GovBody::Presence(presence)) => !presence.body.here,
                 Ok(_) => false,
                 Err(_) => true,
-            };
-        let (transition, hold_effect) = self
-            .departure_transition(needs_transition, record.entry.skeleton.author_id)
-            .await?;
+            }
+            && self.departure_held(record.entry.skeleton.author_id).await?;
+        #[cfg(not(feature = "test-knobs"))]
+        let hold_effect = false;
+        let kind = record.entry.skeleton.v2.as_ref().map(|header| header.kind);
         // The fold's turn runs inside this write: reserve its scratch as `Operation::Governance`.
         let scratch = if matches!(
             kind,
@@ -635,7 +632,6 @@ impl Receiver {
                         Ok((record, facts, pending, instance, epoch))
                     },
                     move |(record, facts, pending, instance, epoch), store, owned| {
-                        let _transition = transition;
                         // The validation token, re-derived from its sealed cursor in this write.
                         let validated = match facts.with(|room| {
                             admission::advance_entry(room, store, &effect.committed, binding)
@@ -704,7 +700,6 @@ impl Receiver {
                     Ok((record, pending, instance, epoch))
                 },
                 move |(record, pending, instance, epoch), store, owned| {
-                    let _transition = transition;
                     let published = pending.publish(
                         store,
                         &effect.committed,
@@ -734,99 +729,21 @@ impl Receiver {
             .await
     }
 
-    /// Hold this exact signed consent before writer admission; sender-key delivery remains
-    /// independent. The optional retained-row journey observes real rows on both sides.
-    async fn hold_incoming_consent(&self, record: &Record) -> Result<()> {
-        #[cfg(feature = "test-knobs")]
-        if let Ok(crate::governance::entry::GovBody::ConsentGrant(consent)) =
-            crate::governance::entry::GovEntry::body_bound_to(&record.entry)
+    /// The proof hold `VOX_TEST_DEPARTURE_HOLD_FILE`: `true` while the file exists and `author`
+    /// is another member, so the departure's effect stays pending.
+    #[cfg(feature = "test-knobs")]
+    async fn departure_held(&self, author: Digest32) -> Result<bool> {
+        if !std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+            .is_some_and(|path| std::path::Path::new(&path).is_file())
         {
-            if consent.body.target_id == self.node {
-                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_INCOMING_CONSENT_FILE")
-                    .filter(|path| !path.is_empty())
-                    .map(std::path::PathBuf::from)
-                    .filter(|path| path.is_file())
-                {
-                    let encode = crate::node::link::b32_encode;
-                    let scope = format!(
-                        "{} {} {}",
-                        encode(&record.entry.skeleton.channel_id),
-                        encode(&record.entry.skeleton.author_id),
-                        encode(&consent.body.target_id)
-                    );
-                    if std::fs::read_to_string(&path).ok().as_deref() == Some(scope.as_str()) {
-                        let entered = path.with_extension("entered");
-                        static NEXT_MARKER: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let temporary = path.with_extension(format!(
-                            "entered.{}.{}.tmp",
-                            std::process::id(),
-                            NEXT_MARKER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        ));
-                        std::fs::write(
-                            &temporary,
-                            format!("{} {}", scope, encode(&record.entry.entry_hash())),
-                        )
-                        .map_err(|_| Error::Profile("consent hold could not record engagement"))?;
-                        std::fs::rename(&temporary, &entered).map_err(|_| {
-                            Error::Profile("consent hold could not publish engagement")
-                        })?;
-                        while path.is_file() {
-                            tokio::select! {
-                                biased;
-                                () = self.source.fence.retired() => return Err(Error::Unreachable("consent hold cancelled")),
-                                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-                            }
-                        }
-                    }
-                }
-            }
+            return Ok(false);
         }
-        #[cfg(not(feature = "test-knobs"))]
-        let _ = record;
-        Ok(())
-    }
-
-    /// Stop the departing author's own-key response writers before its departure's effect
-    /// commits, so no own-key release reaches it after; `true` when the test departure hold
-    /// keeps that effect pending instead.
-    async fn departure_transition(
-        &self,
-        needs_transition: bool,
-        author: Digest32,
-    ) -> Result<(
-        Option<crate::node::channel::own_writer_gate::Transition>,
-        bool,
-    )> {
-        if !needs_transition {
-            return Ok((None, false));
-        }
-        let (gate, me) = {
-            let room = tokio::select! {
-                biased;
-                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                room = self.source.room.lock() => room,
-            };
-            (Arc::clone(&room.own_writer_gate), room.me())
+        let me = tokio::select! {
+            biased;
+            () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+            room = self.source.room.lock() => room.me(),
         };
-        let self_departure = author == me;
-        // Keep a remote departure's effect pending while the leaver probes a live head.
-        #[cfg(feature = "test-knobs")]
-        if !self_departure
-            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
-                .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
-            return Ok((None, true));
-        }
-        let targets = (!self_departure).then(|| std::slice::from_ref(&author));
-        Ok((
-            Some(tokio::select! {
-                biased;
-                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                transition = gate.transition(targets) => transition,
-            }),
-            false,
-        ))
+        Ok(author != me)
     }
 
     fn effect_inputs(&self, now: crate::time::Ms) -> EffectInputs {
@@ -917,13 +834,17 @@ impl Receiver {
         )>,
     > {
         let job = record.job.clone();
-        // A staged record may contain only a header. Inspect the authenticated stored body
-        // off actor so unrelated governance does not cancel an active key response.
-        let governance =
-            record.entry.skeleton.v2.as_ref().is_some_and(|header| {
-                header.kind == crate::log::history::SignedEntryKind::Governance
-            });
-        let needs_transition = if governance {
+        // A proof can hold a remote departure's effect: the stored body is classified off actor
+        // only while that hold is set.
+        #[cfg(feature = "test-knobs")]
+        if record
+            .entry
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|header| header.kind == crate::log::history::SignedEntryKind::Governance)
+            && self.departure_held(record.entry.skeleton.author_id).await?
+        {
             let classified = self
                 .read_precharged(
                     &job,
@@ -941,8 +862,6 @@ impl Receiver {
                         let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
                             "pending history body record missing",
                         ))?;
-                        // A join cannot narrow membership. If classification fails, gate
-                        // conservatively until the effect verifies or rejects the body.
                         Ok(Some(
                             match crate::governance::entry::GovEntry::body_bound_to(&entry) {
                                 Ok(crate::governance::entry::GovBody::Presence(presence)) => {
@@ -956,18 +875,11 @@ impl Receiver {
                 )
                 .await?;
             match classified {
-                Lookup::Found(held) => held.value.1,
+                Lookup::Found(held) if held.value.1 => return Ok(Lookup::Busy),
+                Lookup::Found(_) => {}
                 Lookup::Busy => return Ok(Lookup::Busy),
                 Lookup::Missing => return Ok(Lookup::Missing),
             }
-        } else {
-            false
-        };
-        let (transition, hold_effect) = self
-            .departure_transition(needs_transition, record.entry.skeleton.author_id)
-            .await?;
-        if hold_effect {
-            return Ok(Lookup::Busy);
         }
         let staged = record.staged.is_some() || record.memory;
         let effect = self.effect_inputs(now);
@@ -977,7 +889,6 @@ impl Receiver {
                 (64 * 1024, 0, false),
                 |_, _| Ok(()),
                 move |(), store, owned| {
-                    let _transition = transition;
                     let progress = effect_quantum(
                         owned,
                         store,

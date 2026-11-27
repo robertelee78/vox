@@ -1,5 +1,5 @@
 //! Own-feed recovery is a durable write fence, not authority supplied by an inventory hint.
-use super::pending_text::recovery::{Audit, AuditWrite, Ranges};
+use super::pending_text::recovery::Ranges;
 use super::*;
 use crate::log::history::{
     inclusion_ranges, ContextSource, ControlContext, Descriptor, HistoryStep, LocalAppendBudget,
@@ -525,66 +525,6 @@ impl PendingOwnRecovery {
     }
 }
 
-/// One bounded step toward certifying the actual content in the retained signed prefix.
-/// Debts are parked until the exact body, key or authority changes; they are not a timer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OwnReadability {
-    Complete,
-    Runnable,
-    Waiting,
-    /// The authenticated own body now opens, but its sparse semantic effect has not settled.
-    /// Re-run the existing staged Page rather than queueing render backfill, which skips
-    /// unsettled effects and cannot advance the role-complete own prefix.
-    EffectReady {
-        target: Digest32,
-        seq: u64,
-        entry_hash: Digest32,
-    },
-    BodyDebt {
-        target: Digest32,
-        seq: u64,
-        entry_hash: Digest32,
-    },
-    KeyDebt {
-        target: Digest32,
-        seq: u64,
-        entry_hash: Digest32,
-        epoch: u64,
-        chain: u64,
-        iteration: u64,
-    },
-}
-
-/// A cursor is meaningful only for one exact authenticated recovery target. Legacy markers
-/// have no cursor and start at one; a changed target is conservatively checked from one again.
-struct ReadabilityCursor {
-    target: Digest32,
-    next: u64,
-}
-impl ReadabilityCursor {
-    fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut d = Decoder::new(bytes);
-        if d.array()? != 3 || d.uint()? != 1 {
-            return Err(Error::MalformedAtRest("own readability cursor"));
-        }
-        let target = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| Error::MalformedAtRest("own readability target"))?;
-        let next = d.uint()?;
-        d.finish()?;
-        if next == 0 {
-            return Err(Error::MalformedAtRest("own readability position"));
-        }
-        Ok(Self { target, next })
-    }
-    fn bytes(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
-        e.array(3).uint(1).bytes(&self.target).uint(self.next);
-        e.finish()
-    }
-}
-
 impl ChannelState {
     pub(crate) fn prepare_recovery_contexts(
         &self,
@@ -764,222 +704,6 @@ impl ChannelState {
             _ if held != 0 || settled != 0 => extent(held.max(settled)),
             _ => Ok(OwnHistory::None),
         }
-    }
-
-    /// Check one bounded chunk of the exact own-author prefix. An already-settled receipt
-    /// alone is not evidence that ciphertext from a later sender generation can be read.
-    pub(crate) fn prepare_own_readability(
-        &self,
-        store: &Store,
-        now: crate::time::Ms,
-    ) -> Result<Audit> {
-        if !self.own_behind {
-            return Ok(Audit::unchanged(OwnReadability::Waiting));
-        }
-        let Recovery::Head(target) = &self.own_recovery else {
-            return Ok(Audit::unchanged(OwnReadability::Waiting));
-        };
-        let target = target.clone();
-        self.checked_own_head(&target)?;
-        let read = self.history_read(store)?;
-        if read.publication_busy() || !read.history_head_accepted(&target.id(), target.binding)? {
-            return Ok(Audit::unchanged(OwnReadability::Waiting));
-        }
-        let snapshot = store.snapshot()?;
-        let stored = snapshot.get_segment_bounded(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_OWN_READABILITY,
-            128,
-        )?;
-        let mut initialize = stored.is_none();
-        let mut cursor = match stored {
-            Some(segment) => ReadabilityCursor::parse(&open_segment(
-                &self.sek,
-                SegmentKind::KeyMaterial,
-                SEG_OWN_READABILITY,
-                &segment,
-            )?)?,
-            None => ReadabilityCursor {
-                target: target.id(),
-                next: 1,
-            },
-        };
-        if cursor.target != target.id() {
-            cursor = ReadabilityCursor {
-                target: target.id(),
-                next: 1,
-            };
-            initialize = true;
-        }
-        if cursor.next > target.root.leaves.saturating_add(1) {
-            return Err(Error::MalformedAtRest(
-                "own readability cursor exceeds target",
-            ));
-        }
-        let start = cursor.next;
-        let rendered = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
-        let own_pending = rendered.author_backfill_pending(&self.me())?;
-        if own_pending {
-            return Ok(Audit::unchanged(OwnReadability::Waiting));
-        }
-        let mut outcome = OwnReadability::Runnable;
-        let mut render_from = None;
-        for _ in 0..RENDER_BACKFILL_ROWS_PER_TURN {
-            if cursor.next > target.root.leaves {
-                outcome = OwnReadability::Complete;
-                break;
-            }
-            let seq = cursor.next;
-            let Some((_source, header)) = read.history_validated_header(&self.me(), seq)? else {
-                outcome = OwnReadability::Waiting;
-                break;
-            };
-            let hash = header.entry_hash();
-            let effect_finished = read.history_effect_finished(&hash)?;
-            let kind = header
-                .skeleton
-                .v2
-                .as_ref()
-                .ok_or(Error::OwnHistoryBehind)?
-                .kind;
-            if kind == crate::log::history::SignedEntryKind::Content
-                && rendered.fact(&hash)?.is_none()
-            {
-                let entry = read.history_entry(&hash)?;
-                let payload = entry.as_ref().and_then(|entry| entry.payload.as_deref());
-                let Some(payload) = payload else {
-                    // Match body pruning's age: a future signed claim cannot extend the
-                    // lifetime beyond this node's persisted first sight of the entry.
-                    if effect_finished && self.governance_display_current(now.get()) {
-                        if let Some(log) = read.log_id(&hash)? {
-                            let first_seen =
-                                history_first_seen_at(&snapshot, &self.sek, &self.channel_id, log)?;
-                            let base = header.skeleton.claimed_ms.min(first_seen);
-                            if expired_at(base, now.get(), self.effective_retention())
-                                && expired_at(base, now.get(), self.effective_step_retention())
-                            {
-                                cursor.next += 1;
-                                continue;
-                            }
-                        }
-                    }
-                    outcome = OwnReadability::BodyDebt {
-                        target: target.id(),
-                        seq,
-                        entry_hash: hash,
-                    };
-                    break;
-                };
-                let message = GroupMessage::from_wire(payload)?;
-                if message.header.author_id != self.me()
-                    || message.header.epoch != header.skeleton.epoch
-                {
-                    return Err(Error::MalformedAtRest("own readability message binding"));
-                }
-                // Session payloads use the drive receiver and are accounted for by their own
-                // already-settled effects; they are not ordinary sender-chain messages.
-                if message.header.channel_id != drive_channel(&self.channel_id) {
-                    if message.header.channel_id != self.channel_id {
-                        return Err(Error::MalformedAtRest("own readability room binding"));
-                    }
-                    let slot = (self.me(), message.header.chain_id);
-                    let historical = if message.header.epoch < self.epoch {
-                        let root = self
-                            .authors
-                            .get(&self.me())
-                            .ok_or(Error::MalformedGovernance("own history author missing"))?;
-                        own_historical_keys::lookup(
-                            &snapshot,
-                            &self.sek,
-                            &self.channel_id,
-                            root,
-                            &self.me(),
-                            message.header.epoch,
-                            message.header.chain_id,
-                        )?
-                    } else {
-                        None
-                    };
-                    let plaintext = historical
-                        .as_ref()
-                        .or_else(|| {
-                            self.receivers
-                                .get(&slot)
-                                .filter(|chain| chain.epoch() == message.header.epoch)
-                        })
-                        .and_then(|chain| chain.decrypt_retained(&message).ok())
-                        .map(Zeroizing::new);
-                    let Some(plaintext) = plaintext else {
-                        outcome = OwnReadability::KeyDebt {
-                            target: target.id(),
-                            seq,
-                            entry_hash: hash,
-                            epoch: message.header.epoch,
-                            chain: message.header.chain_id,
-                            iteration: message.header.iteration,
-                        };
-                        break;
-                    };
-                    if !effect_finished {
-                        outcome = OwnReadability::EffectReady {
-                            target: target.id(),
-                            seq,
-                            entry_hash: hash,
-                        };
-                        break;
-                    }
-                    if let Ok(Decoded::Text(content)) = crate::node::content::decode(&plaintext) {
-                        let Some(entry) = entry.as_ref() else {
-                            return Err(Error::MalformedAtRest("own readable entry missing"));
-                        };
-                        if !self.already_expired_entry(
-                            Transaction::Snapshot(&snapshot),
-                            entry,
-                            content.created_millis,
-                            now.get(),
-                        )? {
-                            // A prior opaque receipt may already have drained the ordinary
-                            // cursor. Queue the exact now-readable position and recheck after
-                            // the normal projection has committed its user-visible row.
-                            render_from = Some(seq);
-                            break;
-                        }
-                    }
-                }
-            }
-            if !effect_finished {
-                outcome = OwnReadability::Waiting;
-                break;
-            }
-            cursor.next = cursor
-                .next
-                .checked_add(1)
-                .ok_or(Error::MalformedAtRest("own readability overflow"))?;
-        }
-        if cursor.next > target.root.leaves {
-            outcome = OwnReadability::Complete;
-        }
-        drop(rendered);
-        drop(read);
-        drop(snapshot);
-        let write = if cursor.next != start || initialize || render_from.is_some() {
-            Some(AuditWrite {
-                marker: self.own_recovery.bytes(),
-                cursor: seal_segment(
-                    &self.sek,
-                    SegmentKind::KeyMaterial,
-                    SEG_OWN_READABILITY,
-                    &cursor.bytes(),
-                )?,
-                render_from,
-            })
-        } else {
-            None
-        };
-        Ok(Audit { outcome, write })
     }
 
     /// An authenticated high observation fences the next append even before the actor has
@@ -1218,55 +942,10 @@ impl ChannelState {
         }
     }
 
-    /// This path is exclusively an original author's authenticated recovery response, not a
-    /// trust grant from its transport peer. The ordinary inbound-SKDM trust gate is unchanged.
-    ///
-    /// A release is a fact about one key (author, epoch, chain, iteration), not about a head:
-    /// it is accepted while recovery stands at an accepted, current target, whichever target
-    /// the request named when it was asked (per-head audit item 22). The release itself is
-    /// verified under this node's own admitted root by the native installation below.
-    pub(crate) fn accept_own_recovery_release(
-        &mut self,
-        store: &Store,
-        release: &crate::group::skdm::Skdm,
-        now: crate::time::Ms,
-    ) -> Result<super::AcceptedSkdm> {
-        if !self.own_behind
-            || release.body.author_id != self.me()
-            || release.body.channel_id != self.channel_id
-            || release.body.epoch > self.epoch
-            || !self.recovery_standing(store, &self.me())?
-        {
-            return Err(Error::OwnHistoryBehind);
-        }
-        let Recovery::Head(target) = &self.own_recovery else {
-            return Err(Error::OwnHistoryBehind);
-        };
-        let (target, binding) = (target.id(), target.binding);
-        match self.own_recovery_evidence(store)? {
-            Some(Recovery::Head(current)) if current.id() == target => {}
-            _ => return Err(Error::OwnHistoryBehind),
-        }
-        if !self
-            .history_read(store)?
-            .history_head_accepted(&target, binding)?
-        {
-            return Err(Error::OwnHistoryBehind);
-        }
-        self.accept_skdm_mode(store, release, now, true)
-    }
-
     pub(super) fn require_own_recovery_complete(&self, store: &Store) -> Result<()> {
         if !self.own_behind || !self.recovery_standing(store, &self.me())? {
             return Err(Error::OwnHistoryBehind);
         }
-        #[cfg(feature = "test-knobs")]
-        let extent = if crate::node::computer::fx28_mutant("drop-recovery-extent") {
-            None
-        } else {
-            unknown_higher(store, &self.sek, &self.channel_id)?
-        };
-        #[cfg(not(feature = "test-knobs"))]
         let extent = unknown_higher(store, &self.sek, &self.channel_id)?;
         let Recovery::Head(target) = &self.own_recovery else {
             return Err(Error::OwnHistoryBehind);
@@ -1329,22 +1008,21 @@ impl ChannelState {
         {
             return Err(Error::OwnHistoryBehind);
         }
-        let snapshot = store.snapshot()?;
-        let segment = snapshot
-            .get_segment_bounded(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_OWN_READABILITY,
-                128,
-            )?
-            .ok_or(Error::OwnHistoryBehind)?;
-        let audit = ReadabilityCursor::parse(&open_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_OWN_READABILITY,
-            &segment,
-        )?)?;
-        if audit.target != target.id() || audit.next != target.root.leaves.saturating_add(1) {
+        // `VOX_TEST_FWD_MUTANT=audit-back` puts back the completion check of the deleted
+        // blocking readability audit: completion waits for an audit cursor, which nothing
+        // writes any more, as the audit waited for own keys no node releases any more.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("audit-back")
+            && store
+                .snapshot()?
+                .get_segment_bounded(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    super::SEG_OWN_READABILITY,
+                    128,
+                )?
+                .is_none()
+        {
             return Err(Error::OwnHistoryBehind);
         }
         self.require_legacy_current(store)?;

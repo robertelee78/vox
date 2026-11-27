@@ -34,6 +34,11 @@ use crate::log::history::{
 
 pub type RequestId = [u8; 16];
 pub const MAX_PREAMBLE: usize = 128;
+/// The history preamble version. 3 is the forward-only key policy (v0.4.31): a build that
+/// speaks 2 releases older history, so neither end answers the other's room requests, and a
+/// room key goes only on a connection that completed a version-3 exchange for that room and
+/// epoch (`pull::Holdings::exchanged_at`).
+pub const PREAMBLE_VERSION: u64 = 3;
 pub const DONE_RESERVE: usize = 512;
 /// A captured flow grant no longer names current authorization; this is not a disk failure.
 pub(crate) const AUTHORIZATION_CHANGED: &str = "history authorization changed before publication";
@@ -375,11 +380,28 @@ pub struct Preamble {
     pub request: RequestId,
 }
 
+/// The history preamble version this node speaks: [`PREAMBLE_VERSION`]. Test apparatus
+/// (`test-knobs`, `VOX_TEST_FWD_OLDER_PEER`): version 2, the Vox before the forward-only policy,
+/// so a proof can stage a computer that has not updated. No shipped build names it.
+fn spoken_version() -> u64 {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_TEST_FWD_OLDER_PEER").is_some() {
+        return PREAMBLE_VERSION - 1;
+    }
+    PREAMBLE_VERSION
+}
+
+/// What `vox status` says on a member's sync row while that member's computer speaks another
+/// history preamble version (R10, R11): this node refused its preamble, or it refused this
+/// node's. Said of that computer only: the room's other computers may still exchange.
+pub(crate) const OTHER_VERSION: &str = "that computer runs another Vox version; this computer \
+     exchanges no history or keys with it until both run the same version";
+
 impl Preamble {
     pub fn encode(self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(6)
-            .uint(2)
+            .uint(spoken_version())
             .bytes(&self.room)
             .uint(self.epoch)
             .uint(0)
@@ -392,8 +414,21 @@ impl Preamble {
         bound(bytes, MAX_PREAMBLE)?;
         let mut d = Decoder::new(bytes);
         arity(&mut d, 6)?;
-        if d.uint()? != 2 {
-            return Err(invalid("history preamble version"));
+        let version = d.uint()?;
+        // `test-knobs` mutant `VOX_TEST_FWD_MUTANT=preamble-any`: a preamble of another version
+        // is taken, so a mixed room exchanges (R10 off). Never selectable without the feature.
+        #[cfg(feature = "test-knobs")]
+        let other_taken = version != spoken_version()
+            && std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("preamble-any");
+        #[cfg(not(feature = "test-knobs"))]
+        let other_taken = false;
+        if other_taken {
+            eprintln!("test-knobs: preamble-any mutant engaged: took a version-{version} preamble");
+        } else if version != spoken_version() {
+            return Err(invalid(
+                "history preamble version: the other computer runs another Vox version; this \
+                 computer exchanges no history or keys with it until both run the same version",
+            ));
         }
         let room = digest(&mut d)?;
         let epoch = d.uint()?;
@@ -414,6 +449,18 @@ impl Preamble {
             purpose,
             request,
         })
+    }
+
+    /// The room a preamble of another Vox version names, so its refusal is said on that
+    /// member's sync row (R10, R11); `None` for a preamble of this node's version or bytes that
+    /// are not a preamble. The room is the sender's claim: the caller checks it.
+    pub(crate) fn other_version(bytes: &[u8]) -> Option<Digest32> {
+        let mut d = Decoder::new(bytes);
+        arity(&mut d, 6).ok()?;
+        if d.uint().ok()? == spoken_version() {
+            return None;
+        }
+        digest(&mut d).ok()
     }
 }
 
@@ -1106,22 +1153,8 @@ pub(crate) struct KeyBodyNeed {
     pub(crate) hash: Digest32,
 }
 
-/// One retained original sender release this holder can hand back to its author (ADR-054
-/// adoption step 5, OwnRelease): which author, key epoch and chain, and the earliest iteration
-/// it can open from. Never the key. Told ONLY to that author, as the Have's own section
-/// (`Frame::Releases`, `pull::tell`); the author asks it with the sealed one-shot request
-/// (`actor/own_keys.rs`) only while its native readability check lacks that key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReleaseHave {
-    pub(crate) author: Digest32,
-    pub(crate) epoch: u64,
-    pub(crate) chain: u64,
-    pub(crate) earliest: u64,
-}
-
-/// Entries in one `Frame::Releases`; a longer section goes as several frames.
-pub(crate) const MAX_RELEASES_PER_FRAME: usize = 256;
-const RELEASE_WIRE_BOUND: usize = 72;
+/// Entries a reserved tag-0x0D frame may carry: it is still decoded, then discarded.
+const MAX_RELEASES_PER_FRAME: usize = 256;
 
 pub enum Proof {
     Inclusion(InclusionProof),
@@ -1172,9 +1205,9 @@ pub enum Frame<'a> {
     /// A Have (`AuthorHave` per author), or, inside a Range answer, the holder's corrected
     /// Have of the asked author.
     Holding(Vec<AuthorHave>),
-    /// The Have's own-release section (`ReleaseHave`), told only to that author; each entry
-    /// replaces the one of its (epoch, chain) told before. Tag 0x0D.
-    Releases(Vec<ReleaseHave>),
+    /// Tag 0x0D: reserved. A receiver decodes it and discards it with no effect
+    /// (`server::answer`); this node never sends it.
+    Releases,
     /// A Have that also carries the holder's private Session tip, `(donor incarnation,
     /// through)`: told only to a peer currently eligible for the room's private Sessions
     /// (Drive), never to any other peer, and never inside an answer. An observation, not a
@@ -1252,12 +1285,7 @@ impl<'a> Frame<'a> {
                 .checked_add(16)
                 .filter(|bound| *bound <= MAX_FRAME_BYTES)
                 .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
-            Self::Releases(releases) => {
-                if releases.len() > MAX_RELEASES_PER_FRAME {
-                    return Err(invalid("history releases"));
-                }
-                16 + RELEASE_WIRE_BOUND * releases.len()
-            }
+            Self::Releases => return Err(invalid("history releases")),
             Self::PrivateHolding(authors, _) => authors
                 .iter()
                 .map(AuthorHave::wire_bound)
@@ -1412,20 +1440,7 @@ impl<'a> Frame<'a> {
                 }
                 0x0C
             }
-            Self::Releases(releases) => {
-                if releases.len() > MAX_RELEASES_PER_FRAME {
-                    return Err(invalid("history releases"));
-                }
-                e.array(releases.len());
-                for release in releases {
-                    e.array(4)
-                        .bytes(&release.author)
-                        .uint(release.epoch)
-                        .uint(release.chain)
-                        .uint(release.earliest);
-                }
-                0x0D
-            }
+            Self::Releases => return Err(invalid("history releases")),
             Self::PrivateHolding(authors, tip) => {
                 if authors.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -1596,17 +1611,14 @@ impl<'a> Frame<'a> {
                 if count > MAX_RELEASES_PER_FRAME {
                     return Err(invalid("history releases"));
                 }
-                let mut releases = Vec::with_capacity(count);
                 for _ in 0..count {
                     arity(&mut d, 4)?;
-                    releases.push(ReleaseHave {
-                        author: digest(&mut d)?,
-                        epoch: d.uint()?,
-                        chain: d.uint()?,
-                        earliest: d.uint()?,
-                    });
+                    digest(&mut d)?;
+                    d.uint()?;
+                    d.uint()?;
+                    d.uint()?;
                 }
-                Self::Releases(releases)
+                Self::Releases
             }
             0x0E => {
                 arity(&mut d, 3)?;

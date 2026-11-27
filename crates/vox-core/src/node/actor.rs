@@ -62,7 +62,6 @@ mod local_trust;
 mod maintenance_save;
 mod metadata_save;
 mod own_attempts;
-pub(crate) mod own_keys;
 mod package_save;
 mod peer_book_save;
 mod policy_save;
@@ -116,19 +115,6 @@ struct Initiated {
     hello_delivered: bool,
     /// Exact selected one-time opening ownership until it is named or discarded.
     reservation: Option<Arc<prekeys::OneTimeReservation>>,
-}
-
-/// Exact registration and ratchet state before an older-peer frame is sealed but not published.
-/// Restoring this value makes a rejected attempt observationally absent, including its session
-/// serial and hello ownership, so retries cannot accumulate an untransmitted `MAX_SKIP` gap.
-struct LegacySessionRollback {
-    pair: (Digest32, Digest32),
-    session: Option<crate::pairwise::session::Session>,
-    initiated: Option<Initiated>,
-    accepted: Option<Digest32>,
-    reopened: bool,
-    serial: Option<u64>,
-    last_serial: u64,
 }
 
 /// **Which of two competing sessions for one pair both ends keep** (ADR-004 O2): the
@@ -857,7 +843,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyComputerCancelled { .. } => "retiring Computer policy",
         NetEvent::OwnKeyPolicyReady { .. } | NetEvent::OwnKeyPolicyFailed { .. } => {
-            "resuming own-key recovery after Computer policy"
+            "resuming own-history recovery after Computer policy"
         }
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
@@ -934,8 +920,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         #[cfg(feature = "test-knobs")]
         NetEvent::HeldRoomPause { .. } => "resuming a held room pause",
-        #[cfg(feature = "test-knobs")]
-        NetEvent::HeldRekey { .. } => "resuming a held sender-key batch",
         NetEvent::ComputerPolicy { .. } => "applying computer trust",
         NetEvent::ConstructorPolicyFailed { .. } => "retiring a failed constructor policy",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1308,12 +1292,6 @@ enum NetEvent {
         authority: computer::ComputerAuthority,
         publication_guard: std::fs::File,
         reply: oneshot::Sender<Result<vox_agentcomms::drive::PauseSelection, Fault>>,
-    },
-    #[cfg(feature = "test-knobs")]
-    HeldRekey {
-        target: Box<consent_release::HeldRekeyTarget>,
-        authority: Option<computer::ComputerAuthority>,
-        owns_reader: bool,
     },
     /// A private Session page a connection's loop fetched, for the native private admission.
     PrivateLoopPage(Box<crate::node::history_stream::private::PrivatePage>),
@@ -2004,16 +1982,6 @@ enum NetEvent {
 impl NetEvent {
     /// Only snapshot/transport work may pass an admitted save's store writer.
     fn waits_for_store(&self) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if matches!(
-            self,
-            Self::HeldRekey {
-                owns_reader: true,
-                ..
-            }
-        ) {
-            return false;
-        }
         !matches!(
             self,
             Self::Names(_)
@@ -2152,6 +2120,36 @@ fn spawn_stream_loop(
         net.forget_observed(&peer);
         let _ = tx.send(NetEvent::ConnectionClosed { peer, serial }).await;
     })
+}
+
+/// A member's computer opened a history stream with another Vox version's preamble (R10): its
+/// sync row here says so while it stands (R11). The room is the peer's unverified claim, so a
+/// row is written only for a room this node serves and a peer that is a member there whose
+/// removal is not applied (the check ordinary serving makes, `answer_off_actor`).
+async fn other_version_refused(net: &NodeNet, room: Digest32, peer: Digest32) {
+    let Some(serving) = net.serving().cloned() else {
+        return;
+    };
+    let Some(served) = serving.room(&room) else {
+        return;
+    };
+    let (Some(snapshot), Some(store)) = (
+        served.snapshot.upgrade().and_then(|cell| cell.current()),
+        served.store.upgrade(),
+    ) else {
+        return;
+    };
+    if !snapshot.is_member(&peer) {
+        return;
+    }
+    let removed =
+        tokio::task::spawn_blocking(move || snapshot.peer_removal_applied(&store, &peer)).await;
+    if matches!(removed, Ok(Ok(false))) {
+        crate::node::status::SyncBook::with(&serving.book, room, peer, |counts| {
+            counts.failed += 1;
+            counts.note_failure(crate::node::history_stream::OTHER_VERSION.to_owned());
+        });
+    }
 }
 
 /// **A member's bounded history request is accepted and answered on its connection's own task**,
@@ -2519,18 +2517,32 @@ async fn serve_typed(
             let net = Arc::clone(net);
             tokio::spawn(async move {
                 let mut recv = recv;
-                let Ok(preamble) = crate::node::syncstream::read_request_preamble(&mut recv).await
-                else {
-                    return;
-                };
-                let Some(preamble) = preamble else {
-                    let mut send = send;
-                    crate::node::net::refuse_stream_because(
-                        &mut send,
-                        &mut recv,
-                        crate::wire::WireError::SyncModeUnsupported,
-                    );
-                    return;
+                let preamble = match crate::node::syncstream::read_request_preamble(&mut recv).await
+                {
+                    Ok(crate::node::syncstream::Opening::Request(preamble)) => preamble,
+                    Ok(crate::node::syncstream::Opening::Legacy) => {
+                        let mut send = send;
+                        crate::node::net::refuse_stream_because(
+                            &mut send,
+                            &mut recv,
+                            crate::wire::WireError::SyncModeUnsupported,
+                        );
+                        return;
+                    }
+                    // R10: refused with the version code, so a peer that knows it can say why;
+                    // said here on that member's row (R11).
+                    Ok(crate::node::syncstream::Opening::OtherVersion(room)) => {
+                        conn.note_other_version();
+                        other_version_refused(&net, room, peer).await;
+                        let mut send = send;
+                        crate::node::net::refuse_stream_because(
+                            &mut send,
+                            &mut recv,
+                            crate::wire::WireError::ProtocolVersionUnsupported,
+                        );
+                        return;
+                    }
+                    Err(_) => return,
                 };
                 let (channel_id, epoch) = (preamble.room, preamble.epoch);
                 let Some((send, recv)) =
@@ -2898,9 +2910,6 @@ async fn read_pairwise_streams(
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
     let peer = conn.peer_id();
-    // The existing per-connection queue allowance also bounds recovery requests retained
-    // beyond actor dequeue while they wait on a real local admission edge.
-    let recovery_slots = Arc::new(Semaphore::new(PAIRWISE_QUEUE));
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2938,10 +2947,12 @@ async fn read_pairwise_streams(
                 }
             }
         }
-        if matches!(first, PairwiseFrame::RecoveryReply { .. })
-            || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
-                && !conn.supports_own_recovery())
-        {
+        // No own key is asked for or released over the network: a recovery request or reply is
+        // refused before it reaches the actor.
+        if matches!(
+            first,
+            PairwiseFrame::RecoveryReply { .. } | PairwiseFrame::RecoveryOpen { .. }
+        ) {
             let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
             let _ = send.reset(why);
             let _ = recv.stop(why);
@@ -2954,23 +2965,7 @@ async fn read_pairwise_streams(
         } else {
             None
         };
-        let recovery_credit = if matches!(&first, PairwiseFrame::RecoveryOpen { .. }) {
-            match Arc::clone(&recovery_slots).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
-                    let _ = send.reset(why);
-                    let _ = recv.stop(why);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
         let stream = PairwiseIn {
-            recovery_credit,
-            donor_admission: None,
-            inherited_lifetime: None,
             conn: Arc::clone(&conn),
             peer,
             first,
@@ -2986,10 +2981,6 @@ async fn read_pairwise_streams(
 
 /// A pairwise stream whose frames have been read off the actor.
 struct PairwiseIn {
-    recovery_credit: Option<OwnedSemaphorePermit>,
-    donor_admission: Option<PairwiseAdmission>,
-    /// Existing local decision retained across donor admission and its causal retry event.
-    inherited_lifetime: Option<Arc<maintenance_save::Lifetime>>,
     conn: Arc<VoxConnection>,
     /// The authenticated peer.
     peer: Digest32,
@@ -3204,6 +3195,9 @@ pub const TEST_SECRET_WORK_DELAY_ENV: &str = "VOX_TEST_SECRET_WORK_DELAY_MS";
 /// compiled in without the `test-knobs` feature.
 #[cfg(feature = "test-knobs")]
 pub const TEST_REOPEN_FAILS_ENV: &str = "VOX_TEST_REOPEN_FAILS";
+
+/// A read guard of `secret_work` held by work that must end before a lock completes.
+type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
 /// Run `work`, which holds a secret, on a blocking thread, and hold a read guard of `secret_work`
 /// until it is done and its result handed over; `None` if the thread panicked.
@@ -6489,21 +6483,11 @@ fn read_pending_withdrawals(
     Ok(pending)
 }
 
-/// An opened room stays private until one bounded recovery/retention turn completes.
-/// Only its original caller is held; no transcript-sized task or waiter list is retained.
-enum RecoveryWriterGate {
-    Waiting {
-        owner: Arc<()>,
-        fence: Arc<crate::transport::stream_transport::Fence>,
-    },
-    Ready(crate::node::channel::own_writer_gate::Transition),
-}
-
 /// These result cells belong to already-admitted transitions, not another queue.
 /// Producers keep only a weak cell reference, so actor teardown also retires a
 /// handed-off publication/secret lease without waiting for another select turn.
 struct OwnKeyComputerReady {
-    _secret: own_keys::SecretLease,
+    _secret: SecretLease,
     owner: Arc<()>,
     publication: Option<crate::node::computer::ComputerPublicationTransition>,
     binding: crate::error::Result<()>,
@@ -6522,7 +6506,6 @@ struct RoomPreparation {
     reply: Option<oneshot::Sender<Outcome>>,
     reopening: bool,
     recovery: Option<std::sync::Weak<crate::node::channel::RoomLock>>,
-    recovery_writer_gate: Option<RecoveryWriterGate>,
     save: preparation_save::State,
     retry_packages: bool,
     legacy_cleanup_due: Option<std::time::Instant>,
@@ -6719,7 +6702,6 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
-    role_wake: Arc<crate::node::channel::role_owed::BoardWake>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
@@ -7133,8 +7115,6 @@ pub struct Node {
     /// Signed rollback retained before a joining task publishes to a board. It is not sent
     /// during a successful join; failure or startup recovery promotes it before partial purge.
     join_cleanup: BTreeMap<Digest32, PendingWithdrawal>,
-    /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
-    departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: the member's keys not taken. Without it, a pair that could not
     /// converge was sent a key once a tick for as long as both ran: 560 refusals in 3 minutes,
     /// measured.
@@ -7152,12 +7132,6 @@ pub struct Node {
     /// acknowledgement or a completed store-and-forward append. Kept through refusal so a stale
     /// published room view cannot briefly report completion before the fallback updates it.
     key_delivery_settling: BTreeSet<(Digest32, Digest32)>,
-    /// Test-only exact legacy-route marker, emitted only after the changed user view is published.
-    #[cfg(feature = "test-knobs")]
-    fx28_ended_unanswered_marker: Option<(std::path::PathBuf, Vec<u8>)>,
-    /// Test-only exact re-key pair paused after a staged `ENDED_UNANSWERED` selection.
-    #[cfg(feature = "test-knobs")]
-    fx28_rekey_pause: Option<(Digest32, Digest32)>,
     #[cfg(feature = "test-knobs")]
     fx28_post_rekey: BTreeMap<Digest32, post_save::PostProof>,
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
@@ -7169,17 +7143,6 @@ pub struct Node {
     /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
     /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
     key_waiting: BTreeMap<(Digest32, Digest32), String>,
-    /// Per `(room, member)`: a member that ended a key delivery's stream without an answer, as a
-    /// Vox older than v0.4.3 does (ADR-030 W-4), so it is sent this node's keys in the pair's
-    /// long-lived session, as it expects them; and whether a probe is due, a delivery in a session
-    /// of its own once per reconnect, so a member that has updated is seen to have. A member
-    /// leaves only by taking such a delivery.
-    older: BTreeMap<(Digest32, Digest32), bool>,
-    /// Members reconnected while marked [`Self::older`], whose current key is to be owed again so
-    /// the probe goes out.
-    /// Value: last room whose reset attempt actually completed; a paused probe never
-    /// rewinds earlier rooms over newer key acknowledgements.
-    older_probes: BTreeMap<Digest32, Option<Digest32>>,
     /// Per `(room, member)`: since when, connected, its key has waited for a fresh one-time prekey
     /// ([`ONE_TIME_WAIT_MS`]).
     one_time_waits: BTreeMap<(Digest32, Digest32), u64>,
@@ -7559,7 +7522,6 @@ impl Node {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
-            role_wake: Arc::new(crate::node::channel::role_owed::BoardWake::default()),
             bounded_retirement_ledger,
             serving,
             history_holdings,
@@ -7713,7 +7675,6 @@ impl Node {
             status_trusted: BTreeSet::new(),
             reads_after: None,
             winding: BTreeMap::new(),
-            departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
             join_cleanup: BTreeMap::new(),
             governance_work: governance::Maintenance::default(),
@@ -7724,16 +7685,10 @@ impl Node {
             keys_in_flight: BTreeMap::new(),
             key_delivery_settling: BTreeSet::new(),
             #[cfg(feature = "test-knobs")]
-            fx28_ended_unanswered_marker: None,
-            #[cfg(feature = "test-knobs")]
-            fx28_rekey_pause: None,
-            #[cfg(feature = "test-knobs")]
             fx28_post_rekey: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
-            older: BTreeMap::new(),
-            older_probes: BTreeMap::new(),
             one_time_waits: BTreeMap::new(),
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
@@ -8104,7 +8059,6 @@ impl Node {
         // this select cannot spin on a dead branch.
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
-        let role_wake = Arc::clone(&self.role_wake);
         let own_key_completions = Arc::clone(&self.own_key_completions);
         let own_key_transition_wake = Arc::clone(&self.own_key_transition_wake);
         let post_save_wake = Arc::clone(&self.post_save_wake);
@@ -8285,7 +8239,7 @@ impl Node {
                     for (room, (rendered, governance)) in frontier.take_advanced() {
                         self.room_advanced(room, rendered, governance).await;
                         // What the loop admitted while this node's own history is behind wakes
-                        // the native recovery stages again (audit, readability, completion).
+                        // the native recovery stages again (receiver, ranges, completion).
                         if self.own_recovery_rooms.contains_key(&room) {
                             self.governance_work.wake_room(room);
                         }
@@ -8297,10 +8251,6 @@ impl Node {
                     }
                     for receipt in frontier.take_receipts() {
                         self.loop_receipt(receipt).await;
-                    }
-                    // OwnRelease: the loops' asks for the actor's current checks.
-                    for ask in frontier.take_own_release_asks() {
-                        self.grant_own_release(ask);
                     }
                     // Saved private requests their donor's loop completed or could not go on.
                     // Their registrations, published before their debt, are taken first.
@@ -8718,12 +8668,6 @@ impl Node {
                     self.publish_soon();
                     self.schedule().await;
                 }
-                _ = role_wake.notify.notified() => {
-                    for (room, owner) in role_wake.take_board() {
-                        if role_wake.current(room, &owner) { self.own_key_board_growth(room); }
-                    }
-                    self.schedule().await;
-                }
                 _ = bounded_completion_wake.notified() => {
                     // Results were stored before this retained/coalesced edge fired. Audit every
                     // slot: one notification is sufficient for any number of completions, and
@@ -8841,20 +8785,22 @@ impl Node {
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
-                    self.owe_older_probes().await;
                     self.deliver_owed_rekeys().await;
                     // Auto-consent for trusted identities, retried here for the
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
                     self.deliver_owed_consents(None).await;
+                    // R14: a superseded generation's key goes once every post under it is shown
+                    // and a later generation is proved. It goes before drive tending: a room
+                    // busy with another owner is skipped until the next tick, while drive
+                    // tending parks behind it and resumes once the room is free; after it, the
+                    // prune found the room taken on every tick and no key was ever deleted.
+                    self.schedule_superseded_key_prune().await;
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
                     let sessions_changed = self.tend_drive_keys().await;
                     let peers: Vec<_> = self.net.as_ref().map(|n| n.manager().peers()).unwrap_or_default();
                     for peer in peers { self.pull_presentation(peer); }
-                    // R14: a superseded generation's key goes once no full-history grant
-                    // still has to release it.
-                    self.schedule_superseded_key_prune().await;
                     // Paths change on the tick with no event to say so — a retired connection
                     // closed, a circuit this node relayed ended — and a view published only on
                     // events kept showing them: an anchor with no rooms reported a circuit it
@@ -9365,9 +9311,7 @@ impl Node {
         // all belong to other channels. The drop is acceptable, not harmless.
         {
             let tx = self.net_tx.clone();
-            let role_wake = Arc::clone(&self.role_wake);
             net.on_board_growth(Arc::new(move |channel_id: Digest32| {
-                role_wake.board_growth(channel_id);
                 let _ = tx.try_send(NetEvent::BoardGrew { channel_id });
             }));
             // A withdraw changes what the board shows (V030-14): an event, so the view is
@@ -9965,8 +9909,7 @@ impl Node {
         {
             self.start_renew_room_publication(room, waiting).await;
         } else {
-            self.begin_metadata_publication_reject(room, waiting, None)
-                .await;
+            self.begin_metadata_publication_reject(room, waiting).await;
         }
         None
     }
@@ -12061,7 +12004,7 @@ impl Node {
                 {
                     self.own_key_policy_waiting.remove(&room);
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
-                        note: format!("own-key recovery stopped: {error}"),
+                        note: format!("own-history recovery stopped: {error}"),
                     });
                 }
             }
@@ -12506,7 +12449,6 @@ impl Node {
                 for (room, token) in self.session_release_tokens_for_peer(peer) {
                     self.wake_session_release(room, peer, Some(token)).await;
                 }
-                self.probe_older(peer);
                 if let Some(conn) = conn {
                     let rooms: Vec<_> = self
                         .prekey_publish_owed
@@ -12586,25 +12528,6 @@ impl Node {
                     let refused_as =
                         |r: KeyRefusal| why == KeyRefusal::describe(r.code().into_inner());
                     let delivery = (channel_id, peer, chain_id);
-                    // **A member that runs an older Vox** (ADR-030 W-4) is sent this node's keys in
-                    // the pair's long-lived session from now, as it expects them, and that is said
-                    // beside it. Its kept deliveries in sessions of their own are no use to it.
-                    if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
-                        #[cfg(feature = "test-knobs")]
-                        if !crate::node::computer::fx28_mutant(
-                            "legacy-ended-unanswered-not-selected",
-                        ) {
-                            self.older.insert((channel_id, peer), false);
-                        }
-                        #[cfg(not(feature = "test-knobs"))]
-                        self.older.insert((channel_id, peer), false);
-                        self.deliveries
-                            .retain(|(room, member, _), _| *room != channel_id || *member != peer);
-                        self.delivery_reserved
-                            .retain(|(room, member, _), _| *room != channel_id || *member != peer);
-                        #[cfg(feature = "test-knobs")]
-                        self.mark_ended_unanswered_for_proof(channel_id, peer);
-                    }
                     if session.is_none()
                         && self
                             .deliveries
@@ -12721,17 +12644,9 @@ impl Node {
                 // and adopting it resends at once (`accept_hello`). Should that offer be lost
                 // with its connection, the retry here is what brings the next one: it stays at
                 // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
-                // Refused by a member that runs an older Vox: sent again at once, in the session it
-                // expects (ADR-030 W-4), not after a backoff.
-                if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
-                    self.key_backoff.remove(&(channel_id, peer));
-                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
-                        channel_id,
-                        peer,
-                        why,
-                    });
-                    return;
-                }
+                // Ended unanswered: the member runs a Vox that cannot take this key. It is not
+                // sent in the pair's long-lived session (refused since v0.4.31): it stays owed,
+                // and backs off as any refusal until the member updates.
                 let now = self.now_ms().get();
                 // A key delivery's opening refused is not a hello race: it backs off as any refusal.
                 let hello_refused = session.is_some()
@@ -13043,12 +12958,6 @@ impl Node {
                 {
                     self.deliveries.remove(&delivery);
                 }
-                // Taken in a session of its own: the member runs v0.4.3 or later, whatever it ran
-                // before (ADR-030 W-4). Taken in the long-lived session, it is still the older Vox
-                // it was, and that stays said.
-                if session.is_none() {
-                    self.older.remove(&(channel_id, peer));
-                }
                 self.key_waiting.remove(&(channel_id, peer));
                 // Taken under the session still held: the peer holds its hello (V210-89).
                 if session.is_some()
@@ -13068,7 +12977,6 @@ impl Node {
                     channel_id,
                     peer,
                     chain_id,
-                    history,
                     removal_generation,
                     whole_history,
                 )
@@ -13437,12 +13345,6 @@ impl Node {
                     .await;
                 drop(publication_guard);
                 let _ = reply.send(result);
-            }
-            #[cfg(feature = "test-knobs")]
-            NetEvent::HeldRekey {
-                target, authority, ..
-            } => {
-                self.resume_held_rekey(*target, authority).await;
             }
             NetEvent::ComputerPolicy {
                 guard,
@@ -14375,7 +14277,6 @@ impl Node {
         // A new connection syncs at once, then on the interval (ADR-016; ADR-025 D2, D5).
         self.connected.insert(peer);
         self.discover_peers.insert(peer);
-        self.probe_older(peer);
     }
 
     /// Answer a punch session a coordinator relayed here (ADR-012 rung 3), on its own
@@ -15767,90 +15668,9 @@ impl Node {
         Ok(bundle)
     }
 
-    fn snapshot_legacy_session(
-        &self,
-        pair: (Digest32, Digest32),
-        legacy: bool,
-    ) -> Option<LegacySessionRollback> {
-        legacy.then(|| LegacySessionRollback {
-            pair,
-            session: self
-                .sessions
-                .get(&pair)
-                .map(crate::pairwise::session::Session::snapshot_for_unpublished_rollback),
-            initiated: self.initiated.get(&pair).cloned(),
-            accepted: self.accepted_hello.get(&pair).copied(),
-            reopened: self.reopen.contains(&pair),
-            serial: self.session_serial.get(&pair).copied(),
-            last_serial: self.last_session_serial,
-        })
-    }
-
-    fn restore_legacy_session(&mut self, rollback: Option<LegacySessionRollback>) {
-        let Some(rollback) = rollback else { return };
-        let pair = rollback.pair;
-        match rollback.session {
-            Some(session) => {
-                self.sessions.insert(pair, session);
-            }
-            None => {
-                self.sessions.remove(&pair);
-            }
-        }
-        match rollback.initiated {
-            Some(initiated) => {
-                self.initiated.insert(pair, initiated);
-            }
-            None => {
-                self.initiated.remove(&pair);
-            }
-        }
-        match rollback.accepted {
-            Some(accepted) => {
-                self.accepted_hello.insert(pair, accepted);
-            }
-            None => {
-                self.accepted_hello.remove(&pair);
-            }
-        }
-        if rollback.reopened {
-            self.reopen.insert(pair);
-        } else {
-            self.reopen.remove(&pair);
-        }
-        match rollback.serial {
-            Some(serial) => {
-                self.session_serial.insert(pair, serial);
-            }
-            None => {
-                self.session_serial.remove(&pair);
-            }
-        }
-        self.last_session_serial = rollback.last_serial;
-    }
-
-    /// What is said of `member` in `room` about this node's key, after its name (ADR-030 D-5,
-    /// W-4): that it runs an older Vox while it is marked [`Self::older`], whatever else is under
-    /// way, so the line leaves only with the mark; else why a key for it waits, if one does.
+    /// Why this node's key for `member` in `room` waits, if it does (ADR-030 D-5).
     fn said_of(&self, room: &Digest32, member: &Digest32) -> Option<String> {
-        if self.older.contains_key(&(*room, *member)) {
-            return Some(crate::node::pairwise_stream::RUNS_OLDER.to_owned());
-        }
         self.key_waiting.get(&(*room, *member)).cloned()
-    }
-
-    /// `peer` connected: each room it is marked [`Self::older`] in owes it a probe (ADR-030 W-4).
-    fn probe_older(&mut self, peer: Digest32) {
-        let mut any = false;
-        for ((_, member), probe) in &mut self.older {
-            if *member == peer {
-                *probe = true;
-                any = true;
-            }
-        }
-        if any {
-            self.older_probes.entry(peer).or_insert(None);
-        }
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
@@ -16079,12 +15899,6 @@ impl Node {
                 attempt.retire();
             }
             self.retire_departed_port(room, peer);
-        }
-        // A changed trust set may make another donor grantable (`grant_own_release`) or end
-        // one: the recovering rooms' audits name their own-key debts to the loops again.
-        let recovering: Vec<Digest32> = self.own_recovery_rooms.keys().copied().collect();
-        for room in recovering {
-            self.governance_work.wake_room(room);
         }
     }
 
@@ -17689,14 +17503,30 @@ impl Node {
         Some(admitted)
     }
 
+    /// Whether `conn` completed a version-3 history preamble exchange for `room` at the room's
+    /// current epoch (R10): the only connection a room key is written to or taken from. A key
+    /// that cannot go stays owed.
+    fn key_connection(&self, room: &Digest32, conn: &VoxConnection) -> Option<u64> {
+        let epoch = self
+            .serving
+            .room(room)
+            .and_then(|served| served.snapshot.upgrade())
+            .and_then(|cell| cell.current())?
+            .epoch();
+        self.history_holdings
+            .exchanged_at(*room, conn.peer_id(), conn.serial(), epoch)
+            .then_some(epoch)
+    }
+
     fn reserve_key_deliveries(
         &mut self,
         room: &Digest32,
         peer: Digest32,
+        conn: &VoxConnection,
         keys: &[crate::group::skdm::Skdm],
-        modern: bool,
         history: bool,
     ) -> Option<Vec<PairwiseAdmission>> {
+        let epoch = self.key_connection(room, conn)?;
         let profile = self.profile.as_ref()?;
         let channel = self.channels.get(room)?.try_lock().ok()?;
         if channel
@@ -17704,10 +17534,15 @@ impl Node {
             .ok()?
             || channel.is_member_removed(profile.store(), &peer).ok()?
             || channel.room_removal_rotation_needed(profile.store()).ok()?
+            || channel.key_departed(&peer)
+            // A member that came back takes room keys only by return-bound package (R4).
+            || channel.key_returned(&peer)
         {
             return None;
         }
         let generation = channel.removal_generation(profile.store()).ok()?;
+        let departure =
+            crate::node::channel::governance::departure(profile.store(), room, &peer).ok()?;
         let fence = Arc::new(crate::node::pairwise_stream::RoomSendFence {
             resource: channel.history_read_resource()?,
             signer: Arc::downgrade(&profile.signer_arc().ok()?),
@@ -17715,6 +17550,9 @@ impl Node {
             store: profile.store_handle(),
             room: *room,
             generation,
+            epoch,
+            holdings: Arc::clone(&self.history_holdings),
+            target: (peer, departure),
         });
         drop(channel);
         let fresh: Vec<bool> = keys
@@ -17744,9 +17582,7 @@ impl Node {
                         self.delivery_reserved.insert(id, old.reservation);
                     }
                 }
-                modern
-                    && !self.deliveries.contains_key(&id)
-                    && !self.delivery_reserved.contains_key(&id)
+                !self.deliveries.contains_key(&id) && !self.delivery_reserved.contains_key(&id)
             })
             .collect();
         let mut admitted = self.reserve_pairwise(peer, &fresh);
@@ -18387,10 +18223,6 @@ impl Node {
         }
         self.opening_rooms.clear();
         for (_, prepared) in std::mem::take(&mut self.preparing_rooms) {
-            if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate
-            {
-                fence.retire();
-            }
             Self::retire_prepared_channel(prepared.channel);
             if let Some(reply) = prepared.reply {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
@@ -18452,8 +18284,6 @@ impl Node {
         self.deliveries.clear();
         self.delivery_reserved.clear();
         self.key_waiting.clear();
-        self.older.clear();
-        self.older_probes.clear();
         self.one_time_waits.clear();
         self.signed_said.clear();
         self.packages_posted.clear();
@@ -19003,7 +18833,6 @@ impl Node {
                 reply,
                 reopening,
                 recovery: None,
-                recovery_writer_gate: None,
                 save: preparation_save::State::default(),
                 retry_packages: false,
             },
@@ -19045,9 +18874,6 @@ impl Node {
         let Some(prepared) = self.preparing_rooms.remove(id) else {
             return opening || publishing;
         };
-        if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate {
-            fence.retire();
-        }
         Self::retire_prepared_channel(prepared.channel);
         if let Some(reply) = prepared.reply {
             let _ = reply.send(Outcome::Failed(fault));
@@ -19137,12 +18963,6 @@ impl Node {
             let waited_before = prepared.waiting.clone();
             match self.retention_before_publication(&mut prepared).await {
                 Ok(false) => {
-                    if matches!(
-                        prepared.recovery_writer_gate,
-                        Some(RecoveryWriterGate::Ready(_))
-                    ) {
-                        prepared.recovery_writer_gate = None;
-                    }
                     if prepared.legacy_cleanup_due.is_none() {
                         prepared.legacy_cleanup_due = Some(
                             std::time::Instant::now()
@@ -19178,12 +18998,6 @@ impl Node {
                     if ChannelState::governance_refreshing(&error)
                         || ChannelState::legacy_classification_refreshing(&error) =>
                 {
-                    if matches!(
-                        prepared.recovery_writer_gate,
-                        Some(RecoveryWriterGate::Ready(_))
-                    ) {
-                        prepared.recovery_writer_gate = None;
-                    }
                     // Current policy and classification are prerequisites for private
                     // retention/publication. Pending replay keeps this room unpublished.
                     prepared.wait_on("its governance records to refresh", self.now_ms().get());
@@ -19204,69 +19018,11 @@ impl Node {
                 }
                 Ok(true) => {
                     if prepared.recovery.is_some() {
-                        let transition = match prepared.recovery_writer_gate.take() {
-                            Some(RecoveryWriterGate::Ready(transition)) => transition,
-                            Some(waiting @ RecoveryWriterGate::Waiting { .. }) => {
-                                prepared.recovery_writer_gate = Some(waiting);
-                                self.preparing_rooms.insert(id, prepared);
-                                return;
-                            }
-                            None => {
-                                let Some(old) =
-                                    prepared.recovery.as_ref().and_then(|old| old.upgrade())
-                                else {
-                                    self.preparing_rooms.insert(id, prepared);
-                                    return;
-                                };
-                                let owner = Arc::new(());
-                                let fence = crate::transport::stream_transport::Fence::new();
-                                prepared.recovery_writer_gate = Some(RecoveryWriterGate::Waiting {
-                                    owner: Arc::clone(&owner),
-                                    fence: Arc::clone(&fence),
-                                });
-                                self.preparing_rooms.insert(id, prepared);
-                                let completions = Arc::clone(&self.own_key_completions);
-                                let lifecycle_epoch = completions.lifecycle_epoch();
-                                let mut room_cancel = self.own_key_room_watch(id);
-                                let mut epoch_changed = self.pairwise_epoch.subscribe();
-                                tokio::spawn(async move {
-                                    let gate = tokio::select! {
-                                        biased;
-                                        () = fence.retired() => None,
-                                        _ = room_cancel.changed() => None,
-                                        _ = epoch_changed.changed() => None,
-                                        channel = old.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                                    };
-                                    let transition = if let Some(gate) = gate {
-                                        tokio::select! {
-                                            biased;
-                                            () = fence.retired() => None,
-                                            _ = room_cancel.changed() => None,
-                                            _ = epoch_changed.changed() => None,
-                                            transition = gate.transition(None) => Some(transition),
-                                        }
-                                    } else {
-                                        None
-                                    };
-                                    completions.complete_lifecycle(
-                                        lifecycle_epoch,
-                                        leave_save::Ready::Recovery {
-                                            room: id,
-                                            owner,
-                                            transition,
-                                        },
-                                    );
-                                });
-                                return;
-                            }
-                        };
                         let channel =
                             match crate::node::channel::RoomLock::try_unwrap(prepared.channel) {
                                 Ok(channel) => channel,
                                 Err(channel) => {
                                     prepared.channel = channel;
-                                    prepared.recovery_writer_gate =
-                                        Some(RecoveryWriterGate::Ready(transition));
                                     self.preparing_rooms.insert(id, prepared);
                                     return;
                                 }
@@ -19274,7 +19030,6 @@ impl Node {
                         self.begin_metadata_recovered_open(
                             id,
                             channel,
-                            Some(transition),
                             prepared.save.take_lifetime(),
                             prepared.reply.take(),
                             prepared.reopening,
@@ -19293,7 +19048,6 @@ impl Node {
                             };
                         self.begin_publish_open_channel(
                             channel,
-                            None,
                             prepared.save.take_lifetime(),
                             metadata_save::OpenCallback {
                                 reply: prepared.reply.take(),
@@ -19351,7 +19105,6 @@ impl Node {
     async fn begin_publish_open_channel(
         &mut self,
         mut ch: ChannelState,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         callback: metadata_save::OpenCallback,
     ) {
@@ -19379,7 +19132,6 @@ impl Node {
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         let install = || {
-            self.role_wake.install(channel_id, &ch.role_owed());
             if let Some(net) = self.net.as_ref() {
                 net.forget_board_exchange_room(&channel_id);
             }
@@ -19398,7 +19150,6 @@ impl Node {
             .await;
             return;
         }
-        drop(transition);
         // Retire request/response owners from any replaced room instance before processing
         // further actor events. Existing physical blocking workers still join on their own task.
         self.cancel_own_key_room(channel_id);
@@ -19684,21 +19435,20 @@ impl Node {
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
-        transition: crate::node::channel::own_writer_gate::Transition,
         mut purpose: LeftPurgePurpose,
-        secret: own_keys::SecretLease,
+        secret: SecretLease,
     ) {
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         let completions = Arc::clone(&self.own_key_completions);
         let lifecycle_epoch = completions.lifecycle_epoch();
         tokio::spawn(async move {
-            let transition = tokio::select! {
+            let admitted = tokio::select! {
                 biased;
-                _ = purpose.caller_closed() => None,
-                _ = room_cancel.changed() => None,
-                _ = epoch_changed.changed() => None,
-                channel = instance.lock() => { drop(channel); Some(transition) },
+                _ = purpose.caller_closed() => false,
+                _ = room_cancel.changed() => false,
+                _ = epoch_changed.changed() => false,
+                _ = instance.lock() => true,
             };
             completions.complete_lifecycle(
                 lifecycle_epoch,
@@ -19707,7 +19457,7 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     purpose,
                     retired: None,
                     admission_fault: None,
@@ -19808,28 +19558,17 @@ impl Node {
                     }
                 }
             }
-            let gate = if retired.succeeded() && admission_fault.is_none() {
-                tokio::select! {
+            // The room is taken once its current holder lets go, unless the caller, the room or
+            // the attachment went away first.
+            let admitted = retired.succeeded()
+                && admission_fault.is_none()
+                && tokio::select! {
                     biased;
-                    _ = purpose.caller_closed() => None,
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                }
-            } else {
-                None
-            };
-            let transition = if let Some(gate) = gate {
-                tokio::select! {
-                    biased;
-                    _ = purpose.caller_closed() => None,
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    transition = gate.transition(None) => Some(transition),
-                }
-            } else {
-                None
-            };
+                    _ = purpose.caller_closed() => false,
+                    _ = room_cancel.changed() => false,
+                    _ = epoch_changed.changed() => false,
+                    _ = instance.lock() => true,
+                };
             completions.complete_lifecycle(
                 lifecycle_epoch,
                 leave_save::Ready::LeftPurge {
@@ -19837,7 +19576,7 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     purpose,
                     retired: Some(retired),
                     admission_fault,
@@ -19851,19 +19590,18 @@ impl Node {
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
-        transition: crate::node::channel::own_writer_gate::Transition,
-        secret: own_keys::SecretLease,
+        secret: SecretLease,
     ) {
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         let completions = Arc::clone(&self.own_key_completions);
         let lifecycle_epoch = completions.lifecycle_epoch();
         tokio::spawn(async move {
-            let transition = tokio::select! {
+            let admitted = tokio::select! {
                 biased;
-                _ = room_cancel.changed() => None,
-                _ = epoch_changed.changed() => None,
-                channel = instance.lock() => { drop(channel); Some(transition) },
+                _ = room_cancel.changed() => false,
+                _ = epoch_changed.changed() => false,
+                _ = instance.lock() => true,
             };
             completions.complete_lifecycle(
                 lifecycle_epoch,
@@ -19872,7 +19610,7 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     retired: None,
                 },
             );
@@ -19902,26 +19640,13 @@ impl Node {
         let lifecycle_epoch = completions.lifecycle_epoch();
         tokio::spawn(async move {
             let retired = retirement.run().await;
-            let gate = if retired.succeeded() {
-                tokio::select! {
+            let admitted = retired.succeeded()
+                && tokio::select! {
                     biased;
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                }
-            } else {
-                None
-            };
-            let transition = if let Some(gate) = gate {
-                tokio::select! {
-                    biased;
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    transition = gate.transition(None) => Some(transition),
-                }
-            } else {
-                None
-            };
+                    _ = room_cancel.changed() => false,
+                    _ = epoch_changed.changed() => false,
+                    _ = instance.lock() => true,
+                };
             completions.complete_lifecycle(
                 lifecycle_epoch,
                 leave_save::Ready::EndedPurge {
@@ -19929,14 +19654,14 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     retired: Some(retired),
                 },
             );
         });
     }
 
-    /// Retire physical own-key sends off actor before the close can take effect.
+    /// Retire the room's bounded network work off actor before the close can take effect.
     async fn begin_own_key_close(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
         let instance = self.channels.get(&room).cloned();
         if self.own_key_leave_pending.contains_key(&room) {
@@ -19960,32 +19685,17 @@ impl Node {
         let lifecycle_epoch = completions.lifecycle_epoch();
         tokio::spawn(async move {
             let retired = retirement.run().await;
-            let gate = if retired.succeeded() {
-                if let Some(instance) = instance.as_ref() {
-                    tokio::select! {
+            let admitted = retired.succeeded()
+                && match instance.as_ref() {
+                    Some(instance) => tokio::select! {
                         biased;
-                        _ = reply.closed() => None,
-                        _ = room_cancel.changed() => None,
-                        _ = epoch_changed.changed() => None,
-                        channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let transition = if let Some(gate) = gate {
-                tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    transition = gate.transition(None) => Some(transition),
-                }
-            } else {
-                None
-            };
+                        _ = reply.closed() => false,
+                        _ = room_cancel.changed() => false,
+                        _ = epoch_changed.changed() => false,
+                        _ = instance.lock() => true,
+                    },
+                    None => false,
+                };
             completions.complete_lifecycle(
                 lifecycle_epoch,
                 leave_save::Ready::Close {
@@ -19993,7 +19703,7 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     retired: Some(retired),
                     reply,
                 },
@@ -20001,10 +19711,10 @@ impl Node {
         });
     }
 
-    /// Retire physical own-key sends off actor before the leave can commit.
+    /// Retire the room's bounded network work off actor before the leave can commit.
     async fn begin_own_key_leave(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
         let Some(instance) = self.channels.get(&room).cloned() else {
-            self.begin_leave(room, reply, None, None, None).await;
+            self.begin_leave(room, reply, None, None).await;
             return;
         };
         if instance.lock().await.ended(self.now_ms().get()).is_some() {
@@ -20064,8 +19774,8 @@ impl Node {
         let lifecycle_epoch = completions.lifecycle_epoch();
         tokio::spawn(async move {
             let retired = retirement.run().await;
-            // Actual bounded retirement precedes publication and the own-writer fence. Nothing
-            // here holds an actor/room guard or acquires a reader while owning that gate.
+            // Actual bounded retirement precedes publication. Nothing here holds an actor/room
+            // guard while it waits.
             let lifetime = if let Some(error) = retired.failure() {
                 Err(fault_of(error))
             } else {
@@ -20087,29 +19797,14 @@ impl Node {
                     })
                 })
             };
-            let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = if lifetime.is_ok()
-            {
-                tokio::select! {
+            let admitted = lifetime.is_ok()
+                && tokio::select! {
                     biased;
-                    _ = reply.closed() => None,
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                }
-            } else {
-                None
-            };
-            let transition = if let Some(gate) = gate {
-                tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    _ = room_cancel.changed() => None,
-                    _ = epoch_changed.changed() => None,
-                    transition = gate.transition(None) => Some(transition),
-                }
-            } else {
-                None
-            };
+                    _ = reply.closed() => false,
+                    _ = room_cancel.changed() => false,
+                    _ = epoch_changed.changed() => false,
+                    _ = instance.lock() => true,
+                };
             completions.complete_lifecycle(
                 lifecycle_epoch,
                 leave_save::Ready::Leave {
@@ -20117,7 +19812,7 @@ impl Node {
                     room,
                     instance,
                     owner,
-                    transition,
+                    admitted,
                     lifetime,
                     retired: Some(retired),
                     reply,
@@ -20643,17 +20338,10 @@ impl Node {
                 .into_iter()
                 .filter(|a| *a != me && ch.has_left(a))
                 .collect();
-            // A member that left and came back joined from scratch and holds none of this
-            // identity's keys: they are delivered to it again.
-            let seen = self.departed_seen.entry(cid).or_default();
-            let back: Vec<Digest32> = seen
+            // A member that comes back is applied as a readmission by the governance fold that
+            // learns its return (a return cut and the room's rotation): nothing is reset here.
+            let departures: Vec<(Digest32, Option<u64>)> = departed
                 .iter()
-                .filter(|d| !departed.contains(d))
-                .copied()
-                .collect();
-            let newly: Vec<(Digest32, Option<u64>)> = departed
-                .iter()
-                .filter(|d| !seen.contains(*d))
                 .map(|d| (*d, ch.last_departure_ms(d)))
                 .collect();
             // Durable refusals are scoped by the source and author's signed membership
@@ -20662,8 +20350,6 @@ impl Node {
             // historical departures for new ones and erase otherwise-current decisions, and
             // lifecycle tending never scans a room-wide refusal table.
             let ended_here = ch.ended(now_ms).is_some();
-            // Returning peers stay in this same book until the actual native reset terminal.
-            seen.extend(departed.iter().copied());
             let over = ch.ended(now_ms).is_some();
             // The creator endorses a valid End it observes, including a delegated End,
             // using the same durable room withdrawal used for idle expiry.
@@ -20673,9 +20359,6 @@ impl Node {
             let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
             drop(ch);
-            if !back.is_empty() {
-                self.begin_owned_rejoin_reset(cid, None).await;
-            }
             for d in &departed {
                 self.deliveries
                     .retain(|(room, peer, _), _| *room != cid || peer != d);
@@ -20686,9 +20369,10 @@ impl Node {
             }
             // This node's own board no longer offers what the room's log says is gone (V030-14):
             // a member that left, or the whole room once it ended. A joiner reading it, or an
-            // anchor this node mirrors to, would otherwise be handed them.
+            // anchor this node mirrors to, would otherwise be handed them. The withdrawal is
+            // idempotent, so it is applied on every tend.
             if let Some(net) = self.net.as_ref() {
-                for (d, departure_ms) in &newly {
+                for (d, departure_ms) in &departures {
                     if let Some(departure_ms) = departure_ms {
                         // Reopening an old leave must not supersede a newer admission.
                         net.forget_member_on_board(&cid, d, *departure_ms);
@@ -22471,6 +22155,24 @@ impl Node {
             })
     }
 
+    /// Whether a room other than `except` holds `name`, by a reservation or as last published:
+    /// a search that leaves `except` out, so its own reservation hides no other holder.
+    fn name_held_by_other(&self, name: &str, except: &Digest32) -> bool {
+        self.join_name_reservations
+            .iter()
+            .any(|(id, reserved)| id != except && reserved == name)
+            || self
+                .rename_name_reservations
+                .iter()
+                .any(|(id, reserved)| id != except && reserved == name)
+            || self
+                .view_tx
+                .borrow()
+                .channels
+                .iter()
+                .any(|c| c.channel_id != *except && c.name.as_deref() == Some(name))
+    }
+
     /// Owes a publication to a network event: the view is rebuilt once the window closes, or
     /// sooner by any other publication. Replies never wait on this; a command publishes itself.
     fn publish_soon(&mut self) {
@@ -22543,10 +22245,6 @@ impl Node {
             .retain(|id, _| self.channels.contains_key(id));
         self.status_reads.extend(read);
         self.view_tx.send_replace(view);
-        #[cfg(feature = "test-knobs")]
-        if let Some((marker, contents)) = self.fx28_ended_unanswered_marker.take() {
-            let _ = crate::node::computer::publish_proof_marker(&marker, &contents);
-        }
     }
 
     /// The node's view, built **without waiting long on any room a session holds.**
@@ -22985,16 +22683,9 @@ impl Node {
             connected_peers,
             boards_connected: self.boards_connected(),
             key_waits: self
-                .older
-                .keys()
-                .chain(self.key_waiting.keys())
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter_map(|(room, member)| {
-                    self.said_of(&room, &member)
-                        .map(|said| (room, member, said))
-                })
+                .key_waiting
+                .iter()
+                .map(|(&(room, member), said)| (room, member, said.clone()))
                 .collect(),
         };
         (view, read)
@@ -23624,6 +23315,14 @@ async fn offer_board_records(
     let mut complete = true;
     let mut rejected = false;
     for wire in records {
+        // `VOX_TEST_FWD_MUTANT=notice-not-offered`: admission notices are left out of the offer,
+        // so a board learns a member's readmission only from the member that admitted it.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("notice-not-offered")
+            && crate::nat::notice::AdmissionNotice::from_wire(wire).is_ok()
+        {
+            continue;
+        }
         if !scope.is_live() {
             client.finish();
             return Err(());

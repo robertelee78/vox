@@ -276,10 +276,16 @@ Leaving tells the other members and deletes the room from your node. Vox waits u
 for a member to take the news. If none can, your node leaves once one can be told: keep it
 online. To come back later, join again with the link.
 
+Coming back is a new start. Each member rotates its key for the room and sends your node only the
+new one, so after joining again you read what is written from your return on. Messages written
+before you left, or while you were away, stay unreadable unless your node still holds them, and
+no member or option can release them later.
+
 Vox retains a small, non-secret record of your node's signed history so joining again does not
 fork its authorship. It contains no messages, room name, passphrase or keys. On returning, Vox
 recovers that history before it can sign new entries; keep a member holding the history online.
-Verified End evidence deletes the record too.
+When it is done the daemon says `this node is back in this room: it reads what is written from
+now on and can write here again`. Verified End evidence deletes the record too.
 
 ## End a room for everyone
 

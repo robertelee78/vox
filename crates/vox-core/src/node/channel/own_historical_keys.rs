@@ -109,13 +109,6 @@ struct Header {
     count: usize,
 }
 impl Header {
-    fn empty() -> Self {
-        Self {
-            root: 0,
-            next: 1,
-            count: 0,
-        }
-    }
     fn decode(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
         if d.array()? != 4 || d.uint()? != 1 {
@@ -233,66 +226,4 @@ pub(super) fn lookup_batch(
         author,
         (epoch, chain),
     )?))
-}
-
-/// Retain the earlier verified floor without evicting a potentially needed key. The sealed tree
-/// performs bounded page operations without a fixed key-count cap; room purge removes its rows.
-pub(super) fn put(
-    batch: &mut crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    root: &CompositePublicKey,
-    author: &Digest32,
-    release: &Skdm,
-) -> Result<bool> {
-    let epoch = release.body.epoch;
-    let chain = release.body.chain_id;
-    release.verify(root, room, epoch)?;
-    if release.body.author_id != *author {
-        return Err(bad());
-    }
-    let mut h = match batch.get_segment_bounded(room, KIND, 0, 128)? {
-        Some(sealed) => Header::decode(&open_segment(sek, KIND, 0, &sealed)?)?,
-        None => Header::empty(),
-    };
-    let k = key(epoch, chain);
-    let previous = session_tree::Read::batch(batch, sek, room, KIND).find(h.root, &k)?;
-    if let Some(id) = previous {
-        if id == 0 || id >= h.next {
-            return Err(bad());
-        }
-        let sealed = batch
-            .get_segment_bounded(room, KIND, id, MAX_BYTES)?
-            .ok_or_else(bad)?;
-        let existing = decode_state(&sealed, id, sek, room, root, author, (epoch, chain))?;
-        let incoming = ReceiverChain::from_skdm(release, root, room, epoch)?;
-        let mut check = ReceiverChain::from_state(&existing.to_state())?;
-        // Also validates the same sender signing key and complete chain binding.
-        if !check.retain_history_release(&incoming)? {
-            return Ok(false);
-        }
-    }
-    // The release is verified above; persist only the resulting receiver state.
-    let state = ReceiverChain::from_skdm(release, root, room, epoch)?.to_state();
-    if state.len() > MAX_BYTES {
-        return Err(Error::SizeLimitExceeded("own historical receiver state"));
-    }
-    let id = h.next;
-    h.next = h.next.checked_add(1).ok_or_else(bad)?;
-    batch.put_segment(room, KIND, id, &seal_segment(sek, KIND, id, &state)?)?;
-    {
-        let mut tree = session_tree::Write::new(batch, sek, room, KIND, h.next)?;
-        h.root = tree.set(h.root, k, Some(id))?;
-        h.next = tree.next_page();
-    }
-    if let Some(old) = previous {
-        batch.delete_segment(room, KIND, old)?;
-    } else {
-        h.count = h
-            .count
-            .checked_add(1)
-            .ok_or(Error::SizeLimitExceeded("own historical key index"))?;
-    }
-    h.seal(batch, sek, room)?;
-    Ok(true)
 }

@@ -11,7 +11,7 @@ pub(crate) struct HeadlessPending {
     task: tokio::task::JoinHandle<()>,
     work: computer::OwnKeyPolicyWork,
     _transition: Arc<crate::node::computer::ComputerPublicationTransition>,
-    _secret: own_keys::SecretLease,
+    _secret: SecretLease,
 }
 impl HeadlessPending {
     pub(super) async fn retire(self) {
@@ -30,7 +30,7 @@ impl Node {
     pub(super) fn begin_headless_policy(
         &mut self,
         work: computer::OwnKeyPolicyWork,
-        secret: own_keys::SecretLease,
+        secret: SecretLease,
         transition: crate::node::computer::ComputerPublicationTransition,
     ) {
         if self.pending_policy.is_some() {

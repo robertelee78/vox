@@ -2745,8 +2745,6 @@ pub struct Computer {
     /// in-memory snapshot, for exactly the authority that replacement changes. Status reads do
     /// not consult this and therefore never wedge on I/O.
     authority_in_flight: Mutex<Option<AuthorityChange>>,
-    own_key_writers:
-        Mutex<Vec<std::sync::Weak<crate::node::channel::own_writer_gate::RevocableSend>>>,
     own_key_settled: tokio::sync::watch::Sender<()>,
     pub(crate) signer: Arc<dyn RootSigner + Send + Sync>,
     /// Serialize replacement-state transactions without making readers wait for their disk I/O.
@@ -2826,48 +2824,6 @@ impl Computer {
             b"policy replacement reached publication fence\n",
         );
         fx28_mutant("join-writer-fence")
-    }
-
-    #[cfg(feature = "test-knobs")]
-    fn mark_held_rekey_writer_for_proof(
-        &self,
-        replacing: bool,
-        held: &State,
-        next: &State,
-    ) -> bool {
-        if !replacing {
-            return false;
-        }
-        let Ok(spec) = std::env::var("VOX_TEST_HOLD_REKEY_ENQUEUE") else {
-            return false;
-        };
-        let Some(engaged) = spec.split('\t').nth(2) else {
-            return false;
-        };
-        let engaged = std::path::Path::new(engaged);
-        if !engaged.is_file() {
-            return false;
-        }
-        let target = std::fs::read_to_string(engaged.with_extension("target"))
-            .ok()
-            .and_then(|text| crate::node::link::b32_decode(text.trim(), "proof Computer").ok());
-        let Some(target) = target else {
-            return false;
-        };
-        let contains = |state: &State| {
-            state
-                .members
-                .values()
-                .any(|grant| grant.computer.fingerprint().ok() == Some(target))
-        };
-        if !contains(held) || contains(next) {
-            return false;
-        }
-        let _ = std::fs::write(
-            engaged.with_extension("writer"),
-            b"policy replacement reached publication fence\n",
-        );
-        fx28_mutant("rekey-writer-fence")
     }
 
     pub(crate) fn writer_pending(&self) -> bool {
@@ -3133,37 +3089,11 @@ impl Computer {
         }
     }
 
-    /// Register while `publish_with_current_authority` retains its physical publication lease.
-    pub(crate) fn register_own_key_writer(
-        &self,
-        writer: &Arc<crate::node::channel::own_writer_gate::RevocableSend>,
-    ) -> bool {
-        let mut writers = lock(&self.own_key_writers);
-        if self.own_key_authority_blocked() || self.storage_ready().is_err() {
-            return false;
-        }
-        writers.retain(|writer| writer.strong_count() != 0);
-        writers.push(Arc::downgrade(writer));
-        true
-    }
-
     fn block_own_key_authority(&self, change: AuthorityChange) {
-        let owners = {
-            let mut writers = lock(&self.own_key_writers);
-            *lock(&self.authority_in_flight) = Some(change);
-            writers.retain(|writer| writer.strong_count() != 0);
-            writers
-                .iter()
-                .filter_map(std::sync::Weak::upgrade)
-                .collect::<Vec<_>>()
-        };
-        for owner in owners {
-            owner.revoke();
-        }
+        *lock(&self.authority_in_flight) = Some(change);
     }
 
     fn unblock_own_key_authority(&self) {
-        let _writers = lock(&self.own_key_writers);
         *lock(&self.authority_in_flight) = None;
         self.own_key_settled.send_replace(());
     }
@@ -4370,7 +4300,6 @@ impl Computer {
                 account: account.clone(),
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
                 authority_in_flight: Mutex::new(None),
-                own_key_writers: Mutex::new(Vec::new()),
                 own_key_settled: tokio::sync::watch::channel(()).0,
                 signer,
                 changes: Arc::new(publication_gate::Gate::default()),
@@ -4450,7 +4379,6 @@ impl Computer {
             account: account.clone(),
             storage_failed: std::sync::atomic::AtomicBool::new(false),
             authority_in_flight: Mutex::new(None),
-            own_key_writers: Mutex::new(Vec::new()),
             own_key_settled: tokio::sync::watch::channel(()).0,
             signer: Arc::new(root),
             changes: Arc::new(publication_gate::Gate::default()),
@@ -4620,13 +4548,8 @@ impl Computer {
             let authority_change = self.publication_authority_change(&held, &next);
             let publication_changed = authority_change.is_some();
             #[cfg(feature = "test-knobs")]
-            let skip_publication = self
-                .mark_held_join_writer_for_proof(publication_changed && transition.is_none())
-                || self.mark_held_rekey_writer_for_proof(
-                    publication_changed && transition.is_none(),
-                    &held,
-                    &next,
-                );
+            let skip_publication =
+                self.mark_held_join_writer_for_proof(publication_changed && transition.is_none());
             #[cfg(not(feature = "test-knobs"))]
             let skip_publication = false;
             let _publication = if publication_changed && transition.is_none() && !skip_publication {
@@ -4902,13 +4825,8 @@ impl Computer {
             let authority_change = self.publication_authority_change(&held, &next);
             let publication_changed = authority_change.is_some();
             #[cfg(feature = "test-knobs")]
-            let skip_publication = self
-                .mark_held_join_writer_for_proof(publication_changed && !publication_owned)
-                || self.mark_held_rekey_writer_for_proof(
-                    publication_changed && !publication_owned,
-                    &held,
-                    &next,
-                );
+            let skip_publication =
+                self.mark_held_join_writer_for_proof(publication_changed && !publication_owned);
             #[cfg(not(feature = "test-knobs"))]
             let skip_publication = false;
             let _publication = if publication_changed && !publication_owned && !skip_publication {

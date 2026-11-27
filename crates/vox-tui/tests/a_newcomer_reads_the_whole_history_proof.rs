@@ -268,6 +268,11 @@ fn daemon_with(dir: &Path, tag: &str, args: &[&str], env: &[(&str, &str)]) -> Da
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", at.display()))
     };
     let mut cmd = Command::new(VOX);
+    // The run's forward-only mutant selector reaches the daemon only by name: a proof process
+    // keeps no `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
+    if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
+        cmd.env("VOX_TEST_FWD_MUTANT", mutant);
+    }
     cmd.arg("daemon");
     if !args.contains(&"--listen") {
         cmd.args(["--listen", "127.0.0.1:0"]);
@@ -781,6 +786,10 @@ fn room_id_as(
 
 /// Exact authenticated room-order hashes exposed by the shipped diagnostic command.
 fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
+    // Each refusal here tells the reader to retry, and a person does: the room changed while it
+    // was read, or its saved history is still being refreshed (just after a join, say). A
+    // refresh that never ends is a red of its own, named below.
+    let refreshing_since = Instant::now();
     let (ok, out, err) = loop {
         let result = vox(dir, &["room", "read", room, "--hashes"], None);
         if !result.0
@@ -790,6 +799,13 @@ fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
                     | "vox: node: the room changed while reading; refresh and retry"
             )
         {
+            continue;
+        }
+        if !result.0
+            && result.2.trim() == "vox: node: the room is refreshing saved history; retry"
+            && refreshing_since.elapsed() < Duration::from_secs(120)
+        {
+            std::thread::sleep(Duration::from_millis(250));
             continue;
         }
         break result;
@@ -814,21 +830,9 @@ fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
         .collect()
 }
 
-fn grant_full_history(dir: &Path, fingerprint: &str, name: &str) -> (bool, String, String) {
+fn grant_trust(dir: &Path, fingerprint: &str, name: &str) -> (bool, String, String) {
     loop {
-        let result = vox(
-            dir,
-            &[
-                "trust",
-                "add",
-                fingerprint,
-                "--name",
-                name,
-                "--history",
-                "full",
-            ],
-            None,
-        );
+        let result = vox(dir, &["trust", "add", fingerprint, "--name", name], None);
         if result.0
             || !result.2.lines().any(|line| {
                 line.trim() == "vox: a previous change to this room is still being applied; this request made no change"
@@ -3503,13 +3507,13 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     let (ok, bob_fp, err) = vox(&bob, &["id"], None);
     assert!(ok, "PRODUCT: Bob's `vox id` failed: {err}");
     let (ok, out, err) = vox(
-        &bob,
-        &["trust", "add", alice_fp.trim(), "--name", "alice"],
+        &alice,
+        &["trust", "add", bob_fp.trim(), "--name", "bob"],
         None,
     );
     assert!(
         ok,
-        "PRODUCT: Bob's `vox trust add alice` failed: {out}{err}"
+        "PRODUCT: Alice's `vox trust add bob` failed: {out}{err}"
     );
     let alice_daemon = daemon_env(
         &alice,
@@ -3578,13 +3582,16 @@ fn key_before_consent_survives_a_restart(root: &Path) {
 
     std::fs::write(&alice_fold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage Alice's fold: {error}"));
+    let full_room = vox_core::node::link::b32_encode(&room_id(&alice, "alice", &room));
+    let consent_scope = format!("{} {} {}", full_room, alice_fp.trim(), bob_fp.trim());
+    std::fs::write(&consent_hold, &consent_scope)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot hold incoming consent: {error}"));
     let (ok, out, err) = vox(
         &bob,
         &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: Bob could not join consent-last: {out}{err}");
-    wait_reader_one_way_trust(&bob, "bob", &room, "alice");
     wait_for_held_rows(&bob, &room, &hashes, "author-governance");
     wait_room_status(
         &alice,
@@ -3597,17 +3604,10 @@ fn key_before_consent_survives_a_restart(root: &Path) {
 
     std::fs::write(&bob_fold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage Bob's fold: {error}"));
-    let full_room = vox_core::node::link::b32_encode(&room_id(&alice, "alice", &room));
-    let consent_scope = format!("{} {} {}", full_room, alice_fp.trim(), bob_fp.trim());
-    std::fs::write(&consent_hold, &consent_scope)
-        .unwrap_or_else(|error| panic!("APPARATUS: cannot hold incoming consent: {error}"));
     std::fs::remove_file(&alice_fold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Alice's fold: {error}"));
-    let (ok, out, err) = grant_full_history(&alice, bob_fp.trim(), "bob");
-    assert!(
-        ok,
-        "PRODUCT: Alice could not grant Bob full history: {out}{err}"
-    );
+    let (ok, out, err) = grant_trust(&bob, alice_fp.trim(), "alice");
+    assert!(ok, "PRODUCT: Bob could not trust Alice: {out}{err}");
     let with_key = wait_room_status(
         &bob,
         "bob",
@@ -3691,7 +3691,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         "VOX_TEST_HOLD_RENDER_FILE",
     ]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let mut tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
     key_before_consent_survives_a_restart(&tmp.path().join("key-before-consent"));
     let row_before_key = tmp.path().join("row-before-key");
     let root = row_before_key.as_path();
@@ -3721,15 +3725,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     for (dir, fp, name) in [
         (&alice, &fps[2], "carol"),
-        (&bob, &fps[0], "alice"),
-        (&bob, &fps[2], "carol"),
+        (&alice, &fps[1], "bob"),
+        (&carol, &fps[1], "bob"),
         (&carol, &fps[0], "alice"),
     ] {
-        let (ok, _, err) = vox(
-            dir,
-            &["trust", "add", fp, "--name", name, "--history", "now"],
-            None,
-        );
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
     let fold_hold = root.join("fx22-fold-hold");
@@ -3865,9 +3865,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         );
     }
 
-    // Neither author trusts Bob yet. He can retain their existing LogDb prefixes without
-    // consent or sender keys. The product itself must show those exact retained hashes while
-    // their content remains unreadable: the APPARATUS preconditions for the late-render verdict.
+    // Both authors trusted Bob before posting. Bob has not yet trusted either author, so
+    // he retains the exact ciphertext without rendering it before reciprocal trust.
     std::fs::write(&fold_hold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage the fold hold: {error}"));
     std::fs::write(&carol_fold_hold, b"")
@@ -3895,9 +3894,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             "Bob never retained Alice's pre-key room prefix",
             |status| status.log_entries > 0,
         );
-        wait_reader_one_way_trust(&bob, "bob", room, "alice");
         wait_for_held_rows(&bob, room, &late_hashes[i], "governance-fold");
-        wait_reader_one_way_trust(&bob, "bob", room, "carol");
         wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-governance-fold");
         // Membership, not counts over two different retained collections, is the precondition
         // for Alice to issue Bob's consent after the fold is released.
@@ -3914,6 +3911,10 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // The exact held rows and missing product facts above are the staging evidence. CPU and
     // elapsed time are not verdicts for this claim: the causal consent/key events below must
     // either make those same hashes readable or leave structural render work unfinished.
+    for (fingerprint, name) in [(&fps[0], "alice"), (&fps[2], "carol")] {
+        let (ok, out, err) = grant_trust(&bob, fingerprint, name);
+        assert!(ok, "PRODUCT: Bob could not trust {name}: {out}{err}");
+    }
     bob_before_key.stop();
     if package_hold_engaged.exists() {
         std::fs::remove_file(&package_hold_engaged).unwrap_or_else(|error| {
@@ -3925,8 +3926,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // trust answers establish the grants; a whole-room hash delta cannot identify one grant.
     std::fs::remove_file(&fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
-    // The real trust decision is the missing fact and wakes Alice's released fold.
-    let (ok, out, err) = grant_full_history(&alice, &fps[1], "bob");
+    // Reassert Alice's decision to wake her released fold.
+    let (ok, out, err) = grant_trust(&alice, &fps[1], "bob");
     assert!(
         ok,
         "PRODUCT: Alice could not grant Bob her retained history: {out}{err}"
@@ -3934,9 +3935,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
 
     std::fs::remove_file(&carol_fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
-    // Carol must not have consented before the missing-fact boundary. Her earlier room join
-    // can already publish off-roster consent when Bob is in her keyring.
-    let (ok, out, err) = grant_full_history(&carol, &fps[1], "bob");
+    // Reassert Carol's existing decision to wake her released fold.
+    let (ok, out, err) = grant_trust(&carol, &fps[1], "bob");
     assert!(
         ok,
         "PRODUCT: Carol could not grant Bob her retained history: {out}{err}"
@@ -4102,24 +4102,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     });
     std::fs::remove_file(&render_hold_ready)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the exact-key hold: {error}"));
-    // Bob is a member, not an administrator. His real history-grant upgrade publishes consent
-    // and wakes retained work without pretending that he may rename this room.
-    let (ok, out, err) = vox(
-        &bob,
-        &[
-            "trust",
-            "add",
-            &fps[0],
-            "--name",
-            "alice",
-            "--history",
-            "full",
-        ],
-        None,
-    );
+    // Bob is a member, not an administrator. Reassert his trust to wake retained work.
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
     assert!(
         ok,
-        "PRODUCT: Bob could not grant Alice his full history: {out}{err}"
+        "PRODUCT: Bob could not reassert trust in Alice: {out}{err}"
     );
 
     // The marker engages only after one real bounded turn commits Carol's exact-author row, then
@@ -4189,22 +4176,10 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     std::fs::remove_file(&render_hold_engaged)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fair-turn hold: {error}"));
-    let (ok, out, err) = vox(
-        &bob,
-        &[
-            "trust",
-            "add",
-            &fps[2],
-            "--name",
-            "carol",
-            "--history",
-            "full",
-        ],
-        None,
-    );
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
-        "PRODUCT: Bob could not grant Carol his full history: {out}{err}"
+        "PRODUCT: Bob could not reassert trust in Carol: {out}{err}"
     );
 
     for (index, room) in rooms.iter().enumerate() {
@@ -4232,19 +4207,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
 
     // Replay the retained package through the shipped trust command while its source is offline.
     // Projection and key-generation counters are not independent consumer verdicts.
-    let (ok, out, err) = vox(
-        &bob,
-        &[
-            "trust",
-            "add",
-            &fps[0],
-            "--name",
-            "alice",
-            "--history",
-            "full",
-        ],
-        None,
-    );
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
     assert!(
         ok,
         "PRODUCT: Bob's idempotent `vox trust add alice` could not replay the retained key \
@@ -4490,6 +4453,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         }
         std::thread::yield_now();
     };
+    println!(
+        "[proof] the non-post rows Alice held after the rotation when the transition was captured: {transition_rows:?}"
+    );
 
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
     attached(&bob, "bob-repeated-grant");
@@ -4519,6 +4485,21 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         &rooms[0],
         "the source-generated reset and newer equal grant never completed their governance fold",
     );
+    if trust_detail(&bob, "bob", &rooms[0], "alice") != "you trust each other" {
+        let non_post = |dir: &Path, reader: &str| -> Vec<String> {
+            room_hashes(dir, reader, &rooms[0])
+                .into_iter()
+                .filter(|hash| {
+                    !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
+                })
+                .collect()
+        };
+        println!(
+            "[proof] trace: non-post rows since the rotation now held by Alice {:?}, by Bob {:?}",
+            non_post(&alice, "alice"),
+            non_post(&bob, "bob")
+        );
+    }
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
         "you trust each other",
@@ -5977,6 +5958,10 @@ fn newcomer_reads_the_whole_history(
 
     // ---- bob pages back, asking for each page below what he holds, until he has it all ----
     let mut demands = 0usize;
+    // What bob's node said when it named posts it holds but cannot read with the keys it
+    // retains (design-4 R11's page sentence): no further page makes them readable, so the
+    // paging ends there and the count below says what he reads.
+    let mut unreadable = None;
     let mut last_count = usize::MAX;
     let mut have;
     loop {
@@ -6023,6 +6008,10 @@ fn newcomer_reads_the_whole_history(
             &oldest[..12],
             err.trim()
         );
+        if err.contains("cannot be read with the keys this node retains") {
+            unreadable = Some(err.trim().to_owned());
+            break;
+        }
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let now = held(&bob, &room, page)
@@ -6056,9 +6045,10 @@ fn newcomer_reads_the_whole_history(
     assert!(
         distinct.len() == posts,
         "PRODUCT: a member trusted before every post must read all {posts} of them on explicit \
-         demand (V210-45), but read {}; missing posts {:?}",
+         demand (V210-45), but read {}; missing posts {:?}; his node said {:?}",
         distinct.len(),
-        missing_ranges(&distinct, posts)
+        missing_ranges(&distinct, posts),
+        unreadable
     );
     assert!(
         history.len() == posts,

@@ -1,7 +1,5 @@
-//! **Parked until PRD-001 R12's full-history grant existed** (a default grant releases the
-//! sender key from approval onward, so a message posted before it never renders). Alice's
-//! grant to bob now uses `--history full`, which makes the pre-approval row readable
-//! deterministically — ADR-023 M23.4.
+//! Alice trusts bob before posting; bob trusts alice only after the ciphertext arrives.
+//! Reciprocal trust delivers the key from bob's entitlement and renders the row.
 //!
 //! PRD-001 R16 — **the TUI's unread badge counts a message that became readable when its
 //! sender key arrived**, exactly once — read off the screen of the real `vox` TUI running
@@ -24,8 +22,8 @@
 //!   prompt; what it draws is replayed into a screen grid and read the way a person reads it;
 //! - rooms are made over bob's TUI's own control socket with the real CLI: bob's `home`, and
 //!   alice's `mission`, which bob joins;
-//! - alice posts in `mission` **before** she trusts bob, so the row reaches bob as ciphertext;
-//!   then she trusts him, her node consents, and the key renders the row on bob's side.
+//! - alice trusts bob, then posts in `mission` while bob has not yet trusted her; the row
+//!   reaches bob as ciphertext, and his later reciprocal trust allows the key to arrive.
 //!
 //! Bob has `home` open on screen throughout — a different room — so the row is off-screen
 //! and must be counted. The badge must then read `(1 unread)`: not 0 (the defect) and not 2
@@ -49,8 +47,8 @@
 //! you 1" at once, counted from what bob's node recorded as read (`Request::Unread`), with no new
 //! event to count it from.
 //!
-//! Mutations: `--history now` for alice's grant, or the backfill on grant arrival removed —
-//! the row never renders and the badge stays at 0. An addressed message counted as plain new
+//! Mutations: the backfill on grant arrival removed — the row never renders and the badge stays
+//! at 0. An addressed message counted as plain new
 //! (`unread_level` never `ToYou`): mission reads "2 new", not "to you 1".
 //! A TUI that does not count what came while it was closed (no `Request::Unread` at its start):
 //! mission reads nothing once the TUI is opened again.
@@ -379,18 +377,16 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     // The list's title is gone once a room is on screen.
     tui.expect("home on screen", 10, |t| !t.contains("Rooms (Enter"));
 
-    // Bob trusts alice: his own decision about who reads HIM, which renders nothing of
-    // hers. Measured by hand, a consent that only one side has given did not deliver the
-    // key; with both, it crossed in about two seconds.
+    // Establish Bob's entitlement before Alice posts. His own reciprocal trust comes later.
     let alice_fp = fps[0].clone();
     let (ok, _, err) = vox(
-        &bob_dir,
-        &["trust", "add", &alice_fp, "--name", "alice"],
+        &alice_dir,
+        &["trust", "add", &bob_fp, "--name", "bob"],
         None,
     );
-    assert!(ok, "bob trusts alice: {err}");
+    assert!(ok, "alice trusts bob: {err}");
 
-    // ---- alice posts BEFORE she trusts bob, so the row reaches him as ciphertext ----
+    // ---- alice posts before bob trusts her, so the row reaches him as ciphertext ----
     let (ok, _, err) = vox(
         &alice_dir,
         &["room", "post", &room, "the plan, before bob can read it"],
@@ -403,25 +399,17 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     let (_, early, _) = vox(&bob_dir, &["room", "read", &room], None);
     assert!(
         !early.contains("before bob can read it"),
-        "bob read alice's post before she consented to him; this proof needs the key path: \
+        "bob read alice's post before reciprocal trust; this proof needs the key path: \
          {early:?}"
     );
 
-    // ---- alice trusts bob; her node consents; the key renders the row on bob's side ----
+    // Bob's reciprocal trust allows Alice's already-entitled key to arrive.
     let (ok, _, err) = vox(
-        &alice_dir,
-        &[
-            "trust",
-            "add",
-            &bob_fp,
-            "--name",
-            "bob",
-            "--history",
-            "full",
-        ],
+        &bob_dir,
+        &["trust", "add", &alice_fp, "--name", "alice"],
         None,
     );
-    assert!(ok, "alice trusts bob with full history: {err}");
+    assert!(ok, "bob trusts alice: {err}");
     until(
         &bob_dir,
         "alice's post to become readable on bob's node",

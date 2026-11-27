@@ -84,7 +84,7 @@ impl Display {
 }
 
 /// A room's current consent facts held in memory (ADR-038 FX-22): each author/target's
-/// granted or revoked sequence, each author's reset, and every pair ever revoked. This same
+/// granted or revoked sequence, each author's reset, and each pair's latest revocation. This same
 /// projection serves saved readers and user pagination, including off-roster identities.
 /// Reconstruction is bounded per turn, rather than narrowing the identities callers may query.
 /// Persistent ordered trees keep snapshots immutable without copying the full projection:
@@ -94,7 +94,8 @@ impl Display {
 pub(in crate::node::channel) struct ConsentFacts {
     consent: imbl::OrdMap<Digest32, imbl::OrdMap<Digest32, Consent>>,
     resets: imbl::OrdMap<Digest32, u64>,
-    revoked: imbl::OrdSet<[u8; 64]>,
+    /// Each revoked pair's latest revocation: `(sequence, epoch, new_chain_id)`.
+    revoked: imbl::OrdMap<[u8; 64], (u64, u64, u64)>,
 }
 
 impl Drop for ConsentFacts {
@@ -151,16 +152,19 @@ impl ConsentFacts {
         }
     }
 
-    pub(in crate::node::channel) fn set_ever_revoked(
+    pub(in crate::node::channel) fn set_latest_revocation(
         &mut self,
         author: Digest32,
         target: Digest32,
-        revoked: bool,
+        revocation: Option<(u64, u64, u64)>,
     ) {
-        if revoked {
-            self.revoked.insert(pair(&author, &target));
-        } else {
-            self.revoked.remove(&pair(&author, &target));
+        match revocation {
+            Some(revocation) => {
+                self.revoked.insert(pair(&author, &target), revocation);
+            }
+            None => {
+                self.revoked.remove(&pair(&author, &target));
+            }
         }
     }
 
@@ -180,7 +184,15 @@ impl ConsentFacts {
             }
             GovBody::ConsentRevocation(revoke) => {
                 let target = revoke.body.target_id;
-                self.revoked.insert(pair(&author, &target));
+                let key = pair(&author, &target);
+                if self
+                    .revoked
+                    .get(&key)
+                    .is_none_or(|(held, _, _)| *held < seq)
+                {
+                    self.revoked
+                        .insert(key, (seq, revoke.body.epoch, revoke.body.new_chain_id));
+                }
                 if revoke.body.epoch == 0 {
                     let readers = self.consent.entry(author).or_default();
                     let replace = readers.get(&target).is_none_or(|state| match state {
@@ -222,13 +234,16 @@ impl ConsentFacts {
         }
     }
 
-    /// Whether any authenticated revocation for this pair has been recorded.
-    pub(in crate::node::channel) fn ever_revoked(
+    /// The latest authenticated revocation for this pair, if any: `(epoch, new_chain_id)`, the
+    /// author's generation from which the target was cut off.
+    pub(in crate::node::channel) fn latest_revocation(
         &self,
         author: &Digest32,
         target: &Digest32,
-    ) -> bool {
-        self.revoked.contains(&pair(author, target))
+    ) -> Option<(u64, u64)> {
+        self.revoked
+            .get(&pair(author, target))
+            .map(|(_, epoch, cut)| (*epoch, *cut))
     }
 }
 
@@ -473,10 +488,10 @@ impl SemanticWork {
                         .set_reset(author, view.consent_reset(&author)?);
                 }
                 4 => {
-                    std::sync::Arc::make_mut(&mut build.facts.consent).set_ever_revoked(
+                    std::sync::Arc::make_mut(&mut build.facts.consent).set_latest_revocation(
                         author,
                         target,
-                        view.ever_revoked(&author, &target)?,
+                        view.latest_revocation(&author, &target)?,
                     );
                 }
                 _ => return Err(invalid("governance semantic phase")),
@@ -750,6 +765,49 @@ impl<'a> View<'a> {
         Ok(Some((chain, entitlement)))
     }
 
+    /// The cut `sender` took at `target`'s current return (R3), validated against the
+    /// authenticated target-authored Presence and incarnation, never against member decisions:
+    /// the record's return is the target's own `here` Presence for this room, its departure is
+    /// the latest the target stated before that return, and no departure is held after it.
+    /// `None` when the target shows no current return here, or the record is another
+    /// incarnation's or another sender's.
+    pub(in crate::node::channel) fn return_cut(
+        &self,
+        target: &Digest32,
+        sender: &Digest32,
+    ) -> Result<Option<super::facts::ReturnCut>> {
+        let Some(id) = self.facts.get(
+            Table::SenderRemovalCuts,
+            &super::facts::return_cut_key(target),
+        )?
+        else {
+            return Ok(None);
+        };
+        let cut = super::facts::ReturnCut::parse(&self.facts.record(id)?, target)?;
+        if cut.sender != *sender {
+            return Ok(None);
+        }
+        let Some(log) = self.facts.locator(&cut.back)? else {
+            return Ok(None);
+        };
+        let entry = self.facts.entry(log)?;
+        let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) else {
+            return Ok(None);
+        };
+        let seq = entry.skeleton.seq;
+        if entry.entry_hash() != cut.back
+            || entry.skeleton.author_id != *target
+            || presence.body.author_id != *target
+            || presence.body.channel_id != *self.room
+            || !presence.body.here
+            || super::channel::leave_before(&self.facts, target, seq)?.unwrap_or(0) != cut.departure
+            || super::channel::leave_after(&self.facts, target, seq)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(cut))
+    }
+
     pub(in crate::node::channel) fn is_member_removed(&self, target: &Digest32) -> Result<bool> {
         Ok(self.facts.get(Table::CurrentRemoved, &hash_key(target))?
             == Some(self.facts.authority_generation()))
@@ -973,6 +1031,21 @@ impl<'a> View<'a> {
         Ok(match state {
             RecipientCutState::NotRemoved => RecipientCut::Unrestricted,
             RecipientCutState::Removed => RecipientCut::Removed,
+            // `VOX_TEST_FX62_MUTANT=readmission-backfill`: the readmission body cut (#1171) is
+            // lifted with the rest of the readmission boundary (`pending_text/consent.rs`).
+            #[cfg(feature = "test-knobs")]
+            RecipientCutState::After(_)
+                if std::env::var("VOX_TEST_FX62_MUTANT").as_deref()
+                    == Ok("readmission-backfill") =>
+            {
+                static ENGAGED: std::sync::Once = std::sync::Once::new();
+                ENGAGED.call_once(|| {
+                    eprintln!(
+                        "test-knobs: readmission-backfill mutant engaged: a readmitted member's bodies are unrestricted"
+                    );
+                });
+                RecipientCut::Unrestricted
+            }
             RecipientCutState::After(hash) => {
                 let Some(log) = self
                     .facts
@@ -1419,13 +1492,14 @@ impl<'a> View<'a> {
             .transpose()
     }
 
-    pub(in crate::node::channel) fn ever_revoked(
+    /// The pair's latest authenticated revocation: `(sequence, epoch, new_chain_id)`.
+    pub(in crate::node::channel) fn latest_revocation(
         &self,
         author: &Digest32,
         target: &Digest32,
-    ) -> Result<bool> {
+    ) -> Result<Option<(u64, u64, u64)>> {
         let Some(log) = self.facts.get(Table::EverRevoked, &pair(author, target))? else {
-            return Ok(false);
+            return Ok(None);
         };
         let entry = self.facts.entry(log)?;
         match GovEntry::body_bound_to(&entry)? {
@@ -1434,7 +1508,11 @@ impl<'a> View<'a> {
                     && revoke.body.author_id == *author
                     && revoke.body.target_id == *target =>
             {
-                Ok(true)
+                Ok(Some((
+                    entry.skeleton.seq,
+                    revoke.body.epoch,
+                    revoke.body.new_chain_id,
+                )))
             }
             _ => Err(invalid("governance revoked locator binding")),
         }
@@ -1784,19 +1862,102 @@ fn recipient_eligibility_at(
     recipient: &Digest32,
     entries: &[Entry],
 ) -> Result<Vec<super::channel::ContentEligibility>> {
-    use super::channel::ContentEligibility::Eligible;
-    // No validated removal has ever been applied here: nothing to read per body.
-    if super::removal_generation(store, room)? == 0 {
+    use super::channel::ContentEligibility::{Eligible, Ineligible, Refreshing};
+    let packages = entries
+        .iter()
+        .any(|entry| body_restricted(entry, recipient) && is_key_package(entry));
+    // No validated removal or return has ever been applied here and no key package is asked
+    // about: nothing to read per body.
+    if super::removal_generation(store, room)? == 0 && !packages {
         return Ok(vec![Eligible; entries.len()]);
     }
     let Some(view) = View::recipient(store, sek, room, creator)? else {
         return Ok(vec![Eligible; entries.len()]);
     };
     let cut = view.recipient_cut(recipient, now)?;
+    let membership = if packages {
+        Some(view.key_membership(recipient)?)
+    } else {
+        None
+    };
     entries
         .iter()
-        .map(|entry| view.body_eligibility_after(&cut, recipient, entry))
+        .map(|entry| {
+            let eligibility = view.body_eligibility_after(&cut, recipient, entry)?;
+            if eligibility != Eligible
+                || !body_restricted(entry, recipient)
+                || !is_key_package(entry)
+            {
+                return Ok(eligibility);
+            }
+            // A room-key package for a member that left is never opened or served to it; one
+            // for a member that came back must contain its return (R4). Content is not cut.
+            Ok(match &membership {
+                None | Some(KeyMembership::NeverLeft) => Eligible,
+                Some(KeyMembership::Departed) => Ineligible,
+                Some(KeyMembership::Returned(back)) => match view.contains_cut(entry, back)? {
+                    Some(true) => Eligible,
+                    // `VOX_TEST_FWD_MUTANT=package-unbound` undoes R4's binding: a package
+                    // sealed before the return is opened and served as if bound to it.
+                    #[cfg(feature = "test-knobs")]
+                    Some(false) | None
+                        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref()
+                            == Ok("package-unbound") =>
+                    {
+                        eprintln!(
+                            "test-knobs: package-unbound mutant engaged: a key package without \
+                             the return is eligible"
+                        );
+                        Eligible
+                    }
+                    Some(false) => Ineligible,
+                    None => Refreshing,
+                },
+            })
+        })
         .collect()
+}
+
+fn is_key_package(entry: &Entry) -> bool {
+    match entry.skeleton.v2.as_ref() {
+        Some(v2) => v2.kind == crate::log::history::SignedEntryKind::KeyPackage,
+        None => entry
+            .payload
+            .as_deref()
+            .is_some_and(crate::node::keypackage::KeyPackage::is_key_package),
+    }
+}
+
+/// A member's standing for room keys from its own held signed Presence (R4).
+enum KeyMembership {
+    /// No departure of it is held here.
+    NeverLeft,
+    /// Its latest held Presence after its latest departure is not a return.
+    Departed,
+    /// Its return: the earliest `here` after its latest departure.
+    Returned(crate::log::history::EntryReference),
+}
+
+impl View<'_> {
+    fn key_membership(&self, member: &Digest32) -> Result<KeyMembership> {
+        if super::channel::leave_before(&self.facts, member, u64::MAX)?.is_none() {
+            return Ok(KeyMembership::NeverLeft);
+        }
+        let Some((seq, _)) = super::channel::held_return(&self.facts, member)? else {
+            return Ok(KeyMembership::Departed);
+        };
+        let log = self
+            .facts
+            .get(Table::Positions, &super::facts::position(member, seq))?
+            .ok_or(invalid("return presence not held"))?;
+        Ok(KeyMembership::Returned(
+            crate::log::history::EntryReference {
+                author: *member,
+                seq,
+                hash: self.facts.entry(log)?.entry_hash(),
+            },
+        ))
+    }
 }
 
 impl View<'_> {

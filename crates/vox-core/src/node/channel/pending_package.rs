@@ -99,6 +99,8 @@ pub(crate) struct Attempt {
     pub(crate) floor_wait: Option<(u64, u64, u64, u64)>,
     floor_baseline: Option<(u64, u64, u64, u64)>,
     floor_resolved: bool,
+    /// R1: an ordinary room key this node deleted; it installs nothing.
+    tombstoned: bool,
 }
 
 pub(crate) enum Saved {
@@ -420,7 +422,17 @@ impl ChannelState {
                 }
                 // #1171: once this node knows its own removal, a package whose signed causal
                 // past lacks its cut is old key material, whichever peer relayed it.
-                let eligible = if key_boundary_off("package-open") {
+                // A version-1 package was sealed under the policy that released older history:
+                // it is never opened, so no prekey is spent on it and nothing installs.
+                let eligible = if !pending.package.opens() {
+                    false
+                } else if self.own_history_behind() {
+                    // R4: while this node does not know whether it left, the package waits in
+                    // the log unopened. Opening spends its one-time prekey, and install would
+                    // wait and drop the opened key; install checks again. A Drive key cannot be
+                    // told apart before opening, so it waits with the rest.
+                    return Err(Error::Profile(governance::REFRESHING));
+                } else if key_boundary_off("package-open") {
                     true
                 } else if self.is_member_removed(store, &pending.author)? {
                     false
@@ -558,11 +570,19 @@ impl ChannelState {
         let drive = skdm
             .as_ref()
             .is_some_and(|skdm| skdm.body.channel_id == drive_channel(&self.channel_id));
-        let fresh = skdm.as_ref().is_some_and(|skdm| {
-            !self
-                .receivers
-                .contains_key(&(skdm.body.author_id, skdm.body.chain_id))
-        });
+        // R1: a room key this node deleted stays deleted, and is not fresh; Drive keys are
+        // another namespace.
+        let tombstoned = !drive
+            && skdm.as_ref().is_some_and(|skdm| {
+                self.deleted_receivers
+                    .covers(&skdm.body.author_id, self.epoch, skdm.body.chain_id)
+            });
+        let fresh = !tombstoned
+            && skdm.as_ref().is_some_and(|skdm| {
+                !self
+                    .receivers
+                    .contains_key(&(skdm.body.author_id, skdm.body.chain_id))
+            });
         let floor_wait = if let Some((author, log_id)) = locator {
             // Selection owns the evidence baseline through Open/Install/Acknowledge.
             // Capturing here would swallow an event that arrived while opening.
@@ -579,6 +599,43 @@ impl ChannelState {
                 && self.is_member_removed(store, &skdm.body.author_id)?
             {
                 return Err(Error::StreamRefused("sender key author is removed"));
+            }
+            // This node's own membership for room keys (R4). While it does not know whether it
+            // left (its own history is behind), it takes no new room key: a package waits in the
+            // log. A node that came back takes room keys only from a package bound to its
+            // return; a direct offer carries no locator and is refused.
+            // `VOX_TEST_FWD_MUTANT=direct-accepted` undoes the rule: a direct offer is taken
+            // as if this node had never left.
+            #[cfg(feature = "test-knobs")]
+            let direct_accepted = locator.is_none()
+                && std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("direct-accepted");
+            #[cfg(not(feature = "test-knobs"))]
+            let direct_accepted = false;
+            #[cfg(feature = "test-knobs")]
+            if direct_accepted && !drive {
+                let me = self.me();
+                if self.own_history_behind() || self.key_departed(&me) || self.key_returned(&me) {
+                    eprintln!(
+                        "test-knobs: direct-accepted mutant engaged: a direct room key offer is \
+                         taken by a node that left or came back"
+                    );
+                }
+            }
+            if !drive && !direct_accepted {
+                let me = self.me();
+                if self.own_history_behind() {
+                    return Err(match locator {
+                        Some(_) => Error::Profile(governance::REFRESHING),
+                        None => Error::StreamRefused(
+                            "this node does not yet know whether it left the room",
+                        ),
+                    });
+                }
+                if locator.is_none() && (self.key_departed(&me) || self.key_returned(&me)) {
+                    return Err(Error::StreamRefused(
+                        "a node that came back takes room keys only from its return-bound packages",
+                    ));
+                }
             }
             if let Some((author, log)) = locator {
                 if author != skdm.body.author_id {
@@ -670,6 +727,7 @@ impl ChannelState {
                 floor_wait,
                 floor_baseline: floor_wait,
                 floor_resolved: false,
+                tombstoned,
             },
             selected,
             debt,
@@ -1091,6 +1149,16 @@ impl Prepared {
                                 return Ok(Saved::Installed(receipt));
                             }
                         };
+                        // R1: authenticated above, then answered as accepted and unchanged, with
+                        // its floor resolved. No receiver, index, backfill or debt is written.
+                        if receipt.tombstoned {
+                            receipt.floor_resolved = true;
+                            receipt.accepted = Some(AcceptedSkdm {
+                                rendered: 0,
+                                changed: false,
+                            });
+                            return Ok(Saved::Installed(receipt));
+                        }
                         let existing = selected
                             .existing
                             .as_deref()
@@ -1161,38 +1229,6 @@ impl Prepared {
                             )?;
                         }
                         poison = true;
-                        let retained = if receipt.drive {
-                            false
-                        } else {
-                            let existing = selected
-                                .existing
-                                .as_deref()
-                                .map(|state| ReceiverChain::from_state(state))
-                                .transpose()?;
-                            match receiver_releases::remember(
-                                &mut batch,
-                                sek,
-                                &pending.room,
-                                &selected.key,
-                                &selected.skdm,
-                                existing.as_ref(),
-                                &candidate,
-                            )? {
-                                receiver_releases::Remember::Busy { changed } => {
-                                    if changed {
-                                        batch.commit()?;
-                                        committed = true;
-                                    }
-                                    poison = false;
-                                    receipt.refusal = Some(Error::StreamRefused(
-                                        receiver_releases::CLEANUP_PENDING,
-                                    ));
-                                    return Ok(Saved::Installed(receipt));
-                                }
-                                receiver_releases::Remember::Retained => true,
-                                _ => false,
-                            }
-                        };
                         let slot = (selected.skdm.body.author_id, candidate.chain_id());
                         if changed {
                             let snapshot = snapshot
@@ -1285,7 +1321,7 @@ impl Prepared {
                         // **The one exit for an accepted key**: no other return of this arm
                         // accepts. What the install queued and the debt its acceptance computed
                         // (`owed_again`) commit together, or the key is not accepted.
-                        if changed || retained || debt.is_some() {
+                        if changed || debt.is_some() {
                             if let Some(debt) = &debt {
                                 debt.queue(&mut batch, sek, &pending.room)?;
                             }

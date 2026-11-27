@@ -5563,7 +5563,9 @@ final class FirstRunProof: XCTestCase {
         if !returnerControl {
             print("[proof] APPARATUS/dependency #1163: never-removed other-room returner did not recover: \(controlAfter)")
         }
-        // Never-removed same-room control: ordinary full history, including what it missed offline.
+        // Never-removed same-room control: its node was locked, it never left the room, so it reads
+        // what it missed offline, written under alice's key it already holds (forward-only covers a
+        // member that leaves the room and comes back, not one that was offline).
         let twinDuring = waitFor(room, ["NATIVE-UNSEEN-BEFORE", "NATIVE-DURING"], as: twin)
         let twinReturned = twinDuring.contains("NATIVE-DURING")
         let propagated = roster(twin, until: { !$0.contains(bobFp) && $0.contains(aliceFp) })
@@ -5583,7 +5585,7 @@ final class FirstRunProof: XCTestCase {
             XCTAssertTrue(otherRoster.contains(bobFp), "PRODUCT: room removal must leave Bob in the other room: \(otherRoster)")
             XCTAssertTrue(twinReturned, "\(returnerControl ? "PRODUCT: a never-removed member must receive room activity after returning" : "APPARATUS/dependency #1163: returner continuity was not established"): \(twinDuring)")
             XCTAssertTrue(!twinReturned || twinDuring.contains("NATIVE-UNSEEN-BEFORE"),
-                          "PRODUCT: a never-removed returner must keep ordinary full history: \(twinDuring)")
+                          "PRODUCT: a never-removed member whose node was locked must read what was posted while it was offline: \(twinDuring)")
             XCTAssertTrue(propagated.holds, "PRODUCT: Bob's removal must reach the never-removed member: \(propagated.said)")
             XCTAssertTrue(twinReadmit.status != 0, "PRODUCT: a non-creator readmitted Bob: \(twinReadmit.out)")
             XCTAssertFalse(during.contains("NATIVE-DURING"), "PRODUCT: removed Bob received future room activity: \(during)")

@@ -121,6 +121,8 @@ enum TurnStage {
     Cleanup,
     CleanupRecovery,
     Governance,
+    /// The room's forward-only migration (R9): the first room work after a ready fold, once.
+    ForwardMigration,
     RoomRotation,
     RoomDriveRotation,
     CacheDelete,
@@ -675,14 +677,10 @@ impl Node {
                         TurnStage::Cleanup,
                         Result::Consent(consent_save::Effect::Cleanup {
                             more,
-                            retry_ready,
                             own_retry_ready,
                         }),
                     ) => {
                         self.governance_work.again |= more;
-                        if retry_ready {
-                            self.key_package_rooms.entry(room).or_insert(false);
-                        }
                         if own_retry_ready {
                             self.governance_work.wake_room(room);
                             turn.stage = TurnStage::CleanupRecovery;
@@ -729,6 +727,27 @@ impl Node {
                         turn.stage = TurnStage::Cleanup;
                     }
                     (TurnStage::RoomRotation, Result::Unavailable) => {}
+                    (
+                        TurnStage::ForwardMigration,
+                        Result::Consent(consent_save::Effect::Consent(
+                            crate::node::channel::pending_text::consent::ConsentSaved::Migrated,
+                        )),
+                    ) => {
+                        eprintln!(
+                            "vox daemon: room {}: its keys are released from each member's trust \
+                             point on (forward only); this room is updated once",
+                            crate::node::link::b32_encode(&room)
+                        );
+                        // The owed re-deliveries the migration wrote go now, under v2.
+                        Box::pin(self.begin_owned_rekeys_for(
+                            room,
+                            false,
+                            None,
+                            consent_release::RekeyAfter::Automatic,
+                        ))
+                        .await;
+                    }
+                    (TurnStage::ForwardMigration, Result::Unavailable) => {}
                     (
                         TurnStage::RoomDriveRotation,
                         Result::Session(
@@ -945,7 +964,7 @@ impl Node {
             TurnStage::Governance => {
                 return self.governance_after_fold(room, continuation, reply).await
             }
-            TurnStage::RoomRotation => {
+            TurnStage::ForwardMigration | TurnStage::RoomRotation => {
                 return self.governance_after_fold(room, continuation, reply).await
             }
             TurnStage::RoomDriveRotation => {
@@ -1038,6 +1057,28 @@ impl Node {
         {
             self.governance_work.again = true;
             turn.stage = TurnStage::RoomDriveRotation;
+        }
+        if turn.ready
+            && matches!(turn.stage, TurnStage::Governance | TurnStage::Cleanup)
+            && !continuation.instance.lock().await.forward_migrated()
+        {
+            turn.stage = TurnStage::ForwardMigration;
+            let legacy_full = self
+                .trust
+                .legacy_full()
+                .iter()
+                .map(|identity| (*identity, self.trust_decision(identity)))
+                .collect();
+            self.continue_governance_save(
+                room,
+                maintenance_save::Work::Consent(consent_save::Work::ForwardMigration {
+                    legacy_full,
+                }),
+                continuation,
+                reply,
+            )
+            .await;
+            return;
         }
         if turn.ready
             && !matches!(

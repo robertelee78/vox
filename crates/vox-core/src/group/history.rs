@@ -1,15 +1,16 @@
 //! History delivery: per-epoch origin chain-key retention and the
 //! release-at-iteration mechanism (ADR-006 §History).
 //!
-//! The chain is one-way, so *what* a newly-consented member can read is fixed by
-//! *which* iteration's chain key the sender releases in the SKDM:
+//! The chain is one-way, so *what* a reader can read is fixed by *which*
+//! iteration's chain key the sender releases in the SKDM:
 //!
-//! - **Forward-only:** release the chain key at the sender's **current**
-//!   iteration → the newcomer reads only from now on. (No retention needed; use
+//! - **Forward:** release the chain key at the sender's **current** iteration →
+//!   the reader reads only from now on. This is what every other member is
+//!   released (forward-only, design-4 R7). (No retention needed; use
 //!   [`crate::group::state::SenderChain::current_position`].)
-//! - **Full-history:** release the **origin** chain key (`iteration = 0`) for each
-//!   epoch the retained history spans → the newcomer derives the whole chain and
-//!   reads all of that sender's retained history.
+//! - **Origin:** release the **origin** chain key (`iteration = 0`) of one of
+//!   this node's own retained generations, from which the whole chain derives:
+//!   only to this node's own local recovery ([`OriginKeyStore::full_history_skdm`]).
 //!
 //! To release at *any* past iteration, the sender must retain the origin chain
 //! key of that generation; from the origin it can derive the key at any
@@ -19,8 +20,8 @@
 //!
 //! ## Scope boundary (ADR-006 / ADR-007 / ADR-010)
 //! M4 provides only the **mechanism**: "retain origin keys" and "release a
-//! verifiable SKDM at iteration X to identity Y". The **policy choice**
-//! (forward-only vs full-history) and the **consent gate** (whether/when to send
+//! verifiable SKDM at iteration X to identity Y". The **policy** (forward only;
+//! the origin to this node's own local recovery) and the **consent gate** (whether/when to send
 //! an SKDM to a given identity at all — the per-sender-consent differentiator)
 //! are ADR-007 / M6: M6 decides, M4 executes. The **TTL bound** on how long
 //! origin keys are retained is ADR-010 / M8 (the channel-retention window); M4
@@ -81,8 +82,8 @@ struct OriginRecord {
     mint_seq: Option<Stamp>,
 }
 
-/// A sender's store of origin chain keys, enabling full-history (and
-/// any-iteration) SKDM release (ADR-006 §History).
+/// A sender's store of origin chain keys, enabling any-iteration SKDM release
+/// (ADR-006 §History): a forward release, or the origin to this node's own local recovery.
 ///
 /// Keyed by `(channel_id, epoch, chain_id)` so generations are unambiguous across
 /// channels, epochs, and rotations — and, critically, so a retained key can only
@@ -111,7 +112,7 @@ impl OriginKeyStore {
 
     /// Retain the origin (iteration-0) chain key for one
     /// `(channel_id, epoch, chain_id)` generation, with its signing public key and
-    /// author identity, so the sender can later release full history. Call this
+    /// author identity, so the sender can later release it at any iteration. Call this
     /// when a generation is created (alongside
     /// [`crate::group::state::SenderChain::new`]/`rotated`).
     ///
@@ -378,9 +379,10 @@ impl OriginKeyStore {
         Ok(ck)
     }
 
-    /// Build a **full-history** SKDM: release the origin SKDM (`iteration = 0`) for
-    /// `(channel_id, epoch, chain_id)` so the recipient derives the whole retained
-    /// chain (ADR-006 §History full-history).
+    /// Build an **origin** SKDM: release `(channel_id, epoch, chain_id)` at
+    /// `iteration = 0`, from which the whole retained chain derives. Its one caller is this
+    /// node's own local recovery (`pending_recovery.rs`); no other identity is released one
+    /// (forward-only, design-4 R7).
     pub fn full_history_skdm(
         &self,
         author_root: &dyn RootSigner,

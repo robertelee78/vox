@@ -1779,10 +1779,10 @@ impl Node {
                         page.arriving
                     ));
                 }
-                if page.keys_awaited > 0 {
+                if page.unreadable > 0 {
                     say(format!(
-                        "The oldest posts held here of {} member(s) cannot be read here: no key for them has reached this node.",
-                        page.keys_awaited
+                        "The oldest posts held here of {} member(s) cannot be read with the keys this node retains. Coming back to a room does not restore earlier keys.",
+                        page.unreadable
                     ));
                 }
                 if page.left_out > 0 {

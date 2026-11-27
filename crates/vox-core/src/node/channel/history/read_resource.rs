@@ -240,10 +240,14 @@ impl ReadResource {
             .is_ok()
     }
 
+    /// Run `step` inside the publication fence only while the room's membership counter is
+    /// `generation`, and, for a room key sealed for `target`, while the departure sequence
+    /// recorded when it was sealed is still the target's (R2).
     pub(crate) fn with_removal_fence<T>(
         &self,
         room: &Digest32,
         generation: u64,
+        target: Option<(Digest32, u64)>,
         signer: Option<&dyn crate::identity::composite::RootSigner>,
         step: impl FnOnce() -> T,
     ) -> Option<T> {
@@ -252,6 +256,13 @@ impl ReadResource {
             .with_publication_fence(|| {
                 if !self.removal_authorization_current(room, generation) {
                     return Ok(None);
+                }
+                if let Some((target, departure)) = target {
+                    if crate::node::channel::governance::departure(&store, room, &target)?
+                        != departure
+                    {
+                        return Ok(None);
+                    }
                 }
                 if let Some(signer) = signer {
                     let locks = crate::node::pending_lock::PendingLocks::load(&store, signer)?;
