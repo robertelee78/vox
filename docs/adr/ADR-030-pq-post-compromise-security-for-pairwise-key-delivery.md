@@ -85,6 +85,16 @@ binds PQ freshness to every key delivery, not to the ratchet.
   QUIC packets it cannot read, so no third party can cause the fallback. There is no capability bit.
   (Amended 2026-10-10, by the lead under the decider's delegation, in place of lockstep, under which
   an older peer read nothing new until it updated.)
+  *(Amended 2026-11-27 by ADR-055 FO-10: a key is never sent in the pair's long-lived session; that
+  fallback and its probe are deleted. When a delivery's stream ends unanswered, the sender's daemon
+  says the peer "runs an older Vox, which cannot take a key delivered in a session of its own …;
+  your key stays owed to it until it updates", and the key stays owed. A room key goes directly only
+  on a connection that completed a version-3 history exchange for that room and epoch, so a
+  computer on another version exchanges no history or keys with this one until both run the same
+  version. `vox status` says so on that room and peer's sync line, "that computer runs another Vox
+  version; this computer exchanges no history or keys with it until both run the same version",
+  written only for a current member and retired by a successful round; a v0.4.30 computer still
+  drops the stream without a word.)*
 
 ### 3. Prekeys
 
@@ -129,6 +139,8 @@ binds PQ freshness to every key delivery, not to the ratchet.
     session. ADR-006 S-12 makes its key inert.
   - A peer that runs a Vox older than v0.4.3 is sent its keys in the pair's long-lived session (W-4),
     so S-1 to S-3 do not hold for keys sent to it until it updates; this is said beside it.
+    *(Amended 2026-11-27 by ADR-055 FO-10: no key is sent in the long-lived session any more, so
+    this degradation no longer arises; an older peer is sent no key until it updates.)*
 - **S-6. Precondition.** S-1 to S-3 hold only while D-1 covers every confidential payload on the
   pairwise channel. A change that adds a payload MUST state how it meets D-1, or reopen this ADR.
 
@@ -177,6 +189,8 @@ binds PQ freshness to every key delivery, not to the ratchet.
 - v0.4.3 sends a peer on v0.4.2 or earlier its keys the old way, in the long-lived session, and says
   so beside it, so a mixed room keeps reading; those keys have no post-compromise recovery until the
   peer updates (W-4).
+  *(Amended 2026-11-27 by ADR-055 FO-10: a mixed pair no longer keeps reading; it exchanges no
+  history or keys until both computers run the same version.)*
 - Recipient-side healing is bounded by prekey hygiene: P-1 retires unused one-time prekeys and P-2
   refuses stale bundles and bundles dated more than 10 minutes ahead, so a recipient clock running
   fast lengthens the bound by at most 10 minutes.

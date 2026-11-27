@@ -2331,6 +2331,9 @@ Plan A's sections for items 6, 8 and 10 each chose an invariant that the eight a
     TC-3). (d) ADR-048 TC-9 act 5 stages 'behind own history with the missing original key held
     by one other member' by snapshotting a member's scratch store before a rotation it then
     performs; SY-11's recovery journey owns that staging and ADR-048 reuses it."
+    *(Overtaken 2026-11-27 by ADR-055 FO-7: items (c) and (d) no longer apply. The own-original
+    release is deleted, and own-history recovery fetches entries only, opening them with the keys
+    the node still holds; a missing original key neither blocks recovery nor is asked for.)*
   - *An open node meeting the fence* (item 89): a node already open that learns, from a `Head(me)`
     answer, that a member holds more of its feed than it does, sets the fence (`vox room post`
     refused "behind what a member holds", ADR-037 R5), parks daemon-owned work on

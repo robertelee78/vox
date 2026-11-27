@@ -64,6 +64,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [052](ADR-052-fix-reproduced-causes-one-per-task.md) | v0.4.31 Fixes Reproduced Causes, One per Task (KISS; one busy-room journey decides the room requirements; a join is admitted by one member; a trust change applies room by room; every "not yet" is retried; the sync method is chosen by measurement; three journeys are the release bar) — accepted for v0.4.31 | 007, 012, 018, 043, 051 |
 | [053](ADR-053-a-message-is-shown-on-its-authors-own-proof.md) | A Message Is Shown on Its Author's Own Proof (a message needs its author's own signed prefix and the governing changes it acknowledged, nothing about other members' chat; shown is not citable; a removal cuts at the target's witnessed tip; control evidence is kept and served; one list of missing positions per member; each signed header kept once, then only the chain's fingerprint after expiry; the store file follows what it holds) — accepted for v0.4.31; amendment 4: the two storage stages move to v0.4.32, and the fetching machinery its Order assumed is replaced by ADR-054 | 007, 018, 036, 052 |
 | [054](ADR-054-fetching-is-one-pull-loop-per-connection.md) | Fetching Is One Pull Loop per Connection (a node says what it can serve; owes from its own records through one frontier per author; each connection asks its peer one request at a time; answers are the existing proofs; serving runs off the actor; no timer, no retry count, no negative cache; the change deletes more than it adds) — accepted for v0.4.31; nothing of it landed when written | 018, 052, 053 |
+| [055](ADR-055-a-member-reads-forward-from-its-trust-or-its-return.md) | A Member Reads Forward from Its Trust or Its Return (nobody is given older history; `--history full` is removed; leaving excludes a member from keys and coming back is applied like a readmission; a deleted key stays deleted; no own key is released over the network; the update migrates each room once, with three accepted losses; two computers on different versions exchange no history or keys) — accepted for v0.4.31; merged in #1418 | 006, 007, 023, 030, 052, 053, 054 |
 
 ## Tiers
 
@@ -96,7 +97,8 @@ does not import that branch's unreleased command surface into the released manua
   050 (an agent turn is finished or declared uncertain), 051 (the Linux build runs where it
   installs), 052 (v0.4.31 fixes reproduced causes, one per task), which supersedes 040 to 050
   for v0.4.31 and keeps 051, and 053 (a message is shown on its author's own proof), which
-  amends 036 and 052.
+  amends 036 and 052; and 055 (a member reads forward from its trust or its return), which amends
+  006, 007, 023, 030, 038 and 054.
 
 ## Status (integrate/v0.3.0)
 
@@ -152,6 +154,7 @@ planned. This is the roll-up.
 | 051 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends no accepted ADR; built under ADR-052 RG-11 |
 | 052 | accepted for v0.4.31 (the decider, 2026-11-20), **not built**, each requirement is to land with its proof; supersedes 040 to 050 for v0.4.31 (043 except CJ-11, CJ-12 and CJ-17) and `docs/release/v0.4.31.md`; keeps 051; adds the KISS rule to AGENTS.md |
 | 053 | accepted for v0.4.31 (the decider, 2026-11-23, after gpt-6.1-sol's review), **not built**, each requirement is to land with its proof; amends 036 (H-2, H-4, the v2 signature-retention sentence) and 052 (RG-0, RG-5, RG-13); product question 3 deferred to a measurement |
+| 055 | accepted for v0.4.31 (the decider, 2026-11-27, by the question form), **merged** in pull request #1418 (merge commit `18048bf56`, the tree of `a8d41d7d6`, with main `18822e02a`; checks passed); its product diff accepted in security review through `a8d41d7d6`; the update journey on stores of the published v0.4.30, the acts on the merged tree and the busy-room journey on that code ran green; two arms show no engaged line and one act order is not run (open proof gaps); amends 006 (S-18, S-19), 007 (G-16, G-30, G-32), 023 (R12, R14, RL-4.1, RL-4.4, RL-4.8, decision 5, RL-8.1b, RL-8.5, RL-8.8, proof 7, M23.4), 030 (W-4), 038 (FX-28, FX-32, FX-62) and 054 (PL-2, PL-20, PL-21, PL-23, PL-24, PL-25, PL-27, PL-36); overtakes lines of 046, 048 and 049 |
 
 ## Conformance-vector obligations
 

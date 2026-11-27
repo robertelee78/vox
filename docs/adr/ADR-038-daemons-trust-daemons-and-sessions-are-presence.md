@@ -239,6 +239,16 @@ lessons. It changes neither this record's decision status nor any requirement or
   An unsupported room MUST be refused with one sentence naming what to do (leave it and create a
   new one). Vox MUST NOT delete or reset stored data, and current-format data integrity, restart,
   trust and access rules remain in force.
+  *(Amended 2026-11-27 by #1417 (merged, main `18822e02a`; `release/owed/OwedFix2.md` item 5), outside
+  ADR-055: the parenthesis "(leave it and create a new one)" no longer applies. Leaving a room not
+  open on this node stays refused, by the decider's decision of 2026-11-21 (`exec/deviations.md`
+  row 6: "keep it as it is, nothing new is built"), since a leave is a signed entry in a room this
+  version cannot read. The sentence now says that this version cannot open the room, that its saved
+  data is kept untouched, and to make a new room: "This room was saved in a format from an older Vox
+  that this version cannot open; its saved data is kept untouched. To go on talking, make a new room
+  and send its link to the members." (`UNSUPPORTED_ROOM_FORMAT`, `crates/vox-core/src/node/channel.rs`).
+  Every command on such a room, leaving included, answers with it. Nothing is converted, deleted or
+  reset; rooms made before v0.4.10 have been refused since v0.4.10 (`release/legacy-room/report.md`).)*
   The decider's v0.4.10 baseline decision also permits recreating existing format 3 rooms:
   sparse roots with 20, 21, 22 or 23 fields are unsupported and MUST be refused before mutation,
   with the same recreation guidance. Their stored files remain intact. New 25-field roots MUST
@@ -555,6 +565,19 @@ lessons. It changes neither this record's decision status nor any requirement or
   original room ID and reply, rather than fail solely because the policy moved. Stale authority
   MUST NOT commit the room. The FX-28 shipped journey stages this exact boundary and checks the
   resumed create and room list; FX-61a defines its ownership and lifecycle.
+  *(Amended 2026-11-27 by ADR-055 FO-10 and (f): the arm of `nodes_of_one_daemon_proof`'s
+  `two_paired_computers_that_are_idle_exchange_nothing` that staged an older-Vox peer taking its key
+  in the pair's long-lived session is deleted with that session, and with it the rekey-writer and
+  stale-authority phases staged through it (`stale_rekey_is_not_delivered`) and the test switches
+  only they used; its prejoin-clock refusal and restart assertions are kept in
+  `skewed_prejoin_is_refused`. The new act `a_computer_on_an_older_vox_exchanges_nothing_until_it_updates`
+  stages computers speaking the older history preamble: what was owed stays owed and arrives after
+  the update, and a computer whose trust was withdrawn while it was on the older version reads
+  nothing. The journey's stale-post stage asserted a refusal the product no longer makes (a post
+  racing a trust revision is kept since `465f2345e`); it is restaged: while the moved policy is held
+  the post is neither published nor refused, and once the policy applies it is published under it
+  and read once. Its claim, nothing published under stale authority, is kept; the journey is green
+  and the stage's arm `VOX_MUTANT_FX28=stale-post-authority` red (ADR-055 (f)).)*
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
@@ -697,6 +720,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   writes MUST stay refused until its own feed is current again and MUST resume then. Measured
   before this: a restored node refused its writes correctly and never read the member's next
   post (the restarts proof, step 5, 2026-10-19).
+  *(Amended 2026-11-27 by ADR-055 FO-3, FO-7 and (c): it recovers its entries only; no key is asked
+  of a member, and it opens its own recovered posts with the keys it still holds. A restored node
+  that never left keeps reading meanwhile, as written. A node that left and came back reads nothing
+  written before its return, also while its recovery is pending, since every member holds it
+  departed until its return Presence, which is signed when recovery completes.)*
 - **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
   it, every member MUST still read and post there, the rows the member holds that are older
   than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
@@ -1639,6 +1667,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   and connected-member push, not wait for an address change, an anchor or the next TTL renewal.
   A partially saved membership decision must retain its pending generation bump across a real
   authority expiry; completed decisions must not rotate again on unrelated governance.
+  *(Amended 2026-11-27 by ADR-055 (f): the readmission act's never-removed full-history arm is
+  deleted, its claim withdrawn by the decider's ruling of that day, and the queued-debt act stages
+  its debt as catch-up. Their shared mutant arm is `VOX_MUTANT_FX62=readmission-backfill`, which
+  undoes the boundary at the rotation's entitlement and at the readmission body cut; the former
+  `old-entitlement` arm no longer turned either act red.)*
 - **FX-64. Direct publication target.** Every link route the link marks as a member that a joiner
   dials while finding a board (all routes raced by `reach_a_board`, whether selected or not, and
   `another_board_with_the_room`) is reported as a board dial and inserted into the global anchor

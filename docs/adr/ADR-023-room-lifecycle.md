@@ -21,9 +21,12 @@ PRD-001 sets the room's lifecycle:
   shortest wins; an expired message leaves nothing visible. This is look and feel, not a security
   property.
 - **R11:** keys reach an offline member through always-on member nodes, never through the anchor.
-- **R12:** the approver chooses history per grant, defaulting to from-approval-onward.
+- **R12:** the approver chooses history per grant, defaulting to from-approval-onward. *(Amended
+  2026-11-27 by ADR-055 FO-7: there is no choice; a member reads from its trust point, or its
+  return, on.)*
 - **R13:** messages appear in the same order on every node.
-- **R14:** sender keys that are no longer needed are deleted.
+- **R14:** sender keys that are no longer needed are deleted. *(Amended 2026-11-27 by ADR-055 FO-1:
+  the deletion runs, and a deleted key stays deleted on that node.)*
 - **R33–R34:** any always-on node can be an anchor, and an anchor stores nothing for rooms it is not
   a member of.
 
@@ -170,6 +173,8 @@ below remain unchanged.
   (consent granted, or a rotation) and cannot reach the recipient (the dial reports it unreachable),
   it MUST seal the SKDM to the recipient and post it as a `key-package` log entry (struct tag
   `0x0017`, `vox/key-package/v1`).
+  *(Amended 2026-11-27 by ADR-055 FO-4 and FO-10: the package body is version 2; a version-1
+  package is kept and parsed for structure, never opened, installed or counted as delivered.)*
 - **RL-4.2. The seal.** A key-package MUST be sealed with a one-shot PQXDH to the recipient's
   published prekey bundle (ADR-004): the package carries the PQXDH initial message and the first
   ratchet message, whose plaintext is the SKDM. It MUST NOT be sealed in a pairwise session, because
@@ -180,6 +185,14 @@ below remain unchanged.
 - **RL-4.4. Forward-only is preserved.** A package for a consent MUST release the sender key at its
   current position, as direct delivery does; a package for a rotation MUST release the new
   generation at its origin. A message sealed before the grant MUST stay unreadable to the recipient.
+  *(Amended 2026-11-27 by ADR-055 FO-4 and FO-5: a consent for a member that already holds an
+  entitlement releases from that entitlement, its stable floor, not from the current position. A
+  member that came back gets room keys only by package, never directly, and each such package
+  names its signed return as a required ancestor; a package that does not contain the return is
+  not opened, installed or served to it. Key releases to a member trusted again after being
+  untrusted start where the author trusted it again, as any member's start at its trust point; only
+  a mark taken after the latest signed revocation counts. Keys and messages it already holds stay
+  usable.)*
 - **RL-4.5. Every member node replicates it** like any entry, and an always-on member (a NAS, for
   example) carries it to the recipient when it next syncs. No store-and-forward service is added.
   A non-recipient MUST NOT be able to open a package.
@@ -192,12 +205,24 @@ below remain unchanged.
   any generation a full-history grant still has to release (decision 5). A superseded generation's
   origin key MUST be deleted (`ChannelState::prune_superseded_origins`, zeroized on drop), and
   `vox status` MUST report the generations held per room (`key_generations`).
+  *(Amended 2026-11-27 by ADR-055 FO-1 and FO-6: no full-history grant exists, so no generation is
+  kept for one. A continuously entitled member's history floor keeps origins until its keys are
+  delivered; a member that left or was removed keeps none through its history floor, but a
+  still-trusted identity without an entitlement here may keep origins under the separate bounded
+  hold for one that has not joined (`UNJOINED_HOLD_SECS`). A reader's deletion of a received
+  generation writes an exact tombstone in the same batch, and the generation is never installed
+  there again.)*
 - **RL-4.9. The accepted consequence (PRD-001 §7 Q7).** A room with no always-on member, whose
   members are never online together, cannot deliver keys. `vox status` MUST say so for that room
   ("no always-on member: keys wait for overlap"). *Status:* planned; `vox status` reports
   `always_on_member` as unknown. The recipient's own log says why it read nothing (proof 5).
 
 ### Decision 5. History per grant (R12)
+
+*(Amended 2026-11-27 by ADR-055 FO-7: RL-5.1, RL-5.2 and RL-5.4 are withdrawn. There is no
+`--history` option (`vox trust add --history …` is refused by clap) and no full release; every
+grant releases from the trust point. RL-5.3 stands: a key that arrives after its posts still makes
+them readable.)*
 
 - **RL-5.1.** When approving a member, the approver MUST choose "from now" (the default) or "full
   history": `vox trust add <fp> --history now|full`. The choice MUST be kept per identity in the
@@ -287,6 +312,12 @@ below remain unchanged.
   member's departure supplies the recovery standing in RL-8.5 before return Presence. It
   does not supply read/Drive trust or supersede an admin removal. Peers retain and propagate
   that standing through the existing notice machinery, including after restart.
+  *(Amended 2026-11-27 by ADR-055 FO-2 to FO-4: for keys, a member is left out when its latest
+  authenticated Presence is a departure, whatever entries follow it, and a return lifts that. A
+  return is applied as a readmission is for keys: each member takes one return cut and advances
+  its membership counter once per return, decided by feed position, rotates, and sends the
+  returner only its fresh chain, by a key package that names the return as a required ancestor.
+  The returner reads what is written from its return on.)*
 - **RL-8.2. End.** The room's creator, or an admin it delegated (ADR-007 G-5), MAY end the room (a
   room-lifecycle fact `0x0019`, kind end); the creator MAY choose an idle end at creation (kind idle
   end), and the room then ends once nothing is said in it for that long. A node holding an ended
@@ -382,6 +413,13 @@ below remain unchanged.
   send it early; post-publication cleanup remains required once the departure is acknowledged.
   Distinguish recovery standing from a new authored Presence rather than bypassing history safety.
   This explicitly qualifies RL-8.1b and ADR-037 R5; new authors still settle locally.
+  *(Amended 2026-11-27 by ADR-055 FO-7 and FO-8: recovery obtains no key material from peers.
+  Own-generation recovery over the network and key redelivery to a returner before its return are
+  removed; peers honor the notice for its own head and pages only. A returner opens its own
+  recovered posts with the keys it still holds, and reads nothing others wrote before its return,
+  including while its recovery is pending, since every member holds it departed until its return
+  Presence, signed at recovery's completion. The fence and the notice's travel by the board
+  exchange are unchanged.)*
   Seed markers for currently held valid room histories before further appends. For an
   unmarked binding, first try to derive the author's prior signed history through the
   authenticated admitting member. The operator ruled on 2026-11-06: “it should be automatic
@@ -482,6 +520,8 @@ below remain unchanged.
   reads ten distinct returner posts; normal leave, restart and rejoin preserve the history and
   allow distinct new traffic both ways without replacement-prefix corruption. A returning
   author awaiting recovery still reads permitted fresh traffic and reports pending, not healthy.
+  *(Amended 2026-11-27 by ADR-055 FO-3 and (c): a returning author awaiting recovery reads nothing
+  written before its return, and reports pending; the act asserts that.)*
   Exercise missing-peer and genuine conflicting/older-history inverses without destructive
   cleanup. Wrong-passphrase then correct retry, duplicate-name failure then corrected retry,
   rejected-existing-open recovery, concurrent name reservations and post-admission rename must
@@ -542,6 +582,12 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    `full` grant reads earlier messages and a `now` grant does not.
    `crates/vox-tui/tests/history_grant_proof.rs`; the unread badge with `--history full`:
    `crates/vox-tui/tests/tui_unread_backfill_proof.rs`.
+   *(Amended 2026-11-27 by ADR-055 (f): the full-history arm is deleted with the option. The R14
+   act is `an_author_keeps_a_key_only_while_a_member_still_needs_it_proof.rs`: a member trusted
+   before and offline across two rotations reads every post after its trust, the author then
+   holds one generation, and a member that left pins nothing. The badge act stages a late key by
+   reciprocal trust: Alice trusts Bob before posting; Bob trusts Alice after the ciphertext
+   arrives, and the row counts once when the key makes it readable.)*
 8. **Checkpoints:** a disappearing room sheds expired signatures, reopens, and a cold joiner holds
    the same entries in the same order; a forged entry below the checkpoint is refused; a closing
    checkpoint follows a quiet room; an expired backlog is checkpointed without another prune.
@@ -565,6 +611,9 @@ The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 - **M23.4** Per-grant history (decision 5) and R14 pruning (RL-4.8). Built. Not proved: that a
   generation is kept while a full-history grant is owed and released once delivered; tracked by R14
   (#65).
+  *(Amended 2026-11-27 by ADR-055 FO-1, FO-6 and FO-7: per-grant history is removed; no generation
+  is kept for a full-history grant; R14 runs, with tombstones, since pull request #1418 (merge
+  commit `18048bf56`).)*
 - **M23.5** Delete the anchor log (decision 6). Built.
 - **M23.6** Checkpoints (decision 3). Built.
 
