@@ -846,7 +846,12 @@ pub const MAX_HAVE_HEADS: usize = 4;
 /// it was asked for sends this again, corrected, in its answer. MP-9: whether it holds a
 /// verified fork proof of the author (`fork`, a reason to ask `Query::Fork`), and the author's
 /// one kept signed head whose continuity with its accepted chain is unresolved (`unresolved`,
-/// id and size: a reason to ask `Query::HeadById`, never a committed head). Neither is evidence.
+/// id and size: a reason to ask `Query::HeadById`, never a committed head). An author whose
+/// fork is listed is frozen there and has no unresolved head: its `unresolved` names the kept
+/// proof instead (a digest of its two entry hashes, and its position): never trusted, it only
+/// spares an asker that holds that proof a `Query::Fork` (the fork rule, `pull::FORK_ASKS`; the
+/// position gates nothing); a peer that asks the fork first never reads it as a head. Neither
+/// is evidence.
 ///
 /// `bodies_span` is the interval of positions whose bodies this Have tells completely: inside
 /// it a position outside `bodies` is not held; outside it this Have says nothing of bodies. The

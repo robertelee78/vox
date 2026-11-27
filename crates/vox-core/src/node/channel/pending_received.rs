@@ -135,10 +135,25 @@ impl ChannelState {
                 .saturating_add(64)
                 .min(context.coordinates.len());
             let mut waiting = None;
+            // Rule F3 (sec-5 condition 5): a coordinate this source's admission ignored (not the
+            // accepted control here, naming a proved splitter at or after its boundary) requires
+            // no effect here either. Whether it was certified was decided once, at admission; a
+            // certificate seen since cannot make an admitted source corrupt.
+            let splits = self.history_splits(store)?;
             for coordinate in &context.coordinates[cursor.next..end] {
-                let Some((head, control)) =
-                    input.history_validated_header(&coordinate.author, coordinate.seq)?
-                else {
+                let held = input.history_validated_header(&coordinate.author, coordinate.seq)?;
+                let matched = held
+                    .as_ref()
+                    .is_some_and(|(_, control)| control.entry_hash() == coordinate.hash);
+                if !matched
+                    && splits
+                        .reaching(&coordinate.author, coordinate.seq)
+                        .is_some()
+                {
+                    cursor.next += 1;
+                    continue;
+                }
+                let Some((head, control)) = held else {
                     return Err(Error::MalformedAtRest("validated history control vanished"));
                 };
                 if control.entry_hash() != coordinate.hash {

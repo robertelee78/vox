@@ -20,6 +20,9 @@ pub(crate) struct RoomSnapshot {
     authors: BTreeSet<Digest32>,
     left: BTreeSet<Digest32>,
     frozen: BTreeSet<Digest32>,
+    /// Rule F2: each frozen author's recorded boundary (`governance::splits`), as the
+    /// room knew it at publication: what meets a parked entry's fork wait (`pull::Need::Fork`).
+    fork_boundaries: BTreeMap<Digest32, u64>,
     /// MP-9: per frozen author whose kept proof is still signed, its two signed entry headers:
     /// what `Query::Fork` serves (the Have's fork flag is the record's, `held_history`).
     forks: BTreeMap<Digest32, (Vec<u8>, Vec<u8>)>,
@@ -161,6 +164,10 @@ impl RoomSnapshot {
     /// An author frozen by fork evidence (MP-9a), as the room knew it at publication.
     pub(crate) fn is_frozen(&self, id: &Digest32) -> bool {
         self.frozen.contains(id)
+    }
+    /// Rule F2: a frozen author's recorded boundary, as the room knew it at publication.
+    pub(crate) fn fork_boundary(&self, id: &Digest32) -> Option<u64> {
+        self.fork_boundaries.get(id).copied()
     }
     /// The peer's current removal, read in the store; never from the snapshot.
     pub(crate) fn peer_removal_applied(&self, store: &Store, peer: &Digest32) -> Result<bool> {
@@ -334,6 +341,7 @@ impl ChannelState {
                 .filter(|author| self.dag.is_frozen(author))
                 .copied()
                 .collect(),
+            fork_boundaries: self.history_splits(store)?.boundaries().collect(),
             forks: self
                 .dag
                 .fork_proofs()
@@ -395,6 +403,39 @@ impl ChannelState {
             left,
         })
     }
+
+    /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending,
+    /// each with what its Have says of the kept proof (`fork_listing`): what its Have lists so
+    /// a peer that never met the second history, or holds an older proof, can ask for it.
+    pub(super) fn history_fork_listings(&self) -> BTreeMap<Digest32, (Digest32, u64)> {
+        self.dag
+            .fork_proofs()
+            .into_iter()
+            .filter(|proof| signed_fork(proof))
+            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
+            .map(|proof| (proof.author_id, fork_listing(proof)))
+            .collect()
+    }
+
+    /// What this node's Have says of the proof it keeps for `author` (`fork_listing`), if it
+    /// keeps one: what the fork rule compares a peer's listing with (`pull::FORK_ASKS` (c)).
+    pub(crate) fn history_fork_listing(&self, author: &Digest32) -> Option<(Digest32, u64)> {
+        self.dag.fork_proof(author).map(fork_listing)
+    }
+}
+
+/// What a Have lists of a kept fork proof besides its fork flag, in the author's `unresolved`
+/// slot, which is otherwise empty for a frozen author: a digest of the proof's two entry hashes,
+/// in byte order (so one pair is one identity whichever entry a node held first), and its
+/// position. A proof replaced by a lower one (`record_history_fork`) lists another, so the Have
+/// is told again. A peer never trusts it: it only spares asking for a proof the peer already
+/// holds, and its position gates nothing (the fork rule, `pull::FORK_ASKS`). No new wire field.
+fn fork_listing(proof: &ForkProof) -> (Digest32, u64) {
+    let (a, b) = (proof.existing.entry_hash(), proof.conflicting.entry_hash());
+    let mut hashes = [0u8; 64];
+    hashes[..32].copy_from_slice(&a.min(b));
+    hashes[32..].copy_from_slice(&a.max(b));
+    (crate::hash::sha256(&hashes), proof.seq)
 }
 
 /// A fork proof whose two entries still carry their signatures: the only kind that is listed or
@@ -435,9 +476,6 @@ pub(crate) trait ServedRoom {
     /// An author frozen by a fork proof (MP-9a): its later history is refused, so nothing of it
     /// is fetched, and its unresolved head is not listed.
     fn history_author_frozen(&self, author: &Digest32) -> bool;
-    /// MP-9: the authors this node holds a verified, still-signed fork proof for, ascending:
-    /// what its Have lists so a peer that never met the second history can ask for it.
-    fn history_fork_authors(&self) -> Vec<Digest32>;
     /// MP-9: the two signed headers of the proof this node verified and kept for `author`.
     /// No body and no key material travel.
     fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)>;
@@ -757,15 +795,6 @@ impl ServedRoom for ChannelState {
     fn history_author_frozen(&self, author: &Digest32) -> bool {
         self.dag.is_frozen(author)
     }
-    fn history_fork_authors(&self) -> Vec<Digest32> {
-        self.dag
-            .fork_proofs()
-            .into_iter()
-            .filter(|proof| signed_fork(proof))
-            .map(|proof| proof.author_id)
-            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
-            .collect()
-    }
     fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
         let proof = self.dag.fork_proof(author)?;
         signed_fork(proof).then(|| {
@@ -838,14 +867,6 @@ impl ServedRoom for RoomView<'_> {
     }
     fn history_author_frozen(&self, author: &Digest32) -> bool {
         self.snapshot.is_frozen(author)
-    }
-    fn history_fork_authors(&self) -> Vec<Digest32> {
-        self.snapshot
-            .forks
-            .keys()
-            .copied()
-            .take(crate::log::history::MAX_CONTEXT_AUTHORS)
-            .collect()
     }
     fn history_fork_proof(&self, author: &Digest32) -> Option<(Vec<u8>, Vec<u8>)> {
         self.snapshot.forks.get(author).cloned()

@@ -2185,17 +2185,115 @@ fn mp9_own_feed_through(w: &Worker, room: &str) -> u64 {
         })
 }
 
+/// Wait on `reader` until `done` holds of its `vox room roster` and `vox room read`, by its state
+/// and not by a deadline. Red (`PRODUCT [claim]`) when, twenty polls in a row (ten seconds),
+/// `reader`'s `vox status --json` says `author` is connected and advertised its feed through
+/// `through` or later and no governance work is queued, and neither the room's log entries nor
+/// `author`'s verified or latest shown position there moved, yet `done` does not hold.
+/// `NO RESULT` after three minutes without either.
+fn mp9_until_on(
+    reader: &Worker,
+    author: &Worker,
+    id: &str,
+    through: u64,
+    claim: &str,
+    done: impl Fn(&Out, &Out) -> bool,
+) {
+    let give_up = Instant::now() + Duration::from_secs(180);
+    let author_id = author.b32();
+    let (mut stalled, mut last) = (0, None);
+    loop {
+        let roster = reader.vox(None, &["room", "roster", id]);
+        let read = reader.vox(None, &["room", "read", id]);
+        if roster.ok && read.ok && done(&roster, &read) {
+            return;
+        }
+        let status = reader.vox(None, &["status", "--json"]);
+        let v = if status.ok {
+            status.json()
+        } else {
+            serde_json::Value::Null
+        };
+        let room = v["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["id"].as_str().is_some_and(|rid| mp9_same_id(rid, id)))
+            .cloned()
+            .unwrap_or_default();
+        let member = room["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| {
+                m["id"]
+                    .as_str()
+                    .is_some_and(|mid| mp9_same_id(mid, &author_id))
+            })
+            .cloned()
+            .unwrap_or_default();
+        let progress = (
+            room["log_entries"].clone(),
+            member["verified_through"].clone(),
+            member["holds_through"].clone(),
+        );
+        let waiting_on_nothing = v["governance_pending"] == false
+            && member["connected"] == true
+            && member["advertised_through"]
+                .as_u64()
+                .is_some_and(|advertised| advertised >= through);
+        stalled = if waiting_on_nothing && last.as_ref() == Some(&progress) {
+            stalled + 1
+        } else {
+            0
+        };
+        last = Some(progress);
+        assert!(
+            stalled < 20,
+            "PRODUCT [{claim}]: {} is connected to {}, which advertised its feed through {through} \
+             or later, reports no governance work queued and took no entry for ten seconds, yet \
+             the claim does not hold: roster={roster:?} read={read:?} status={status:?}",
+            reader.name,
+            author.name
+        );
+        assert!(
+            Instant::now() < give_up,
+            "NO RESULT [{claim}]: {} never settled in the state the verdict reads ({} connected \
+             and advertised through {through}, no governance work, no entry taken): \
+             roster={roster:?} read={read:?} status={status:?}",
+            reader.name,
+            author.name
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// ADR-053 MP-9 with a member that forks itself into two branches of one length: **a reader
-/// holding one branch records the fork when it meets a member holding the other.** alice
-/// (creator), carol (the forking member), dave. carol's last entry before the fork is a post
-/// every member read, so each branch is posts alone. dave stops; carol posts branch A and alice
-/// shows it; alice stops. A copy of carol's profile from before branch A then posts branch B, as
-/// long as branch A, with only dave running: dave accepts and shows branch B. carol stops and
-/// alice comes back: dave and alice each hold one branch of one length.
+/// holding one branch records the fork when it meets a member holding the other, and applies the
+/// creator's removal of that member made on the other branch.** alice (creator), carol (the
+/// forking member, never an admin), dave. carol's last entry before the fork is a post every
+/// member read. dave stops; carol posts branch A, then signs one membership entry of her own on
+/// it (`vox trust remove dave`: a consent revocation, with its re-key), and alice holds and
+/// applies all of it; carol stops and alice removes her (the removal names branch A's tip, and
+/// alice's context from then on names carol's branch-A control); alice stops. A copy of carol's
+/// profile from before branch A then posts branch B, as long as branch A, with only dave
+/// running: dave accepts and shows branch B. carol stops and alice comes back: dave and alice
+/// each hold one branch of one length, and only alice holds the removal and carol's control.
 ///
-/// Asserted on dave: `vox status --json` lists carol's equivocation (`MP9 fork-recorded`).
-/// Mutant `VOX_MUTANT_FORK=equal-rival-refused` (a head of the accepted size with another root
-/// refused at staging, as before MP-9) turns it red there.
+/// Asserted on dave: `vox status --json` lists carol's equivocation (`MP9 fork-recorded`); his
+/// roster no longer names carol (`MP9 removal applied`); he shows a post alice made after she
+/// came back, whose signed context names carol's branch-A control he can never hold (`MP9
+/// remover's later post`, rule F3: an ordinary splitter's coordinate past her boundary is
+/// ignored); he no longer shows carol's posts after her split, which he had shown (`MP9 split
+/// posts gone`). carol, started again from her branch-B profile, never shows a post dave made
+/// after he applied the removal, which alice shows (`MP9 no new key`). Mutant
+/// `VOX_MUTANT_FORK=equal-rival-refused` (a head of the accepted size with another root refused
+/// at staging, as before MP-9) turns it red at `MP9 fork-recorded` without the removal staged;
+/// with it, the removal's own evidence records the fork. Mutant `VOX_MUTANT_FORK=seen-required`
+/// (rule F2 D off: a control's reference to the forker past her boundary still needs the
+/// reader's own entry there) and mutant `VOX_MUTANT_FORK=fallback-off` (rule F3's coordinate
+/// fallback off: every splitter reads as certified, so alice's entries naming carol's branch-A
+/// control wait for it) each turn it red at `MP9 remover's later post`.
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_branches() {
@@ -2235,24 +2333,58 @@ fn a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_bra
         setup(carol, &["room", "post", id, tag]);
     }
     mp6_all_shown(&[alice], id, &branch_a, "carol's branch A");
+    // carol's own membership entry on branch A only: an ordinary member's consent revocation.
+    setup(
+        carol,
+        &[
+            "trust",
+            "remove",
+            &dave.b32(),
+            "--identity-passphrase-file",
+            carol
+                .pass
+                .to_str()
+                .expect("APPARATUS: UTF-8 passphrase path"),
+        ],
+    );
+    mp9_peer_holds_own_feed(carol, alice, id);
+    mp6_quiet(&[alice, carol]);
     let a_through = mp9_own_feed_through(carol, id);
-    alice.stop_daemon_cleanly();
+    eprintln!(
+        "[proof] MP9: carol's branch A, with her consent revocation, runs through {a_through}"
+    );
     carol.stop_daemon_cleanly();
+    let removal = unchanged_busy_retry(alice, &["room", "remove-member", id, &carol.b32()]);
+    assert!(
+        removal.ok,
+        "PRODUCT (staging): the creator could not remove carol: {removal:?}"
+    );
+    let removal = mp6_signed_entry(&removal);
+    eprintln!("[proof] MP9: alice removed carol holding her branch A: signed entry {removal}");
+    alice.stop_daemon_cleanly();
     std::fs::remove_dir_all(&carol.data).expect("APPARATUS: remove carol's branch-A data");
     std::fs::remove_dir_all(&carol.cfg).expect("APPARATUS: remove carol's branch-A config");
     copy_profile_tree(&base_data, &carol.data);
     copy_profile_tree(&base_cfg, &carol.cfg);
     dave.restart_daemon(&tmp.path().join("dave-b.err"));
     carol.restart_daemon(&tmp.path().join("carol-b.err"));
-    let branch_b = ["MP9-BRANCH-B-1", "MP9-BRANCH-B-2"];
-    for tag in branch_b {
-        setup(carol, &["room", "post", id, tag]);
+    // Branch B: posts alone, as long as branch A (its control and re-key included). Her status
+    // names her own feed once the room is open again, after her first post.
+    let mut branch_b = Vec::new();
+    loop {
+        let tag = format!("MP9-BRANCH-B-{}", branch_b.len() + 1);
+        setup(carol, &["room", "post", id, &tag]);
+        branch_b.push(tag);
+        if mp9_own_feed_through(carol, id) >= a_through {
+            break;
+        }
     }
     let b_through = mp9_own_feed_through(carol, id);
     assert_eq!(
         a_through, b_through,
         "APPARATUS: carol's two branches are not of one length"
     );
+    let branch_b: Vec<&str> = branch_b.iter().map(String::as_str).collect();
     mp6_all_shown(&[dave], id, &branch_b, "carol's branch B");
     mp9_peer_holds_own_feed(carol, dave, id);
     carol.stop_daemon_cleanly();
@@ -2274,6 +2406,62 @@ fn a_target_that_forks_itself_has_its_fork_recorded_by_a_reader_holding_both_bra
         "PRODUCT [MP9 fork-recorded]: dave, holding carol's branch B, met alice holding her branch A of one length and never recorded her fork: {status:?}"
     );
     eprintln!("[proof] MP9: dave recorded carol's fork: {status:?}");
+    let later = "MP9-ALICE-AFTER-REMOVAL";
+    setup(alice, &["room", "post", id, later]);
+    let alice_through = mp9_own_feed_through(alice, id);
+    mp9_until_on(
+        dave,
+        alice,
+        id,
+        alice_through,
+        "MP9 removal applied",
+        |roster, _| !roster.stdout.contains(&carol_id),
+    );
+    eprintln!("[proof] MP9: dave's roster no longer names carol");
+    mp9_until_on(
+        dave,
+        alice,
+        id,
+        alice_through,
+        "MP9 remover's later post",
+        |_, read| read.stdout.contains(later),
+    );
+    eprintln!("[proof] MP9: dave shows alice's {later}");
+    mp9_until_on(
+        dave,
+        alice,
+        id,
+        alice_through,
+        "MP9 split posts gone",
+        |_, read| branch_b.iter().all(|tag| !read.stdout.contains(tag)),
+    );
+    eprintln!("[proof] MP9: dave no longer shows carol's posts after her split");
+    let dave_later = "MP9-DAVE-AFTER-REMOVAL";
+    setup(dave, &["room", "post", id, dave_later]);
+    mp6_all_shown(
+        &[alice],
+        id,
+        &[dave_later],
+        "dave's post after he applied carol's removal",
+    );
+    carol.restart_daemon(&tmp.path().join("carol-b-back.err"));
+    let (open, read) = poll(carol, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        open,
+        "PRODUCT (staging): carol's branch-B room did not open after a restart: {read:?}"
+    );
+    let (leaked, read) = poll(carol, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(dave_later)
+    });
+    assert!(
+        !leaked,
+        "PRODUCT [MP9 no new key]: carol, removed, shows {dave_later}, which dave posted after he \
+         applied her removal: {read:?}"
+    );
+    eprintln!(
+        "[proof] MP9: carol from branch B never showed {dave_later} in {WITHIN:?}; her roster: {:?}",
+        carol.vox(None, &["room", "roster", id])
+    );
 }
 
 /// Count, newest page, thread summary and thread page of `w` for `cid` and `root`: what the acts

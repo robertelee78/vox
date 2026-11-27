@@ -5359,10 +5359,12 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Keep every fork proof the DAG holds in `SEG_FORKS`, if it holds more than are kept.
-    fn keep_forks(&mut self, store: &Store) -> Result<()> {
+    /// Keep every fork proof the DAG holds in `SEG_FORKS`, if it holds more than are kept, or
+    /// when `replaced`: a kept proof was replaced by one giving a lower boundary (the count is
+    /// unchanged, the proof is not).
+    fn keep_forks(&mut self, store: &Store, replaced: bool) -> Result<()> {
         let proofs = self.dag.fork_proofs();
-        if proofs.len() <= self.forks_kept {
+        if proofs.len() <= self.forks_kept && !replaced {
             return Ok(());
         }
         let seg = seal_segment(

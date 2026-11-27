@@ -161,14 +161,19 @@ fn held_rank(writer: &Write<'_, '_>, hash: &Digest32, log: u64) -> Result<Option
     Ok((writer.get(Table::Order, &rank_key(rank))? == Some(log)).then_some(rank))
 }
 
-/// Greatest governance sequence in a frontier. The entry's own position is
-/// excluded, even though its inclusive causal vector contains that position.
+/// Greatest governance sequence in `entry`'s frontier at `author`. The entry's own position is
+/// excluded, even though its inclusive causal vector contains that position. A coordinate this
+/// node's admission ignored gives none (`ignored`).
 fn predecessor(
     writer: &Write<'_, '_>,
+    entry: &Digest32,
     author: &Digest32,
     seq: u64,
     own: bool,
 ) -> Result<Option<u64>> {
+    if ignored(writer, entry, author, seq)? {
+        return Ok(None);
+    }
     let mut before = position(author, seq);
     if !own {
         before[40] = 1;
@@ -177,6 +182,31 @@ fn predecessor(
     Ok(row
         .filter(|(key, _)| key[..32] == author[..])
         .map(|(_, log)| log))
+}
+
+/// Rule F3 (`sec-5.md` conditions 5 and 9), read here as admission and received-effect
+/// readiness read it (`pending_received.rs`): a frontier coordinate that is not this node's
+/// accepted entry at its position and names a proved splitter at or after its boundary was
+/// ignored when its entry was admitted. It names an entry of the other branch, so this node's
+/// own entries of that member at or below its sequence are no dependency: it adds nothing to
+/// the order. Certification is not read again: a certified splitter's unmatched coordinate is
+/// never admitted, and a certificate seen since cannot turn an ignored coordinate into
+/// ancestry. Below the boundary, and for a member with no fork, every coordinate is this
+/// node's own accepted entry and counts as before: no clamp. Stable once ordered: before a
+/// fork is recorded every admitted coordinate matches, and a matching one still matches after
+/// a boundary appears or is lowered.
+fn ignored(writer: &Write<'_, '_>, entry: &Digest32, author: &Digest32, seq: u64) -> Result<bool> {
+    let Some(boundary) = writer.get(Table::ForkBoundary, &hash_key(author))? else {
+        return Ok(false);
+    };
+    if seq < boundary {
+        return Ok(false);
+    }
+    let accepted = writer
+        .get(Table::SourcePositions, &position(author, seq))?
+        .map(|log| writer.entry(log).map(|held| held.entry_hash()))
+        .transpose()?;
+    Ok(accepted.is_none() || accepted != writer.frontier_identity(entry, author)?)
 }
 
 fn next_author_entry(writer: &Write<'_, '_>, author: &Digest32, seq: u64) -> Result<Option<u64>> {
@@ -276,9 +306,13 @@ fn plan(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
             return Ok(());
         };
         state.after = Some(author);
-        if let Some(parent_log) =
-            predecessor(writer, &author, seq, author == entry.skeleton.author_id)?
-        {
+        if let Some(parent_log) = predecessor(
+            writer,
+            &hash,
+            &author,
+            seq,
+            author == entry.skeleton.author_id,
+        )? {
             let parent = writer.entry(parent_log)?;
             match held_rank(writer, &parent.entry_hash(), parent_log)? {
                 Some(rank) => state.maximum = state.maximum.max(rank),
@@ -350,8 +384,13 @@ fn check(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
             return Ok(());
         };
         state.after = Some(author);
-        let Some(parent_log) =
-            predecessor(writer, &author, seq, author == entry.skeleton.author_id)?
+        let Some(parent_log) = predecessor(
+            writer,
+            &hash,
+            &author,
+            seq,
+            author == entry.skeleton.author_id,
+        )?
         else {
             continue;
         };

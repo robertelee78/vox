@@ -40,6 +40,9 @@ pub(crate) struct PendingText {
     authors: BTreeMap<Digest32, CompositePublicKey>,
     admission: AdmissionPolicy,
     dag: Dag,
+    /// Whether the room's DAG held any fork proof at preparation (the candidate `dag` keeps
+    /// none): without one, authoring reads no splitter (`governance::splits`).
+    forked: bool,
     entries: entry_store::EntryIndex,
     sek: WeakSek,
     continuity_key: WeakSek,
@@ -395,6 +398,7 @@ impl ChannelState {
             authors: self.authors.clone(),
             admission: self.admission.clone(),
             dag: self.dag.authored_candidate(),
+            forked: self.dag.any_frozen(),
             entries: entry_store::EntryIndex::default(),
             sek: self.sek.reader(),
             continuity_key: self.continuity_key.reader(),
@@ -947,6 +951,9 @@ impl PendingText {
                 required,
                 self.reserved_tip_author.as_ref(),
                 kind,
+                // Rule F3: read at this authoring, as the room's own route reads it; nothing is
+                // read when the room's DAG held no fork proof at preparation.
+                &governance::splits(store, sek, &self.room, &self.creator, self.forked)?,
             )
             .map(Some)
         })

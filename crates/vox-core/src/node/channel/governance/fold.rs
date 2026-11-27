@@ -572,9 +572,10 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
             writer.put(Table::IssuerRoles, key, Some(record))?;
         }
         GovBody::AdminRevocation(rev) => {
+            // Rule F2 C: a revocation keeps its effect after a fork proof of its issuer; it is
+            // authorized only through its own signed scope, as every revocation is.
             let authorization = if rev.body.epoch == 0
                 && writer.get(Table::Incomplete, &hash_key(&hash))?.is_none()
-                && (entry.skeleton.author_id == *root || writer.fork_safe(&entry)?)
             {
                 let Some(grant) =
                     state.query(writer, root, Scope(Some(hash)), rev.body.issuer_id)?

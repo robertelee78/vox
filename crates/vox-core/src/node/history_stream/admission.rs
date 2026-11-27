@@ -851,11 +851,66 @@ pub(super) fn promote_head(
     Ok(Advanced::Complete)
 }
 
+/// Rule F2 E and rule F3 (ledger 73): what a cross-author reference or signed-context
+/// coordinate that this node's own record of its author contradicts waits for. A wait, never an
+/// admission and never a refusal of the citing author.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ForkWait {
+    /// The named entry differs from this node's validated one at `at`, and no fork proof of
+    /// `author` with a boundary at or below `at` is recorded yet: park on that author's fork,
+    /// woken when one is recorded (`pull::Need::Fork`); meanwhile a peer listing it is asked.
+    Fork { author: Digest32, at: u64 },
+    /// Rule F3 (sec-5 condition 3): a signed-context coordinate that is not this node's
+    /// accepted control and names a certified proved splitter (the creator, or one with any
+    /// creator-issued certificate held here) at or after its boundary. The citing entry waits
+    /// as it was refused before this rule: only the splitter's matching entry there could meet
+    /// the wait, and a frozen author's later entries are never accepted here
+    /// (`pull::Need::Unmatched`).
+    Unmatched(crate::log::history::EntryReference),
+}
+
+/// Rule F2 D: a `seen` reference naming a proved forker at or after its boundary requires no
+/// entry and adds nothing (`fork_boundary` is that member's recorded boundary, if any).
+fn seen_waived(boundary: Option<u64>, reference: &crate::log::history::EntryReference) -> bool {
+    boundary.is_some_and(|boundary| reference.seq >= boundary) && !fork_mutant_is("seen-required")
+}
+
+/// Rule F2 E: a cross-author `seen` reference whose named entry differs from this node's
+/// validated one at that position: two entries of one author at one place. It waits for that
+/// fork to be recorded with a boundary that reaches it; once it is, the reference is waived.
+fn mismatched_reference(
+    boundary: Option<u64>,
+    reference: &crate::log::history::EntryReference,
+) -> Result<ForkWait> {
+    if boundary.is_some_and(|boundary| reference.seq >= boundary) {
+        // Only the mutant that requires the reference reaches here: today's refusal.
+        return Err(invalid("signed parent differs from validated position"));
+    }
+    Ok(ForkWait::Fork {
+        author: reference.author,
+        at: reference.seq,
+    })
+}
+
+/// Rule F3, scheduling side: a signed-context coordinate that is not this node's accepted
+/// control and names a proved splitter at or after its boundary is passed over here, certified
+/// or not. Preflight is never an authority token: the validator decides it only once every
+/// other coordinate is resolved (`SparseValidation::advance`, sec-5 condition 2).
+fn coordinate_deferred(
+    splits: &governance::Splits,
+    coordinate: &crate::log::history::EntryReference,
+) -> bool {
+    splits
+        .reaching(&coordinate.author, coordinate.seq)
+        .is_some()
+}
+
 pub(super) enum EntryStart {
     Preflight,
     BodyNeeded,
     Cursor(CursorBinding),
     Need(Query),
+    Fork(ForkWait),
     Busy,
 }
 
@@ -954,18 +1009,32 @@ pub(super) fn start_entry(
     }
     references.extend(seen.iter().cloned());
     let mut parents = Vec::with_capacity(references.len());
-    for reference in references {
+    let splits = room.history_splits(store)?;
+    for (at, reference) in references.into_iter().enumerate() {
+        let own_parent = at == 0 && seq > 1;
+        let boundary = if own_parent {
+            None
+        } else {
+            splits.boundary(&reference.author)
+        };
+        if seen_waived(boundary, &reference) {
+            parents.push(None);
+            continue;
+        }
         // A validated parent must still be the entry it names.
         if let Some((_, held)) = input.history_validated_header(&reference.author, reference.seq)? {
             if held.entry_hash() != reference.hash {
-                return Err(invalid("signed parent differs from validated position"));
+                if own_parent {
+                    return Err(invalid("signed parent differs from validated position"));
+                }
+                return mismatched_reference(boundary, &reference).map(EntryStart::Fork);
             }
         }
         if let Some(parent) = parent_evidence(&input, &reference.author, reference.seq)? {
             // Before preflight follows its frontier: a published parent's positional prefix
             // must be its own whole context, else a local fault of this store.
             parent.check_published(&input)?;
-            parents.push(parent);
+            parents.push(Some(parent));
             continue;
         }
         // Neither published here nor proven by an answer: its receipt is asked under the
@@ -1056,6 +1125,7 @@ pub(super) enum EntryAdvanced {
     ControlPending { head: Digest32, through: u64 },
     ControlSource { head: Digest32, seq: u64 },
     Validated(governance::ValidatedSparseEntry),
+    Fork(ForkWait),
     Busy,
 }
 
@@ -1073,7 +1143,10 @@ pub(super) fn advance_entry(
     else {
         return Err(local("entry validation cursor missing"));
     };
-    let result = cursor.advance(&input, &mut WorkBudget::default())?;
+    // Rule F3: the proved splitters as this node holds them now, read again at every step, so
+    // the completing step decides against what is held at that moment (sec-5 condition 3).
+    let splits = room.history_splits(store)?;
+    let result = cursor.advance(&input, &mut WorkBudget::default(), &splits)?;
     let outcome = match result {
         governance::SparseValidationStep::Complete(token) => {
             // Keep the prior sealed cursor: publication's next slice can re-create the token
@@ -1082,6 +1155,17 @@ pub(super) fn advance_entry(
         }
         governance::SparseValidationStep::MissingContext(hash) => {
             EntryAdvanced::Need(Query::Context(hash))
+        }
+        governance::SparseValidationStep::Mismatch(reference) => {
+            // The validator returns a mismatch only below any boundary recorded for that author
+            // (one at or after it is deferred and decided at completion): park on the fork.
+            EntryAdvanced::Fork(ForkWait::Fork {
+                author: reference.author,
+                at: reference.seq,
+            })
+        }
+        governance::SparseValidationStep::Unmatched(reference) => {
+            EntryAdvanced::Fork(ForkWait::Unmatched(reference))
         }
         governance::SparseValidationStep::MissingControl(reference) => {
             match input
@@ -1135,6 +1219,7 @@ pub(super) enum Preflight {
         through: u64,
         effects: bool,
     },
+    Fork(ForkWait),
     Complete,
     Busy,
 }
@@ -1151,6 +1236,7 @@ pub(super) fn preflight(
         return Ok(Preflight::Busy);
     }
     let input = room.history_read(store)?;
+    let splits = room.history_splits(store)?;
     let Some(included) =
         entry_inclusion(&input, &head, &entry.skeleton.author_id, entry.skeleton.seq)?
     else {
@@ -1195,11 +1281,27 @@ pub(super) fn preflight(
         } else {
             seen[parent - own].clone()
         };
+        let own_parent = own == 1 && parent == 0;
+        let boundary = if own_parent {
+            None
+        } else {
+            splits.boundary(&reference.author)
+        };
+        if seen_waived(boundary, &reference) {
+            // Rule F2 D: it adds nothing, so nothing of its frontier is followed.
+            return Ok(Preflight::Progress {
+                parent: parent + 1,
+                next: 0,
+            });
+        }
         if let Some((_, prior)) =
             input.history_validated_header(&reference.author, reference.seq)?
         {
             if prior.entry_hash() != reference.hash {
-                return Err(invalid("preflight parent position differs"));
+                if own_parent {
+                    return Err(invalid("preflight parent position differs"));
+                }
+                return mismatched_reference(boundary, &reference).map(Preflight::Fork);
             }
         }
         // One lookup, by author and position, as `start_entry` does.
@@ -1237,7 +1339,10 @@ pub(super) fn preflight(
             }));
         };
         if receipt.header().entry_hash() != reference.hash {
-            return Err(invalid("preflight parent receipt differs"));
+            if own_parent {
+                return Err(invalid("preflight parent receipt differs"));
+            }
+            return mismatched_reference(boundary, &reference).map(Preflight::Fork);
         }
         // Before anything follows the frontier (`start_entry` checked it too; a resumed
         // preflight checks again).
@@ -1278,6 +1383,9 @@ pub(super) fn preflight(
         let Some((control_head, control)) =
             input.history_validated_header(&coordinate.author, coordinate.seq)?
         else {
+            if coordinate_deferred(&splits, coordinate) {
+                continue;
+            }
             let Some(control_head) = input
                 .sparse_author(&coordinate.author, LogScope::Public)?
                 .and_then(|state| state.committed)
@@ -1299,7 +1407,13 @@ pub(super) fn preflight(
             });
         };
         if control.entry_hash() != coordinate.hash {
-            return Err(invalid("preflight control coordinate differs"));
+            if coordinate_deferred(&splits, coordinate) {
+                continue;
+            }
+            return Ok(Preflight::Fork(ForkWait::Fork {
+                author: coordinate.author,
+                at: coordinate.seq,
+            }));
         }
         for effects in [false, true] {
             let complete = if effects {
@@ -1603,7 +1717,11 @@ fn unlinked_prefix(
 /// `second-head-unkept`, an unresolved second head is neither kept nor listed;
 /// `fork-unpropagated`, a recorded fork is never listed to peers; `equal-rival-refused`, a head
 /// of the accepted size with another root is refused at staging as before;
-/// `terminal-header-only`, a matching entry at the overlap ends the comparison (no prefix walk).
+/// `terminal-header-only`, a matching entry at the overlap ends the comparison (no prefix walk);
+/// `seen-required`, a control's `seen` reference naming a proved forker past its boundary still
+/// requires the reader's own entry there, refused when it differs (rule F2 D switched off);
+/// `fallback-off`, every proved splitter reads as certified, so no coordinate naming it is ever
+/// ignored (rule F3's coordinate fallback switched off, `governance::splits`).
 /// Said once when first read.
 #[cfg(feature = "test-knobs")]
 pub(crate) fn fork_mutant_is(which: &str) -> bool {

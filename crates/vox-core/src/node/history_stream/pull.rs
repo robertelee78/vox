@@ -120,7 +120,44 @@ impl PartialEq for Listing {
     }
 }
 
+/// What [`observe`] read of a peer's row to decide what to stage and ask: its heads' ids, its
+/// committed head, and what it lists of a fork proof (the proof's identity) or of an unresolved
+/// head (its id). The row is marked observed only while it still says this.
+#[derive(Clone, Debug)]
+struct Inspected {
+    ids: Vec<Digest32>,
+    committed: Option<(Digest32, u64)>,
+    fork: bool,
+    unresolved: Option<Digest32>,
+}
+
+/// The identity in an `unresolved` slot: a listed fork proof's digest, or an unresolved head's
+/// id. Its second half (the proof's advertised position, the head's size) is never compared:
+/// the digest commits to the proof's two entries, the id to the head, so a peer that changes
+/// only that half says nothing new, and buys no ask (the fork rule, [`FORK_ASKS`]).
+fn slot_id(slot: Option<(Digest32, u64)>) -> Option<Digest32> {
+    slot.map(|(id, _)| id)
+}
+
 impl PeerAuthor {
+    /// What [`observe`] reads of this row ([`Inspected`]).
+    fn inspected(&self) -> Inspected {
+        Inspected {
+            ids: self.heads.iter().map(|(id, _, _)| *id).collect(),
+            committed: self.committed,
+            fork: self.fork,
+            unresolved: slot_id(self.unresolved),
+        }
+    }
+
+    /// This row still says what `seen` read of it.
+    fn says(&self, seen: &Inspected) -> bool {
+        self.heads.iter().map(|(id, _, _)| id).eq(&seen.ids)
+            && self.committed == seen.committed
+            && self.fork == seen.fork
+            && slot_id(self.unresolved) == seen.unresolved
+    }
+
     /// The newest page `other` tells of the author what this row already says, bodies apart:
     /// the same heads, committed head, proof and control runs, fork, unresolved and role heads.
     fn tells_same(&self, other: &Self) -> bool {
@@ -132,7 +169,7 @@ impl PeerAuthor {
             && self.proof == other.proof
             && self.controls == other.controls
             && self.fork == other.fork
-            && self.unresolved == other.unresolved
+            && slot_id(self.unresolved) == slot_id(other.unresolved)
             && self.role == other.role
     }
 
@@ -196,7 +233,7 @@ impl PeerAuthor {
             || outside(&have.bodies, &self.bodies)
             || outside(&have.controls, &self.controls)
             || (have.fork && !self.fork)
-            || (have.unresolved.is_some() && have.unresolved != self.unresolved)
+            || (have.unresolved.is_some() && slot_id(have.unresolved) != slot_id(self.unresolved))
     }
 
     /// What this row keeps in memory, as its peer's bound counts it ([`HAVE_KEPT_BYTES`]):
@@ -326,6 +363,9 @@ struct Peer {
     /// served the peer on this connection: what ends the tell-only loop toward a departed
     /// author once it covers its departure ([`standing`]).
     receipt_served: u64,
+    /// The fork rule's allowance ([`FORK_ASKS`]): per room author, how many fork proofs this
+    /// connection was asked for. Only ever grows; at most one entry per room author.
+    fork_asks: BTreeMap<Digest32, u8>,
 }
 
 /// A room's record generation made durable, and the flush that made it so.
@@ -399,6 +439,7 @@ impl Holdings {
                     version: tokio::sync::watch::Sender::new(0),
                     private: None,
                     receipt_served: 0,
+                    fork_asks: BTreeMap::new(),
                 })
             }
         };
@@ -670,7 +711,7 @@ impl Holdings {
         let mut new = match (old, fresh) {
             (Some(old), None) => old,
             (Some(mut old), Some(mut new)) => {
-                if old.fork == new.fork && old.unresolved == new.unresolved {
+                if old.fork == new.fork && slot_id(old.unresolved) == slot_id(new.unresolved) {
                     new.listed = old.listed.take();
                 }
                 new
@@ -692,9 +733,11 @@ impl Holdings {
         }
     }
 
-    /// The peer's heads `ids` of `author` were observed here; `head` is its committed one, held
-    /// here; `listing` is what its Have makes this node ask it about the author (MP-9). A newer
-    /// Have of the author meanwhile is observed afresh.
+    /// The peer's row of `author` was observed here as `seen` says it read it; `head` is its
+    /// committed head, held here; `listing` is what that row makes this node ask it about the
+    /// author (MP-9). Marked observed only while the row still says exactly what was read
+    /// (`PeerAuthor::says`): a newer Have of the author meanwhile, a replaced fork proof whose
+    /// heads did not change included, is observed afresh (`sec-code-4.md` P1).
     #[allow(clippy::too_many_arguments)]
     fn observed(
         &self,
@@ -702,14 +745,14 @@ impl Holdings {
         peer: Digest32,
         serial: u64,
         author: Digest32,
-        ids: &[Digest32],
+        seen: &Inspected,
         head: Option<Arc<SignedHead>>,
         listing: Option<Listing>,
     ) {
         if let Some(held) = lock(&self.peers)
             .get_mut(&(room, peer, serial))
             .and_then(|entry| entry.authors.get_mut(&author))
-            .filter(|held| held.heads.iter().map(|(id, _, _)| id).eq(ids))
+            .filter(|held| held.says(seen))
         {
             held.observed = true;
             held.head = head;
@@ -735,6 +778,44 @@ impl Holdings {
                 held.listed = Some(listing.clone());
                 Some((*author, listing))
             })
+    }
+
+    /// The fork rule's per-connection half ([`FORK_ASKS`]): the identity of the proof the
+    /// peer's Have lists for `author` ([`slot_id`] of the `unresolved` slot beside a listed
+    /// fork), when its Have lists that fork and this connection has asks left for `author`.
+    fn fork_listed(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        serial: u64,
+        author: Digest32,
+    ) -> Option<Option<Digest32>> {
+        let peers = lock(&self.peers);
+        let entry = peers.get(&(room, peer, serial))?;
+        let held = entry.authors.get(&author).filter(|held| held.fork)?;
+        (entry.fork_asks.get(&author).copied().unwrap_or(0) < FORK_ASKS)
+            .then_some(slot_id(held.unresolved))
+    }
+
+    /// One of this connection's [`FORK_ASKS`] for `author` spent, before the ask is sent;
+    /// false when none is left. Never given back.
+    fn spend_fork_ask(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        serial: u64,
+        author: Digest32,
+    ) -> bool {
+        let mut peers = lock(&self.peers);
+        let Some(entry) = peers.get_mut(&(room, peer, serial)) else {
+            return false;
+        };
+        let spent = entry.fork_asks.entry(author).or_insert(0);
+        if *spent >= FORK_ASKS {
+            return false;
+        }
+        *spent += 1;
+        true
     }
 
     /// An answer of this peer saved something about `author`: the next ask reads its Have of
@@ -883,6 +964,21 @@ pub(crate) enum Need {
     /// malformed-root wait); met once this node's committed head of the author passes `size`,
     /// whichever head that is.
     Head { author: Digest32, size: u64 },
+    /// Rule F2 E: a fork proof of `author` whose boundary here is at or below `at`: met once one
+    /// is recorded (`RoomSnapshot::fork_boundary`). Not a range ask: MP-9's comparisons and fork
+    /// listings bring the proof; a peer listing a proof this node lacks is asked for it by the
+    /// fork rule ([`FORK_ASKS`]), frozen author or not, whether or not an entry is parked.
+    Fork { author: Digest32, at: u64 },
+    /// Rule F3: a signed-context coordinate (`author`, `seq`, `hash`) that is not this node's
+    /// accepted control and names a certified proved splitter at or after its boundary. Only
+    /// that matching entry could meet it, and a frozen author's later entries are never
+    /// accepted here: never met and never asked, so its citing entry stays unadmitted, as it was
+    /// refused before the rule.
+    Unmatched {
+        author: Digest32,
+        seq: u64,
+        hash: Digest32,
+    },
 }
 
 /// One checked entry waiting for the existing admission path, its body (if any) held in
@@ -3146,7 +3242,8 @@ struct Ask {
 /// it lists, an unresolved head it lists, its committed head of this node's committed size
 /// with another id, or this node's own unresolved head of the author). The peer's committed
 /// head is then held for its promotion ask. A frozen author's later history is refused, so
-/// its heads are not observed again (MP-9).
+/// its heads are not observed again (MP-9); a fork it lists is still read, for the fork rule
+/// ([`FORK_ASKS`]).
 async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
     let history = snapshot.history();
     let held_here = |id: &Digest32| history.and_then(|history| history.head(id)).cloned();
@@ -3157,7 +3254,7 @@ async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
         if held.observed || !snapshot.is_author(&author) {
             continue;
         }
-        let ids: Vec<Digest32> = held.heads.iter().map(|(id, _, _)| *id).collect();
+        let seen = held.inspected();
         let row = history.and_then(|history| history.author(&author));
         let base = row.map_or(0, HeldAuthor::committed_size);
         let frozen = snapshot.is_frozen(&author);
@@ -3170,19 +3267,19 @@ async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
                     .and_then(|row| row.committed.as_ref())
                     .is_some_and(|ours| *size == ours.root.leaves && *id != ours.id())
         });
-        let compare = !frozen
-            && (held.fork
-                || held.unresolved.is_some()
-                || rival.is_some()
-                || row.is_some_and(|row| row.have.unresolved.is_some()));
+        let compare = held.fork
+            || (!frozen
+                && (held.unresolved.is_some()
+                    || rival.is_some()
+                    || row.is_some_and(|row| row.have.unresolved.is_some())));
         held.heads
             .retain(|(id, size, _)| !frozen && *size >= base && held_here(id).is_none());
         if held.heads.is_empty() && !compare {
             let head = held.committed.and_then(|(id, _)| held_here(&id));
             c.holdings
-                .observed(c.room, c.peer, c.conn.serial(), author, &ids, head, None);
+                .observed(c.room, c.peer, c.conn.serial(), author, &seen, head, None);
         } else {
-            stage.push((author, ids, held, compare, rival));
+            stage.push((author, seen, held, compare, rival));
         }
     }
     if stage.is_empty() {
@@ -3193,7 +3290,7 @@ async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
         .with_room(move |room, store, pin| {
             let mut own_observed = false;
             let mut out = Vec::new();
-            for (author, ids, held, compare, rival) in stage {
+            for (author, seen, held, compare, rival) in stage {
                 for (id, _, wire) in &held.heads {
                     if room.history_read(store)?.history_head(id)?.is_none() {
                         let committed = std::sync::atomic::AtomicBool::new(false);
@@ -3221,7 +3318,7 @@ async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
                 } else {
                     None
                 };
-                out.push((author, ids, head, listing));
+                out.push((author, seen, head, listing));
             }
             Ok((out, own_observed))
         })
@@ -3231,21 +3328,74 @@ async fn observe(c: &Connection, snapshot: &RoomSnapshot) -> Result<()> {
     if own_observed {
         c.frontier.advanced(c.room, false, true);
     }
-    for (author, ids, head, listing) in observed {
-        c.holdings
-            .observed(c.room, c.peer, c.conn.serial(), author, &ids, head, listing);
+    for (author, seen, head, listing) in observed {
+        c.holdings.observed(
+            c.room,
+            c.peer,
+            c.conn.serial(),
+            author,
+            &seen,
+            head,
+            listing,
+        );
     }
     Ok(())
 }
 
+/// Rule F3's fork rule (sec-2 condition 1 as amended here; `sec-code-1.md` finding 3,
+/// `sec-code-2.md` P2, `sec-code-3.md` P1 and P2): what a fork proof does to a member's
+/// boundary, and when this node asks a peer for one.
+///
+/// - **Boundary, two steps at most** (`facts::Write::record_fork_boundary`, its only writer):
+///   the first proof of a member sets its boundary by rule A (the proof's position when its two
+///   entries share a predecessor that is this node's own accepted entry of that member; else
+///   1). Any later proof that would lower it sets it to 1: two different splits of one member
+///   leave no prefix of it trusted. A proof that would lower nothing is dropped by that same
+///   rule A before any signature is verified (`record_history_fork`). At 1 nothing more is
+///   asked or taken.
+/// - **Asking, a constant allowance.** This node asks a connection for `author`'s proof
+///   (`Query::Fork`) only when (a) the peer's Have lists a fork of `author`, (b) this node's
+///   boundary for `author` is not 1, (c) the identity of the proof that Have lists (the digest
+///   in its `unresolved` slot, [`slot_id`]) is not that of the proof this node holds, and
+///   (d) the connection has asked for `author` fewer than `FORK_ASKS` times. The ask spends one
+///   before it is sent, whatever comes back: a proof lowering or not, unavailable, Busy,
+///   Cancelled, an error, nothing. Nothing the peer says gives one back. (b) and (c) are read
+///   under the room when the Have is observed (`listing_step`) and again just before the ask
+///   (`listed_object`); the Have's proof identity is unauthenticated and only spares an ask,
+///   never grants one; its advertised position gates nothing. A Have saying the same again is
+///   not asked again (`PeerAuthor::listed`), so an honest peer's allowance goes to new proofs.
+///
+/// So a peer, honest or not, costs at most `FORK_ASKS` asks per connection and author, and a
+/// member's boundary is lowered (and its governance replayed) at most twice in this node's
+/// life, however many valid proofs the splitter mints. Three asks cover a first proof, one
+/// answer that lowers nothing, and the replacement that lowers to 1.
+const FORK_ASKS: u8 = 3;
+
+/// The fork rule's conditions read from the room ([`FORK_ASKS`] (b), (c)): `author` is a
+/// member whose key this node holds, its boundary here is not 1, and `listed`, the identity of
+/// the proof the peer's Have lists ([`slot_id`]), is not that of the proof this node holds
+/// (with none held, any listed fork is wanted).
+fn fork_ask_wanted(
+    room: &ChannelState,
+    store: &Store,
+    author: Digest32,
+    listed: Option<Digest32>,
+) -> Result<bool> {
+    Ok(room.is_author(&author)
+        && room.history_splits(store)?.boundary(&author) != Some(1)
+        && room
+            .history_fork_listing(&author)
+            .is_none_or(|(held, _)| listed != Some(held)))
+}
+
 /// MP-9: what the peer's Have of `author` makes this node ask that peer next, under the room:
-/// the fork proof it lists, when this node has not frozen the author (a listing alone records
-/// nothing); else (rule 6) the unresolved head it lists, by its id when not held here, or the
-/// next step comparing it with the accepted head; else the next step comparing `rival`, the
-/// head of the accepted size with another root it serves under (observed above), with the
-/// accepted head; else the next step of this node's own kept unresolved comparison of the
-/// author. A comparison whose held openings already prove a fork records it here, as one found
-/// by an answer is.
+/// the fork proof it lists, when the fork rule wants it ([`FORK_ASKS`]; a listing alone
+/// records nothing); else, for an author not frozen here (rule 6), the unresolved head it
+/// lists, by its id when not held here, or the next step comparing it with the accepted head;
+/// else the next step comparing `rival`, the head of the accepted size with another root it
+/// serves under (observed above), with the accepted head; else the next step of this node's
+/// own kept unresolved comparison of the author. A comparison whose held openings already
+/// prove a fork records it here, as one found by an answer is.
 fn listing_step(
     room: &mut ChannelState,
     store: &Store,
@@ -3254,7 +3404,7 @@ fn listing_step(
     rival: Option<(Digest32, u64)>,
 ) -> Result<Option<Listing>> {
     let wanted = room.history_fork_wanted(&[author]).is_some();
-    let step = if held.fork && wanted {
+    let step = if held.fork && fork_ask_wanted(room, store, author, slot_id(held.unresolved))? {
         Some(super::admission::Advanced::Need(Query::Fork(author)))
     } else {
         let read = room.history_read(store)?;
@@ -3514,7 +3664,23 @@ async fn ask(c: &Connection) -> Result<()> {
 /// each verified with the author's key; the head observed as a Head answer is
 /// (`admission::stage`), then compared at the next step. Not served, it records nothing and
 /// fails nothing: the peer's next Have of the author may name it again.
+///
+/// A fork proof is asked only as the fork rule says ([`FORK_ASKS`]): its conditions read again
+/// now, under the room (a published snapshot can be older), and one of this connection's asks
+/// for the author spent before the ask is sent, whatever comes back.
 async fn listed_object(c: &Connection, author: Digest32, query: Query) -> Result<()> {
+    if let Query::Fork(asked) = query {
+        let serial = c.conn.serial();
+        let Some(listed) = c.holdings.fork_listed(c.room, c.peer, serial, asked) else {
+            return Ok(());
+        };
+        let wanted = c
+            .with_room(move |room, store, _| fork_ask_wanted(room, store, asked, listed))
+            .await?;
+        if !wanted || !c.holdings.spend_fork_ask(c.room, c.peer, serial, asked) {
+            return Ok(());
+        }
+    }
     let preamble = c.preamble(Purpose::Control)?;
     let reply = bundle::ask(
         &c.conn,
@@ -4092,6 +4258,18 @@ fn choose(
                     }
                     continue;
                 }
+                Need::Fork { author, at } => {
+                    if prefer
+                        && snapshot
+                            .fork_boundary(&author)
+                            .is_some_and(|boundary| boundary <= at)
+                    {
+                        met.push((*need, None));
+                    }
+                    continue;
+                }
+                // Only the splitter's matching entry could meet it; none is ever accepted here.
+                Need::Unmatched { .. } => continue,
                 Need::Position { author, seq } => (author, seq, None),
                 Need::Controls { author, lo, hi } => (author, hi, Some(lo)),
             };

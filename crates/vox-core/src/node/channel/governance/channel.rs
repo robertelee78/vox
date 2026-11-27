@@ -423,20 +423,18 @@ impl ChannelState {
     }
 
     /// Resolve an exact service name or base32 service fingerprint from current source facts.
-    /// A departed host or a withdrawn share returns none; incomplete source replay is an error.
+    /// A departed or removed host (a proved splitter among them, rule F3 B's derived exclusion)
+    /// or a withdrawn share returns none; incomplete source replay is an error.
     pub fn shared_service(
         &self,
-        _store: &Store,
+        store: &Store,
         host: &Digest32,
         name: &str,
     ) -> Result<Option<Share>> {
-        self.with_semantic_facts(self.now_hint, |facts| {
-            if self.has_left(host) {
-                Ok(None)
-            } else {
-                facts.share_selector(host, name)
-            }
-        })?
+        if self.has_left(host) || self.peer_removal_applied(store, host)? {
+            return Ok(None);
+        }
+        self.with_semantic_facts(self.now_hint, |facts| facts.share_selector(host, name))?
     }
 
     /// Answer one exact lookup or page inspecting at most 64 slots.
@@ -799,21 +797,24 @@ impl ChannelState {
         })
     }
 
-    /// Page through current shares, filtering withdrawn announcements and departed hosts.
+    /// Page through current shares, filtering withdrawn announcements and departed or removed
+    /// hosts (a proved splitter among them, rule F3 B's derived exclusion).
     /// Inspect at most `limit` clamped to 1..=64 slots; an empty page may still continue.
     pub fn share_page(
         &self,
-        _store: &Store,
+        store: &Store,
         after: Option<(Digest32, Digest32)>,
         limit: usize,
     ) -> Result<GovernanceShares> {
         let page = self.with_semantic_facts(self.now_hint, |facts| facts.shares(after, limit))?;
+        let mut shares = Vec::with_capacity(page.rows.len());
+        for share in page.rows {
+            if !self.has_left(&share.host) && !self.peer_removal_applied(store, &share.host)? {
+                shares.push(share);
+            }
+        }
         Ok(GovernanceShares {
-            shares: page
-                .rows
-                .into_iter()
-                .filter(|share| !self.has_left(&share.host))
-                .collect(),
+            shares,
             next: page.next,
         })
     }

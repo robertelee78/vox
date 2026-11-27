@@ -29,8 +29,11 @@ pub(crate) fn checked_seen(v2: &crate::log::history::EntryV2) -> &[EntryReferenc
 /// Exact authenticated input with complete signed causal evidence: its own prefix, every
 /// coordinate of its signed context and, for a control, every `seen` parent. An ordinary
 /// Content entry's `seen` references are ordering hints only (ADR-053 M0) and are not part of
-/// this claim. A control may enter the existing evaluator through this token; its authority
-/// and effect are still unresolved.
+/// this claim. Rule F3 (ledger 73) narrows it: a coordinate that is not this node's accepted
+/// control and names an ordinary proved splitter at or after its boundary
+/// (`governance::Splits::ignores`) was deliberately ignored, not closed. It required no entry,
+/// adds nothing, and no consumer may read it as authenticated ancestry. A control may enter the
+/// existing evaluator through this token; its authority and effect are still unresolved.
 pub(crate) struct ValidatedSparseEntry {
     included: IncludedHeader,
     pre_context: ControlContext,
@@ -283,7 +286,19 @@ pub(crate) enum SparseValidationStep {
     Progress,
     MissingContext(Digest32),
     MissingControl(EntryReference),
-    ControlPrefixPending { head: Digest32, through: u64 },
+    ControlPrefixPending {
+        head: Digest32,
+        through: u64,
+    },
+    /// A signed-context coordinate names another entry than this node's validated one at that
+    /// position: two entries of one author at one place, below any boundary recorded for it.
+    /// Admission parks the entry on that author's fork (rule F2 E).
+    Mismatch(EntryReference),
+    /// Rule F3 (sec-5 condition 3): a coordinate that is not this node's accepted control and
+    /// names a certified proved splitter (the creator, or one with any creator-issued
+    /// certificate held here) at or after its boundary. The entry waits, as it was refused
+    /// before: only the splitter's matching entry at that position could meet the wait.
+    Unmatched(EntryReference),
     Yielded,
 }
 
@@ -291,12 +306,29 @@ pub(crate) enum SparseValidationStep {
 /// and dropped before returning; only the completed token temporarily owns the signed map.
 pub(crate) struct SparseValidation {
     included: IncludedHeader,
-    parents: Vec<SparseParent>,
+    /// One per reference, own predecessor first. `None`: a `seen` reference admission waived
+    /// because it names a proved forker at or after its boundary (rule F2 D); it requires no
+    /// entry and adds nothing. A forker's boundary only ever moves lower, so a restored waiver
+    /// still holds.
+    parents: Vec<Option<SparseParent>>,
     parent: usize,
     parent_coordinate: usize,
     coordinate: usize,
     finished: bool,
     payload_state: SparsePayloadState,
+    /// Rule F3: coordinates naming a proved splitter at or after its boundary that are not this
+    /// node's accepted control (`underclaim` false), and parents' coordinates of it the signed
+    /// context does not dominate (`underclaim` true), one of each per author. Kept unresolved
+    /// until every other coordinate is resolved exactly, then decided at the completing step
+    /// against the splitters read for that step (sec-5 conditions 2 and 3); never decided early.
+    deferred: Vec<Deferred>,
+}
+
+/// One coordinate rule F3's fallback may ignore (`SparseValidation::deferred`).
+#[derive(Clone)]
+struct Deferred {
+    reference: EntryReference,
+    underclaim: bool,
 }
 
 impl TypedSparseBody {
@@ -438,12 +470,17 @@ impl SparseValidation {
     }
     pub(crate) fn checkpoint(&self) -> Result<Vec<u8>> {
         let mut e = crate::cbor::Encoder::new();
-        e.array(8)
+        // Nine fields since rule F3 (the deferred coordinates); an eight-field cursor has none.
+        e.array(9)
             .uint(1)
             .bytes(&self.included.local_receipt()?)
             .array(self.parents.len());
         for parent in &self.parents {
-            e.bytes(&parent.checkpoint()?);
+            match parent {
+                Some(parent) => e.bytes(&parent.checkpoint()?),
+                // A waived reference: no receipt bytes (every kept receipt is non-empty).
+                None => e.bytes(&[]),
+            };
         }
         e.uint(self.parent as u64)
             .uint(self.parent_coordinate as u64)
@@ -460,6 +497,14 @@ impl SparseValidation {
                 e.array(2).uint(2).bytes(&recipient);
             }
         }
+        e.array(self.deferred.len());
+        for deferred in &self.deferred {
+            e.array(4)
+                .bytes(&deferred.reference.author)
+                .uint(deferred.reference.seq)
+                .bytes(&deferred.reference.hash)
+                .uint(u64::from(deferred.underclaim));
+        }
         let bytes = e.finish();
         if bytes.len() > 352 * 1024 {
             return Err(Error::SizeLimitExceeded("sparse validation checkpoint"));
@@ -473,7 +518,8 @@ impl SparseValidation {
             return Err(Error::SizeLimitExceeded("sparse validation checkpoint"));
         }
         let mut d = crate::cbor::Decoder::new(bytes);
-        if d.array()? != 8 || d.uint()? != 1 {
+        let fields = d.array()?;
+        if !(fields == 8 || fields == 9) || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("sparse validation checkpoint"));
         }
         let included = IncludedHeader::from_authenticated_receipt(d.bytes()?)?;
@@ -483,7 +529,12 @@ impl SparseValidation {
         }
         let mut parents = Vec::with_capacity(count);
         for _ in 0..count {
-            parents.push(SparseParent::from_authenticated_checkpoint(d.bytes()?)?);
+            let bytes = d.bytes()?;
+            parents.push(if bytes.is_empty() {
+                None
+            } else {
+                Some(SparseParent::from_authenticated_checkpoint(bytes)?)
+            });
         }
         let parent = usize::try_from(d.uint()?)
             .map_err(|_| Error::MalformedAtRest("sparse checkpoint offset"))?;
@@ -508,6 +559,34 @@ impl SparseValidation {
             },
             _ => return Err(Error::MalformedAtRest("sparse checkpoint body state")),
         };
+        let mut deferred = Vec::new();
+        if fields == 9 {
+            let count = d.array()?;
+            if count > 2 * crate::log::history::MAX_CONTEXT_AUTHORS {
+                return Err(Error::MalformedAtRest("sparse checkpoint deferred count"));
+            }
+            for _ in 0..count {
+                if d.array()? != 4 {
+                    return Err(Error::MalformedAtRest("sparse checkpoint deferred"));
+                }
+                let digest = |bytes: &[u8]| {
+                    Digest32::try_from(bytes)
+                        .map_err(|_| Error::MalformedAtRest("sparse checkpoint deferred digest"))
+                };
+                let author = digest(d.bytes()?)?;
+                let seq = d.uint()?;
+                let hash = digest(d.bytes()?)?;
+                let underclaim = match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::MalformedAtRest("sparse checkpoint deferred kind")),
+                };
+                deferred.push(Deferred {
+                    reference: EntryReference { author, seq, hash },
+                    underclaim,
+                });
+            }
+        }
         d.finish()?;
         if parent > count
             || parent_coordinate > crate::log::history::MAX_CONTEXT_AUTHORS
@@ -549,12 +628,13 @@ impl SparseValidation {
         cursor.parent_coordinate = parent_coordinate;
         cursor.coordinate = coordinate;
         cursor.finished = finished;
+        cursor.deferred = deferred;
         Ok(cursor)
     }
     pub(crate) fn new(
         included: IncludedHeader,
         body: TypedSparseBody,
-        parents: Vec<SparseParent>,
+        parents: Vec<Option<SparseParent>>,
     ) -> Result<Self> {
         let entry = included.header().entry();
         let v2 = entry
@@ -582,6 +662,12 @@ impl SparseValidation {
             } else {
                 seen[at - own].clone()
             };
+            let Some(parent) = parent else {
+                if own == 1 && at == 0 {
+                    return Err(Error::MalformedBundle("own predecessor cannot be waived"));
+                }
+                continue;
+            };
             let header = parent.header();
             if header.skeleton.channel_id != entry.skeleton.channel_id
                 || parent.binding().scope != v2.scope
@@ -603,15 +689,18 @@ impl SparseValidation {
             coordinate: 0,
             finished: false,
             payload_state: body.state,
+            deferred: Vec::new(),
         })
     }
 
     /// No network operation or await occurs under this snapshot. The caller persists/reloads
     /// proof inputs by exact IDs and reserves the common 4-MiB verifier envelope before entry.
+    /// `splits` are the proved splitters read for this one step (rule F3).
     pub(crate) fn advance(
         &mut self,
         input: &entry_store::Read<'_>,
         budget: &mut WorkBudget,
+        splits: &super::Splits,
     ) -> Result<SparseValidationStep> {
         if self.finished {
             return Err(Error::MalformedAtRest(
@@ -651,7 +740,12 @@ impl SparseValidation {
             ));
         }
         if self.parent < self.parents.len() {
-            let parent = &self.parents[self.parent];
+            let Some(parent) = &self.parents[self.parent] else {
+                // A waived reference adds nothing: no frontier of it is followed.
+                self.parent += 1;
+                self.parent_coordinate = 0;
+                return Ok(SparseValidationStep::Progress);
+            };
             if !input.history_head_committed(&parent.head_id(), parent.binding())? {
                 return Err(Error::MalformedBundle(
                     "parent head has no accepted consistency",
@@ -715,21 +809,39 @@ impl SparseValidation {
                 .min(frontier.coordinates.len());
             while self.parent_coordinate < stop {
                 let earlier = &frontier.coordinates[self.parent_coordinate];
-                let Ok(at) = pre
+                // Rule F3: another member's parent coordinate naming a proved splitter at or
+                // after its boundary need not be dominated if its split turns out ordinary;
+                // that is decided once everything else is resolved. The own prefix stays exact.
+                // Matched here or not: a writer holding the splitter's other version drops that
+                // coordinate as unmatched there (`local_history`'s `join_prefix`), so a reader
+                // whose accepted control it is must not demand it (`sec-code-4.md` P2, refuted
+                // by the act in `ForkRemoval.md` 16.3). Nothing the ordinary splitter signed
+                // from its boundary confers anything here, matched or not.
+                let quarantined =
+                    !own_parent && splits.reaching(&earlier.author, earlier.seq).is_some();
+                let underclaimed = match pre
                     .coordinates
                     .binary_search_by_key(&earlier.author, |coordinate| coordinate.author)
-                else {
-                    return Err(Error::MalformedBundle(
-                        "signed context omits parent control",
-                    ));
-                };
-                let later = &pre.coordinates[at];
-                if later.seq < earlier.seq
-                    || (later.seq == earlier.seq && later.hash != earlier.hash)
                 {
-                    return Err(Error::MalformedBundle(
-                        "signed context underclaims parent control",
-                    ));
+                    Ok(at) => {
+                        let later = &pre.coordinates[at];
+                        later.seq < earlier.seq
+                            || (later.seq == earlier.seq && later.hash != earlier.hash)
+                    }
+                    Err(_) if quarantined => true,
+                    Err(_) => {
+                        return Err(Error::MalformedBundle(
+                            "signed context omits parent control",
+                        ))
+                    }
+                };
+                if underclaimed {
+                    if !quarantined {
+                        return Err(Error::MalformedBundle(
+                            "signed context underclaims parent control",
+                        ));
+                    }
+                    defer(&mut self.deferred, earlier, true);
                 }
                 // A higher coordinate is not by itself a continuity proof. Both endpoints
                 // must belong to this node's consistency-accepted author commitment. This
@@ -737,8 +849,15 @@ impl SparseValidation {
                 if !budget.take_control_lookup() {
                     return Ok(SparseValidationStep::Yielded);
                 }
-                if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
-                    return Ok(pending);
+                match validate_control_coordinate(input, &pre, earlier)? {
+                    Some(
+                        SparseValidationStep::Mismatch(reference)
+                        | SparseValidationStep::MissingControl(reference),
+                    ) if splits.reaching(&reference.author, reference.seq).is_some() => {
+                        defer(&mut self.deferred, &reference, false);
+                    }
+                    Some(pending) => return Ok(pending),
+                    None => {}
                 }
                 self.parent_coordinate += 1;
             }
@@ -758,13 +877,44 @@ impl SparseValidation {
             if !budget.take_control_lookup() {
                 return Ok(SparseValidationStep::Yielded);
             }
-            if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
-                return Ok(pending);
+            match validate_control_coordinate(input, &pre, coordinate)? {
+                // Rule F3: not this node's accepted control, naming a proved splitter at or
+                // after its boundary: no early return here (sec-5 condition 2).
+                Some(
+                    SparseValidationStep::Mismatch(reference)
+                    | SparseValidationStep::MissingControl(reference),
+                ) if splits.reaching(&reference.author, reference.seq).is_some() => {
+                    defer(&mut self.deferred, &reference, false);
+                }
+                Some(pending) => return Ok(pending),
+                None => {}
             }
             self.coordinate += 1;
         }
         if self.coordinate < pre.coordinates.len() {
             return Ok(SparseValidationStep::Progress);
+        }
+        // Rule F3 (sec-5 conditions 2 and 3): the own prefix and every other coordinate are
+        // resolved exactly (their sources here, their effects at preflight, which ran before
+        // this validation started), so every creator certificate they expose is held. Only now,
+        // against the splitters read for this step, is each deferred coordinate decided: an
+        // ordinary splitter's is ignored (it requires no entry and adds nothing); a certified
+        // one's waits, or is refused as an underclaim, exactly as before. Nothing of this
+        // decision is kept: a step that does not complete decides again.
+        for deferred in &self.deferred {
+            let reference = &deferred.reference;
+            let ordinary = splits
+                .reaching(&reference.author, reference.seq)
+                .is_some_and(|split| !split.certified);
+            if ordinary {
+                continue;
+            }
+            if deferred.underclaim {
+                return Err(Error::MalformedBundle(
+                    "signed context underclaims parent control",
+                ));
+            }
+            return Ok(SparseValidationStep::Unmatched(reference.clone()));
         }
         self.finished = true;
         Ok(SparseValidationStep::Complete(ValidatedSparseEntry {
@@ -772,6 +922,19 @@ impl SparseValidation {
             pre_context: pre,
             payload_state: self.payload_state,
         }))
+    }
+}
+
+/// Keep `reference` for rule F3's decision at completion, once per author and kind.
+fn defer(deferred: &mut Vec<Deferred>, reference: &EntryReference, underclaim: bool) {
+    if !deferred
+        .iter()
+        .any(|held| held.reference.author == reference.author && held.underclaim == underclaim)
+    {
+        deferred.push(Deferred {
+            reference: reference.clone(),
+            underclaim,
+        });
     }
 }
 
@@ -790,8 +953,10 @@ fn validate_control_coordinate(
     let Some(v2) = &control.skeleton.v2 else {
         return Err(Error::MalformedAtRest("validated control is legacy"));
     };
-    if control.entry_hash() != coordinate.hash
-        || control.skeleton.channel_id != context.room
+    if control.entry_hash() != coordinate.hash {
+        return Ok(Some(SparseValidationStep::Mismatch(coordinate.clone())));
+    }
+    if control.skeleton.channel_id != context.room
         || v2.scope != context.scope
         || !v2.kind.is_control()
     {

@@ -4,7 +4,7 @@
 //! publishes the record with the snapshot. The connections' pull loops plan and tell from it
 //! alone: no store read and no room lock per plan or per Have.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -367,12 +367,13 @@ impl ChannelState {
         previous: Option<Arc<HeldHistory>>,
     ) -> Result<Arc<HeldHistory>> {
         let touched = store.take_history_touched(&self.channel_id);
-        // MP-9: the authors whose fork proof this node holds, each listed in its Have of them,
-        // read from the room as the snapshot's own list of fork proofs is.
-        let forks: BTreeSet<Digest32> = if fork_mutant_is("fork-unpropagated") {
-            BTreeSet::new()
+        // MP-9: the authors whose fork proof this node holds, each listed in its Have of them
+        // with what tells its kept proof apart (`fork_listing`), read from the room as the
+        // snapshot's own list of fork proofs is.
+        let forks: BTreeMap<Digest32, (Digest32, u64)> = if fork_mutant_is("fork-unpropagated") {
+            BTreeMap::new()
         } else {
-            self.history_fork_authors().into_iter().collect()
+            self.history_fork_listings()
         };
         let previous = match previous {
             Some(previous) if !touched.all => previous,
@@ -394,13 +395,15 @@ impl ChannelState {
             .into_iter()
             .map(|(author, positions)| (author, positions.into_iter().collect()))
             .collect();
-        // A fork recorded since (a proof is kept once and stays) changes the author's Have: it
-        // lists the fork and no longer its unresolved head.
-        for author in &forks {
+        // A fork recorded since changes the author's Have: it lists the fork and no longer its
+        // unresolved head. So does a kept proof replaced by a lower one (`record_history_fork`):
+        // the Have lists the new proof, which a peer holding another may ask for (the fork rule,
+        // `pull::FORK_ASKS`).
+        for (author, listing) in &forks {
             if previous
                 .authors
                 .get(author)
-                .is_some_and(|row| !row.have.fork)
+                .is_some_and(|row| !row.have.fork || row.have.unresolved != Some(*listing))
             {
                 changed.entry(*author).or_default();
             }
@@ -434,7 +437,7 @@ impl ChannelState {
         author: Digest32,
         old: Option<&HeldAuthor>,
         positions: &[u64],
-        forks: &BTreeSet<Digest32>,
+        forks: &BTreeMap<Digest32, (Digest32, u64)>,
     ) -> Result<Option<HeldAuthor>> {
         let Some(state) = read.sparse_author(&author, LogScope::Public)? else {
             return Ok(None);
@@ -552,8 +555,12 @@ impl ChannelState {
             Vec::new()
         };
         // MP-9 (rule 6): the author's kept unresolved head, as `ServedRoom` lists it (not while
-        // the author is frozen, nor once the head is accepted).
-        let unresolved = if fork_mutant_is("second-head-unkept") {
+        // the author is frozen, nor once the head is accepted). For an author whose fork is
+        // listed (frozen here, so it has no unresolved head), the slot names the kept proof
+        // instead (`fork_listing`): what tells a replacement apart, never a head to ask by id.
+        let unresolved = if let Some(listing) = forks.get(&author) {
+            Some(*listing)
+        } else if fork_mutant_is("second-head-unkept") {
             None
         } else {
             self.history_unresolved_hint(read, &author)?
@@ -568,7 +575,7 @@ impl ChannelState {
             proof: row.proof.newest(),
             bodies,
             controls,
-            fork: forks.contains(&author),
+            fork: forks.contains_key(&author),
             unresolved,
             // The exact role-complete head (a receipt hint for the author; the receipt is the
             // author's Control Head(self) exchange, which flushes before answering).

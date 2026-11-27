@@ -189,6 +189,7 @@ impl ChannelState {
             required.as_slice(),
             None,
             kind,
+            &self.history_splits(store)?,
         )
     }
 
@@ -462,6 +463,12 @@ impl<'r, 'a> AuthoredReach<'r, 'a> {
 /// `reserved`: a removal's target. Its latest settled tip keeps one of the sixteen `seen` slots
 /// whatever the other authors' clocks, so the removal's cut is at the tip its author held
 /// (ADR-053 MP-6), never only at the target's last control the context reaches.
+///
+/// `splits`: the proved splitters read for this authoring (rule F3). A joined frontier's
+/// coordinate that this node's admission ignores (`governance::Splits::ignores`) is left out of
+/// the join, and only it (sec-5 condition 4): an honest member holding the proof never signs an
+/// ignored coordinate as its own acknowledgement, and keeps every other coordinate of the
+/// frontier it joins.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn authored_context(
     read: &entry_store::Read<'_>,
@@ -472,6 +479,7 @@ pub(super) fn authored_context(
     required: &[Digest32],
     reserved: Option<&Digest32>,
     kind: SignedEntryKind,
+    splits: &governance::Splits,
 ) -> Result<(ControlContext, Vec<EntryReference>, bool)> {
     if authors.len() > MAX_CONTEXT_AUTHORS {
         return Err(Error::SizeLimitExceeded("local context authors"));
@@ -559,17 +567,24 @@ pub(super) fn authored_context(
         return Ok((context, seen, advance));
     }
     for reference in &seen {
-        context = join_prefix(read, binding, context, reference.author, reference.seq)?;
+        context = join_prefix(
+            read,
+            binding,
+            context,
+            reference.author,
+            reference.seq,
+            splits,
+        )?;
     }
     if kind == SignedEntryKind::ContextUpdate {
         // The advance before Content acknowledges every applied real change and required
         // ancestor, whether or not its author won one of the sixteen `seen` slots.
         for (other, seq) in applied_changes(read, binding, authors, &context, own_seq)? {
-            context = join_prefix(read, binding, context, other, seq)?;
+            context = join_prefix(read, binding, context, other, seq, splits)?;
         }
         for (required_author, seq) in &required_positions {
             if reached_by(&context, author, own_seq, required_author) < *seq {
-                context = join_prefix(read, binding, context, *required_author, *seq)?;
+                context = join_prefix(read, binding, context, *required_author, *seq, splits)?;
             }
         }
     }
@@ -628,13 +643,16 @@ fn applied_changes(
     Ok(joinable)
 }
 
-/// Join the authenticated prefix frontier of `who` through `seq`.
+/// Join the authenticated prefix frontier of `who` through `seq`, less the coordinates this
+/// node's admission ignores (rule F3, sec-5 condition 4): nothing else of it is dropped, and the
+/// frontier is never replaced, truncated or emptied.
 fn join_prefix(
     read: &entry_store::Read<'_>,
     binding: TreeBinding,
     context: ControlContext,
     who: Digest32,
     seq: u64,
+    splits: &governance::Splits,
 ) -> Result<ControlContext> {
     let binding = TreeBinding {
         author: who,
@@ -643,9 +661,31 @@ fn join_prefix(
     let prefix = read
         .history_range(binding, 1, seq)?
         .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
-    let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
+    let mut frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
         authored_missing("authored history settled peer frontier context missing")
     })?;
+    // Compacted in place, in order. With no splitter (an honest room) nothing is inspected,
+    // moved or allocated: the frontier is joined as before rule F3.
+    if !splits.is_empty() {
+        let mut kept = 0;
+        for at in 0..frontier.coordinates.len() {
+            let coordinate = &frontier.coordinates[at];
+            let ignored = splits
+                .reaching(&coordinate.author, coordinate.seq)
+                .is_some()
+                && {
+                    let matched = read
+                        .history_validated_header(&coordinate.author, coordinate.seq)?
+                        .is_some_and(|(_, control)| control.entry_hash() == coordinate.hash);
+                    splits.ignores(coordinate, matched)
+                };
+            if !ignored {
+                frontier.coordinates.swap(kept, at);
+                kept += 1;
+            }
+        }
+        frontier.coordinates.truncate(kept);
+    }
     context.join(&frontier)
 }
 

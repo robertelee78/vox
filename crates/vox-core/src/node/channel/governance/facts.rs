@@ -1416,6 +1416,35 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(true)
     }
 
+    /// Rule F3's boundary, two steps at most (the fork rule, `pull::FORK_ASKS`): record
+    /// `boundary`, rule A's for one proof of `author`, when none is held; when one is held and
+    /// `boundary` is lower, record 1 (two different splits of one member leave no prefix of it
+    /// trusted); otherwise nothing. Says whether it wrote. The only writer of `ForkBoundary`,
+    /// so a member's boundary changes at most twice and never after 1, however many proofs
+    /// reach it. Each kept proof is noted again on every save and restore; noted again, it
+    /// gives its rule-A boundary again, which lowers nothing (were it ever lower, 1 is the
+    /// stricter answer). What a reader shows is read against the boundary (positive
+    /// registers, eligibility, service shares), so a new or lowered boundary moves the
+    /// published display revision in the same commit. The semantic registers' reconstruction
+    /// basis is that revision (`SemanticWork::advance`), so they are rebuilt against every
+    /// boundary by construction, whether or not the membership pass then changes who is
+    /// removed (`sec-code-1.md` finding 1).
+    pub(super) fn record_fork_boundary(
+        &mut self,
+        author: &Digest32,
+        boundary: u64,
+    ) -> Result<bool> {
+        let key = hash_key(author);
+        let boundary = match self.get(Table::ForkBoundary, &key)? {
+            None => boundary,
+            Some(held) if boundary < held => 1,
+            Some(_) => return Ok(false),
+        };
+        self.put(Table::ForkBoundary, key, Some(boundary))?;
+        self.display_changed()?;
+        Ok(true)
+    }
+
     /// Reconstruct exact signed coordinate hashes after a newly proven fork.
     pub(super) fn start_fork_replay(&mut self) -> Result<()> {
         let mut e = Encoder::new();
