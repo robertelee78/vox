@@ -19,10 +19,34 @@ use crate::log::history::{
 /// (Typed Content binds the room's own channel, `TypedSparseBody::verify`, so a legacy Drive
 /// carrier never takes this path.)
 pub(crate) fn checked_seen(v2: &crate::log::history::EntryV2) -> &[EntryReference] {
-    if v2.kind == SignedEntryKind::Content {
+    if v2.kind == SignedEntryKind::Content && !seen_hint_mutant("checked") {
         &[]
     } else {
         &v2.seen
+    }
+}
+
+/// Mutant arms of the proofs that a post's `seen` is a hint, never authority (test-knobs only):
+/// whether this daemon's `VOX_TEST_SEEN_HINT` names `arm`. `checked` makes a Content's hints
+/// checked parents again ([`checked_seen`]); `joined` makes a control join the hints of the
+/// Content tips it names (`local_history::authored_context`). Says `vox: VOX_TEST_SEEN_HINT=<arm>
+/// engaged` the first time it answers yes. Without the feature it is always `false`.
+pub(crate) fn seen_hint_mutant(arm: &str) -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static MODE: std::sync::LazyLock<Option<String>> =
+            std::sync::LazyLock::new(|| std::env::var("VOX_TEST_SEEN_HINT").ok());
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let on = MODE.as_deref() == Some(arm);
+        if on {
+            SAID.call_once(|| eprintln!("vox: VOX_TEST_SEEN_HINT={arm} engaged"));
+        }
+        on
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    {
+        let _ = arm;
+        false
     }
 }
 
@@ -610,19 +634,6 @@ impl SparseValidation {
             hash: header.entry_hash(),
             state,
         };
-        // A format-1 Content cursor captured before ADR-053 M0 also carries a receipt for
-        // each `seen` hint. Keep its exact own-parent receipt and its position, and drop
-        // only the hint receipts: a cursor already past the own parent restarts at the
-        // context-coordinate phase, whose own cursor is unchanged.
-        let (mut parents, mut parent, mut parent_coordinate) = (parents, parent, parent_coordinate);
-        let own = usize::from(header.skeleton.seq > 1);
-        if v2.kind == SignedEntryKind::Content && parents.len() == own + v2.seen.len() {
-            parents.truncate(own);
-            if parent > own || (parent == own && parent_coordinate != 0) {
-                parent = own;
-                parent_coordinate = 0;
-            }
-        }
         let mut cursor = Self::new(included, body, parents)?;
         cursor.parent = parent;
         cursor.parent_coordinate = parent_coordinate;

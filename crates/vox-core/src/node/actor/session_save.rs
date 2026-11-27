@@ -1110,7 +1110,16 @@ impl Node {
                         .as_ref()
                         .map(|profile| Arc::downgrade(&profile.store_handle()));
                     let tx = self.net_tx.clone();
+                    // "Publication is busy" is the room's history publication or the computer's
+                    // publication lease (`maintenance_save.rs` `try_acquire_publication`). A try
+                    // made while the lease is held waits for its release, not for the next turn.
+                    let released = self
+                        .computer_authority()
+                        .map(|authority| authority.publication_released());
                     let task = self.spawn_join_housekeeping(async move {
+                        if let Some(released) = released {
+                            released.await;
+                        }
                         let Some(room_state) = weak_room.upgrade() else {
                             return;
                         };

@@ -1721,11 +1721,13 @@ impl Router {
                 }
             }
         }
+        // Forgetting never stops a node, so the refusal says nothing of whether it runs: `vox
+        // node lock` says that itself, as it may stop the node after this refusal.
         self.write_attach_file_held(Some(node), was)
             .await
             .map_err(|why| Refusal::Failed {
                 node: node.clone(),
-                why: format!("could not forget node {node}'s remembered state: {why}; this request did not stop the node; correct the storage problem and retry"),
+                why: format!("could not forget node {node}'s remembered state: {why}; correct the storage problem and retry"),
             })?;
         Ok(())
     }

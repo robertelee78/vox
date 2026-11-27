@@ -955,63 +955,6 @@ impl Dag {
         self.newest_clock = newest;
     }
 
-    /// Whether `a` **happened before** `b`: `a` is a proper ancestor of `b` through `b`'s own
-    /// feed and the `seen` edges, as far as this node holds them.
-    ///
-    /// This is **hint-graph ancestry only** (ADR-053 M0): an ordinary signed-format Content
-    /// entry's `seen` are unchecked ordering hints, so this relation is never evidence for an
-    /// authority, membership, cut, key, private-access or required-ancestor decision; such a
-    /// consumer must prove its fact from verified contexts and own chains instead. `false`
-    /// means concurrent **or** not yet known to be ordered — `a` may be an ancestor through an
-    /// entry this node has not received. Neither entry held is `false`.
-    pub fn happened_before(
-        &self,
-        entries: &impl EntryRead,
-        a: &Digest32,
-        b: &Digest32,
-    ) -> Result<bool> {
-        let Some((a_author, a_seq)) = self.position(entries, a)? else {
-            return Ok(false);
-        };
-        let Some((b_author, b_seq)) = self.position(entries, b)? else {
-            return Ok(false);
-        };
-        if a_author == b_author {
-            return Ok(a_seq < b_seq);
-        }
-        // Reaching an author's position reaches its complete prefix. Scan each newly reached
-        // interval once; the work maps have one high-water per author, never one row per entry.
-        // This also works during authenticated provisional acceptance, before display clocks
-        // are published, and never substitutes display order for causal authority.
-        let mut pending = BTreeMap::from([(b_author, b_seq)]);
-        let mut scanned: BTreeMap<Digest32, u64> = BTreeMap::new();
-        while let Some((author, through)) = pending.pop_first() {
-            let from = scanned.get(&author).copied().unwrap_or(0).saturating_add(1);
-            if from > through {
-                continue;
-            }
-            for seq in from..=through {
-                let entry = entries
-                    .get(&author, seq)?
-                    .ok_or(Error::MalformedAtRest("causal prefix missing"))?;
-                for parent in &entry.skeleton.seen {
-                    let Some((other, reached)) = self.position(entries, parent)? else {
-                        continue;
-                    };
-                    if other == a_author && reached >= a_seq {
-                        return Ok(true);
-                    }
-                    if reached > scanned.get(&other).copied().unwrap_or(0) {
-                        let at = pending.entry(other).or_insert(0);
-                        *at = (*at).max(reached);
-                    }
-                }
-            }
-            scanned.insert(author, through);
-        }
-        Ok(false)
-    }
-
     /// Build the fork proof for a `(author, seq)` conflict (ADR-008 §"Fork /
     /// equivocation handling"). Every entry is composite-signed, so a conflict
     /// between two that both verified is always a self-authenticating proof.

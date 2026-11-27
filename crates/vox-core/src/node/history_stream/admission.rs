@@ -1258,14 +1258,6 @@ pub(super) fn preflight(
     let own = usize::from(entry.skeleton.seq > 1);
     let seen = governance::checked_seen(v2);
     let parent_count = own + seen.len();
-    // A cursor captured before ADR-053 M0 may still point past Content's own parent at a
-    // hint it no longer needs: resume at the context phase.
-    let (parent, next) =
-        if v2.kind == crate::log::history::SignedEntryKind::Content && parent > parent_count {
-            (parent_count, 0)
-        } else {
-            (parent, next)
-        };
     if parent > parent_count {
         return Err(local("preflight parent cursor"));
     }

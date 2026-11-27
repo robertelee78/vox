@@ -1482,7 +1482,8 @@ pub async fn node_status(
 /// Its identity, rooms, messages and the app's chosen node stay where they are.
 ///
 /// # Errors
-/// A missing node, no daemon, or a refusal to forget or lock it.
+/// A missing node, no daemon, or a refusal to forget or lock it. A refused forget is an error
+/// even when the node is then locked, so `vox node signout` keeps the app's choice of node.
 pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     let name = NodeName::parse(name)?;
     let account = args.account()?;
@@ -1503,18 +1504,17 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     // One request per control connection. Forget first, so a stopped node cannot return.
     // A refused forget stops the node only once its remembered entry is gone, when nothing can
     // bring it back; otherwise, or when the daemon cannot say, the node is left as it was.
-    let mut stops_it = false;
+    // Either way the refusal is this request's answer.
     if let Some(error) = &forget_error {
         let mut d = daemon(&account).await?;
-        let node = match d.request(DaemonRequest::Nodes).await {
-            Ok(DaemonFrame::Nodes(nodes)) => nodes.into_iter().find(|n| n.name == name),
-            _ => None,
+        let forgotten = match d.request(DaemonRequest::Nodes).await {
+            Ok(DaemonFrame::Nodes(nodes)) => nodes.iter().any(|n| n.name == name && !n.keep),
+            _ => false,
         };
-        let Some(node) = node.filter(|n| !n.keep) else {
+        if !forgotten {
             eprintln!("vox: {error}");
             return Err(AppError::Usage(format!("node {name} was not locked: the daemon could not confirm that its remembered state was forgotten, so the node is left as it was; correct the error above and run `vox node lock {name}` again")));
-        };
-        stops_it = node.state != NodeState::Detached;
+        }
     }
     let mut d = daemon(&account).await?;
     match d
@@ -1533,34 +1533,30 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
                 n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Ready)
             }) {
                 println!("vox: node {name} is Ready after the lock request; run `vox node list` to see its current remembered state");
-                if let Some(error) = &forget_error {
-                    eprintln!("vox: {error}");
-                }
-                return Ok(());
+                return forget_error.map_or(Ok(()), |error| Err(AppError::Usage(error)));
             }
             if !nodes.iter().any(|n| {
                 n.name == name
                     && n.status == Some(vox_core::node::daemonipc::NodeStatus::Locked)
                     && !n.keep
             }) {
-                return Err(AppError::Usage(format!("node {name}'s state changed after the lock request; run `vox node list` to see its current status")));
-            }
-            if let Some(error) = &forget_error {
-                println!("vox: node {name} is Locked; its rooms and messages stay here; `vox node unlock {name}` makes it Ready again");
-                // Its words say this request did not stop the node: true only if it was not running.
-                if !stops_it {
+                if let Some(error) = &forget_error {
                     eprintln!("vox: {error}");
                 }
-            } else {
+                return Err(AppError::Usage(format!("node {name}'s state changed after the lock request; run `vox node list` to see its current status")));
+            }
+            let Some(error) = forget_error else {
                 println!(
                     "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
                      `vox node unlock {name}` makes it Ready again"
                 );
-            }
-            Ok(())
+                return Ok(());
+            };
+            println!("vox: node {name} is Locked; its rooms and messages stay here; `vox node unlock {name}` makes it Ready again");
+            Err(AppError::Usage(error))
         }
         Ok(DaemonFrame::Refused(r)) => {
-            if let Some(error) = forget_error.as_ref().filter(|_| !stops_it) {
+            if let Some(error) = &forget_error {
                 eprintln!("vox: {error}");
             }
             Err(AppError::Usage(r.to_string()))

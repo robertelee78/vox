@@ -7424,22 +7424,6 @@ impl ChannelState {
         result
     }
 
-    /// Whether `a` happened before `b` in this room's hint graph: `a` is an ancestor of `b`
-    /// through `b`'s author's feed and the `seen` edges this node holds
-    /// ([`Dag::happened_before`]). Display ordering only, never an authority, membership,
-    /// cut, key, private-access or required-ancestor predicate (ADR-053 M0). `false` means
-    /// concurrent or not yet known to be ordered.
-    pub fn happened_before(&self, store: &Store, a: &Digest32, b: &Digest32) -> Result<bool> {
-        if self.poisoned.get() {
-            return Err(self.save_failure());
-        }
-        self.dag.happened_before(
-            &self.entries.read(store, &self.sek, &self.channel_id)?,
-            a,
-            b,
-        )
-    }
-
     /// Pin published display roots for a bounded query. Drop the view before a client/network
     /// wait. Its keys are the fixed display keys, never the causal clock.
     pub fn order_view(&self, store: &Store) -> Result<OrderView<'_>> {

@@ -4223,7 +4223,9 @@ impl Node {
                         continue;
                     };
                     // The actor does not wait for a room's lock: a session holding it is asked
-                    // again on the next tick.
+                    // again on the next tick. That holds past the join's patience too: only with
+                    // the lock can this node see whether it may post, has left, or is frozen, and
+                    // the join's answer says which, so it is given late rather than unchecked.
                     let Ok(channel) = instance.try_lock() else {
                         self.pending_metadata
                             .get_or_insert_with(Pending::default)

@@ -178,7 +178,11 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         } else if let Some(offer) = ui.offer(vm) {
             render_offer(frame, regions[1], offer);
         } else {
-            let p = Paragraph::new("No room open — Enter opens the room selected in the sidebar")
+            let text = failed_room_said(vm, ui).unwrap_or_else(|| {
+                "No room open — Enter opens the room selected in the sidebar".to_owned()
+            });
+            let p = Paragraph::new(text)
+                .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL));
             frame.render_widget(p, regions[1]);
         }
@@ -648,14 +652,25 @@ fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     frame.render_widget(list, area);
 }
 
+/// The reason the room selected in the sidebar did not reopen and, below it, what reopens it, as
+/// `vox room list` says it.
+fn failed_room_said(vm: &ViewModel, ui: &UiState) -> Option<String> {
+    let reason = ui
+        .selected_room
+        .and_then(|id| vm.channels.iter().find(|c| c.channel_id == id))
+        .and_then(|c| c.open_failure.as_deref())?;
+    Some(format!(
+        "{reason}\n\n{}",
+        crate::room_cli::reopen_advice(&vm.node)
+    ))
+}
+
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
-        let text = ui
-            .selected_room
-            .and_then(|id| vm.channels.iter().find(|c| c.channel_id == id))
-            .and_then(|c| c.open_failure.as_deref())
-            .unwrap_or("No room open");
-        let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
+        let text = failed_room_said(vm, ui).unwrap_or_else(|| "No room open".to_owned());
+        let p = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL));
         frame.render_widget(p, area);
         return;
     };

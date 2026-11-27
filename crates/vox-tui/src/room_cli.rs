@@ -236,7 +236,10 @@ async fn room_of_readiness(
             return Ok(id);
         }
         if let Some(reason) = open_failure {
-            return Err(AppError::Usage(reason));
+            return Err(AppError::Usage(match client.node_name() {
+                Some(node) => format!("{reason}\n  {}", reopen_advice(node.as_str())),
+                None => reason,
+            }));
         }
         if !preparing {
             return Err(room_closed(&id, &name));
@@ -330,6 +333,19 @@ async fn ended_room_said(client: &mut IpcClient, prefix: &str) -> Option<AppErro
     )))
 }
 
+/// What a person does about a room that did not reopen on node `node`: one sentence, said on a
+/// line below the failure's reason wherever that room is shown (`vox room list`, read and post,
+/// the agent hook, `vox tui`). The address comes from outside this node, which cannot print
+/// the address of a room it does not hold open.
+pub(crate) fn reopen_advice(node: &str) -> String {
+    let join = vox_text::shell::node_command(&["vox", "room", "join"], node);
+    format!(
+        "To reopen it once the cause above is fixed, run `{join}` with this room's address and \
+         passphrase (the `vox://` address you joined with, or another member's `vox room link`, \
+         gives the address)."
+    )
+}
+
 /// What every verb says of a room the node holds closed, with a daemon or without one
 /// (`vox service list`'s one-shot form, V210-149).
 pub(crate) fn room_closed(id: &Digest32, name: &str) -> AppError {
@@ -399,12 +415,7 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         );
         if open_failure.is_some() {
             let node = crate::client::name_of(paths)?;
-            let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
-            println!(
-                "  To reopen it once the cause above is fixed, run `{join}` with this room's \
-                 address and passphrase (the `vox://` address you joined with, or another \
-                 member's `vox room link`, gives the address)."
-            );
+            println!("  {}", reopen_advice(node.as_str()));
         }
     }
     for name in &clashing {
