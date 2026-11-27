@@ -174,16 +174,6 @@ impl Write<'_, '_> {
         self.directory.read_sent_ms = now_ms;
     }
 
-    pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
-        receipt_cache(
-            &Source::Batch(self.batch),
-            self.sek,
-            self.channel,
-            self.render_roots()?,
-            receipt,
-        )
-    }
-
     /// Install one already-sealed cache row. Repeated receipt hashes never add references.
     /// The caller seals these roots and commits the cache, ratchet and retention together.
     pub(crate) fn put_read_receipt(

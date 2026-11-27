@@ -315,8 +315,8 @@ impl ChannelState {
         !self.projection_state.pending
             && self.projection_state.policy
                 == Some([
-                    self.effective_retention(),
-                    self.effective_step_retention(),
+                    self.configured_lifetimes()[0],
+                    self.configured_lifetimes()[1],
                     self.legacy_sessions.display_revision(),
                 ])
     }

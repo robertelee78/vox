@@ -1410,7 +1410,20 @@ The first sets a one-second message lifetime and keeps posting: reads must answe
 already-expired messages and with exact pages, counts and thread summaries, while messages
 expire; a backlog larger than one cleanup sweep must still answer `the room is refreshing saved
 history; retry` until it is readable. The second holds the native prune with a test knob and
-requires the hook's continuation read to skip the expired rows instead of refusing.
+requires the hook's continuation read to skip the expired rows instead of refusing. Then, with
+removal held (`VOX_TEST_HOLD_RETENTION_REMOVAL_FILE`) and the lengthening's projection turn held
+(`VOX_TEST_HOLD_LENGTHENING_FILE`), the admin keeps everything: the hook's read must still leave
+out what the one second had made due. Its mutant is `VOX_MUTANT_RETENTION_EDGE=read`.
+
+The same knob names the other retention-fence mutants: `stopped`, `seen` and `merged` for
+`a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired` (a node stopped cleanly
+keeps what passed its old lifetime while it was stopped; after a kill, what its shorter lifetime
+hid stays hidden and a message that first reaches it after a lengthening is kept; a later
+shortening and lengthening does not remove that message, which `merged`, one pair per kind,
+does), and `private`
+for `session_steps_expire_after_two_days_unless_the_admin_chose_otherwise` (a step the admin's
+three-second step lifetime had expired, still stored, removal held, when the running room switches
+to two days, stays expired, and is removed once the hold goes).
 
 ## RG-15 release assets in disposable guests
 

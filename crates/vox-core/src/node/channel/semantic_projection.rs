@@ -254,6 +254,10 @@ pub(crate) struct SemanticProjection {
     next_log_id: u64,
     legacy: legacy_session::LegacyProjectionContext,
     retention: (u64, u64),
+    /// What lengthenings keep expired (`retention::Fence`): a body that arrives or comes back
+    /// covered is expired on arrival when it is read here; one that cannot be read is stored and
+    /// clears the room's "clean" mark (`covered`), so cleanup removes it.
+    fence: [crate::node::retention::Fence; 2],
     governance_current: bool,
     held: BTreeMap<Digest32, (u64, u64)>,
     now: u64,
@@ -266,6 +270,11 @@ pub(crate) struct SemanticProjection {
     pub(crate) committed: bool,
     pub(crate) display_changed: bool,
     pruned: u64,
+    /// A body this projection stored has a retention fact the fences cover (an arrival or a
+    /// returning body whose first sight and age a lengthening fenced). Whatever `apply_with`
+    /// then did with it, the room's public "clean" mark is cleared at install, so the next
+    /// cleanup pass walks the fences again and removes it (`history::State::clean`).
+    covered: bool,
 }
 
 impl SemanticProjection {
@@ -289,6 +298,7 @@ impl SemanticProjection {
                 channel.effective_retention(),
                 channel.effective_step_retention(),
             ),
+            fence: channel.retention_fence(),
             held: channel
                 .authors
                 .keys()
@@ -315,6 +325,7 @@ impl SemanticProjection {
             committed: false,
             display_changed: false,
             pruned: 0,
+            covered: false,
         })
     }
 
@@ -657,7 +668,7 @@ impl SemanticProjection {
         entry: &Entry,
         created: u64,
     ) -> Result<bool> {
-        if !self.governance_current || entry.payload.as_deref().is_some_and(retained_control) {
+        if entry.payload.as_deref().is_some_and(retained_control) {
             return Ok(false);
         }
         let tracked = self
@@ -673,14 +684,22 @@ impl SemanticProjection {
             },
             |tracked| tracked.steps,
         );
+        let first_seen = tracked.map_or(self.now, |tracked| tracked.first_seen_ms);
+        let base = created.min(first_seen);
+        // What a lengthening keeps expired here stays so however its body comes back. This
+        // node's own fact, not the room's policy: it needs no current governance.
+        if self.fence[usize::from(steps)].covers(base, first_seen) {
+            return Ok(true);
+        }
+        if !self.governance_current {
+            return Ok(false);
+        }
         let ttl = if steps {
             self.retention.1
         } else {
             self.retention.0
         };
-        let first_seen = tracked.map_or(self.now, |tracked| tracked.first_seen_ms);
-        Ok(ttl != 0
-            && created.min(first_seen) <= self.now.saturating_sub(ttl.saturating_mul(1_000)))
+        Ok(ttl != 0 && base <= self.now.saturating_sub(ttl.saturating_mul(1_000)))
     }
 
     fn expired_into(
@@ -751,6 +770,8 @@ impl SemanticProjection {
             cache_id: previous.and_then(|tracked| tracked.cache_id),
             returned: previous.is_some_and(|tracked| tracked.returned),
         };
+        // The same test the cleanup walk applies to this stored fact (`next_due`).
+        self.covered |= self.fence[usize::from(steps)].covers(tracked.base(), first_seen_ms);
         let age = seal_segment(
             sek,
             SegmentKind::Index,
@@ -962,6 +983,9 @@ impl SemanticProjection {
         for hash in self.step_bodies {
             channel.invalidate_display();
             channel.private_sessions.legacy_pending.insert(hash);
+        }
+        if self.covered {
+            channel.note_covered();
         }
         if self.pruned != 0 {
             channel.dag.install_retention_delta(self.pruned, &[]);

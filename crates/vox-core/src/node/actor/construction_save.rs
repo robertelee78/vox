@@ -136,6 +136,7 @@ impl Work {
                         Arc::new(()),
                         crate::node::channel::pending_retention::Step::Projection,
                         now,
+                        now,
                     )? {
                         let completed = pending.save(store);
                         channel.finish_pending_retention(store, completed)?;
@@ -215,6 +216,9 @@ impl Work {
                     ));
                 }
                 fold_unpublished_governance(&mut channel, store, now)?;
+                // Before anything is shown under them, the lifetimes it applies are on disk:
+                // after a kill, the restart finds them, and a lengthening is fenced from them.
+                channel.save_lifetimes_before_opening(store, now.get())?;
                 Ok(channel)
             }
         }

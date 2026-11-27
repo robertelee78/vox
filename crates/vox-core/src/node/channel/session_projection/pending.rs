@@ -112,10 +112,7 @@ impl ChannelState {
             } else {
                 BTreeMap::new()
             },
-            policy: SourcePolicy {
-                retention: self.effective_retention(),
-                step_retention: self.effective_step_retention(),
-            },
+            policy: self.expiry(),
             now: now.get(),
             next_log_id: self.next_log_id,
             work,
@@ -252,10 +249,7 @@ impl ChannelState {
             root: self.genesis.creator_pubkey().fingerprint(),
             me: self.me(),
             authors: self.authors.clone(),
-            policy: SourcePolicy {
-                retention: self.effective_retention(),
-                step_retention: self.effective_step_retention(),
-            },
+            policy: self.expiry(),
             now: now.get(),
             next_log_id: self.next_log_id,
             work: ProjectionWork::Governance,

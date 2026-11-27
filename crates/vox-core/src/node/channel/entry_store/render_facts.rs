@@ -1170,10 +1170,10 @@ impl RenderView<'_> {
         now: u64,
         ttl: u64,
         step_ttl: u64,
-        floor: [u64; 2],
+        fence: [crate::node::retention::Fence; 2],
     ) -> Result<bool> {
         let read = &self.order.read;
-        if !read.retention_due(now, ttl, step_ttl, floor, 0)?.1
+        if !read.retention_due(now, ttl, step_ttl, fence, 0)?.1
             && self.next_owed_expiry()?.is_none_or(|at| at > now)
         {
             return Ok(false);
@@ -1181,7 +1181,7 @@ impl RenderView<'_> {
         if expiry_mutant("refuse") {
             return Ok(true);
         }
-        let (selected, more) = read.retention_due(now, ttl, step_ttl, floor, DUE_ENTRIES)?;
+        let (selected, more) = read.retention_due(now, ttl, step_ttl, fence, DUE_ENTRIES)?;
         if more {
             return Ok(true);
         }

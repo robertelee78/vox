@@ -151,9 +151,33 @@ the messages when the work is done, and gives the node's answer only if it has n
 15 seconds. The terminal app, the Mac app, an agent's hook and `vox room read --since` or `--tag`
 still get the answer at once. Within one sweep, reads exclude expired messages and report exact
 pages and totals without waiting for physical deletion.
-A message that expired stays gone: a longer retention set afterwards, by the room or by your
-node's own setting, does not bring it back, even if its deletion had not run yet or the node
-restarted in between.
+A message your node showed and that then expired stays gone: a longer retention set afterwards,
+by the room or by your node's own setting, does not bring it back, even if its deletion had not
+run yet, a peer sends it again, or the node restarted in between. That holds from the moment the
+longer retention is in force, for every read, including `--since`, an agent's hook and Session
+activity. Your node puts a longer retention in force at its next retention turn, usually within
+seconds, not when `vox room retention` answers (a change to your node's own file is read within a
+minute): until then it keeps the shorter one, `vox status` shows the retention in force, and a
+count or page may answer `refreshing` as above. A shorter retention is in force once your node
+has saved it. A message that arrives already expired is never shown. A room message that does
+keeps its place and stays gone; a private Session record or step that does is not kept at all, so
+if a peer sends it again after the retention was lengthened, it is taken as new and shown if the
+longer retention keeps it.
+
+This covers only what your node had already left out: a message that first reaches your node
+after the longer retention took effect is kept as the longer retention says, and so is one that
+passed the shorter retention while your node was stopped, if it was stopped normally (Ctrl-C, a
+service manager's stop, a lock) and that room's stop was saved. After a crash or a kill, or if
+saving that room's stop failed or was skipped because a write was in progress, your node counts
+from its restart instead and removes those. A lengthening of your node's own setting made while
+it was stopped is known at its restart. A room's lengthening made by its admin while your node
+was stopped is learned only by syncing: before syncing, a restarting node uses the room policy in
+its saved log and may delete messages the newer room policy retains. After more than eight
+lengthenings of the same kind of retention, your node folds the oldest two together, and some
+messages that first reached it late may then be removed. All of this assumes the computer's clock
+does not step backwards: if it does, messages your node had already left out can be shown again,
+and messages that reach it late can be removed although the room keeps them. In each case other
+members may still retain copies.
 
 A row that reads `(not received yet)` is a message whose text your node is still waiting for. See
 [a message says not received yet](troubleshooting.md#a-message-says-not-received-yet).

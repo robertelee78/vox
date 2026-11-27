@@ -1220,15 +1220,6 @@ impl<'a> View<'a> {
         Ok(Read::open_existing(store, sek, room)?.map(|facts| Self { facts, root, room }))
     }
 
-    pub(in crate::node::channel) fn recipient_in(
-        batch: &'a crate::node::store::Batch<'a>,
-        sek: &'a Sek,
-        room: &'a Digest32,
-        root: Digest32,
-    ) -> Result<Option<Self>> {
-        Ok(Read::from_batch_existing(batch, sek, room)?.map(|facts| Self { facts, root, room }))
-    }
-
     /// Single-writer consent/presence/share facts do not depend on the admin
     /// fold. Their source receipt barrier must still be complete.
     pub(in crate::node::channel) fn current(
@@ -1775,54 +1766,6 @@ impl super::super::ChannelState {
             return Ok(super::channel::ContentEligibility::Eligible);
         }
         Ok(self.recipient_bodies_eligibility(store, recipient, std::slice::from_ref(entry))?[0])
-    }
-
-    /// Whether this node holds an applied removal incarnation and an indexed removal row for
-    /// `recipient`, without a fold gate. The cheap generation read keeps never-removed rooms
-    /// off the derived index entirely.
-    pub(in crate::node::channel) fn recipient_removal_row_in(
-        &self,
-        batch: &crate::node::store::Batch<'_>,
-        recipient: &Digest32,
-    ) -> Result<bool> {
-        if super::removal_generation_in(batch, &self.channel_id)? == 0 {
-            return Ok(false);
-        }
-        let Some(facts) = Read::from_batch_existing(batch, &self.sek, &self.channel_id)? else {
-            return Ok(false);
-        };
-        // Rule F2 B: a recorded fork proof is a derived exclusion with no removal row.
-        Ok(facts
-            .at_or_after(Table::MemberRemovals, hash_key(recipient))?
-            .is_some_and(|(key, _)| key[..32] == recipient[..])
-            || facts
-                .get(Table::ForkBoundary, &hash_key(recipient))?
-                .is_some())
-    }
-
-    /// The same decision inside the caller's open publication Batch.
-    pub(in crate::node::channel) fn recipient_body_eligibility_in(
-        &self,
-        batch: &crate::node::store::Batch<'_>,
-        recipient: &Digest32,
-        entry: &Entry,
-    ) -> Result<super::channel::ContentEligibility> {
-        if !body_restricted(entry, recipient)
-            || super::removal_generation_in(batch, &self.channel_id)? == 0
-        {
-            return Ok(super::channel::ContentEligibility::Eligible);
-        }
-        let Some(view) = View::recipient_in(
-            batch,
-            &self.sek,
-            &self.channel_id,
-            self.genesis.creator_pubkey().fingerprint(),
-        )?
-        else {
-            return Ok(super::channel::ContentEligibility::Eligible);
-        };
-        let cut = view.recipient_cut(recipient, self.now_hint)?;
-        view.body_eligibility_after(&cut, recipient, entry)
     }
 }
 

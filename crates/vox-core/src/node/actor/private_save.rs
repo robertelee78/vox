@@ -212,6 +212,7 @@ impl Work {
                 owner,
                 pending_retention::Step::PrivateExpiry,
                 now,
+                now,
             )? {
                 Some(pending) => Some(Prepared::Expiry(Box::new(pending))),
                 None => ready(Saved::ExpiryUnavailable),

@@ -241,3 +241,194 @@ impl Tracked {
             .map_or(self.first_seen_ms, |c| c.min(self.first_seen_ms))
     }
 }
+
+/// What one lengthening keeps expired at this node, for one kind (messages or Session steps).
+///
+/// When a longer lifetime replaces a shorter one, what the shorter one had made due here stays
+/// due: a row aged from at or before `floor` (the instant the shorter lifetime last reached) that
+/// this node had first seen by `seen_by` (the instant the shorter lifetime stopped being in force
+/// here). A row that first reaches this node later was never hidden here, and the longer lifetime
+/// keeps it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Pair {
+    pub floor: u64,
+    pub seen_by: u64,
+}
+
+impl Pair {
+    fn covers(self, base: u64, first_seen: u64) -> bool {
+        base <= self.floor && (first_seen <= self.seen_by || edge_mutant(EdgeMutant::Seen))
+    }
+    /// Whether this pair keeps expired everything `other` does.
+    fn dominates(self, other: Self) -> bool {
+        self.floor >= other.floor && self.seen_by >= other.seen_by
+    }
+}
+
+/// How many lengthenings one kind's fence holds apart; past it, the two oldest are merged.
+pub(crate) const FENCE_PAIRS: usize = 8;
+
+/// What all lengthenings here keep expired, for one kind: a row stays expired if any of its pairs
+/// covers it. Pairs no other pair dominates, oldest (`seen_by`) first; none: nothing fenced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Fence {
+    pairs: [Pair; FENCE_PAIRS],
+    len: u8,
+}
+
+impl Fence {
+    pub fn pairs(&self) -> &[Pair] {
+        &self.pairs[..usize::from(self.len)]
+    }
+    /// A saved fence, refused unless it is what [`Self::add`] keeps: at most [`FENCE_PAIRS`]
+    /// pairs, each reaching some age, oldest first, none dominating another.
+    pub fn from_pairs(pairs: &[Pair]) -> Option<Self> {
+        let kept = pairs.len() <= FENCE_PAIRS
+            && pairs.iter().all(|pair| pair.floor != 0)
+            && pairs
+                .windows(2)
+                .all(|w| w[0].seen_by < w[1].seen_by && w[0].floor > w[1].floor);
+        let mut fence = Self::default();
+        fence.pairs[..pairs.len().min(FENCE_PAIRS)]
+            .copy_from_slice(&pairs[..pairs.len().min(FENCE_PAIRS)]);
+        fence.len = pairs.len().min(FENCE_PAIRS) as u8;
+        kept.then_some(fence)
+    }
+    /// Whether a row aged from `base` and first seen here at `first_seen` stays expired.
+    pub fn covers(&self, base: u64, first_seen: u64) -> bool {
+        self.covering(base, first_seen).is_some()
+    }
+    /// The floor of a pair that keeps the row expired.
+    pub fn covering(&self, base: u64, first_seen: u64) -> Option<u64> {
+        self.pairs()
+            .iter()
+            .find(|pair| pair.covers(base, first_seen))
+            .map(|pair| pair.floor)
+    }
+    /// The newest age any pair reaches.
+    pub fn reach(&self) -> Option<u64> {
+        self.pairs().iter().map(|pair| pair.floor).max()
+    }
+    /// Keep `new` expired too. A pair another dominates is dropped; past [`FENCE_PAIRS`], the two
+    /// oldest become one that covers both (and may cover a late arrival neither did).
+    pub fn add(&mut self, new: Pair) {
+        if new.floor == 0 {
+            return;
+        }
+        let mut pairs: Vec<Pair> = self.pairs().to_vec();
+        if edge_mutant(EdgeMutant::Merged) {
+            pairs = vec![pairs.iter().fold(new, |a, b| Pair {
+                floor: a.floor.max(b.floor),
+                seen_by: a.seen_by.max(b.seen_by),
+            })];
+        } else if !pairs.iter().any(|pair| pair.dominates(new)) {
+            pairs.retain(|pair| !new.dominates(*pair));
+            pairs.push(new);
+            pairs.sort_by_key(|pair| (pair.seen_by, pair.floor));
+            while pairs.len() > FENCE_PAIRS {
+                let merged = Pair {
+                    floor: pairs[0].floor.max(pairs[1].floor),
+                    seen_by: pairs[0].seen_by.max(pairs[1].seen_by),
+                };
+                pairs.drain(..2);
+                pairs.retain(|pair| !merged.dominates(*pair));
+                pairs.insert(0, merged);
+                pairs.sort_by_key(|pair| (pair.seen_by, pair.floor));
+            }
+        }
+        *self = Self::default();
+        for (slot, pair) in self.pairs.iter_mut().zip(&pairs) {
+            *slot = *pair;
+        }
+        self.len = pairs.len() as u8;
+    }
+}
+
+/// The fences in force, `[messages, Session steps]`, when the lifetimes last projected here were
+/// `projected` (with the fences `fence` they kept) and the lifetimes now in force are `current`.
+/// The shorter lifetime was in force here until `until`: the switch's instant, or, for a node
+/// that stopped under it, the instant it stopped. A kind whose lifetime grew (or became
+/// unlimited) gets the pair `floor = until − shorter`, `seen_by = until`.
+pub(crate) fn lengthened(
+    fence: [Fence; 2],
+    projected: Option<[u64; 3]>,
+    current: [u64; 2],
+    until: u64,
+) -> [Fence; 2] {
+    let Some(old) = projected else {
+        return fence;
+    };
+    let mut fence = fence;
+    for ((fence, was), now) in fence.iter_mut().zip(old).zip(current) {
+        if longer(was, now) {
+            fence.add(Pair {
+                floor: until.saturating_sub(was.saturating_mul(1_000)),
+                seen_by: until,
+            });
+        }
+    }
+    fence
+}
+
+/// Whether the lifetime `now` keeps longer than `was` (`0` is forever).
+pub(crate) fn longer(was: u64, now: u64) -> bool {
+    was != 0 && (now == 0 || now > was)
+}
+
+/// The lifetimes in force and what lengthenings keep expired, `[messages, Session steps]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Expiry {
+    pub ttl: [u64; 2],
+    pub fence: [Fence; 2],
+}
+
+impl Expiry {
+    /// Whether something of `kind` (0 messages and Session records, 1 Session steps), aged from
+    /// `base` and first seen here at `first_seen`, has expired by `now`.
+    pub fn expired(&self, kind: usize, base: u64, first_seen: u64, now: u64) -> bool {
+        let ttl = self.ttl[kind];
+        (ttl != 0 && base <= now.saturating_sub(ttl.saturating_mul(1_000)))
+            || (self.fence[kind].covers(base, first_seen)
+                && !edge_mutant(EdgeMutant::PrivateUnfenced))
+    }
+}
+
+/// `test-knobs` mutants of the retention fence, one per edge it closes, chosen by
+/// `VOX_TEST_RETENTION_EDGE_MUTANT`. Never selectable in a build without the feature.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeMutant {
+    /// A longer lifetime applies to reads and cleanup before its switch saves and publishes it,
+    /// with only the saved fences.
+    Read,
+    /// The fence covers late arrivals too: first sight is ignored.
+    Seen,
+    /// A node that stopped under the shorter lifetime fences from its restart, not its stop.
+    Stopped,
+    /// Private Session expiry ignores the fences.
+    PrivateUnfenced,
+    /// Every lengthening folds into one pair per kind (the largest floor and `seen_by`).
+    Merged,
+}
+
+pub(crate) fn edge_mutant(which: EdgeMutant) -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        let name = match which {
+            EdgeMutant::Read => "read",
+            EdgeMutant::Seen => "seen",
+            EdgeMutant::Stopped => "stopped",
+            EdgeMutant::PrivateUnfenced => "private",
+            EdgeMutant::Merged => "merged",
+        };
+        if std::env::var("VOX_TEST_RETENTION_EDGE_MUTANT").is_ok_and(|v| v == name) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("test-knobs: retention edge mutant engaged: {name}");
+            }
+            return true;
+        }
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    let _ = which;
+    false
+}

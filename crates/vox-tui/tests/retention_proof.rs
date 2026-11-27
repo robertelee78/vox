@@ -87,6 +87,60 @@ impl Drop for Daemon {
     }
 }
 
+impl Daemon {
+    /// Stop it as a service manager or a person's Ctrl-C does (SIGTERM), and wait until it has
+    /// exited: a clean stop, unlike a drop's kill.
+    fn stop(mut self, tag: &str) {
+        let pid = self.0.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(sent, "APPARATUS: SIGTERM to {tag}'s daemon");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self
+            .0
+            .try_wait()
+            .expect("APPARATUS: wait for the daemon")
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT (staging): {tag}'s daemon did not exit within 60 s of SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// The daemon log lines of the retention edge mutant `which` (`VOX_MUTANT_RETENTION_EDGE`),
+/// printed, and an APPARATUS red when it was asked for and no daemon under `dir` engaged it.
+fn edge_mutant_engaged(dir: &Path, which: &str) {
+    if std::env::var_os("VOX_MUTANT_RETENTION_EDGE").is_none_or(|asked| asked != which) {
+        return;
+    }
+    let said: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".err"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .flat_map(|log| {
+            log.lines()
+                .filter(|line| line.contains("retention edge mutant engaged"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for line in &said {
+        println!("[daemon] {line}");
+    }
+    assert!(
+        !said.is_empty(),
+        "APPARATUS: the retention edge mutant {which:?} was asked for and never engaged"
+    );
+}
+
 fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     vox_with(dir, args, stdin, Some(IDENTITY))
 }
@@ -183,6 +237,18 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
         )
         .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
+        .env(
+            "VOX_TEST_HOLD_RETENTION_REMOVAL_FILE",
+            dir.join("hold-removal"),
+        )
+        .env(
+            "VOX_TEST_HOLD_LENGTHENING_FILE",
+            dir.join("hold-lengthening"),
+        )
+        .envs(
+            std::env::var_os("VOX_MUTANT_RETENTION_EDGE")
+                .map(|which| ("VOX_TEST_RETENTION_EDGE_MUTANT", which)),
+        )
         .envs(
             std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
                 .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
@@ -862,6 +928,216 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         "PRODUCT: a message that arrives already expired must never be rendered: alice's syncs \
          rendered {announced} rows where only `fresh` was live"
     );
+
+    // ---- a node stopped under its minute keeps, once it keeps the week, what aged meanwhile ----
+    //
+    // Alice's minute hid the 10 early ones and the 5 late ones here. Three more reach her and are
+    // shown; she is stopped cleanly while they are seconds old, and while she is stopped her node
+    // file goes (she now keeps the room's week) and the three pass her old minute. No read of hers
+    // ever left them out, and the room keeps them: she must show them. What her minute did hide
+    // must stay hidden.
+    for i in 1..=3 {
+        post(&bob, &room, &format!("kept {i}"));
+    }
+    let kept_at = Instant::now();
+    until(
+        &alice,
+        &room,
+        "PRODUCT (staging): alice to read the 3 kept",
+        50,
+        |t| count(t, "kept ") == 3,
+    );
+    let stopped_after = kept_at.elapsed().as_secs();
+    _alice_d.stop("alice-2");
+    std::fs::remove_file(alice.join("cfg").join("retention"))
+        .expect("APPARATUS: remove alice's node retention file");
+    std::thread::sleep(Duration::from_secs(65).saturating_sub(kept_at.elapsed()));
+    let alice_d = daemon_on(
+        &alice,
+        "alice-3",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
+    reopened(&alice, "alice-3");
+    let shown = read(&alice, &room);
+    println!(
+        "alice, stopped {stopped_after} s after the 3 kept were posted, back {} s after: shows \
+         {} kept, {} early, {} late",
+        kept_at.elapsed().as_secs(),
+        count(&shown, "kept "),
+        count(&shown, "early "),
+        count(&shown, "late ")
+    );
+    edge_mutant_engaged(&alice, "stopped");
+    assert_eq!(
+        count(&shown, "kept "),
+        3,
+        "PRODUCT: alice was stopped before her minute reached the 3 kept and now keeps the room's \
+         week, so she must still show them; `vox room read` shows {shown:?}"
+    );
+    assert_eq!(
+        (count(&shown, "early "), count(&shown, "late ")),
+        (0, 0),
+        "PRODUCT: what alice's minute hid must stay hidden once she keeps the week; `vox room \
+         read` shows {shown:?}"
+    );
+
+    // ---- a message older than her old minute that first reaches her after it is kept --------
+    //
+    // Alice keeps a minute again, and that is saved; she is killed (no stop instant saved), bob
+    // posts three while she is down, and they pass her minute. Her node file goes again, so at her
+    // start the week replaces her minute from that start. The three reach her only after: no read
+    // of hers ever hid them, and the room keeps them. She must show them.
+    std::fs::write(alice.join("cfg").join("retention"), "default 60\n")
+        .expect("APPARATUS: alice's node retention file");
+    drop(alice_d);
+    let alice_d = daemon_on(
+        &alice,
+        "alice-4",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
+    reopened(&alice, "alice-4");
+    let shown = read(&alice, &room);
+    assert_eq!(
+        count(&shown, "kept "),
+        0,
+        "PRODUCT (staging): alice keeps a minute again, so the 3 kept must leave her view: {shown:?}"
+    );
+    drop(alice_d);
+    for i in 1..=3 {
+        post(&bob, &room, &format!("after {i}"));
+    }
+    let after_at = Instant::now();
+    std::thread::sleep(Duration::from_secs(65).saturating_sub(after_at.elapsed()));
+    std::fs::remove_file(alice.join("cfg").join("retention"))
+        .expect("APPARATUS: remove alice's node retention file");
+    let alice_d = daemon_on(
+        &alice,
+        "alice-5",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
+    reopened(&alice, "alice-5");
+    post(&bob, &room, "fresh 2");
+    // `fresh 2` follows the three in bob's feed, so once alice shows it she holds them.
+    until(
+        &alice,
+        &room,
+        "PRODUCT (staging): alice to catch up with bob's `fresh 2`",
+        90,
+        |t| t.iter().any(|x| x == "fresh 2"),
+    );
+    let shown = read(&alice, &room);
+    println!(
+        "alice, back keeping the week: shows {} after (posted {} s ago, while she was down), {} \
+         kept, {} early, {} late",
+        count(&shown, "after "),
+        after_at.elapsed().as_secs(),
+        count(&shown, "kept "),
+        count(&shown, "early "),
+        count(&shown, "late ")
+    );
+    edge_mutant_engaged(&alice, "seen");
+    assert_eq!(
+        count(&shown, "after "),
+        3,
+        "PRODUCT: the 3 after first reached alice once she kept the room's week, and no read of \
+         hers ever hid them: she must show them; `vox room read` shows {shown:?}"
+    );
+    assert_eq!(
+        (
+            count(&shown, "kept "),
+            count(&shown, "early "),
+            count(&shown, "late ")
+        ),
+        (0, 0, 0),
+        "PRODUCT: what alice's minute hid must stay hidden once she keeps the week; `vox room \
+         read` shows {shown:?}"
+    );
+
+    // ---- a later shortening and lengthening never removes what an earlier fence kept --------
+    //
+    // The 3 after are older than the minute's fence floor, but first reached alice after it was
+    // set: kept. She now keeps ten minutes (they are about a minute old: kept), then the week
+    // again. That lengthening keeps expired what ten minutes had made due here, which reaches
+    // back ten minutes, not to the 3 after. Neither lengthening's fence covers them, so she must
+    // still show them; what her minute hid stays hidden.
+    std::fs::write(alice.join("cfg").join("retention"), "default 600\n")
+        .expect("APPARATUS: alice's node retention file");
+    drop(alice_d);
+    let alice_d = daemon_on(
+        &alice,
+        "alice-6",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
+    reopened(&alice, "alice-6");
+    let shown = read(&alice, &room);
+    assert_eq!(
+        count(&shown, "after "),
+        3,
+        "PRODUCT (staging): alice keeps ten minutes, which keep the 3 after: {shown:?}"
+    );
+    drop(alice_d);
+    std::fs::remove_file(alice.join("cfg").join("retention"))
+        .expect("APPARATUS: remove alice's node retention file");
+    let _alice_d = daemon_on(
+        &alice,
+        "alice-7",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+    );
+    reopened(&alice, "alice-7");
+    let shown = read(&alice, &room);
+    println!(
+        "alice, keeping the week again after ten minutes: shows {} after (posted {} s ago), {} \
+         kept, {} early, {} late",
+        count(&shown, "after "),
+        after_at.elapsed().as_secs(),
+        count(&shown, "kept "),
+        count(&shown, "early "),
+        count(&shown, "late ")
+    );
+    edge_mutant_engaged(&alice, "merged");
+    assert_eq!(
+        count(&shown, "after "),
+        3,
+        "PRODUCT: neither the minute's fence nor ten minutes' covers the 3 after, which reached \
+         alice after the first and are younger than the second: she must still show them; `vox \
+         room read` shows {shown:?}"
+    );
+    assert_eq!(
+        (
+            count(&shown, "kept "),
+            count(&shown, "early "),
+            count(&shown, "late ")
+        ),
+        (0, 0, 0),
+        "PRODUCT: what alice's minute hid must stay hidden after another lengthening; `vox room \
+         read` shows {shown:?}"
+    );
+}
+
+/// Wait until the daemon at `dir`, just started, lists its room in `vox status --json`.
+fn reopened(dir: &Path, tag: &str) {
+    attached(dir, tag);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (ok, out, err) = vox(dir, &["status", "--json"], None);
+        assert!(ok, "PRODUCT (staging): {tag}'s `vox status --json`: {err}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): {tag}'s `vox status --json` did not parse ({e}): {out}")
+        });
+        if v["rooms"].get(0).is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): {tag} listed no room within 60 s of its start"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -1983,6 +2259,70 @@ fn a_hook_continuation_read_skips_expired_messages() {
         "PRODUCT: the hook continuation read refused or showed an expired body: {reply:?}"
     );
     std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+
+    // ---- a lengthening is fenced from its first instant, for the hook's read too -----------
+    //
+    // Removal is held, so three posts pass the room's second and stay stored, left out of the
+    // hook's read. Then the admin keeps everything, with its projection turn held: the longer
+    // lifetime is in force and its fence not yet saved. The hook's read must still leave out
+    // what the second had made due; once it is saved, only what is posted later shows.
+    std::fs::write(dir.join("hold-removal"), b"hold removal").unwrap();
+    for i in 1..=3 {
+        post(dir, "hook-expiry", &format!("HOOK-FENCED-{i}"));
+    }
+    std::thread::sleep(Duration::from_millis(1_500));
+    let hidden = rt
+        .block_on(client.request(&query))
+        .expect("APPARATUS: hook read before the lengthening");
+    assert!(
+        matches!(&hidden, Frame::Rows { rows } if rows.is_empty()),
+        "PRODUCT (staging): the room keeps a second, so the hook's read must leave out the 3: \
+         {hidden:?}"
+    );
+    std::fs::write(
+        dir.join("hold-lengthening"),
+        b"hold the lengthening's projection",
+    )
+    .unwrap();
+    let (ok, out, err) = vox(dir, &["room", "retention", "hook-expiry", "forever"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): the admin keeps everything: {out}{err}"
+    );
+    assert!(
+        within(60, || dir.join("hold-lengthening.engaged").exists()),
+        "APPARATUS: the lengthening's projection turn was never held"
+    );
+    let window = rt
+        .block_on(client.request(&query))
+        .expect("APPARATUS: hook read with the lengthening in force");
+    println!("[proof] hook Request::Read, longer lifetime in force, fence not saved: {window:?}");
+    edge_mutant_engaged(dir, "read");
+    assert!(
+        matches!(&window, Frame::Rows { rows } if rows.is_empty()),
+        "PRODUCT: the room now keeps everything, but what its second had made due must stay out \
+         of the hook's read before the longer lifetime is saved: {window:?}"
+    );
+    std::fs::remove_file(dir.join("hold-lengthening")).unwrap();
+    std::fs::remove_file(dir.join("hold-removal")).unwrap();
+    post(dir, "hook-expiry", "HOOK-KEPT");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let last = loop {
+        let reply = rt
+            .block_on(client.request(&query))
+            .expect("APPARATUS: hook read once the lengthening is saved");
+        if matches!(&reply, Frame::Rows { rows } if rows.len() == 1 && rows[0].text == "HOOK-KEPT")
+            || Instant::now() >= deadline
+        {
+            break reply;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        matches!(&last, Frame::Rows { rows } if rows.len() == 1 && rows[0].text == "HOOK-KEPT"),
+        "PRODUCT: once the longer lifetime is saved, the hook's read must show what is posted \
+         after and none of the 3: {last:?}"
+    );
 }
 
 #[path = "support/optional_proof.rs"]
@@ -2815,6 +3155,14 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
         let mut child = command()
             .args(["daemon", "--listen", "127.0.0.1:0"])
             .env("VOX_TEST_CLOCK_STEP_MS", offset.to_string())
+            .env(
+                "VOX_TEST_HOLD_RETENTION_REMOVAL_FILE",
+                dir.join("hold-removal"),
+            )
+            .envs(
+                std::env::var_os("VOX_MUTANT_RETENTION_EDGE")
+                    .map(|which| ("VOX_TEST_RETENTION_EDGE_MUTANT", which)),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(log)
@@ -3116,6 +3464,268 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
         "PRODUCT: Session-step retention failed:\n{}",
         failures.join("\n")
     );
+
+    // ---- a lengthened message lifetime never brings back a Session name it had expired ------
+    //
+    // A Session's opening (its name, harness, working directory) is a Session record and lives
+    // as long as the room's messages. The admin keeps messages three seconds; with removal held,
+    // the opening passes them, so the Session is gone here, still stored. The admin then keeps
+    // messages forever: the Session and its name must stay gone.
+    let (ok, out, err) = run(
+        &[
+            "room",
+            "create",
+            "--name",
+            "renamed",
+            "--passphrase-file",
+            "-",
+        ],
+        Some("retention room passphrase\n"),
+    );
+    assert!(ok, "APPARATUS: create renamed: {out}{err}");
+    let Frame::Rooms { rooms: listed } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: rooms did not return a listing");
+    };
+    let renamed_id = listed
+        .iter()
+        .find(|(_, label, ..)| label == "renamed")
+        .expect("APPARATUS: renamed listed")
+        .0;
+    let renamed = vox_core::node::link::b32_encode(&renamed_id);
+    // The room's message lifetime as `vox status` reports it in force on this node.
+    let messages_in_force = |secs: u64| {
+        let began = Instant::now();
+        loop {
+            let (ok, status, err) = run(&["status", "--json"], None);
+            assert!(ok, "APPARATUS: status of renamed: {status}{err}");
+            let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+            if status["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == renamed && r["retention"] == secs)
+            {
+                return;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "PRODUCT (staging): renamed never kept messages {secs} s here: {status}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (ok, out, err) = run(&["room", "retention", &renamed, "3"], None);
+    assert!(
+        ok,
+        "APPARATUS: the admin keeps renamed's messages three seconds: {out}{err}"
+    );
+    messages_in_force(3);
+    std::fs::write(dir.join("hold-removal"), b"hold removal").unwrap();
+    let opening = serde_json::json!({"v":1,"type":"session","from":"named-session",
+        "body":"","at":{"session_name":"TTL-NAME"},
+        "data":{"session":{"harness":"rg13-retention"}}})
+    .to_string();
+    let result = request(Request::AppendSession {
+        channel_id: renamed_id,
+        session_id: "named-session".to_owned(),
+        body: opening,
+    });
+    assert!(
+        matches!(result, Frame::Appended { .. }),
+        "APPARATUS: real private Session append: {result:?}"
+    );
+    let opened = Instant::now();
+    let sessions = || {
+        let (ok, listed, err) = run(&["room", "sessions", &renamed, "--json"], None);
+        (ok, format!("{listed}{err}"))
+    };
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(opened.elapsed()));
+    let (ok, before) = sessions();
+    println!("SEEN: renamed's Session past three seconds, removal held (ok {ok}): {before}");
+    assert!(
+        !before.contains("TTL-NAME"),
+        "PRODUCT (staging): renamed keeps messages three seconds, so past them its Session's \
+         name must not show: {before}"
+    );
+    let (ok, out, err) = run(&["room", "retention", &renamed, "forever"], None);
+    assert!(
+        ok,
+        "APPARATUS: the admin keeps renamed's messages forever: {out}{err}"
+    );
+    messages_in_force(0);
+    let (ok, lengthened) = sessions();
+    println!(
+        "SEEN: renamed keeps messages forever, its expired opening still stored (ok {ok}): \
+         {lengthened}"
+    );
+    if std::env::var_os("VOX_MUTANT_RETENTION_EDGE").is_some_and(|which| which == "private") {
+        let log = std::fs::read_to_string(dir.join("clock-172800001.log"))
+            .expect("APPARATUS: mutant daemon log");
+        assert!(
+            log.contains("retention edge mutant engaged: private"),
+            "APPARATUS: the private fence mutant never engaged: {log}"
+        );
+        println!("[daemon] retention edge mutant engaged: private");
+    }
+    assert!(
+        !lengthened.contains("TTL-NAME"),
+        "PRODUCT: a Session name its three seconds had expired, still stored when the room kept \
+         messages forever, must stay gone: {lengthened}"
+    );
+    std::fs::remove_file(dir.join("hold-removal")).unwrap();
+
+    // ---- a lengthened step lifetime never brings back a step it had expired ---------------
+    //
+    // The room's admin keeps its Session steps three seconds. With removal held, a step passes
+    // them: it is expired here, never shown, and still stored. The admin then keeps steps two
+    // days. A running room switches to a longer lifetime in its retention turn before that
+    // turn's removals run, so a step its shorter lifetime expired can still be stored when two
+    // days apply (here the hold keeps it stored). It must stay expired, never shown again; once
+    // the hold goes it is removed, and the Session itself stays.
+    let (ok, out, err) = run(
+        &[
+            "room",
+            "create",
+            "--name",
+            "lengthened",
+            "--passphrase-file",
+            "-",
+        ],
+        Some("retention room passphrase\n"),
+    );
+    assert!(ok, "APPARATUS: create lengthened: {out}{err}");
+    let Frame::Rooms { rooms: listed } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: rooms did not return a listing");
+    };
+    let cid = listed
+        .iter()
+        .find(|(_, label, ..)| label == "lengthened")
+        .expect("APPARATUS: lengthened listed")
+        .0;
+    let room = vox_core::node::link::b32_encode(&cid);
+    // The room's step lifetime as `vox status` reports it in force on this node.
+    let in_force = |secs: u64| {
+        let began = Instant::now();
+        loop {
+            let (ok, status, err) = run(&["status", "--json"], None);
+            assert!(ok, "APPARATUS: status of lengthened: {status}{err}");
+            let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+            if status["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == room && r["step_retention"] == secs)
+            {
+                return;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "PRODUCT (staging): lengthened never kept steps {secs} s here: {status}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (ok, out, err) = run(&["room", "retention", &room, "--steps", "3"], None);
+    assert!(
+        ok,
+        "APPARATUS: the admin keeps lengthened's steps three seconds: {out}{err}"
+    );
+    in_force(3);
+    std::fs::write(dir.join("hold-removal"), b"hold removal").unwrap();
+    let lifecycle = serde_json::json!({"v":1,"type":"session","from":"ttl-session",
+        "body":"","at":{"session_name":"TTL-LIFECYCLE"},
+        "data":{"session":{"harness":"rg13-retention"}}})
+    .to_string();
+    let activity = serde_json::json!({"v":1,"session":"ttl-session","kind":"reply",
+        "seq":1,"text":"TTL-ACTIVITY"})
+    .to_string();
+    for body in [lifecycle, activity] {
+        let result = request(Request::AppendSession {
+            channel_id: cid,
+            session_id: "ttl-session".to_owned(),
+            body,
+        });
+        assert!(
+            matches!(result, Frame::Appended { .. }),
+            "APPARATUS: real private Session append: {result:?}"
+        );
+    }
+    let appended = Instant::now();
+    // The Session as a person reads it: an answer, or "refreshing" while an expired step waits
+    // for its removal. Anything else is the room not open yet.
+    let session = || {
+        let began = Instant::now();
+        loop {
+            let (ok, shown, err) = run(&["room", "session", &room, "ttl-session", "--json"], None);
+            if ok || err.contains("refreshing saved Sessions") {
+                return (ok, format!("{shown}{err}"));
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "APPARATUS: lengthened's Session never became readable: {shown}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(appended.elapsed()));
+    let (ok, before) = session();
+    println!("SEEN: lengthened's step past three seconds, removal held (ok {ok}): {before}");
+    assert!(
+        !before.contains("TTL-ACTIVITY"),
+        "PRODUCT (staging): lengthened keeps steps three seconds, so past them its step must not \
+         show: {before}"
+    );
+    let (ok, out, err) = run(&["room", "retention", &room, "--steps", "172800"], None);
+    assert!(
+        ok,
+        "APPARATUS: the admin keeps lengthened's steps two days: {out}{err}"
+    );
+    in_force(172_800);
+    let (ok, lengthened) = session();
+    println!(
+        "SEEN: lengthened keeps steps two days, its expired step still stored (ok {ok}): \
+         {lengthened}"
+    );
+    if std::env::var_os("VOX_MUTANT_RETENTION_EDGE").is_some_and(|which| which == "private") {
+        // The daemon the reopening loop above launched last.
+        let log = std::fs::read_to_string(dir.join("clock-172800001.log"))
+            .expect("APPARATUS: mutant daemon log");
+        assert!(
+            log.contains("retention edge mutant engaged: private"),
+            "APPARATUS: the private fence mutant never engaged: {log}"
+        );
+        println!("[daemon] retention edge mutant engaged: private");
+    }
+    assert!(
+        !lengthened.contains("TTL-ACTIVITY"),
+        "PRODUCT: a step its three seconds had expired, still stored when the room kept steps \
+         two days, must stay expired: {lengthened}"
+    );
+    std::fs::remove_file(dir.join("hold-removal")).unwrap();
+    // The Session as a person reads it, once the room answers.
+    let began = Instant::now();
+    let after = loop {
+        let (ok, shown) = session();
+        if ok || began.elapsed() > Duration::from_secs(120) {
+            break (ok, shown);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    println!(
+        "SEEN: lengthened keeps steps two days, removal released (ok {}): {}",
+        after.0, after.1
+    );
+    assert!(
+        after.0 && !after.1.contains("TTL-ACTIVITY"),
+        "PRODUCT: once removed, a step its three seconds had expired stays gone while the room \
+         keeps steps two days: {after:?}"
+    );
+    let (_, listed, err) = run(&["room", "sessions", &room, "--json"], None);
+    assert!(
+        listed.contains("TTL-LIFECYCLE"),
+        "PRODUCT: the Session stays when its expired step goes: {listed}{err}"
+    );
+    drop(daemon);
 }
 
 /// Commands in the small-row proofs never borrow a harness session or the login Keychain.

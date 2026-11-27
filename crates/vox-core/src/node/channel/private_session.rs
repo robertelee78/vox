@@ -495,15 +495,17 @@ fn decode_pull_demands(d: &mut Decoder<'_>) -> Result<BTreeMap<Digest32, PullDem
     Ok(demands)
 }
 
-pub(super) fn expired(saved: &Stored, now: u64, retention: (u64, u64)) -> bool {
-    let ttl = if saved
+/// Whether a private Session record (message lifetime) or step (step lifetime) has expired here
+/// by `now`, including what a lengthening keeps expired (`retention::Fence`).
+pub(super) fn expired(saved: &Stored, now: u64, expiry: Expiry) -> bool {
+    let kind = if saved
         .row
         .as_ref()
         .is_some_and(|row| crate::node::sessions::is_record(&row.body))
     {
-        retention.0
+        0
     } else {
-        retention.1
+        1
     };
     let claimed = saved
         .row
@@ -511,7 +513,7 @@ pub(super) fn expired(saved: &Stored, now: u64, retention: (u64, u64)) -> bool {
         .map(|row| row.created_millis)
         .or_else(|| saved.record.legacy_claimed_ms())
         .unwrap_or(saved.first_seen);
-    ttl != 0 && saved.first_seen.min(claimed) <= now.saturating_sub(ttl.saturating_mul(1_000))
+    expiry.expired(kind, saved.first_seen.min(claimed), saved.first_seen, now)
 }
 
 /// Callers only signal that committed public steps need inspection. The actual work is a
@@ -790,14 +792,6 @@ fn reopen(
 }
 
 impl ChannelState {
-    pub(super) fn private_contains_in(
-        &self,
-        batch: &crate::node::store::Batch<'_>,
-        hash: &Digest32,
-    ) -> Result<bool> {
-        private_index::find_in(batch, &self.sek, &self.channel_id, hash).map(|id| id.is_some())
-    }
-
     pub(super) fn private_id(&self, store: &Store, hash: &Digest32) -> Result<Option<u64>> {
         let snapshot = store.snapshot()?;
         private_index::find(&snapshot, &self.sek, &self.channel_id, hash)
@@ -1534,8 +1528,7 @@ impl ChannelState {
             &self.sek,
             &self.channel_id,
             now,
-            self.effective_retention(),
-            self.effective_step_retention(),
+            self.walk_expiry(1),
         )?
         .is_none())
     }

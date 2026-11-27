@@ -18245,8 +18245,14 @@ impl Node {
         for (_, cancel) in std::mem::take(&mut self.own_key_room_cancel) {
             cancel.send_replace(true);
         }
+        let clock = Arc::clone(&self.clock);
         for (_, shared) in std::mem::take(&mut self.channels) {
-            shared.lock().await.lock_now();
+            let mut room = shared.lock().await;
+            // Each room says until when its retention was in force here (`note_stopped`).
+            if let Some(profile) = &self.profile {
+                room.note_stopped(profile.store(), &*clock);
+            }
+            room.lock_now();
         }
         // Abort the join exchanges and the reopening (#208): each holds the identity or room keys.
         // An aborted task drops what it holds only when it is next polled, so they are collected

@@ -35,6 +35,37 @@ fn lengthening_unfenced() -> bool {
     false
 }
 
+/// `test-knobs` hold: while the file `VOX_TEST_HOLD_RETENTION_REMOVAL_FILE` names exists, no
+/// cleanup removes anything, messages or private Session items. Its turns still complete, so the
+/// room opens and answers as usual, and the room's Session work does not wait for a removal
+/// (`prepare_pending_private_upgrade`). Never selectable in a build without the feature.
+pub(crate) fn removal_held() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if let Some(path) = std::env::var_os("VOX_TEST_HOLD_RETENTION_REMOVAL_FILE") {
+        return std::path::Path::new(&path).exists();
+    }
+    false
+}
+
+/// `test-knobs` hold: while the file `VOX_TEST_HOLD_LENGTHENING_FILE` names exists, a projection
+/// turn that would switch to a longer lifetime waits, and marks `<file>.engaged`: the longer
+/// lifetime is configured and the shorter one still in force. Never in a build without the
+/// feature.
+fn lengthening_held() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LENGTHENING_FILE") {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            let _ = std::fs::write(
+                path.with_extension("engaged"),
+                b"lengthening projection held",
+            );
+            return true;
+        }
+    }
+    false
+}
+
 enum Work {
     Cleanup {
         remove: Vec<(Digest32, u64, Option<Digest32>)>,
@@ -59,12 +90,17 @@ enum Work {
         before: Vec<u8>,
         owed: Vec<(Digest32, Option<(u64, u64)>)>,
         idle: bool,
+        /// The lifetimes, fences or stop instant changed: flushed (`history::State::retention`).
+        flush: bool,
     },
     Prune {
         due: Vec<Pruned>,
+        /// `due` is everything due now: once removed, no stored row is covered.
+        complete: bool,
         legacy: legacy_session::LegacyProjectionContext,
     },
-    PrivateExpiry,
+    /// `None`: removal held (`removal_held`).
+    PrivateExpiry(Option<crate::node::retention::Expiry>),
     HistoricalKeys {
         state: own_historical_keys::Retirement,
         retire: Option<([u8; 64], u64)>,
@@ -95,7 +131,6 @@ pub(crate) struct PendingRetention {
     index: entry_store::EntryIndex,
     next_log_id: u64,
     now: u64,
-    retention: (u64, u64),
     work: Work,
     pin: Option<history::PendingHistoryRead>,
 }
@@ -103,6 +138,8 @@ pub(crate) struct PendingRetention {
 #[derive(Default)]
 pub(crate) struct Installed {
     pub(crate) pruned: usize,
+    /// The private expiry walked everything due and removed it (`history::State::clean`).
+    pub(crate) private_clean: bool,
     pub(crate) pruned_hashes: Vec<Digest32>,
     pub(crate) changed: bool,
     pub(crate) more_key_debt: bool,
@@ -142,14 +179,17 @@ impl ChannelState {
         crate::time::Ms(self.now_hint)
     }
 
-    /// Read-only preparation, apart from the shared publication reservation. Policy cleanup
-    /// can remove settled debt before governance is ready; expiry still needs current policy.
+    /// Read-only preparation, apart from the shared publication reservation and a lengthening's
+    /// switch (`Self::switch_lifetimes`). Policy cleanup can remove settled debt before
+    /// governance is ready; expiry still needs current policy. `fresh` is this node's clock now:
+    /// `now` may be a turn's retained instant.
     pub(crate) fn prepare_pending_retention(
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
         step: Step,
         now: crate::time::Ms,
+        fresh: crate::time::Ms,
     ) -> Result<Option<PendingRetention>> {
         if self.poisoned.get() {
             return Err(self.save_failure());
@@ -166,11 +206,27 @@ impl ChannelState {
             }
         }
         let now_ms = self.now_hint.max(now.get());
-        let retention = (self.effective_retention(), self.effective_step_retention());
-        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-        if read.publication_busy() {
+        if self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .publication_busy()
+        {
             return Ok(None);
         }
+        if step == Step::Projection && self.lengthening_waits() {
+            if lengthening_held() {
+                return Ok(None);
+            }
+            let fresh = fresh.get().max(now_ms);
+            if let Err(error) = self.with_readers_held(store, |room, batch, watermark| {
+                room.switch_lifetimes(batch, fresh.max(watermark))
+            }) {
+                self.poison(&error);
+                return Err(error);
+            }
+        }
+        let retention = (self.effective_retention(), self.effective_step_retention());
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
         let work = match step {
             Step::OwedCleanup => {
                 let start = self.projection_state.cleanup_cursor;
@@ -191,16 +247,20 @@ impl ChannelState {
                 let mut rows = Vec::new();
                 for (author, seq) in positions {
                     let entry = read.get(&author, seq)?;
-                    let ttl = match entry.as_ref() {
-                        Some(entry) => Some(self.entry_retention(read.transaction(), entry)?),
-                        None => None,
+                    // The place's age and the lifetimes and fences in force: a body-less place
+                    // expires as its body would, by its lifetime or by a lengthening's fence.
+                    let age = match entry.as_ref() {
+                        Some(entry) if entry.payload.is_none() => {
+                            Some(self.place_age_in(read.transaction(), entry)?)
+                        }
+                        _ => None,
                     };
-                    let keep = match (entry.as_ref(), ttl) {
-                        (Some(entry), Some(ttl)) => {
-                            entry.payload.is_none()
-                                && self.private_id(store, &entry.entry_hash())?.is_none()
+                    let expiry = self.expiry();
+                    let keep = match (entry.as_ref(), age) {
+                        (Some(entry), Some(age)) => {
+                            self.private_id(store, &entry.entry_hash())?.is_none()
                                 && !(self.governance_display_current(now_ms)
-                                    && expired_at(entry.skeleton.claimed_ms, now_ms, ttl))
+                                    && history::owed_window(entry, now_ms, expiry, age).is_none())
                         }
                         _ => false,
                     };
@@ -219,7 +279,7 @@ impl ChannelState {
                         remove.push((author, seq, entry.map(|entry| entry.entry_hash())));
                         continue;
                     }
-                    let (Some(entry), Some(ttl)) = (&entry, ttl) else {
+                    let (Some(entry), Some(age)) = (&entry, age) else {
                         continue;
                     };
                     if !signed_content {
@@ -247,7 +307,7 @@ impl ChannelState {
                     };
                     match (owed, written) {
                         (true, false) => {
-                            if let Some(window) = history::owed_window(entry, now_ms, ttl) {
+                            if let Some(window) = history::owed_window(entry, now_ms, expiry, age) {
                                 rows.push((hash, Some(window)));
                             }
                         }
@@ -309,12 +369,14 @@ impl ChannelState {
             Step::Projection => {
                 let mut state = self.projection_state.clone();
                 let before = state.to_bytes();
+                // The configured lifetimes, not those in force: this turn is what makes them so.
+                let configured = self.configured_lifetimes();
                 let policy = [
-                    retention.0,
-                    retention.1,
+                    configured[0],
+                    configured[1],
                     self.legacy_sessions.display_revision(),
                 ];
-                let idle = if state.policy == Some(policy) && !state.pending {
+                let idle = if state.policy == Some(policy) && !state.pending && state.stopped == 0 {
                     if let Ok(rendered) =
                         self.entries.render_view(store, &self.sek, &self.channel_id)
                     {
@@ -325,18 +387,12 @@ impl ChannelState {
                 } else {
                     false
                 };
+                // A longer lifetime was switched to before this read (`switch_lifetimes`); what
+                // is left is a shorter one, or none: it applies once this turn's save, flushed,
+                // is installed.
+                // This node is running again: a later stop says when for itself.
+                state.stopped = 0;
                 if state.policy != Some(policy) {
-                    // A longer lifetime must not bring back what the shorter one had already
-                    // made due, whether or not its removal ran: that stays due. It is saved with
-                    // the new policy, before any read answers under it, and survives a restart.
-                    if let Some(old) = state.policy {
-                        for ((floor, was), new) in state.floor.iter_mut().zip(old).zip(policy) {
-                            if was != 0 && (new == 0 || new > was) && !lengthening_unfenced() {
-                                *floor =
-                                    (*floor).max(now_ms.saturating_sub(was.saturating_mul(1_000)));
-                            }
-                        }
-                    }
                     state.policy = Some(policy);
                     state.pending = true;
                     state.cursor = None;
@@ -379,8 +435,14 @@ impl ChannelState {
                         {
                             None
                         } else {
-                            let ttl = self.entry_retention(read.transaction(), &entry)?;
-                            history::owed_window(&entry, now_ms, ttl)
+                            // The lifetimes this turn saves and the fences it keeps: a place a
+                            // shorter lifetime had expired stays expired under a longer one.
+                            let expiry = crate::node::retention::Expiry {
+                                ttl: configured,
+                                fence: state.fence,
+                            };
+                            let age = self.place_age_in(read.transaction(), &entry)?;
+                            history::owed_window(&entry, now_ms, expiry, age)
                         };
                         owed.push((hash, visibility));
                     }
@@ -389,6 +451,7 @@ impl ChannelState {
                         && state.through.is_none_or(|end| state.cursor < Some(end));
                 }
                 Work::Projection {
+                    flush: state.retention() != self.projection_state.retention(),
                     state,
                     before,
                     owed,
@@ -396,13 +459,19 @@ impl ChannelState {
                 }
             }
             Step::Prune => {
-                let (selected, _) = read.retention_due(
-                    now_ms,
-                    retention.0,
-                    retention.1,
-                    self.projection_state.floor,
-                    entry_store::DUE_ENTRIES,
-                )?;
+                let held = removal_held();
+                let (selected, more) = if held {
+                    (Vec::new(), true)
+                } else {
+                    read.retention_due(
+                        now_ms,
+                        retention.0,
+                        retention.1,
+                        self.walk_expiry(0).fence,
+                        entry_store::DUE_ENTRIES,
+                    )?
+                };
+                let selected_len = selected.len();
                 let mut due = Vec::new();
                 let mut bytes = 0usize;
                 for (hash, tracked) in selected {
@@ -435,8 +504,12 @@ impl ChannelState {
                         legacy_kind,
                     });
                 }
+                // Everything due was selected and fits this pass: once it is removed, no stored
+                // row is covered by the fences any more.
+                let complete = !more && due.len() == selected_len;
                 Work::Prune {
                     due,
+                    complete,
                     legacy: self.legacy_projection_context(store)?,
                 }
             }
@@ -444,7 +517,7 @@ impl ChannelState {
                 if !self.private_policy_ready(store, now_ms)? {
                     return Ok(None);
                 }
-                Work::PrivateExpiry
+                Work::PrivateExpiry((!removal_held()).then(|| self.walk_expiry(1)))
             }
             Step::HistoricalKeys => {
                 let (state, retire) = self.prepare_historical_retirement(store, now_ms)?;
@@ -470,10 +543,77 @@ impl ChannelState {
             index: entry_store::EntryIndex::default(),
             next_log_id: self.next_log_id,
             now: now_ms,
-            retention,
             work,
             pin: Some(pin),
         }))
+    }
+
+    /// Whether a configured lifetime keeps longer than the saved one: a lengthening waits for
+    /// its switch.
+    pub(crate) fn lengthening_waits(&self) -> bool {
+        let configured = self.configured_lifetimes();
+        self.projection_state.policy.is_some_and(|saved| {
+            (0..2).any(|kind| crate::node::retention::longer(saved[kind], configured[kind]))
+        })
+    }
+
+    /// A room about to open without a projection turn first (a join, new or resumed): save,
+    /// flushed, the lifetimes it is about to apply, so that no read or arrival ever applies
+    /// lifetimes its saved record does not name. Nothing reads it yet, so it switches at once.
+    pub(crate) fn save_lifetimes_before_opening(&mut self, store: &Store, now: u64) -> Result<()> {
+        let configured = self.configured_lifetimes();
+        let policy = [
+            configured[0],
+            configured[1],
+            self.legacy_sessions.display_revision(),
+        ];
+        if self.projection_state.policy == Some(policy) && self.projection_state.stopped == 0 {
+            return Ok(());
+        }
+        self.switch_lifetimes(store.batch()?, self.now_hint.max(now))
+    }
+
+    /// Switch this room to its configured lifetimes, longer ones among them, with readers held
+    /// out (`Self::with_readers_held`): save the lifetimes and the fence of what the shorter
+    /// ones had made due up to `boundary`, flushed, in `batch`, then install them. `boundary` is
+    /// no earlier than any clock the shorter lifetimes were applied at here: a reader's (the
+    /// publication's watermark), or a reader, arrival or cleanup under the room lock (this
+    /// node's clock now; all of them ran before this turn, one at a time). A kill leaves either
+    /// the old record, under which readers still were, or this one. Opening after a clean stop,
+    /// the fence runs until that stop instead (`history::State::fence_in_force`). The caller
+    /// begins `batch` before it takes the publication: the writer always comes first.
+    pub(crate) fn switch_lifetimes(
+        &mut self,
+        mut batch: crate::node::store::Batch<'_>,
+        boundary: u64,
+    ) -> Result<()> {
+        let configured = self.configured_lifetimes();
+        let mut state = self.projection_state.clone();
+        let fence = state.fence_in_force(configured, boundary);
+        if !lengthening_unfenced() {
+            state.fence = fence;
+        }
+        state.policy = Some([
+            configured[0],
+            configured[1],
+            self.legacy_sessions.display_revision(),
+        ]);
+        state.pending = true;
+        state.cursor = None;
+        state.through = None;
+        state.stopped = 0;
+        // A new pair may cover stored rows: the next cleanup passes walk for them again.
+        state.clean = [false; 2];
+        batch.ruled();
+        let mut index =
+            entry_store::EntryIndex::default().write(&mut batch, &self.sek, &self.channel_id)?;
+        index.note_projection(state.to_bytes())?;
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        self.projection_state = state;
+        self.now_hint = self.now_hint.max(boundary);
+        Ok(())
     }
 
     fn prepare_historical_retirement(
@@ -688,7 +828,7 @@ impl ChannelState {
         if committed {
             if !matches!(
                 &pending.work,
-                Work::PrivateExpiry | Work::HistoricalKeys { .. }
+                Work::PrivateExpiry(_) | Work::HistoricalKeys { .. }
             ) {
                 self.entries.committed();
             }
@@ -719,6 +859,14 @@ impl ChannelState {
                     self.key_debt_retention_pending = more;
                 }
                 Work::HistoricalKeys { state, .. } => self.historical_retirement = state,
+                Work::Prune { complete: true, .. } => self.note_clean(0),
+                Work::PrivateExpiry(Some(_))
+                    if result
+                        .as_ref()
+                        .is_ok_and(|installed| installed.private_clean) =>
+                {
+                    self.note_clean(1);
+                }
                 _ => {}
             }
             if result.as_ref().is_ok_and(|installed| installed.pruned != 0) {
@@ -818,6 +966,7 @@ impl PendingRetention {
                     before,
                     owed,
                     idle,
+                    flush,
                 } => {
                     if *idle {
                         installed.projection_ready = true;
@@ -825,6 +974,9 @@ impl PendingRetention {
                     }
                     let mut batch = store.batch()?;
                     batch.derived();
+                    if *flush {
+                        batch.ruled();
+                    }
                     let mut index = self.index.write(&mut batch, sek, &self.room)?;
                     let mut changed = false;
                     for (hash, visibility) in owed {
@@ -849,7 +1001,7 @@ impl PendingRetention {
                         display_changed |= changed;
                     }
                 }
-                Work::Prune { due, legacy } => {
+                Work::Prune { due, legacy, .. } => {
                     // Keep both existing bounded classification passes: the first learns
                     // declarations before expiry, the second shares the prune transaction.
                     if !due.is_empty() {
@@ -945,19 +1097,22 @@ impl PendingRetention {
                             .extend(due.iter().map(|selected| selected.entry.entry_hash()));
                     }
                 }
-                Work::PrivateExpiry => {
-                    private_session::pending_upgrade::sweep_private(
-                        store,
-                        sek,
-                        &self.room,
-                        self.now,
-                        self.retention,
-                        |hash| {
-                            committed = true;
-                            installed.pruned += 1;
-                            installed.pruned_hashes.push(hash);
-                        },
-                    )?;
+                Work::PrivateExpiry(expiry) => {
+                    if let Some(expiry) = *expiry {
+                        let (_, complete) = private_session::pending_upgrade::sweep_private(
+                            store,
+                            sek,
+                            &self.room,
+                            self.now,
+                            expiry,
+                            |hash| {
+                                committed = true;
+                                installed.pruned += 1;
+                                installed.pruned_hashes.push(hash);
+                            },
+                        )?;
+                        installed.private_clean = complete;
+                    }
                 }
                 Work::HistoricalKeys { retire, .. } => {
                     if let Some((key, id)) = retire {

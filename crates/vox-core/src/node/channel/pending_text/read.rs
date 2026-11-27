@@ -177,11 +177,7 @@ impl ChannelState {
                     let retained = rendered.retention(&hash)?.ok_or(Error::MalformedAtRest(
                         "rendered read-mark retention missing",
                     ))?;
-                    if expired_at(
-                        retained.base(),
-                        now.get(),
-                        self.entry_retention(rendered.transaction(), &entry)?,
-                    ) {
+                    if self.held_expired(&entry, &retained, now.get()) {
                         return Err(Error::Profile("read selection changed; refresh and retry"));
                     }
                     if entry.skeleton.author_id == me {
@@ -330,11 +326,7 @@ impl ChannelState {
                 "pending read-mark retention missing",
             ))?;
             if entry.skeleton.author_id == me
-                || expired_at(
-                    retained.base(),
-                    now.get(),
-                    self.entry_retention(rendered.transaction(), &entry)?,
-                )
+                || self.held_expired(&entry, &retained, now.get())
                 || !facts.can_read(&me, &entry.skeleton.author_id)
             {
                 continue;

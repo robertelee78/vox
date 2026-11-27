@@ -215,59 +215,6 @@ impl ChannelState {
             .legacy_is_session_in(transaction, hash)
     }
 
-    pub(in crate::node::channel) fn remember_legacy_kind(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        hash: Digest32,
-        author: Digest32,
-        session: bool,
-    ) -> Result<()> {
-        self.update_legacy_projection(|projection| {
-            projection.remember_legacy_kind(batch, hash, author, session)
-        })
-    }
-
-    pub(in crate::node::channel) fn inspect_legacy_body_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: &Entry,
-    ) -> Result<()> {
-        self.update_legacy_projection(|projection| {
-            projection.inspect_legacy_body_into(batch, entry)
-        })
-    }
-
-    pub(in crate::node::channel) fn accept_legacy_index(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        declaration: Digest32,
-        author: Digest32,
-        index: LegacySessionIndex,
-        now: u64,
-    ) -> Result<()> {
-        self.update_legacy_projection(|projection| {
-            projection.accept_legacy_index(batch, declaration, author, index, now)
-        })
-    }
-
-    pub(in crate::node::channel) fn reconcile_legacy_sessions(
-        &mut self,
-        store: &Store,
-        now: u64,
-    ) -> Result<bool> {
-        self.update_legacy_projection(|projection| projection.reconcile_legacy_sessions(store, now))
-    }
-
-    pub(in crate::node::channel) fn reconcile_legacy_sessions_in(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        now: u64,
-    ) -> Result<bool> {
-        self.update_legacy_projection(|projection| {
-            projection.reconcile_legacy_sessions_in(batch, now)
-        })
-    }
-
     pub(crate) fn legacy_classification_pending(&self, store: &Store) -> Result<bool> {
         self.legacy_projection()
             .legacy_classification_pending(store)
@@ -775,25 +722,6 @@ impl LegacyProjection<'_> {
         self.put_legacy_target(batch, &mut header, hash, author, session)?;
         if self.legacy_sessions.dirty() {
             self.save_legacy_header(batch, &header)?;
-        }
-        Ok(())
-    }
-    /// Called only after the verified entry has its transaction-local LogDb locator.
-    pub(super) fn inspect_legacy_body_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: &Entry,
-    ) -> Result<()> {
-        if entry.skeleton.v2.is_some() {
-            return Ok(());
-        }
-        if let Some(session) = self.available_legacy_kind(entry) {
-            self.remember_legacy_kind(
-                batch,
-                entry.entry_hash(),
-                entry.skeleton.author_id,
-                session,
-            )?;
         }
         Ok(())
     }

@@ -78,6 +78,35 @@ pub(super) fn entry_steps_in(
     })
 }
 
+/// The age of `entry`'s place here as expiry needs it: `(kind, first sight)`, kind 0 a message,
+/// 1 a Session step. From its retention fact, else from the first sight its place keeps
+/// (`[3, first_seen, steps]`, written when this node first saw it and kept when a body is
+/// pruned), so a body-less place ages exactly as its body would have.
+pub(super) fn place_age_in(
+    entries: &entry_store::EntryIndex,
+    transaction: Transaction<'_, '_>,
+    sek: &Sek,
+    room: &Digest32,
+    entry: &Entry,
+) -> Result<(usize, u64)> {
+    let index = entries.view(transaction, sek, room)?;
+    let hash = entry.entry_hash();
+    if let Some(tracked) = index.retention(&hash)? {
+        return Ok((usize::from(tracked.steps), tracked.first_seen_ms));
+    }
+    let log = index
+        .log_id(&hash)?
+        .ok_or(Error::MalformedAtRest("place age locator missing"))?;
+    let segment = match transaction {
+        Transaction::Snapshot(snapshot) => snapshot.get_segment(room, SegmentKind::Index, log)?,
+        Transaction::Batch(batch) => batch.get_segment(room, SegmentKind::Index, log)?,
+    }
+    .ok_or(Error::MalformedAtRest("place age missing"))?;
+    let (first_seen, steps) =
+        parse_first_seen(&open_segment(sek, SegmentKind::Index, log, &segment)?)?;
+    Ok((usize::from(steps), first_seen))
+}
+
 mod attention;
 pub(crate) use attention::Attention;
 mod diagnostics;
@@ -175,7 +204,7 @@ use crate::node::consent_order::Stamp;
 use crate::node::content::{Content, Decoded};
 use crate::node::drive::{drive_channel, DriveState, SessionRow};
 use crate::node::profile::Profile;
-use crate::node::retention::Tracked;
+use crate::node::retention::{Expiry, Fence, Tracked};
 use crate::node::store::Store;
 use crate::suite::{algo, SuiteFloor};
 use crate::wire::WireError;
@@ -832,21 +861,6 @@ impl std::fmt::Display for SyncFailure {
     }
 }
 
-/// What [`ChannelState::accept_entry`] did with a peer's entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Accepted {
-    /// A governance entry: verified and stored with its projection obligation.
-    Governance,
-    /// A content entry: verified and stored, but not readable — this node holds no
-    /// sender key for that author yet, or that author has not consented to this
-    /// identity (ADR-007: consent, not credentials, grants reading).
-    ContentNotReadable,
-    /// A content entry that was decrypted and rendered into the timeline.
-    Rendered,
-    /// An author's checkpoint on its own feed (ADR-023 decision 3): verified and stored.
-    Checkpoint,
-}
-
 /// Result of taking a sender/drive key. `changed` is false for an unchanged duplicate: callers
 /// acknowledge it but schedule no rendering or governance work.
 #[derive(Debug, Clone, Copy)]
@@ -1001,26 +1015,6 @@ pub struct Rendered {
     /// `text` is empty; it is asked for again on every sync, and replaced by the message when the
     /// body arrives. Selected history queries derive each placeholder from sealed owed facts.
     pub owed: bool,
-}
-
-/// The result of projecting one authenticated content body. `Deferred` means the body is valid
-/// and retained, but a transient governance/receiver-chain dependency prevents a truthful
-/// admission result yet. Callers that own an explicit history demand must not clear it in that
-/// case.
-enum ContentProjection {
-    Visible(Rendered),
-    Applied,
-    Deferred,
-    Unavailable,
-}
-
-impl ContentProjection {
-    fn into_row(self) -> Option<Rendered> {
-        match self {
-            Self::Visible(row) => Some(row),
-            Self::Applied | Self::Deferred | Self::Unavailable => None,
-        }
-    }
 }
 
 /// One line a person is told about the room, in its timeline but not a message (ADR-028 E-5):
@@ -3633,8 +3627,8 @@ impl ChannelState {
     /// no-op that still succeeds.
     ///
     /// **This is the raw operation and it checks no evidence.** Admitting a key is what
-    /// turns "entry from an unadmitted author" into "entry stored" (see
-    /// [`ChannelState::accept_entry`]), and it occupies one of [`MAX_AUTHORS`] slots
+    /// turns "entry from an unadmitted author" into "entry stored", and it occupies one of
+    /// [`MAX_AUTHORS`] slots
     /// permanently within the epoch — so a caller that admits on no evidence hands any
     /// key the ability to write to this node's log, and enough of them exhaust
     /// admission for every legitimate member thereafter. Callers taking keys from a
@@ -4086,22 +4080,6 @@ impl ChannelState {
             self.poison(error);
         }
         result
-    }
-
-    fn entry_at(&self, transaction: Transaction<'_, '_>, hash: &Digest32) -> Result<Option<Entry>> {
-        self.dag.get_by_hash(
-            &self
-                .entries
-                .view(transaction, &self.sek, &self.channel_id)?,
-            hash,
-        )
-    }
-
-    fn entry(&self, store: &Store, hash: &Digest32) -> Result<Option<Entry>> {
-        self.dag.get_by_hash(
-            &self.entries.read(store, &self.sek, &self.channel_id)?,
-            hash,
-        )
     }
 
     /// Every key-package this node holds in the room's log, with its author, whoever it is
@@ -5636,11 +5614,11 @@ impl ChannelState {
         )
     }
 
-    /// The retention this node applies to the room: the shorter of the room's and its own
-    /// (ADR-023 decision 2, PRD-001 R9). `0` is forever.
+    /// The message retention this node applies to the room now (`0` is forever): the one its
+    /// saved projection record names ([`Self::lifetimes_in_force`]).
     #[must_use]
     pub fn effective_retention(&self) -> u64 {
-        crate::node::retention::shortest(self.room_retention(), self.node_retention)
+        self.lifetimes_in_force()[0]
     }
 
     /// Configured room policy for Session activity; defaults to two days.
@@ -5648,12 +5626,51 @@ impl ChannelState {
         self.governance_display.step_ttl_ms / 1_000
     }
 
-    /// Activity never outlives messages, including this node's shorter message rule.
+    /// The Session-step retention this node applies to the room now (see
+    /// [`Self::lifetimes_in_force`]).
     pub fn effective_step_retention(&self) -> u64 {
-        crate::node::retention::shortest(
-            self.effective_retention(),
-            crate::node::retention::shortest(self.room_step_retention(), self.node_step_retention),
-        )
+        self.lifetimes_in_force()[1]
+    }
+
+    /// `[messages, Session steps]` as configured: the shorter of the room's and this node's
+    /// (ADR-023 decision 2, PRD-001 R9); activity never outlives messages. The projection turn
+    /// saves these, flushed, and only then do they apply.
+    pub(crate) fn configured_lifetimes(&self) -> [u64; 2] {
+        use crate::node::retention::shortest;
+        let messages = shortest(self.room_retention(), self.node_retention);
+        [
+            messages,
+            shortest(
+                messages,
+                shortest(self.room_step_retention(), self.node_step_retention),
+            ),
+        ]
+    }
+
+    /// `[messages, Session steps]` in force here: those the saved projection record names
+    /// (`history::State::policy`). Every read, arrival and cleanup applies these, so readers
+    /// never live under lifetimes the disk does not name. A shorter one applies once the
+    /// projection turn has saved it, flushed, and installed it. A longer one applies once its
+    /// switch has saved it with its fence, flushed, and published it to readers, in one step
+    /// readers wait behind (`Self::switch_lifetimes`); until then the shorter one applies. A
+    /// room opening after a clean stop, not yet published to readers, already applies the
+    /// lengthening its switch will save (`Self::opening_after_stop`). A room not yet projected
+    /// applies its configured lifetimes; a joined room saves them before it opens.
+    pub(crate) fn lifetimes_in_force(&self) -> [u64; 2] {
+        use crate::node::retention::{edge_mutant, EdgeMutant};
+        let configured = self.configured_lifetimes();
+        let Some([messages, steps, _]) = self.projection_state.policy else {
+            return configured;
+        };
+        let mut in_force = [messages, steps];
+        for (kind, saved) in in_force.iter_mut().enumerate() {
+            if crate::node::retention::longer(*saved, configured[kind])
+                && (self.opening_after_stop() || edge_mutant(EdgeMutant::Read))
+            {
+                *saved = configured[kind];
+            }
+        }
+        in_force
     }
 
     /// Explicit local Session rule, or no local limit.
@@ -5664,19 +5681,6 @@ impl ChannelState {
     /// Apply the node's Session rule before its next sync or sweep.
     pub fn set_node_step_retention(&mut self, seconds: u64) {
         self.node_step_retention = seconds;
-    }
-
-    /// Floor controls carry durable authorization, like governance: neither message nor
-    /// Session activity expiry may erase the evidence another reader needs after a restart.
-    fn entry_retention(&self, transaction: Transaction<'_, '_>, entry: &Entry) -> Result<u64> {
-        if entry.payload.as_deref().is_some_and(retained_control) {
-            return Ok(0);
-        }
-        Ok(if self.entry_steps_in(transaction, entry)? {
-            self.effective_step_retention()
-        } else {
-            self.effective_retention()
-        })
     }
 
     /// Exact saved Session subtype, including the first-seen fact retained after pruning.
@@ -5692,6 +5696,34 @@ impl ChannelState {
             &self.channel_id,
             entry,
         )
+    }
+
+    /// [`place_age_in`] in this room.
+    pub(super) fn place_age_in(
+        &self,
+        transaction: Transaction<'_, '_>,
+        entry: &Entry,
+    ) -> Result<(usize, u64)> {
+        place_age_in(
+            &self.entries,
+            transaction,
+            &self.sek,
+            &self.channel_id,
+            entry,
+        )
+    }
+
+    /// Whether a held row, `tracked` its retention fact, has expired here by `now`: by the
+    /// lifetime in force or by what a lengthening keeps expired (`Expiry::expired`). A retained
+    /// control never expires.
+    pub(super) fn held_expired(&self, entry: &Entry, tracked: &Tracked, now: u64) -> bool {
+        !entry.payload.as_deref().is_some_and(retained_control)
+            && self.expiry().expired(
+                usize::from(tracked.steps),
+                tracked.base(),
+                tracked.first_seen_ms,
+                now,
+            )
     }
 
     /// `(this node's own retention, the room's)` when the node's own asks to keep messages longer
@@ -5954,24 +5986,9 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Whether an entry this node is about to render has already outlived the effective
-    /// retention — a late arrival of a message that is expired everywhere else.
-    fn already_expired(
-        &self,
-        transaction: Transaction<'_, '_>,
-        entry_hash: &Digest32,
-        claimed_ms: u64,
-        now_ms: u64,
-    ) -> Result<bool> {
-        if !self.governance_display_current(now_ms) {
-            return Ok(false);
-        }
-        let entry = self
-            .entry_at(transaction, entry_hash)?
-            .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-        self.already_expired_entry(transaction, &entry, claimed_ms, now_ms)
-    }
-
+    /// Whether `entry`, claimed at `claimed_ms`, has expired here by `now_ms`: by the lifetime in
+    /// force or by what a lengthening keeps expired (`Expiry::expired`), aged from its claim but
+    /// never from later than this node's first sight of its place.
     fn already_expired_entry(
         &self,
         transaction: Transaction<'_, '_>,
@@ -5979,220 +5996,16 @@ impl ChannelState {
         claimed_ms: u64,
         now_ms: u64,
     ) -> Result<bool> {
-        if !self.governance_display_current(now_ms) {
+        if !self.governance_display_current(now_ms)
+            || entry.payload.as_deref().is_some_and(retained_control)
+        {
             return Ok(false);
         }
-        let ttl = self.entry_retention(transaction, entry)?;
-        if ttl == 0 {
-            return Ok(false);
-        }
-        let entry_hash = entry.entry_hash();
-        let first_seen = self
-            .retention_get_in(transaction, &entry_hash)?
-            .map_or(now_ms, |t| t.first_seen_ms);
-        Ok(claimed_ms.min(first_seen) <= now_ms.saturating_sub(ttl.saturating_mul(1_000)))
-    }
-
-    /// Drop the bodies of `due`: rewrite each log page with the skeleton alone, delete its
-    /// cache row and its retention record, in one batch. `with_receivers` also persists the
-    /// receiver chains, for a caller that has just advanced one (a render that decrypted and
-    /// then found the message expired must still record that the key was used).
-    fn prune(
-        &mut self,
-        store: &Store,
-        due: &[(Digest32, Tracked)],
-        with_receivers: bool,
-    ) -> Result<usize> {
-        let selected = (|| -> Result<Vec<(Digest32, Tracked)>> {
-            let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-            let mut selected = Vec::new();
-            let mut bytes = 0usize;
-            for (hash, tracked) in due.iter().take(64) {
-                let entry = self
-                    .dag
-                    .get_by_hash(&read, hash)?
-                    .ok_or(Error::MalformedAtRest("pruned entry missing"))?;
-                let size = entry.payload.as_ref().map_or(0, Vec::len);
-                if !selected.is_empty() && bytes.saturating_add(size) > 1024 * 1024 {
-                    break;
-                }
-                bytes = bytes.saturating_add(size);
-                if entry.payload.as_deref().is_some_and(retained_control) {
-                    return Err(Error::MalformedAtRest(
-                        "retained control indexed for expiry",
-                    ));
-                }
-                selected.push((*hash, *tracked));
-            }
-            drop(read);
-            self.reconcile_legacy_sessions(store, self.now_hint)?;
-            Ok(selected)
-        })();
-        let due = match selected {
-            Ok(due) => due,
-            Err(error) => {
-                self.poison(&error);
-                return Err(error);
-            }
-        };
-        if due.is_empty() && !with_receivers && !self.legacy_sessions.dirty() {
-            return Ok(0);
-        }
-        let shed = self.effective_retention() != 0;
-        let mut display_changed = false;
-        let persisted = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.derived();
-            for (hash, tracked) in &due {
-                let entry = self
-                    .dag
-                    .get_by_hash(
-                        &self.entries.in_batch(&batch, &self.sek, &self.channel_id)?,
-                        hash,
-                    )?
-                    .ok_or(Error::MalformedAtRest("pruned control entry missing"))?;
-                session_projection::private_index::observe_public(
-                    &mut batch,
-                    &self.sek,
-                    &self.channel_id,
-                    &entry,
-                    self.epoch,
-                )?;
-                self.inspect_legacy_body_into(&mut batch, &entry)?;
-                {
-                    let mut index = self
-                        .entries
-                        .write(&mut batch, &self.sek, &self.channel_id)?;
-                    index.committing(self.next_log_id);
-                    display_changed |= index.has_rendered(hash)?;
-                    index.remove_rendered(hash)?;
-                    index.remove_read_receipt(hash)?;
-                    index.set_retention(*hash, None)?;
-                    self.dag.prune_payload(&mut index, hash)?;
-                    if shed {
-                        self.dag.drop_signature_if_checkpointed(&mut index, hash)?;
-                    }
-                    index.seal()?;
-                }
-                let age = seal_segment(
-                    &self.sek,
-                    SegmentKind::Index,
-                    tracked.log_id,
-                    &first_seen_bytes(tracked.first_seen_ms, tracked.steps),
-                )?;
-                batch.put_segment(&self.channel_id, SegmentKind::Index, tracked.log_id, &age)?;
-                if let Some(cache_id) = tracked.cache_id {
-                    batch.delete_segment(
-                        &self.channel_id,
-                        SegmentKind::PlaintextCache,
-                        cache_id,
-                    )?;
-                }
-            }
-            self.reconcile_legacy_sessions_in(&mut batch, self.now_hint)?;
-            if with_receivers {
-                self.queue_receivers(&mut batch)?;
-            }
-            batch.commit()
-        })();
-        if let Err(error) = persisted {
-            self.mark_poisoned();
-            self.save_error = Some(error.to_string());
-            return Err(error);
-        }
-        self.entries.committed();
-        self.legacy_sessions.committed();
-        if display_changed {
-            self.remove_display_rows();
-            let tail = self
-                .entries
-                .render_view(store, &self.sek, &self.channel_id)
-                .and_then(|view| view.step(None, true, None, true))
-                .map(|row| row.map(|(key, _)| key));
-            match tail {
-                Ok(tail) => self.display_tail = tail,
-                Err(error) => {
-                    self.poison(&error);
-                    return Err(error);
-                }
-            }
-        }
-        Ok(due.len())
-    }
-
-    fn retention_get_in(
-        &self,
-        transaction: Transaction<'_, '_>,
-        hash: &Digest32,
-    ) -> Result<Option<Tracked>> {
-        self.entries
-            .view(transaction, &self.sek, &self.channel_id)?
-            .retention(hash)
-    }
-    fn queue_retention(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-        hash: Digest32,
-        value: Option<Tracked>,
-    ) -> Result<()> {
-        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-        index.set_retention(hash, value)?;
-        index.seal()
-    }
-    fn queue_retention_rendered(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-        hash: &Digest32,
-        created: u64,
-        cache: Option<u64>,
-    ) -> Result<()> {
-        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-        index.retention_rendered(hash, created, cache)?;
-        index.seal()
-    }
-
-    /// Queue a body's age beside its authoritative log row, before the same commit.
-    fn track_body_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry_hash: Digest32,
-        log_id: u64,
-        now_ms: u64,
-    ) -> Result<()> {
-        let entry = self
-            .entry_at(Transaction::Batch(batch), &entry_hash)?
-            .ok_or(Error::MalformedAtRest("tracked entry missing"))?;
-        if entry.payload.as_deref().is_some_and(retained_control) {
-            return Ok(());
-        }
-        let steps = entry
-            .payload
-            .as_deref()
-            .is_some_and(|body| is_step_body(&self.channel_id, body));
-        if steps {
-            self.invalidate_display();
-            self.private_sessions.legacy_pending.insert(entry_hash);
-        }
-        let claimed_ms = steps.then_some(entry.skeleton.claimed_ms);
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            log_id,
-            &first_seen_bytes(now_ms, steps),
-        )?;
-        batch.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg)?;
-        self.queue_retention(
-            batch,
-            entry_hash,
-            Some(Tracked {
-                log_id,
-                steps,
-                first_seen_ms: now_ms,
-                claimed_ms,
-                cache_id: None,
-                returned: false,
-            }),
-        )
+        let kind = usize::from(self.entry_steps_in(transaction, entry)?);
+        let (_, first_seen) = self.place_age_in(transaction, entry)?;
+        Ok(self
+            .expiry()
+            .expired(kind, claimed_ms.min(first_seen), first_seen, now_ms))
     }
 
     /// Append an already-built governance struct as a signed log entry.
@@ -6464,80 +6277,6 @@ impl ChannelState {
         std::mem::take(&mut self.display_news)
     }
 
-    /// Open one Session entry with the drive key it names, if this node holds it, queueing its
-    /// cache row into `batch`; skipped quietly if it does not.
-    fn render_session_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        author: Digest32,
-        entry_hash: Digest32,
-        msg: &GroupMessage,
-        now_ms: u64,
-        expired: &mut Vec<(Digest32, Tracked)>,
-    ) -> Result<()> {
-        let Some(chain) = self.drive.receivers.get_mut(&(author, msg.header.chain_id)) else {
-            // An entry under a key of the author's this node does not hold, from an author whose
-            // key it held: the author changed its key away from this node, and this node's drive
-            // over the author's Sessions is gone (SC-2b). Said once as Session news for the room,
-            // so a client that keeps the room's Sessions reads them again; there is no row.
-            if self.drive.holds_from(&author) && self.drive.told_unheld.insert(author) {
-                self.drive
-                    .news
-                    .push(crate::node::drive::KEY_CHANGED.to_owned());
-            }
-            return Ok(());
-        };
-        let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {
-            return Ok(());
-        };
-        self.receiver_persistence.advance_drive()?;
-        self.chains_advanced = true;
-        // Only a Session entry opens under a drive key: a node's message to the room is sealed
-        // under its sender key, for every reader.
-        let Ok(Decoded::Session(entry)) = crate::node::content::decode(&plaintext) else {
-            self.remember_legacy_kind(batch, entry_hash, author, false)?;
-            return Ok(());
-        };
-        self.remember_legacy_kind(batch, entry_hash, author, true)?;
-        if self.already_expired(
-            Transaction::Batch(batch),
-            &entry_hash,
-            entry.created_millis,
-            now_ms,
-        )? {
-            self.queue_retention_rendered(batch, &entry_hash, entry.created_millis, None)?;
-            expired.extend(
-                self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
-                    .map(|t| (entry_hash, t)),
-            );
-            return Ok(());
-        }
-        let id = self.next_log_id;
-        let row = SessionRow {
-            entry_hash,
-            author,
-            created_millis: entry.created_millis,
-            session_id: entry.session_id,
-            body: entry.body,
-        };
-        let cache_seg = seal_segment(
-            &self.sek,
-            SegmentKind::PlaintextCache,
-            id,
-            &session_cache_bytes(&row),
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::PlaintextCache,
-            id,
-            &cache_seg,
-        )?;
-        self.queue_retention_rendered(batch, &entry_hash, row.created_millis, Some(id))?;
-        self.next_log_id = id.saturating_add(1);
-        self.drive.pending.push((row, id));
-        Ok(())
-    }
-
     fn persist_drive(&mut self, store: &Store) -> Result<()> {
         let saved = (|| -> Result<()> {
             let mut batch = store.batch()?;
@@ -6633,74 +6372,12 @@ impl ChannelState {
             .is_ok_and(|marker| marker.len() == 64 && marker[..32] == self.channel_id[..])
     }
 
-    /// Try to decrypt one stored content payload and, on success, render it into the
-    /// timeline and persist the sealed plaintext cache row.
-    ///
-    /// Both gates apply: this node must hold the author's sender key for the
-    /// message's generation **and** the author must have consented to this identity
-    /// on the log (ADR-007). A message whose key is absent, whose consent is absent,
-    /// or that fails to open is left stored as ciphertext.
-    fn render_content(
-        &mut self,
-        store: &Store,
-        author: Digest32,
-        entry_hash: Digest32,
-        payload: &[u8],
-        now_ms: u64,
-    ) -> Result<bool> {
-        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
-        let persisted = (|| -> Result<Option<Rendered>> {
-            let mut batch = store.batch()?;
-            batch.derived();
-            let projection = self.render_content_into(
-                &mut batch,
-                author,
-                entry_hash,
-                payload,
-                None,
-                now_ms,
-                false,
-                &mut expired,
-            )?;
-            let deferred = matches!(&projection, ContentProjection::Deferred);
-            let row = projection.into_row();
-            if row.is_none()
-                && expired.is_empty()
-                && self.drive.pending.is_empty()
-                && !self.chains_advanced
-                && !self.legacy_sessions.dirty()
-                && !deferred
-            {
-                return Ok(None);
-            }
-            self.queue_receivers(&mut batch)?;
-
-            batch.commit()?;
-            Ok(row)
-        })();
-        match persisted {
-            Ok(row) => {
-                let shown = row.is_some();
-                self.place_committed(store, row.into_iter().collect(), &expired)?;
-                Ok(shown)
-            }
-            Err(e) => {
-                // The chain advanced in memory but the advance was not persisted: a
-                // reopen would re-derive a consumed key. Poison instead.
-                self.mark_poisoned();
-                self.save_error = Some(e.to_string());
-                Err(e)
-            }
-        }
-    }
-
-    /// Whether a sender key this node holds opens `author`'s post sealed under `header`: the one
-    /// predicate deciding both whether the post becomes a row here (`render_content_into`) and
-    /// whether a person's older-history request counts it as unreadable here
-    /// (`history_older_page`), so the two never disagree. A post it does not open is never
-    /// said to predate this node's trust: nothing signed this node holds marks where an
-    /// author's grant to it begins (the grant entry is written after the trust decision's mark,
-    /// and is written again after the author's consent reset), and a key it lacks may still come.
+    /// Whether a sender key this node holds opens `author`'s post sealed under `header`: what a
+    /// person's older-history request counts as readable here (`history_older_page`). A post it
+    /// does not open is never said to predate this node's trust: nothing signed this node holds
+    /// marks where an author's grant to it begins (the grant entry is written after the trust
+    /// decision's mark, and is written again after the author's consent reset), and a key it
+    /// lacks may still come.
     pub(crate) fn key_opens(
         &self,
         author: &Digest32,
@@ -6711,373 +6388,6 @@ impl ChannelState {
             .is_some_and(|chain| {
                 chain.epoch() == header.epoch && header.iteration >= chain.history_iteration()
             })
-    }
-
-    /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`.
-    /// `Visible` carries the row the caller places after commit; `Applied` records an intentional
-    /// non-row; `Deferred` preserves an explicit demand until transient projection state advances.
-    ///
-    /// **One transaction per pass, not two per entry.** Each entry used to commit its own cache
-    /// row and its own copy of the receiver chains — two durable commits, about 17 ms apiece on
-    /// macOS, taken while holding the room's lock. A sync delivering 133 of another member's
-    /// messages held the room for 2.3 s, and every post made in that room waited behind it
-    /// (V210-08, #179: `vox room post` p95 of seconds while a peer posts). The caller queues the
-    /// receiver chains once, after its loop, and commits once.
-    ///
-    /// **A late arrival of an expired message never renders** (ADR-023 decision 2): its key has
-    /// been used, so the caller still queues the chains, and the body is pushed onto `expired` to
-    /// be pruned **after** the commit — pruning writes, and a write opened while `batch` is open
-    /// blocks forever (redb).
-    #[allow(clippy::too_many_arguments)]
-    fn render_content_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        author: Digest32,
-        entry_hash: Digest32,
-        payload: &[u8],
-        pending_sparse_entry: Option<&Entry>,
-        now_ms: u64,
-        historical: bool,
-        expired: &mut Vec<(Digest32, Tracked)>,
-    ) -> Result<ContentProjection> {
-        let me = self.me();
-        if author != me {
-            let allowed = match self.consent_facts() {
-                Ok(facts) => Some(facts.can_read(&me, &author)),
-                Err(error) if governance::refreshing(&error) => None,
-                Err(error) => return Err(error),
-            };
-            match allowed {
-                Some(true) => {}
-                Some(false) => {
-                    // Park on the missing fact. The consent grant's acceptance queues this
-                    // author in the same durable transaction as that grant; making every row
-                    // queue itself here reset the cursor to one during historical backfill and
-                    // kept an idle daemon turning forever.
-                    return Ok(ContentProjection::Applied);
-                }
-                None => {
-                    let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                    writer.queue_backfill(author, Some(1))?;
-                    writer.seal()?;
-                    return Ok(ContentProjection::Deferred);
-                }
-            }
-            // #1171: once this node knows its own removal it renders no newly received old
-            // body, whichever peer relayed it. Already rendered or cached plaintext stays.
-            let fetched;
-            let held = match pending_sparse_entry {
-                _ if !self.recipient_removal_row_in(batch, &me)? => None,
-                Some(entry) => Some(entry),
-                None => {
-                    fetched = self.dag.get_by_hash(
-                        &self.entries.in_batch(batch, &self.sek, &self.channel_id)?,
-                        &entry_hash,
-                    )?;
-                    fetched.as_ref()
-                }
-            };
-            if let Some(held) = held {
-                let decision = self.recipient_body_eligibility_in(batch, &me, held)?;
-                if decision != governance::ContentEligibility::Eligible {
-                    let writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                    let already = writer.has_rendered(&entry_hash)?
-                        || writer.read_receipt_cache(&entry_hash)?.is_some()
-                        || writer
-                            .retention(&entry_hash)?
-                            .is_some_and(|record| record.cache_id.is_some())
-                        || self.private_contains_in(writer.batch(), &entry_hash)?;
-                    drop(writer);
-                    // Already readable here: the existing logic below decides, unchanged.
-                    if !already {
-                        if decision == governance::ContentEligibility::Ineligible {
-                            return Ok(ContentProjection::Applied);
-                        }
-                        // Undecided: keep the body unrendered and park on the governance
-                        // refresh exactly as an unsettled consent fact does.
-                        let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                        writer.queue_backfill(author, Some(1))?;
-                        writer.seal()?;
-                        return Ok(ContentProjection::Deferred);
-                    }
-                }
-            }
-        }
-        let msg = match GroupMessage::from_wire(payload) {
-            Ok(m) => m,
-            Err(_) => return Ok(ContentProjection::Applied),
-        };
-        // **A Session entry opens only with its node's drive key** (ADR-029 SC-2): a member
-        // without it skips the entry, quietly; it is never owed, never a row.
-        if msg.header.channel_id == drive_channel(&self.channel_id) {
-            self.render_session_into(batch, author, entry_hash, &msg, now_ms, expired)?;
-            return Ok(ContentProjection::Applied);
-        }
-        let slot = (author, msg.header.chain_id);
-        let own = author == me;
-        if historical || own {
-            let writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-            let already = writer.has_rendered(&entry_hash)?
-                || writer.read_receipt_cache(&entry_hash)?.is_some()
-                || writer
-                    .retention(&entry_hash)?
-                    .is_some_and(|record| record.cache_id.is_some())
-                || self.private_contains_in(writer.batch(), &entry_hash)?
-                || self
-                    .drive
-                    .pending
-                    .iter()
-                    .any(|(row, _)| row.entry_hash == entry_hash);
-            if already {
-                return Ok(ContentProjection::Applied);
-            }
-        }
-        let mut historical_own = if own && msg.header.epoch < self.epoch {
-            let root = self
-                .authors
-                .get(&author)
-                .ok_or(Error::MalformedGovernance("own history author missing"))?;
-            own_historical_keys::lookup_batch(
-                batch,
-                &self.sek,
-                &self.channel_id,
-                root,
-                &author,
-                msg.header.epoch,
-                msg.header.chain_id,
-            )?
-        } else {
-            None
-        };
-        // One predicate decides whether a key held here opens another author's post, for its
-        // row here and for a person's older-history request alike (`Self::key_opens`).
-        let chain = if own {
-            historical_own.as_mut().or_else(|| {
-                self.receivers
-                    .get_mut(&slot)
-                    .filter(|chain| chain.epoch() == msg.header.epoch)
-            })
-        } else if self.key_opens(&author, &msg.header) {
-            self.receivers.get_mut(&slot)
-        } else {
-            None
-        };
-        let Some(chain) = chain else {
-            if author == me && self.own_behind {
-                // Retaining ciphertext is not readable recovery. A generation minted after
-                // the backup may have no local origin; never give it a role-complete receipt.
-                return Ok(ContentProjection::Unavailable);
-            }
-            // Park on the missing fact. Installing or widening an SKDM queues this author in
-            // the same durable transaction as the receiver chain. ChannelState is serialized,
-            // so a key cannot commit and drain between this check and this row's acceptance.
-            return Ok(ContentProjection::Applied);
-        };
-        let plaintext = match if own {
-            chain.decrypt_retained(&msg)
-        } else if historical {
-            chain.decrypt_history(&msg)
-        } else {
-            chain.decrypt(&msg)
-        } {
-            Ok(p) => Zeroizing::new(p),
-            Err(_) if historical || own => return Ok(ContentProjection::Unavailable),
-            Err(_) => return Ok(ContentProjection::Applied),
-        };
-        if !own {
-            self.receiver_persistence.advance_normal()?;
-            self.chains_advanced = true;
-        }
-        // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
-        //
-        // An entry this node cannot render is one entry it cannot show, and every other reason for
-        // that here already degrades: an unreadable group message, a missing receiver chain, a
-        // failed decrypt. Only the content decode used `?`, which returns out of a function whose
-        // three callers invoke it with `?` **inside a loop over pending entries** — so one
-        // undecodable envelope did not hide one message, it aborted the render pass and took every
-        // later entry in it along.
-        let content = match crate::node::content::decode(&plaintext) {
-            Ok(Decoded::Text(content)) => content,
-            // **A read record is never a row** (ADR-028 RR-4): it is cached like a message, so it
-            // survives a restart (its key is used up), and ages like one (RR-2), and is indexed
-            // for `read by` once the batch has committed.
-            Ok(Decoded::Read(record)) => {
-                let expired_now = match pending_sparse_entry {
-                    Some(entry) => self.already_expired_entry(
-                        Transaction::Batch(batch),
-                        entry,
-                        record.created_millis,
-                        now_ms,
-                    ),
-                    None => self.already_expired(
-                        Transaction::Batch(batch),
-                        &entry_hash,
-                        record.created_millis,
-                        now_ms,
-                    ),
-                }?;
-                if expired_now {
-                    self.queue_retention_rendered(batch, &entry_hash, record.created_millis, None)?;
-                    expired.extend(
-                        self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
-                            .map(|t| (entry_hash, t)),
-                    );
-                    return Ok(ContentProjection::Applied);
-                }
-                let id = self.next_log_id;
-                let row = ReadRow {
-                    entry_hash,
-                    reader: author,
-                    created_millis: record.created_millis,
-                    read: record.read,
-                };
-                let cache_seg = seal_segment(
-                    &self.sek,
-                    SegmentKind::PlaintextCache,
-                    id,
-                    &read_cache_bytes(&row),
-                )?;
-                batch.put_segment(
-                    &self.channel_id,
-                    SegmentKind::PlaintextCache,
-                    id,
-                    &cache_seg,
-                )?;
-                {
-                    let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                    index.put_read_receipt(&row, id)?;
-                    index.retention_rendered(&entry_hash, row.created_millis, Some(id))?;
-                    index.seal()?;
-                }
-                self.next_log_id = id.saturating_add(1);
-                return Ok(ContentProjection::Applied);
-            }
-            // A Session entry sealed under the sender key is not one: its node gave it to every
-            // reader, and the Session is only for those with drive (SC-2). Not shown.
-            Ok(Decoded::LegacySessionIndex(index)) => {
-                self.accept_legacy_index(batch, entry_hash, author, index, now_ms)?;
-                return Ok(ContentProjection::Applied);
-            }
-            Ok(Decoded::Session(_)) | Err(_) => return Ok(ContentProjection::Applied),
-        };
-        let expired_now = match pending_sparse_entry {
-            Some(entry) => self.already_expired_entry(
-                Transaction::Batch(batch),
-                entry,
-                content.created_millis,
-                now_ms,
-            ),
-            None => self.already_expired(
-                Transaction::Batch(batch),
-                &entry_hash,
-                content.created_millis,
-                now_ms,
-            ),
-        }?;
-        if expired_now {
-            self.queue_retention_rendered(batch, &entry_hash, content.created_millis, None)?;
-            expired.extend(
-                self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
-                    .map(|t| (entry_hash, t)),
-            );
-            return Ok(ContentProjection::Applied);
-        }
-        // The cache row shares the entry's log id space; use a fresh id so it never
-        // collides with an authored row. It is also the row's arrival (ADR-023 decision 1).
-        let id = self.next_log_id;
-        let rendered = Rendered {
-            entry_hash,
-            author,
-            created_millis: content.created_millis,
-            text: content.text,
-            arrival: id,
-            shown_at_ms: 0,
-            late: false,
-            owed: false,
-        };
-        let cache_seg = seal_segment(
-            &self.sek,
-            SegmentKind::PlaintextCache,
-            id,
-            &cache_bytes(&rendered),
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::PlaintextCache,
-            id,
-            &cache_seg,
-        )?;
-        {
-            let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-            index.put_rendered(&rendered, shown_now())?;
-            index.retention_rendered(&entry_hash, rendered.created_millis, Some(id))?;
-            index.seal()?;
-        }
-        // A cache row, not an entry: the generation counts entries only (ADR-025 D1).
-        self.next_log_id = id.saturating_add(1);
-        Ok(ContentProjection::Visible(rendered))
-    }
-
-    /// The data commit has completed. Give its bounded rows one visibility time before
-    /// publishing their display facts, so time spent decrypting or committing this batch
-    /// cannot make its own rows look late relative to each other.
-    fn seal_render_visibility(&mut self, store: &Store, rows: &[Rendered]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let shown = shown_now();
-        let result = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.derived();
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            for row in rows {
-                index.remove_rendered(&row.entry_hash)?;
-            }
-            for row in rows {
-                index.put_rendered(row, shown)?;
-            }
-            index.seal()?;
-            batch.commit()?;
-            self.entries.committed();
-            Ok(())
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
-        }
-        result
-    }
-
-    /// After a committed render pass, retain only display watermarks.
-    /// Bodies/order/late facts are already sealed. Prune expired late arrivals in their own
-    /// transaction now that the rendering batch has committed.
-    fn place_committed(
-        &mut self,
-        store: &Store,
-        rows: Vec<Rendered>,
-        expired: &[(Digest32, Tracked)],
-    ) -> Result<()> {
-        self.seal_render_visibility(store, &rows)?;
-        self.legacy_sessions.committed();
-        for (row, _) in std::mem::take(&mut self.drive.pending) {
-            if !crate::node::drive::is_key_changed(&row.session_id) {
-                self.drive.news.push(row.session_id.clone());
-            }
-        }
-        for rendered in rows {
-            self.note_rendered(store, &rendered.entry_hash)?;
-        }
-        let settled = (|| -> Result<()> {
-            if !expired.is_empty() {
-                self.prune(store, expired, true)?;
-            }
-            Ok(())
-        })();
-        if let Err(ref error) = settled {
-            self.poison(error);
-        }
-        settled
     }
 
     /// Durable written stamps acknowledge only the same transaction as the state. An
@@ -7147,146 +6457,6 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         self.entries.order_view(store, &self.sek, &self.channel_id)
-    }
-
-    /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
-    /// the join stream now and from ADR-008 sync in M14.6).
-    ///
-    /// The author must already be admitted ([`ChannelState::admit_author`]), the
-    /// entry must pass the ADR-008 acceptance predicate under that author's key, and
-    /// its payload decides its kind. A content entry is stored but **not rendered**:
-    /// rendering needs that author's sender key, which only arrives with its SKDM,
-    /// and this node's consent view (ADR-007 — the newcomer sees ciphertext until a
-    /// member consents).
-    pub fn accept_entry(
-        &mut self,
-        store: &Store,
-        entry: Entry,
-        now: crate::time::Ms,
-    ) -> Result<Accepted> {
-        let now_ms = now.get();
-        if self.poisoned.get() {
-            return Err(self.save_failure());
-        }
-        if entry.skeleton.channel_id != self.channel_id {
-            return Err(Error::MalformedGovernance("entry binds another room"));
-        }
-        if entry.skeleton.epoch != self.epoch {
-            return Err(Error::MalformedGovernance("entry binds another epoch"));
-        }
-        // A skeleton without its signature is authentic only through a signed successor,
-        // which a single entry cannot bring; only a sync session, which brings the feed,
-        // takes them (ADR-023 decision 3).
-        if !entry.is_signed() {
-            return Err(Error::MalformedGovernance(
-                "an unsigned entry arrives only inside a sync session",
-            ));
-        }
-        let author = entry.skeleton.author_id;
-        let key = self
-            .authors
-            .get(&author)
-            .ok_or(Error::MalformedGovernance(
-                "entry from an unadmitted author",
-            ))?
-            .clone();
-        // A pruned entry is a skeleton the peer no longer holds a body for: stored, so the
-        // feed stays whole, and never rendered (ADR-023 decision 2).
-        let kind = match entry.payload.as_deref() {
-            Some(payload) => classify_payload(payload)?,
-            None => EntryKind::Content,
-        };
-        let gov = if kind == EntryKind::Governance
-            || entry
-                .payload
-                .as_deref()
-                .is_some_and(crate::governance::step_policy::is_step_policy)
-        {
-            Some(GovEntry::from_verified_log_entry(
-                &entry,
-                &key,
-                &self.channel_id,
-                Default::default(),
-            )?)
-        } else {
-            None
-        };
-        let entry_hash = entry.entry_hash();
-        let id = self.next_log_id;
-
-        let persisted = (|| -> Result<()> {
-            self.prepare_entry(store, &entry, kind, &key, now_ms)?;
-            let mut batch = store.batch()?;
-            // This legacy direct API has no retained receive-flow owner, so its remote entry is
-            // durable in this transaction. Bounded/session receive paths use exact flow debt.
-            batch.ruled();
-            if gov.is_some()
-                || entry
-                    .payload
-                    .as_deref()
-                    .is_some_and(crate::node::keypackage::KeyPackage::is_key_package)
-            {
-                batch.ruled();
-            }
-            if self.publish_entry_into(&mut batch, &entry)?.is_some() {
-                return Err(Error::Profile("remote entry produced local settlement"));
-            }
-            if kind == EntryKind::Content && gov.is_none() && entry.payload.is_some() {
-                self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
-            }
-            self.observe_governance_into(store, &mut batch, &entry, id)?;
-            self.inspect_legacy_body_into(&mut batch, &entry)?;
-            self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            self.mark_poisoned();
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        self.entries.committed();
-        self.legacy_sessions.committed();
-        self.next_log_id = id.saturating_add(1);
-        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.finish_entry_publication(store)?;
-        // A remote entry may be key work for this node; this node's own appends never are (a
-        // package it writes is for another member), so they ask the package queue for no turn
-        // that nothing would then run.
-        self.key_packages.published(self.next_log_id);
-        if kind == EntryKind::Checkpoint {
-            return Ok(Accepted::Checkpoint);
-        }
-        let applied = (|| -> Result<Accepted> {
-            match gov {
-                Some(_) => Ok(Accepted::Governance),
-                // Content: render it if we hold the author's sender key and the author
-                // has consented to us; otherwise it stays stored as ciphertext
-                // (ADR-007 step 3) until an SKDM arrives and backfills it.
-                None => {
-                    let Some((author, payload)) = self
-                        .entry(store, &entry_hash)?
-                        .and_then(|e| Some((e.skeleton.author_id, e.payload.clone()?)))
-                    else {
-                        return Ok(Accepted::ContentNotReadable);
-                    };
-                    if crate::node::keypackage::KeyPackage::is_key_package(&payload) {
-                        if key_package_for(&entry, &self.me()) {
-                            self.key_packages.note(author, id)?;
-                        }
-                        return Ok(Accepted::ContentNotReadable);
-                    }
-                    if self.render_content(store, author, entry_hash, &payload, now_ms)? {
-                        Ok(Accepted::Rendered)
-                    } else {
-                        Ok(Accepted::ContentNotReadable)
-                    }
-                }
-            }
-        })();
-        if let Err(ref error) = applied {
-            self.poison(error);
-        }
-        applied
     }
 
     /// Whether this node may read `author`'s messages: `author` has consented to
@@ -8102,6 +7272,38 @@ impl ChannelState {
     #[must_use]
     pub fn mlock_active(&self) -> bool {
         self.sek.is_mlocked()
+    }
+
+    /// Save that the lifetimes projected here were in force until now, as this node stops or
+    /// locks (`history::State::stopped`), read from `clock` once its reads are revoked. A
+    /// lengthening it first projects when it opens again then fences from here: what passed the
+    /// shorter lifetime while it was stopped, which no read here ever left out, is kept. Skipped
+    /// while a write is in flight or a save failed; the next start then fences from that start,
+    /// as after a kill.
+    pub(crate) fn note_stopped(&mut self, store: &Store, clock: &dyn Fn() -> u64) {
+        if self.poisoned.get()
+            || self.pending_text.is_some()
+            || !matches!(self.legacy_cache_only(store), Ok(false))
+        {
+            return;
+        }
+        if let Some(resource) = &self.history_read {
+            resource.revoke();
+        }
+        let mut state = self.projection_state.clone();
+        state.stopped = clock();
+        let _ = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            batch.ruled();
+            let mut index = entry_store::EntryIndex::default().write(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+            )?;
+            index.note_projection(state.to_bytes())?;
+            index.seal()?;
+            batch.commit()
+        })();
     }
 
     /// App-lock this channel: wipe the SEK now. The state should be dropped

@@ -192,38 +192,3 @@ pub(super) fn lookup(
         (epoch, chain),
     )?))
 }
-
-pub(super) fn lookup_batch(
-    batch: &crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    root: &CompositePublicKey,
-    author: &Digest32,
-    epoch: u64,
-    chain: u64,
-) -> Result<Option<ReceiverChain>> {
-    let Some(sealed) = batch.get_segment_bounded(room, KIND, 0, 128)? else {
-        return Ok(None);
-    };
-    let h = Header::decode(&open_segment(sek, KIND, 0, &sealed)?)?;
-    let Some(id) =
-        session_tree::Read::batch(batch, sek, room, KIND).find(h.root, &key(epoch, chain))?
-    else {
-        return Ok(None);
-    };
-    if id == 0 || id >= h.next {
-        return Err(bad());
-    }
-    let sealed = batch
-        .get_segment_bounded(room, KIND, id, MAX_BYTES)?
-        .ok_or_else(bad)?;
-    Ok(Some(decode_state(
-        &sealed,
-        id,
-        sek,
-        room,
-        root,
-        author,
-        (epoch, chain),
-    )?))
-}

@@ -225,8 +225,8 @@ impl Continuation {
 }
 
 enum Prepared {
-    Projection(session_projection::PendingProjection),
-    Retention(pending_retention::PendingRetention),
+    Projection(Box<session_projection::PendingProjection>),
+    Retention(Box<pending_retention::PendingRetention>),
     Checkpoint(Box<pending_retention::PendingCheckpoint>),
     Session(session_save::Prepared),
     Consent(Box<consent_save::Prepared>),
@@ -244,8 +244,8 @@ enum Prepared {
 }
 
 enum Completed {
-    Projection(session_projection::CompletedProjection),
-    Retention(pending_retention::CompletedRetention),
+    Projection(Box<session_projection::CompletedProjection>),
+    Retention(Box<pending_retention::CompletedRetention>),
     Checkpoint(Box<CompletedText>),
     Session(session_save::Completed),
     Consent(Box<consent_save::Completed>),
@@ -263,6 +263,8 @@ enum Completed {
 }
 
 impl Work {
+    /// `now` is the turn's instant (a governance sweep keeps its own); `fresh` is this node's
+    /// clock as the room's lock is taken.
     fn prepare(
         self,
         channel: &mut ChannelState,
@@ -270,17 +272,22 @@ impl Work {
         owner: Arc<()>,
         holders: &BTreeSet<Digest32>,
         now: crate::time::Ms,
+        fresh: crate::time::Ms,
     ) -> crate::error::Result<Prepared> {
         Ok(match self {
-            Self::Projection(work) => {
-                Prepared::Projection(channel.prepare_pending_projection(store, owner, work, now)?)
-            }
+            Self::Projection(work) => Prepared::Projection(Box::new(
+                channel.prepare_pending_projection(store, owner, work, now)?,
+            )),
             Self::Retention(step) => channel
-                .prepare_pending_retention(store, owner, step, now)?
-                .map_or(Prepared::Unavailable, Prepared::Retention),
+                .prepare_pending_retention(store, owner, step, now, fresh)?
+                .map_or(Prepared::Unavailable, |work| {
+                    Prepared::Retention(Box::new(work))
+                }),
             Self::RetentionAt { step, now } => channel
-                .prepare_pending_retention(store, owner, step, now)?
-                .map_or(Prepared::Unavailable, Prepared::Retention),
+                .prepare_pending_retention(store, owner, step, now, fresh)?
+                .map_or(Prepared::Unavailable, |work| {
+                    Prepared::Retention(Box::new(work))
+                }),
             Self::Checkpoint => channel
                 .prepare_pending_checkpoint(store, owner, channel.me(), now)?
                 .map_or(Prepared::Unavailable, |work| {
@@ -329,8 +336,8 @@ impl Work {
 impl Prepared {
     fn run(self, store: &Store, signer: &VaultRootSigner) -> Completed {
         match self {
-            Self::Projection(work) => Completed::Projection(work.run(store)),
-            Self::Retention(work) => Completed::Retention(work.save(store)),
+            Self::Projection(work) => Completed::Projection(Box::new(work.run(store))),
+            Self::Retention(work) => Completed::Retention(Box::new(work.save(store))),
             Self::Checkpoint(work) => Completed::Checkpoint(Box::new(work.save(store, signer))),
             Self::Session(work) => Completed::Session(work.run(store, signer)),
             Self::Consent(work) => Completed::Consent(Box::new(work.run(store, signer))),
@@ -426,10 +433,10 @@ impl Completed {
         let mut held = None;
         let result = match self {
             Self::Projection(done) => channel
-                .finish_pending_projection(store, done)
+                .finish_pending_projection(store, *done)
                 .map(Saved::Projection),
             Self::Retention(done) => channel
-                .finish_pending_retention(store, done)
+                .finish_pending_retention(store, *done)
                 .map(Saved::Retention),
             Self::Checkpoint(done) => channel
                 .finish_pending_text(store, *done)
@@ -877,12 +884,14 @@ impl Node {
                     if !channel.post_pending() {
                         let input_epoch = channel.epoch();
                         let input_instance = channel.generation();
+                        let fresh = crate::time::Ms(clock());
                         let prepared = work.prepare(
                             &mut channel,
                             &held.store,
                             worker_owner,
                             &holders,
-                            preparation_now.unwrap_or_else(|| crate::time::Ms(clock())),
+                            preparation_now.unwrap_or(fresh),
+                            fresh,
                         )?;
                         break (prepared, input_epoch, input_instance);
                     }

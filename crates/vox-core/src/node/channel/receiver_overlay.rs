@@ -28,9 +28,6 @@ impl Persistence {
     pub(super) fn advance_normal(&mut self) -> Result<()> {
         self.advance_normal_by(1)
     }
-    pub(super) fn advance_drive(&mut self) -> Result<()> {
-        self.advance_drive_by(1)
-    }
     pub(super) fn advance_normal_by(&mut self, advances: u64) -> Result<()> {
         self.normal = self.normal.checked_add(advances).ok_or(invalid())?;
         Ok(())

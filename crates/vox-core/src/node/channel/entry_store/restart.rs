@@ -177,7 +177,7 @@ impl RestartState {
             0 => None,
             1 => {
                 let b = d.bytes()?;
-                if b.len() > 256 {
+                if b.len() > super::PROJECTION_BYTES {
                     return Err(invalid("restart projection bound"));
                 }
                 Some(b.to_vec())
