@@ -872,7 +872,12 @@ impl DaemonCore {
             }
         };
         match made {
-            Ok(Ok(())) => self.attach(Some(pass)),
+            Ok(Ok(())) => {
+                // It has one from here on, whether or not this attach succeeds: a later attach
+                // (after an unlock elsewhere) must not be held back as "no identity yet".
+                self.has_identity = true;
+                self.attach(Some(pass))
+            }
             // **Another vox made it first** (V210-100): this node had no identity when the TUI
             // asked, so one that exists now was made elsewhere.
             Ok(Err(vox_core::error::Error::Profile(_))) if !had => {
@@ -980,6 +985,11 @@ impl DaemonCore {
                     "joined; {}",
                     vox_core::node::api::Outcome::RECOVERING
                 ))
+            }
+            // A trust saved whose key is still being delivered: said, never an error.
+            Ok(Frame::TrustedKeyPending) => {
+                self.asked = None;
+                CommandStatus::Said(one_line(vox_core::node::api::Outcome::KEY_PENDING))
             }
             // **The link is the answer** (#406): set only as a notice, it sat under the "done" this
             // command's own status puts over every notice, and `:link` showed a person nothing to
@@ -1379,7 +1389,12 @@ impl DaemonCore {
                     .into_iter()
                     .map(|n| (n.name.to_string(), n.status.map(|s| s.as_str().to_owned())))
                     .collect();
+                // Never a node this TUI does not know has an identity: its first-run prompt is
+                // still the person's, and one made meanwhile by another vox is named when the
+                // person answers it (V210-100); attaching here would make that answer "already
+                // has an identity" instead.
                 if self.conn.is_none()
+                    && self.has_identity
                     && self.machine_nodes.iter().any(|(name, status)| {
                         name == self.node.as_str() && status.as_deref() == Some("Ready")
                     })

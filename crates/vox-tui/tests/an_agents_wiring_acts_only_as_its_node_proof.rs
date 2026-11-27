@@ -280,8 +280,8 @@ fn an_agents_hooks_act_only_as_its_own_node() {
     assert!(ok, "PRODUCT: vox agent plugin opencode failed: {err}");
     assert!(
         plugin.contains(r#"const VOX_NODE = "oc-mbp""#)
-            && plugin.contains("agent hook --node ${VOX_NODE}")
-            && plugin.contains("output.env.VOX_NODE = VOX_NODE")
+            && plugin.contains(r#"["agent", "hook", "--node", VOX_NODE,"#)
+            && plugin.contains("event.env.VOX_NODE = VOX_NODE")
             && !plugin.contains("@VOX_NODE@"),
         "PRODUCT: the OpenCode plugin must carry its node into the drain and every shell, with \
          nothing of the template left"
@@ -660,6 +660,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
         ok && !repaired.contains("not here")
             && !repaired.contains("could not read")
             && !err.contains("not attached")
+            && !err.contains("is Locked")
             && !err.contains("no vox daemon"),
         "PRODUCT: after running the stated `vox setup` fix, the repaired hook must take its \
          next turn normally; stdout={repaired:?}, stderr={err:?}"
@@ -1078,6 +1079,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
     assert!(
         hook.status.success()
             && !hook_said.contains("not attached")
+            && !hook_said.contains("is Locked")
             && !hook_said.contains("could not read")
             && ok
             && read.contains("posted as the new name"),
@@ -1122,7 +1124,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
         println!("[proof] vox node create, on a Mac with no keychain, said:\n{said}");
         assert!(
             status.success()
-                && said.contains("node plainmac is Ready but not remembered; this Mac has no keychain to remember it in; the node will need its passphrase after a restart")
+                && said.contains("node plainmac is Ready; this Mac has no keychain to remember it in; the node will need its passphrase after a restart")
                 && bare.listed("plainmac").contains(" Ready"),
             "PRODUCT: on a Mac with no keychain, `vox node create` at a terminal must attach the \
              node and say, in one plain line, that this Mac has no keychain to remember it in \

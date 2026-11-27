@@ -118,7 +118,8 @@ and troubleshooting organised by symptom. Read the same canonical manual at
 ### Your computers, or someone else's node?
 
 For your own computers, start with [My computers](docs/manual/keyring.md#my-computers). It explains
-two-sided pairing: `vox computer invite`, preview the actual invitation on the other machine, and approve
+two-sided pairing: `vox computer pair` makes a pairing code, `vox computer pair <code> --preview`
+shows the authenticated computer on the other machine, and you approve
 the exact operation on both. Computer identity is separate from a node fingerprint. Pairing
 applies the managed-node trust policy; it does not join rooms. Use individual node grants instead
 for another person or a deliberately narrower relationship. Read and Drive are different grants:

@@ -9,8 +9,10 @@
 //!
 //! **Staging.** A node made by `vox id`, then given an anchors file of two lines that cannot be
 //! used (a host that does not resolve, a malformed fingerprint). No daemon runs: `vox tui` starts
-//! one, finds the node not attached, and asks for its passphrase at its "Attach node" prompt, where
-//! it is typed (`tests/pty/tui_attach_notes.py`).
+//! one, finds the node not attached, and asks for its passphrase at its "Unlock node" prompt, where
+//! it is typed (`tests/pty/tui_attach_notes.py`). The node's directories are under `/tmp`, so the
+//! anchors file's path is as long as a person's own, not as long as the run's temporary directory
+//! makes it.
 //!
 //! **Asserted:** once the TUI shows its node attached, its bottom rows name the anchors file, say
 //! it names no usable anchor, and say the TUI's node carries on with no anchor. Each red names its
@@ -43,11 +45,23 @@ mod world;
 
 use world::{args, vox_once, IDENTITY, VOX};
 
+/// A person's own anchors file: macOS's default for a short user name. The notice names the file
+/// once for each line it skipped and once more to say it names no usable anchor, within its four
+/// rows (`ui::HINT_ROWS_MAX`), so the staged path is at least this long and not much longer.
+/// Under the release run's temporary directory it was 93 characters, and those three copies filled
+/// the rows before the warning: a path no person has, not what a person sees.
+const ORDINARY_ANCHORS_FILE: &str = "/Users/alice/Library/Application Support/vox/anchors";
+
 #[test]
 #[ignore = "real vox tui in a pty, production Argon2id; needs pyte (VOX_PYTE_PATH)"]
 fn the_tui_says_what_attaching_its_node_said() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    // `/tmp/vox-tui-says-attach-notes-XXXXXX/bob/cfg/anchors`: 53 characters, whatever the
+    // temporary directory of the run.
+    let tmp = tempfile::Builder::new()
+        .prefix("vox-tui-says-attach-notes-")
+        .tempdir_in("/tmp")
+        .expect("APPARATUS: no temp dir");
     let bob = tmp.path().join("bob");
     std::fs::create_dir_all(bob.join("cfg")).expect("APPARATUS: cannot make a directory");
     let (ok, fp, err) = vox_once(&bob, &args(&["id"]));
@@ -63,6 +77,11 @@ fn the_tui_says_what_attaching_its_node_said() {
     )
     .expect("APPARATUS: cannot write the anchors file");
     let file = file.display().to_string();
+    assert!(
+        file.len() >= ORDINARY_ANCHORS_FILE.len(),
+        "APPARATUS: the staged anchors file {file} is shorter than a person's own \
+         ({ORDINARY_ANCHORS_FILE}), so the notice would have room a person's does not"
+    );
 
     // The two tokens this screen must show, from the one token file (ADR-028 L-1).
     let tokens_path = concat!(

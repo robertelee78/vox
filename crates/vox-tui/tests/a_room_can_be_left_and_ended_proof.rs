@@ -75,7 +75,8 @@ optional_proof::not_run!(
     a_node_that_left_rejoins_and_posts_at_once,
     an_unheard_departure_keeps_the_left_copy_until_a_member_returns,
     a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands,
-    a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted
+    a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted,
+    a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open,
 );
 
 #[path = "support/pty_driver.rs"]
@@ -1655,10 +1656,13 @@ fn mp6_kept_once_applied(
     }
 }
 
-/// Hold `reader`'s governance fold, start it, and once it holds `removal` release the fold and
-/// supply a real governance fact (`nudge` renames the room), so the fold applies the removal
-/// before it decides any message it received meanwhile: one fold turn evaluates every admitted
-/// control before any message's eligibility (`channel/governance.rs` `advance`).
+/// Start `reader` again, as a member that was offline while the removal was made comes back, and
+/// check that it holds `removal` before it shows any of `unshown`: the reader that applies the
+/// removal first. Since the history redesign an entry is taken in only once the controls it names
+/// have been applied (`history_stream/admission.rs` `preflight`), so a returning reader applies
+/// the removal as it takes in the target's later posts, with no hold; the test-only fold hold
+/// this used to arm now holds every entry after the first new control, the removal included, so
+/// it can no longer stage this.
 ///
 /// While the reader does not hold the removal yet, `nudge` posts once every two seconds, as the
 /// members of a live room do. A returning member's first history window has been seen to sit
@@ -1666,22 +1670,16 @@ fn mp6_kept_once_applied(
 /// selected and none passed for 30 s, with every connection up until the harness stopped the
 /// daemons; in every run that passed, a newer head re-selected them within a second. The post
 /// may be refused (it is not what this staging measures), so its result is only counted.
-#[allow(clippy::too_many_arguments)]
 fn mp6_apply_first(
     reader: &mut Worker,
     nudge: &Worker,
     id: &str,
     removal: &str,
     unshown: &[&str],
-    hold: &std::path::Path,
     env: &[(&str, &str)],
     err: &std::path::Path,
 ) {
-    std::fs::write(hold, b"hold").expect("APPARATUS: arm a reader's governance fold hold");
-    let hold_text = hold.to_str().expect("APPARATUS: UTF-8 hold path");
-    let mut env = env.to_vec();
-    env.push(("VOX_TEST_FOLD_HOLD_FILE", hold_text));
-    reader.restart_daemon_as(support::VOX, &env, err);
+    reader.restart_daemon_as(support::VOX, env, err);
     let reader: &Worker = reader;
     let deadline = Instant::now() + WITHIN;
     let mut nudges = 0;
@@ -1692,7 +1690,7 @@ fn mp6_apply_first(
         }
         assert!(
             Instant::now() < deadline,
-            "APPARATUS: {} never received the removal while its fold was held, after {nudges} \
+            "APPARATUS: {} never received the removal after it came back, after {nudges} \
              posts by {}: {order:?}",
             reader.name,
             nudge.name
@@ -1712,19 +1710,9 @@ fn mp6_apply_first(
         .collect();
     assert!(
         early.is_empty(),
-        "APPARATUS: {} showed {early:?} before its fold could apply the removal: {read:?}",
+        "APPARATUS: {} showed {early:?} before it held the removal, so it is not a reader that \
+         applies the removal first: {read:?}",
         reader.name
-    );
-    std::fs::remove_file(hold).expect("APPARATUS: release a reader's governance fold");
-    // Releasing the marker does not wake the actor. A real new governance input does.
-    setup(
-        nudge,
-        &[
-            "room",
-            "rename",
-            id,
-            &format!("mp6-{}-applies", reader.name),
-        ],
     );
 }
 
@@ -1735,11 +1723,14 @@ fn mp6_apply_first(
 /// the first) is below all four, and alice and carol show them. With bob and carol stopped, alice
 /// removes bob (her removal names his reply, the latest tip she holds) and stops. bob, who never
 /// hears of it, posts once more and replies once more; carol, started again without alice, shows
-/// both. alice comes back and carol applies the removal. dave comes back with his fold held,
-/// receives the removal and applies it before he decides any of bob's posts: he reads the room as
-/// a reader that applies the removal first does. (A newcomer that joins after the removal cannot
-/// read bob at all: only bob releases bob's keys, ADR-006 §History, and a removed author's later
-/// key package is outside its cut.)
+/// both. alice comes back and carol applies the removal. dave comes back and receives the
+/// removal before he shows either of bob's two posts after it: he reads the room as a reader that
+/// applies the removal before the target's later posts does. He shows bob's four earlier posts
+/// before he holds the removal and cannot do otherwise: the removal names bob's reply in its
+/// `seen`, a control is taken in only with each such parent held, and a post is shown on its own
+/// author's proof. (A newcomer that joins after the removal cannot read bob at all: only bob
+/// releases bob's keys, ADR-006 §History, and a removed author's later key package is outside
+/// its cut.)
 ///
 /// Asserted:
 /// - carol, which showed all six of bob's posts before applying the removal: once she applied it
@@ -1747,9 +1738,10 @@ fn mp6_apply_first(
 ///   the two after them are gone (`MP11 disappears`); her Count is what it was less exactly those
 ///   two and equals her newest page; the thread's summary counts one reply and its page lists
 ///   only bob's earlier reply; the same after carol's daemon restarts;
-/// - dave shows all four, the last one included (`MP6 witnessed`, a verdict by dave's state, not
-///   a deadline), and his thread counts and lists that one reply; alice, the remover, still shows
-///   all four; no one shows bob's posts after the removal again (`MP6 after removal`).
+/// - dave keeps all four, the last one included, once he applied the removal (`MP6 witnessed`, a
+///   verdict by dave's state, not a deadline; with MP-11 a cut below them would take them away),
+///   and his thread counts and lists that one reply; alice, the remover, still shows all four; no
+///   one shows bob's posts after the removal again (`MP6 after removal`).
 ///
 /// Mutant `uncut` (`VOX_MUTANT_MP6`, the cut of main: bob's last control entry, below all four)
 /// is red at `MP6 witnessed` on carol: with MP-11 she loses the rows she showed. Mutant
@@ -1762,7 +1754,7 @@ fn mp6_apply_first(
 fn a_removal_keeps_the_posts_its_remover_held_and_no_later_one() {
     use vox_core::node::ipc::{Frame, Request};
     watchdog::arm();
-    let mutant = mp6_mutant(&["VOX_TEST_MP6_MUTANT", "VOX_TEST_FOLD_HOLD_FILE"]);
+    let mutant = mp6_mutant(&["VOX_TEST_MP6_MUTANT"]);
     let keep_rows = mp11_mutants(&["VOX_MUTANT_MP11_KEEP_ROWS"]);
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
@@ -1975,15 +1967,15 @@ fn a_removal_keeps_the_posts_its_remover_held_and_no_later_one() {
     );
     check(carol, "after carol's daemon restarted");
     bob.stop_daemon_cleanly();
-    let mut unshown = tags.to_vec();
-    unshown.extend([after, after_reply]);
+    // bob's four earlier posts are shown before the removal that names the last of them can be
+    // taken in; only his two later posts can still be unshown when dave holds the removal.
+    let unshown = [after, after_reply];
     mp6_apply_first(
         dave,
         alice,
         id,
         &removal,
         &unshown,
-        &tmp.path().join("dave-fold.hold"),
         &env,
         &tmp.path().join("dave-back.err"),
     );
@@ -2039,24 +2031,27 @@ fn a_removal_keeps_the_posts_its_remover_held_and_no_later_one() {
 /// ADR-053 MP-6 (b): **a removal that names no tip of its target keeps only what its signed
 /// context reached: today's cut, never less.** bob, an admin alice named, runs a node built to
 /// leave the target out of its `seen` (`VOX_TEST_REMOVAL_OMITS_TARGET`), so its context does not
-/// join the target's own frontier either. dave stops. carol posts once, alice posts so carol's
-/// next post carries a context update, and carol posts three more; alice and bob show all four.
-/// alice posts again and bob reads it, so the context bob signs reaches carol's last control
-/// entry through alice's tip, as an honest removal's does today. bob removes carol. dave comes
-/// back with his fold held and applies the removal before he decides any of carol's posts.
+/// join the target's own frontier either. dave stops. carol posts once, then offers a service
+/// (`vox service add`: her own signed statement that she shares it, a governance row any member
+/// writes), so alice, once she applied it, posts with a context update that reaches that row
+/// (ADR-053 MP-4: another author's post or empty context update never would). carol posts three
+/// more; alice and bob show all four. alice posts again and bob reads it, so the context bob signs
+/// reaches carol's service row, above her first post, through alice's tip, as an honest removal's
+/// does today. bob removes carol. dave comes back and receives the removal before he shows any of
+/// carol's three later posts. He shows her first post before he holds the removal and cannot do
+/// otherwise: the removal is taken in only with the prefix its context reaches, which holds that
+/// post, and a post is shown on its own author's proof.
 ///
-/// Asserted on dave: carol's first post, below that control entry, stays (`MP6 omitted kept`);
-/// none of the three after it is ever shown (`MP6 omitted`). Main is green (this is today's
-/// cut). Mutant `absent-open` is red at `MP6 omitted`.
+/// Asserted on dave: carol's first post, below that row, stays once he applied the removal
+/// (`MP6 omitted kept`; with MP-11 a cut below it would take it away); none of the three after it
+/// is ever shown (`MP6 omitted`). Main is green (this is today's cut). Mutant `absent-open` is red
+/// at `MP6 omitted`. Without carol's service row the context reaches only her last control before
+/// her first post, and that post is cut too (`MP6 omitted kept` red).
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn a_removal_that_names_no_tip_of_its_target_keeps_only_what_its_context_reached() {
     watchdog::arm();
-    let mutant = mp6_mutant(&[
-        "VOX_TEST_MP6_MUTANT",
-        "VOX_TEST_FOLD_HOLD_FILE",
-        "VOX_TEST_REMOVAL_OMITS_TARGET",
-    ]);
+    let mutant = mp6_mutant(&["VOX_TEST_MP6_MUTANT", "VOX_TEST_REMOVAL_OMITS_TARGET"]);
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
     let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
@@ -2090,6 +2085,7 @@ fn a_removal_that_names_no_tip_of_its_target_keeps_only_what_its_context_reached
     let kept = "MP6-INSIDE-CUT";
     setup(carol, &["room", "post", id, kept]);
     mp6_all_shown(&[alice, bob], id, &[kept], "carol's first post");
+    setup(carol, &["service", "add", id, "echo", "127.0.0.1:9"]);
     mp6_post_until_read(alice, carol, id, "MP6-ALICE-BETWEEN");
     let tags = ["MP6-OMITTED-1", "MP6-OMITTED-2", "MP6-OMITTED-3"];
     for tag in tags {
@@ -2108,15 +2104,14 @@ fn a_removal_that_names_no_tip_of_its_target_keeps_only_what_its_context_reached
         "PRODUCT: the delegated admin could not remove carol: {removal:?}"
     );
     let removal = mp6_signed_entry(&removal);
-    let mut unshown = tags.to_vec();
-    unshown.push(kept);
+    // carol's first post is shown before the removal whose context reaches her service row above
+    // it can be taken in; only her three later posts can still be unshown when dave holds it.
     mp6_apply_first(
         dave,
         alice,
         id,
         &removal,
-        &unshown,
-        &tmp.path().join("dave-fold.hold"),
+        &tags,
         &env,
         &tmp.path().join("dave-back.err"),
     );
@@ -2408,8 +2403,9 @@ fn posted_root(rt: &tokio::runtime::Runtime, w: &Worker, cid: [u8; 32], text: &s
 /// `926bba2c3` (MP-6 and MP-11 without the reconcile) is red at `MP11 upgrade`: the index main
 /// sealed is settled and nothing recomputes it. Mutant `VOX_MUTANT_MP11_NO_RECONCILE` (the older
 /// index is opened without the new generation) is red at the same.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real daemons and an anchor on a base vox, then the vox under test; run in release"]
+#[ignore = "optional: needs VOX_PROOF_BASE_BINARY, a test-knobs vox built before MP-6 and MP-11 (v0.4.30); run in release"]
 fn a_store_an_older_vox_left_showing_refused_posts_loses_them_at_the_first_open() {
     watchdog::arm();
     let base = std::env::var("VOX_PROOF_BASE_BINARY").unwrap_or_else(|_| {

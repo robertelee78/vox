@@ -48,7 +48,8 @@
 //! 13. A readable part that names two things is refused, saying which: bob calls carol `Nas Box`,
 //!     whose label is his name for alice too.
 //! 14. A command copied from `vox service list` works on another member's machine (ADR-028 S-3,
-//!     #490): bob's listing gives `ssh $USER@<canonical>` for alice's ssh share; carol runs it in
+//!     #490): bob's listing gives `ssh <canonical>` for alice's ssh share (no `$USER@` since
+//!     a483f5f51: ssh's own default user, a whole command to paste); carol runs it in
 //!     a real `ssh` through her own proxy, and the share hears ssh's banner. bob's readable address
 //!     is refused on carol's machine (he names alice `nas-box`, she does not), which is checked
 //!     first, so a copy of the readable form could not pass. Mutation: the commands carry the
@@ -820,7 +821,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          be refused; R23 bounds a refusal at {IMMEDIATE:?}"
     );
     // (14) A command copied from `vox service list` works on another member's machine (ADR-028
-    // S-3, #490): alice shares an ssh stand-in; bob's listing gives `ssh $USER@<address>`; carol
+    // S-3, #490): alice shares an ssh stand-in; bob's listing gives `ssh <address>`; carol
     // pastes it into a real `ssh`, pointed at her own `.vox` proxy by the block her own listing
     // prints. bob's readable address names alice `nas-box`, which carol has no name for, so only
     // the canonical address in the copy can reach it there; the stand-in must hear ssh's banner.
@@ -834,7 +835,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     let (_, bob_login) = listed(
         &bob_dir,
         &room,
-        &["ssh $USER@".to_owned(), "nas-login.".to_owned()],
+        &["ssh ".to_owned(), "nas-login.".to_owned()],
     );
     let copied = bob_login
         .lines()
@@ -896,7 +897,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          a readable copy would pass too: {readable_said}"
     );
     assert!(
-        copied.starts_with("ssh $USER@") && block.contains("ProxyCommand"),
+        copied.starts_with("ssh ") && copied.ends_with(".vox") && block.contains("ProxyCommand"),
         "PRODUCT: `vox service list` must give an ssh share's ssh command, and the ~/.ssh/config \
          block for this machine's proxy; bob's said:\n{bob_login}\ncarol's said:\n{carol_login}"
     );

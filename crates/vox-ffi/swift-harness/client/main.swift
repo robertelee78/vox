@@ -7,6 +7,8 @@
 // It prints one line per step, which the proof reads:
 //   FP <fingerprint>        attached <node> through the daemon; its identity, for the peer to trust
 //   JOINED <room>           joined the peer's room
+//   ENDED <why>             observation ended (the joined room opened on this node; again after
+//                           CREATED, the created one); it subscribes again, as Vox.app does
 //   POSTED <n>              posted "hello from swift"; n is how many of the room's messages,
 //                           read back at once, are that post
 //   (waits for a line on stdin: the peer now trusts it and has posted)
@@ -68,8 +70,8 @@
 //   REQUEST <ref> OPEN <bool>
 //                           after an entry that is a request: its reference, and whether it is open
 //   NOTE <note>             what `sessionRead` says besides; empty for nothing
-//   HEARD <n> <m>           how many times the listener heard of an entry in that Session, and of
-//                           the room's Sessions changing
+//   HEARD <m>               how many times the listener heard the room's Sessions change: news of a
+//                           Session's entries rides that one callback since 7bc390c74
 //   (waits for a line on stdin: the id of a Session of the peer's, which gives this node drive)
 //   PEER DRIVE <bool> ENTRIES <n>
 //                           `sessions` and `sessionRead` of it, once drive shows (up to 90 s)
@@ -108,23 +110,35 @@ func say(_ line: String) {
 /// of Sessions is counted, for the proof to ask.
 final class Listener: ClientListener, @unchecked Sendable {
     private let lock = NSLock()
-    private var entries: [String: Int] = [:]
     private var rooms: [String: Int] = [:]
     private var told = (messages: 0, notices: 0)
     private var notices: [String] = []
+    /// Each end of observation, in order: Vox.app subscribes again after one (`stopped`, then
+    /// `readFacts` with `observationNeedsRestart`), and so does this program.
+    let ends: AsyncStream<String>
+    private let endsTo: AsyncStream<String>.Continuation
 
-    func onMessage(room: String, message: RoomMessage) {
-        lock.lock()
-        told.messages += 1
-        lock.unlock()
-        say("GOT \(message.text)")
+    init() {
+        var to: AsyncStream<String>.Continuation!
+        ends = AsyncStream { to = $0 }
+        endsTo = to
     }
 
-    func onNotice(text: String) {
-        lock.lock()
-        told.notices += 1
-        notices.append(text)
-        lock.unlock()
+    // The listener is awaited to consumption, and says whether it is still current (7bc390c74;
+    // `onDetached`, c778fb252): this one, subscribed again with the client after each end of
+    // observation, always is.
+    func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
+        lock.withLock { told.messages += 1 }
+        say("GOT \(message.text)")
+        return true
+    }
+
+    func onNotice(text: String) async -> Bool {
+        lock.withLock {
+            told.notices += 1
+            notices.append(text)
+        }
+        return true
     }
 
     /// The notices given from the `from`th on.
@@ -141,30 +155,24 @@ final class Listener: ClientListener, @unchecked Sendable {
         return told
     }
 
-    func onEnded(text: String) {
+    func onEnded(text: String) async {
         say("ENDED \(text)")
+        endsTo.yield(text)
     }
 
-    func onDetached() {
+    func onDetached() async {
         say("DETACHED")
     }
 
-    func onSessions(room: String) {
-        lock.lock()
-        rooms[room, default: 0] += 1
-        lock.unlock()
+    func onSessions(room: String) async -> Bool {
+        lock.withLock { rooms[room, default: 0] += 1 }
+        return true
     }
 
-    func onSessionEntry(room: String, node: String, sessionId: String) {
-        lock.lock()
-        entries[sessionId, default: 0] += 1
-        lock.unlock()
-    }
-
-    func heard(session: String, room: String) -> (Int, Int) {
+    func heard(room: String) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        return (entries[session] ?? 0, rooms[room] ?? 0)
+        return rooms[room] ?? 0
     }
 }
 
@@ -175,11 +183,16 @@ do {
     identity.wipe()
     say("FP \(me)")
     let listener = Listener()
+    var ends = listener.ends.makeAsyncIterator()
     try await client.subscribe(listener: listener)
 
     let room = try await client.joinRoom(
         link: link, passphrase: try Passphrase(bytes: Data(args[5].utf8)))
     say("JOINED \(room)")
+    // A room that opens on this node (a join or a create opens one) ends observation, so that its
+    // history is read again; Vox.app then subscribes again, and so does this program.
+    _ = await ends.next()
+    try await client.subscribe(listener: listener)
     // A keyring change takes the identity passphrase: attaching opened no window (ADR-028 K-12).
     let again = try Passphrase(bytes: Data(args[3].utf8))
     try await client.trustAdd(fingerprint: peer, name: "peer", drive: false, identityPassphrase: again)
@@ -194,10 +207,30 @@ do {
     _ = readLine()
     // Once the proof has its answer about the event stream, the peer shares a service.
     _ = readLine()
+    // A room's services and Sessions are read a page at a time (7bc390c74): every page, as the
+    // whole list the app was once given in one answer.
+    func allShared() async throws -> [SharedService] {
+        var page = try await client.servicesPage(room: room, after: nil, revision: nil)
+        var all = page.shared
+        while let next = page.next {
+            page = try await client.servicesPage(room: room, after: next, revision: page.revision)
+            all += page.shared
+        }
+        return all
+    }
+    func allSessions() async throws -> [FfiSession] {
+        var page = try await client.sessionsPage(room: room, after: nil)
+        var all = page.sessions
+        while let next = page.next {
+            page = try await client.sessionsPage(room: room, after: next)
+            all += page.sessions
+        }
+        return all
+    }
     var shared: [SharedService] = []
     let until = Date().addingTimeInterval(120)
     while Date() < until {
-        shared = try await client.services(room: room).shared.filter { $0.by != "you" }
+        shared = try await allShared().filter { $0.by != "you" }
         if !shared.isEmpty { break }
         try await Task.sleep(nanoseconds: 250_000_000)
     }
@@ -312,6 +345,8 @@ do {
     let made = try await client.createRoom(
         name: "mine", passphrase: try Passphrase(bytes: Data("mine passphrase".utf8)))
     say("CREATED \(made) \(try await client.link(room: made).url)")
+    _ = await ends.next()
+    try await client.subscribe(listener: listener)
     _ = readLine()
     let renameEntry = try await client.renameRoom(room: made, name: "renamed")
     say("RENAMED \(renameEntry)")
@@ -324,7 +359,7 @@ do {
     var row: FfiSession? = nil
     let sessionUntil = Date().addingTimeInterval(90)
     while row == nil && Date() < sessionUntil {
-        row = try await client.sessions(room: room).first { $0.sessionId == sid && $0.pending > 0 }
+        row = try await allSessions().first { $0.sessionId == sid && $0.pending > 0 }
         if row == nil { try await Task.sleep(nanoseconds: 250_000_000) }
     }
     say("SESSION \(row?.label ?? "") PENDING \(row?.pending ?? 0) DRIVE \(row?.canDrive ?? false)")
@@ -336,15 +371,14 @@ do {
         }
     }
     say("NOTE \(session.note ?? "")")
-    let (heardEntries, heardRooms) = listener.heard(session: sid, room: room)
-    say("HEARD \(heardEntries) \(heardRooms)")
+    say("HEARD \(listener.heard(room: room))")
 
     // Drive over a Session of the peer's: given, taken back, given again (#662). An app keeps a
     // room's Sessions and reads them again when the listener says they changed: each change must
     // be heard.
     let psid = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
     func peerRow() async -> FfiSession? {
-        try? await client.sessions(room: room).first { $0.sessionId == psid }
+        try? await allSessions().first { $0.sessionId == psid }
     }
     func peerEntries(_ s: FfiSession?) async -> Int {
         guard let s else { return 0 }
@@ -362,7 +396,7 @@ do {
     func heardChange(after before: Int) async -> Bool {
         let until = Date().addingTimeInterval(30)
         while Date() < until {
-            if listener.heard(session: psid, room: room).1 > before { return true }
+            if listener.heard(room: room) > before { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return false
@@ -371,17 +405,17 @@ do {
     // what the listener was told as messages or notices.
     func seenCounts() async -> String {
         let unread = (try? await client.unread(room: room).count) ?? -1
-        let pending = (try? await client.sessions(room: room).reduce(0) { $0 + Int($1.pending) }) ?? -1
+        let pending = (try? await allSessions().reduce(0) { $0 + Int($1.pending) }) ?? -1
         let (messages, notices) = listener.toldCounts()
         return "UNREAD \(unread) WAITING \(pending) MESSAGES \(messages) NOTICES \(notices)"
     }
     let countsBefore = await seenCounts()
     let noticesBefore = listener.toldCounts().1
-    var before = listener.heard(session: psid, room: room).1
+    var before = listener.heard(room: room)
     _ = readLine()
     let revokeHeard = await heardChange(after: before)
     say("REVOKED HEARD \(revokeHeard) DRIVE \(await peerRow()?.canDrive ?? false)")
-    before = listener.heard(session: psid, room: room).1
+    before = listener.heard(room: room)
     _ = readLine()
     let regrantHeard = await heardChange(after: before)
     var regained: FfiSession? = nil

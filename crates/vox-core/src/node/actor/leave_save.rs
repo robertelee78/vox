@@ -1195,7 +1195,8 @@ impl Node {
             .send(NodeEvent::RoomRemoved { channel_id: *room });
         // The left copy is gone, so a join that waited on its departure is an ordinary join now.
         for join in rejoins {
-            Box::pin(self.begin_join_channel(join.link, join.passphrase, join.reply)).await;
+            self.begin_join_channel(join.link, join.passphrase, join.reply)
+                .await;
         }
         Outcome::Done
     }
@@ -1315,7 +1316,12 @@ impl Ready {
 }
 
 impl Node {
-    pub(super) async fn complete_lifecycle(&mut self, ready: Ready) {
+    pub(super) fn complete_lifecycle(&mut self, ready: Ready) -> Boxed<'_, ()> {
+        Box::pin(self.complete_lifecycle_unboxed(ready))
+    }
+
+    /// [`Self::complete_lifecycle`], unboxed: see [`Boxed`].
+    async fn complete_lifecycle_unboxed(&mut self, ready: Ready) {
         match ready {
             Ready::DonorResume(ready) => self.resume_own_key_donor(*ready),
             Ready::Donor(ready) => self.finish_own_key_donor(*ready),

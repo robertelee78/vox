@@ -1935,10 +1935,12 @@ fn can_drive_becomes(
 /// `PRODUCT:`; staging the product refused is `APPARATUS (staging):`.
 ///
 /// **Mutations that must turn it red:** the drive key not begun until the Session's first entry
-/// (arm 2); no entry under the new key when drive is taken back (arm 3, `person`); the new key not
-/// released to a member that keeps drive (arm 3, `keeper`); the key change posted as a room
-/// message rather than an entry no Session has (arm 3, "showed in a room or a Session"); any
-/// waiting key-package, from any author, keeping a member's drive (arm 5).
+/// (arm 2); no entry under the new key when drive is taken back (arm 3, `person`); a member that
+/// keeps drive read as losing it while the new key travels to it (arm 3, `keeper`); the new key
+/// not released to a member that keeps drive (arm 4: its node promised the key by the author's
+/// floor still says `can_drive`, but reads nothing S9 writes afterwards); the key change posted as
+/// a room message rather than an entry no Session has (arm 3, "showed in a room or a Session");
+/// any waiting key-package, from any author, keeping a member's drive (arm 5).
 #[test]
 #[ignore = "real binary; run in release"]
 fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
@@ -2089,12 +2091,16 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
         "PRODUCT: {KEEPER} keeps drive from {AGENT}, yet within 15 s it did not read the call S9 \
          made after {PERSON} lost drive: {kept}"
     );
+    // A member that lost drive is refused the Session itself (ADR-029 CL-3; #956, #1089; the
+    // ruling of 17c3962a6), so nothing S9 wrote afterwards can reach it this way.
     let (ok, seen) = drive(&w, &second, S9, &[]);
     println!("[proof] (4) person's view of S9 after the call (ok {ok}):\n{seen}");
     assert!(
-        ok && seen.contains(" · open") && !seen.contains("after-drive-was-taken"),
-        "PRODUCT: {PERSON} no longer has drive from {AGENT}, yet reads the call S9 made after it \
-         was taken back:\n{seen}"
+        !ok && seen.contains("this node cannot read that Session")
+            && !seen.contains("after-drive-was-taken"),
+        "PRODUCT: {PERSON} no longer has drive from {AGENT}, yet `vox room session` was not \
+         refused with `this node cannot read that Session`, or it showed the call S9 made after \
+         drive was taken back:\n{seen}"
     );
 
     // ---- (5) a package waiting from another author keeps nothing of S9 ----
@@ -2118,7 +2124,21 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
         "APPARATUS (staging): keeper's prompt hook failed: {}",
         String::from_utf8_lossy(&opened.stderr)
     );
-    session_listed(&w, &second, S10);
+    // A Session, its opening included, is sealed to the members its node trusts with drive
+    // (ADR-029 SC-2, ADR-031 SA-3; e4f23581b), so person does not list S10 before keeper gives it
+    // drive: S10 is staged as its own node lists it.
+    let t0 = Instant::now();
+    while !w
+        .vox(KEEPER, &["room", "sessions", &second, "--json"], None)
+        .1
+        .contains(S10)
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "APPARATUS (staging): within 60 s, {KEEPER} never listed its own Session {S10}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
     w.staged(AGENT, &["trust", "drive", &person_fp], None);
     let again = can_drive_becomes(&w, PERSON, &second, S9, true, Duration::from_secs(10));
     assert_eq!(
@@ -2634,6 +2654,9 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
 }
 
 /// Leaving deletes the node's room. Rejoining gives even its author only later Session steps.
+/// The leave also unbinds the author's session from the room: it works in no room until it is
+/// moved there deliberately (`vox agent room`; a later hook never restores a left room, ADR-029
+/// RB-4/RB-5, `wake::clear_room_bindings`).
 #[test]
 #[ignore = "real binary, production Argon2id; run in release"]
 fn a_rejoined_author_is_not_sent_its_old_session_steps() {
@@ -2671,6 +2694,7 @@ fn a_rejoined_author_is_not_sent_its_old_session_steps() {
         &["room", "post", &room, "author returned after leaving"],
         None,
     );
+    w.staged(AGENT, &["agent", "room", &room, "--session", SESSION], None);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let text = w.staged(PERSON, &["room", "read", &room], None);

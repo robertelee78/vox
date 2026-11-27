@@ -61,21 +61,17 @@ pub enum ComputerCmd {
         #[arg(long)]
         details: bool,
     },
-    /// Make one expiring invitation, as Add Computer does in Vox.app.
-    Invite {
-        #[command(flatten)]
-        account: AccountArgs,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Authenticate this invitation, show the computer and policy, and confirm once.
+    /// With no code, make one expiring pairing code for another computer, as Add Computer does in
+    /// Vox.app; with the code from the other computer, review that computer and policy and confirm
+    /// once.
     Pair {
-        /// One-time computer pairing link from Add Computer.
-        link: String,
+        /// The pairing code made on the other computer, by its `vox computer pair` or Add Computer.
+        #[arg(value_name = "CODE")]
+        link: Option<String>,
         #[command(flatten)]
         account: AccountArgs,
-        /// Authenticate and display the proposal without approving it yet.
-        #[arg(long)]
+        /// With a code: review the other computer and policy without approving yet.
+        #[arg(long, requires = "link")]
         preview: bool,
         #[arg(long)]
         json: bool,
@@ -88,7 +84,7 @@ pub enum ComputerCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Cancel a pending invitation or uncommitted proposal.
+    /// Cancel a pending pairing code or uncommitted proposal.
     Cancel {
         operation: String,
         #[command(flatten)]
@@ -112,7 +108,7 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
     }
     let details = matches!(&command, ComputerCmd::Status { details: true, .. });
     let retire = matches!(&command, ComputerCmd::Retire { .. });
-    let include_invitation = matches!(&command, ComputerCmd::Invite { .. });
+    let include_invitation = matches!(&command, ComputerCmd::Pair { link: None, .. });
     let (account, json, request, prompt) = match command {
         ComputerCmd::Binding {
             action,
@@ -157,11 +153,14 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         ComputerCmd::Status { account, json, .. } => {
             (account, json, DaemonRequest::ComputerStatus, false)
         }
-        ComputerCmd::Invite { account, json } => {
-            (account, json, DaemonRequest::ComputerBegin, false)
-        }
         ComputerCmd::Pair {
-            link,
+            link: None,
+            account,
+            json,
+            ..
+        } => (account, json, DaemonRequest::ComputerBegin, false),
+        ComputerCmd::Pair {
+            link: Some(link),
             account,
             preview,
             json,
@@ -253,10 +252,10 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             if conflict.inviter_approved {
                 eprintln!("On {}, the signed incomplete proposal can be closed now; its retained signature can still be used elsewhere until Unix ms {}.", conflict.peer.name, conflict.expires_ms);
             }
-            eprintln!("On {}, close the old proposal now with:\n  {}\nClosing cannot withdraw a signature retained elsewhere; close it on both computers. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
+            eprintln!("On {}, close the old proposal now with:\n  {}\nClosing cannot withdraw a signature retained elsewhere; close it on both computers. Then create a fresh pairing code with:\n  {}\nBring that fresh pairing code here and approve on both computers.",
                 conflict.peer.name,
                 vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
-                vox_text::shell::command(&["vox", "computer", "invite"]));
+                vox_text::shell::command(&["vox", "computer", "pair"]));
             return show(&status, json, false, details, false);
         }
         let proposal = status.pairing.as_ref().ok_or_else(|| {
@@ -422,7 +421,7 @@ fn show(
     match status.state.as_str() {
         "individual" => {
             println!("This computer is not in a group.");
-            println!("Next: vox computer invite — add another computer.");
+            println!("Next: vox computer pair — add another computer.");
         }
         "needs-approval" => {
             println!("This computer needs your pairing approval.");
@@ -468,7 +467,7 @@ fn show(
                 .map(|computer| computer.name.as_str())
                 .collect();
             println!("This computer is in a group with {}.", peers.join(", "));
-            println!("Next: vox computer invite — add a computer; vox computer status --details — review this group.");
+            println!("Next: vox computer pair — add a computer; vox computer status --details — review this group.");
         }
         "removed" => {
             println!("This computer was removed from its group.");
@@ -577,20 +576,20 @@ fn show(
             println!("  {item}");
         }
         if conflict.inviter_approved {
-            println!("The inviter already signed the proposal. Closing it here cannot withdraw that signature on the other computer.");
+            println!("The computer that made the pairing code already signed the proposal. Closing it here cannot withdraw that signature on the other computer.");
         }
         if conflict.expires_ms <= now_ms {
-            println!("The proposal expired. On {}, close it with {} and create a fresh invitation with {}.",
+            println!("The proposal expired. On {}, close it with {} and create a fresh pairing code with {}.",
                 conflict.peer.name,
                 vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
-                vox_text::shell::command(&["vox", "computer", "invite"]));
+                vox_text::shell::command(&["vox", "computer", "pair"]));
         } else {
             println!(
-                "To replace, review this invitation interactively on {}.",
+                "To replace, review this pairing code interactively on {}.",
                 status.this_computer.name
             );
         }
-        println!("To keep the current group and close this review on {}, run {}. This does not withdraw the invitation or signature on {}.",
+        println!("To keep the current group and close this review on {}, run {}. This does not withdraw the pairing code or signature on {}.",
             status.this_computer.name,
             vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
             conflict.peer.name);

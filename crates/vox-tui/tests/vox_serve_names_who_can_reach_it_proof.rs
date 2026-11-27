@@ -102,11 +102,10 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
     // name while a node is attached, so nothing has to be left running.
     assert!(
         out.lines().any(|l| l.trim_start().starts_with(
-            "reach a service as <service>.<node>.<room>.vox through the daemon's proxy, running \
-             while a node is attached"
+            "use the commands beside each service to reach it through the daemon's proxy"
         )) && !out.contains("with `vox up` running"),
-        "PRODUCT: `vox connect` must say a service is reached through the daemon's proxy while a \
-         node is attached, not that `vox up` must be running; it said:\n{out}"
+        "PRODUCT: `vox connect` must say a service is reached through the daemon's proxy, not \
+         that `vox up` must be running; it said:\n{out}"
     );
 
     let host = w.host.as_mut().expect("APPARATUS: the world's host runs");

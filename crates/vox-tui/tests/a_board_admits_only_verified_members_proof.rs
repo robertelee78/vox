@@ -576,7 +576,8 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         if r1_served { "it" } else { "no such record" }
     );
     assert!(
-        past.as_ref().is_err_and(|e| e.contains("policy")),
+        past.as_ref()
+            .is_err_and(|e| e.contains("outside the board's accepted clock window")),
         "PRODUCT: a board record 300 ms past its lifetime must be refused as expired; the victim \
          said {past:?}"
     );

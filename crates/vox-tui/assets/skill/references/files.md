@@ -33,5 +33,5 @@ A file can also go to or from a harness **session** instead of the room (see `se
   session's Session. Only the members your node trusts with drive learn of it and are served it;
   nothing is posted to the room.
 - A member with drive may send a file **into** your session using the selected Session's drive
-  command with `--file` and an existing path. It lands on your node, and your turn says where it
+  command, `vox room session`, with `--file` and an existing path. It lands on your node, and your turn says where it
   is and what its note says. Read it from that path.

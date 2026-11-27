@@ -354,12 +354,22 @@ pub enum Operation {
     },
     /// Authoritative persisted input and its actual running step were observed.
     Observed(InputReceipt),
+    /// This node accepted the Session's own post replying (`re`) to `source`: that wake is
+    /// answered (ADR-020 §9.4, V210-121). Only the node's post path sends it, after the append
+    /// and before the post is acknowledged; it is never read from a socket.
+    #[serde(skip)]
+    Replied {
+        /// Complete registered Session identity, the post's `from`.
+        session: String,
+        /// The entry the post replies to.
+        source: Digest32,
+    },
 }
 impl Operation {
     pub(crate) fn session(&self) -> &str {
         match self {
             Self::Maintain | Self::Recipients { .. } => "",
-            Self::Resolve { session } => session,
+            Self::Resolve { session } | Self::Replied { session, .. } => session,
             Self::Page(query) => &query.session,
             Self::Scan { recipient, .. }
             | Self::Pending { recipient }
@@ -406,6 +416,10 @@ pub enum Reply {
         through: u64,
         /// A sealed notice or hook-output reservation still awaits its context receipt.
         notice_pending: bool,
+        /// Notices this Session's own hook admitted whose sources it has not replied to yet,
+        /// oldest first (ADR-020 §9.4, V210-121).
+        #[serde(default)]
+        woke: Vec<Digest32>,
     },
     /// Requested private page.
     Page(Page),

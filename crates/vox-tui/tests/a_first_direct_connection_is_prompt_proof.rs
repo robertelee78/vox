@@ -318,9 +318,10 @@ fn the_host_asks_a_guest_to_dial_back() {
 /// her is direct — the dial-back's connection replaced the relayed one. The anchor's count is
 /// printed, not asserted. Every run unstaged: `CANNOT MEASURE`.
 fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
+    let anchored = room_anchored_address(w);
     let mut unstaged = Vec::new();
     for n in 1..=STAGINGS {
-        match stage_dial_back(w, n) {
+        match stage_dial_back(w, &anchored, n) {
             Staging::Staged => return,
             Staging::NotStaged(why) => {
                 eprintln!("[proof] staging {n}: not staged — {why}");
@@ -352,9 +353,9 @@ enum Staging {
 }
 
 /// One staging, with a fresh guest `carol-<n>`: see [`dial_back_is_asked_for`].
-fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
+fn stage_dial_back(w: &mut ForwardedWorld, anchored: &str, n: usize) -> Staging {
     use world::{args, room_pass_file, vox_once, VoxProc};
-    let (carol, carol_fp) = anchor_only_guest(w, &format!("carol-{n}"));
+    let (carol, carol_fp) = anchor_only_guest(w, anchored, &format!("carol-{n}"));
     // Her node runs in the daemon her `vox connect` left: stopped, so her `vox up` starts the
     // daemon her reaches are held in ([`CAROL_REACH_HOLD`]).
     world::reap_daemon(&carol);
@@ -483,9 +484,14 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
 }
 
 /// A guest, `name`, trusted by the host and joined from an address that names **only the anchor**
-/// (the host's own entries taken out): its room holds no address for the host, so whatever it
-/// knows of where the host is, it must learn from a board. Returns its profile and fingerprint.
-fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, String) {
+/// (the host's own entries taken out of `anchored`, [`room_anchored_address`]): its room holds no
+/// address for the host, so whatever it knows of where the host is, it must learn from a board.
+/// Returns its profile and fingerprint.
+fn anchor_only_guest(
+    w: &ForwardedWorld,
+    anchored: &str,
+    name: &str,
+) -> (std::path::PathBuf, String) {
     use world::{args, room_pass_file, vox_once};
     let carol = w.tmp.path().join(name);
     world::mkdir(&carol.join("cfg"));
@@ -498,7 +504,7 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
         ok,
         "PRODUCT (staging): the host's `vox trust add` of {name} failed:\n{out}{err}"
     );
-    let anchor_only = without_entry_of(&w.address, &w.host_fp);
+    let anchor_only = without_entry_of(anchored, &w.host_fp);
     assert!(
         !anchor_only.contains(&format!("a={}", w.host_fp)),
         "APPARATUS: the host's entry is still in {name}'s address: {anchor_only}"
@@ -523,6 +529,31 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
     (carol, carol_fp)
 }
 
+/// The room's address naming the world's anchor, as its creator now gets one: `vox room anchors
+/// <room> add`, then `vox room link`. Since the machine anchor inventory (#779, 445b3e35c), the
+/// host's `vox serve --anchor` names a machine anchor, which never enters a room's address.
+fn room_anchored_address(w: &ForwardedWorld) -> String {
+    use world::{args, vox_once};
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["room", "anchors", &w.room, "add", &w.anchor.v4_spec]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the host's `vox room anchors {} add` failed:\n{out}{err}",
+        w.room
+    );
+    let (ok, out, err) = vox_once(&w.host_dir, &args(&["room", "link", &w.room]));
+    let address = out.lines().next().unwrap_or_default().trim().to_owned();
+    let anchor_fp = w.anchor.v4_spec.split_once('@').map_or("-", |(fp, _)| fp);
+    assert!(
+        ok && address.contains(&format!("a={anchor_fp}")),
+        "PRODUCT (staging): the host's `vox room link` printed no address naming the room's \
+         anchor {anchor_fp}:\n{out}{err}"
+    );
+    address
+}
+
 /// **A node reads the board before it bridges** (V030-22, #335). Dave joins from an anchor-only
 /// address, so his node holds no address for the host, and starts a `vox forward` to the host's
 /// service — which reaches the host the moment it starts. The host's only address dave can use is
@@ -544,7 +575,8 @@ fn a_node_reads_the_board_before_bridging() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
-    let (dave, dave_fp) = anchor_only_guest(&w, "dave");
+    let anchored = room_anchored_address(&w);
+    let (dave, dave_fp) = anchor_only_guest(&w, &anchored, "dave");
     let _reaper = world::Reaper(vec![dave.clone()]);
     // **Under one daemon per data root** (ADR-026) the join's daemon kept dave's node running, and
     // it learned the host's record from the board while it ran: a forward started then is its

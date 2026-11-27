@@ -1484,7 +1484,12 @@ impl Node {
         }
     }
 
-    pub(super) async fn complete_pending_metadata(&mut self) {
+    pub(super) fn complete_pending_metadata(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.complete_pending_metadata_unboxed())
+    }
+
+    /// [`Self::complete_pending_metadata`], unboxed: see [`Boxed`].
+    async fn complete_pending_metadata_unboxed(&mut self) {
         self.complete_metadata_publication_network().await;
         self.complete_metadata_journals().await;
         self.complete_prekey_metadata();
@@ -4184,7 +4189,12 @@ impl Node {
         }
     }
 
-    pub(super) async fn advance_metadata_join_replies(&mut self) {
+    pub(super) fn advance_metadata_join_replies(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.advance_metadata_join_replies_unboxed())
+    }
+
+    /// [`Self::advance_metadata_join_replies`], unboxed: see [`Boxed`].
+    async fn advance_metadata_join_replies_unboxed(&mut self) {
         let rooms: Vec<_> = self
             .pending_metadata
             .as_ref()

@@ -23,7 +23,8 @@
 //!   lag. Three earlier versions (a stall during a trickle, then under 450 and 900
 //!   short appends, the last green on macOS and red on GitHub's ubuntu runner) depended
 //!   on how many *bytes* a machine's buffers hold, and failed for exactly that reason;
-//! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
+//! - the consumer **killed three times** with SIGKILL, the first once it has printed what the
+//!   freeze left and said it fell behind, the other two at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
 //! - then the consumer's **node** killed with SIGKILL and started again (ADR-021 F19), after
 //!   alice and bob have posted alternately so bob holds late arrivals — rows that took their
@@ -535,8 +536,22 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     std::thread::sleep(Duration::from_secs(2));
     signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
-    consume(&run, 300, idle, &mut cursor, &mut seen);
-    mark!("run1 consumed 300");
+    // **The lag is reported after the backlog** (since `7bc390c74`, 2026-10-14): an event is a
+    // wake only, and on the first wake `tail` prints everything after its cursor, page by page,
+    // before it reads its stream again; the `Lagged` report waits behind the wakes still in its
+    // socket. Killed partway through that backlog (300 rows, as before that commit, when each
+    // own post was printed from its event) it never reads the report. So it processes the 899
+    // rows the freeze left, then is killed once it has said it fell behind.
+    consume(&run, 899, idle, &mut cursor, &mut seen);
+    mark!("run1 consumed the backlog");
+    let told = std::time::Instant::now();
+    while told.elapsed() < idle
+        && !std::fs::read_to_string(&stderr)
+            .unwrap_or_default()
+            .contains("fell behind")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 2: die in the middle of a synced burst from the other node.
     let mut run = start(bob, &r, &cursor, &stderr);
@@ -590,14 +605,34 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     burst(alice, 300, 0);
     mark!("all bursts posted");
 
-    let all = until(
+    // `vox room read` answers one bounded page (28d77d3a2): what bob holds after the starting
+    // cursor is `--since` it, and each page after that its "For the next page" line names, as a
+    // person pastes it, until none is named.
+    let pages = |first: &Out| -> Vec<serde_json::Value> {
+        let mut rows = first.ndjson();
+        let mut page = first.clone();
+        while let Some(next) = page
+            .stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("For the next page: "))
+            .and_then(|c| c.split_whitespace().skip_while(|w| *w != "--since").nth(1))
+            .map(str::to_owned)
+        {
+            page = bob.vox(None, &["room", "read", &r, "--since", &next, "--json"]);
+            if !page.ok {
+                break;
+            }
+            rows.extend(page.ndjson());
+        }
+        rows
+    };
+    let all = pages(&until(
         bob,
         None,
         "bob to hold all 1,800 messages",
-        &["room", "read", &r, "--json"],
+        &["room", "read", &r, "--since", &start_cursor, "--json"],
         |o: &Out| {
-            o.ok && o
-                .ndjson()
+            o.ok && pages(o)
                 .iter()
                 .filter(|x| {
                     x["text"]
@@ -607,8 +642,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
                 .count()
                 == 1800
         },
-    )
-    .ndjson();
+    ));
     let after: Vec<String> = all
         .iter()
         .map(|x| {
@@ -619,8 +653,6 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
                 })
                 .to_owned()
         })
-        .skip_while(|h| *h != start_cursor)
-        .skip(1)
         .collect();
     assert_eq!(
         after.len(),
@@ -766,12 +798,14 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert!(o.ok, "PRODUCT: bob's `room read` failed: {o:?}");
     std::thread::sleep(Duration::from_secs(12));
     to_alice("-CONT");
+    // Every one of her 20, not her last: an author's posts reach a reader newest and oldest in
+    // turn, newest first (`12abc309b`), so "F19 alice 19" is shown before her middle posts.
     until(
         bob,
         None,
-        "alice's last interleaved post to reach bob",
+        "all 20 of alice's interleaved posts to reach bob",
         &["room", "read", &r],
-        |o: &Out| o.ok && o.stdout.contains("F19 alice 19"),
+        |o: &Out| o.ok && (0..20).all(|i| o.stdout.contains(&format!("F19 alice {i:02}"))),
     );
     let order = |w: &Worker| -> Vec<serde_json::Value> {
         let o = w.vox(None, &["room", "read", &r, "--json"]);

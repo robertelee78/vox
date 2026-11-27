@@ -12,12 +12,16 @@ mod watchdog;
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(a_rollback_to_an_older_release_restarts_its_running_daemon);
+optional_proof::not_run!(
+    an_interrupted_rollback_is_finished_by_the_next_one,
+    a_rollback_to_an_older_release_restarts_its_running_daemon,
+);
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+#[cfg(feature = "optional-proofs")]
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// An install as `install.sh` makes one: the real `vox`, and a marker naming its channel.
@@ -35,6 +39,7 @@ fn install_dir(root: &Path) -> PathBuf {
 }
 
 /// Stage the other genuinely compiled binary, never a script impersonating a release.
+#[cfg(feature = "optional-proofs")]
 fn previous_binary(path: &Path) -> String {
     let binary = std::env::var_os("VOX_PROOF_NEXT_BINARY").expect(
         "APPARATUS: set VOX_PROOF_NEXT_BINARY to a genuinely compiled different-version vox",
@@ -83,6 +88,7 @@ fn apparatus_spawn() -> std::time::Duration {
 }
 
 /// What `path --version` says, or `None` if it did not run.
+#[cfg(feature = "optional-proofs")]
 fn version_of(path: &Path) -> Option<String> {
     let scratch = path.parent()?;
     let out = Command::new(path)
@@ -142,8 +148,9 @@ fn impostor(path: &Path, body: &str) {
 ///    discarded, `vox` is untouched, and with no previous the rollback refuses.
 ///
 /// Mutation: the recovery removed → (1) is refused.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real install directories and the shipped binary; the macOS release gate runs it"]
+#[ignore = "optional: set VOX_PROOF_NEXT_BINARY to a genuinely compiled different-version vox"]
 fn an_interrupted_rollback_is_finished_by_the_next_one() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");

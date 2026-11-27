@@ -132,10 +132,18 @@ pub(crate) async fn offer(
     };
     before(&what, &which, &reach);
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
-    // **A share is a post, and follows a post's hop rule** (ADR-020 §9): a share that answers
-    // `--re` spends a hop of that message's budget.
-    let (re, hops, thread) =
-        crate::room_cli::answers(&mut client, channel_id, opts.re.as_deref()).await?;
+    // **A share is a post, and follows a post's hop rule** (ADR-020 §9, V210-121): it answers
+    // what woke the session, and spends a hop of that budget. An urgent share with a fresh one
+    // would let two agents wake each other for ever by sharing.
+    let (re, hops, thread, mut notes) = crate::room_cli::answers(
+        &mut client,
+        channel_id,
+        paths,
+        session.as_deref(),
+        opts.re.as_deref(),
+        opts.urgent,
+    )
+    .await?;
     let thread = crate::room_cli::reply_thread(re.as_deref(), thread, None)?;
     let tags = crate::room_cli::reply_tags(&mut client, channel_id, thread.as_deref(), &[]).await?;
     let env = {
@@ -174,7 +182,6 @@ pub(crate) async fn offer(
             "the daemon did not say what it shares".into(),
         ));
     };
-    let mut notes = Vec::new();
     if opts.urgent {
         let me = client
             .me()

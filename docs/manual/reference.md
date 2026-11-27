@@ -50,7 +50,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
 | Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | a Ready node |
 | A room's local network | `vox lan up` | the LAN helper |
-| Pair your computers | `vox computer status`, `invite`, `pair`, `approve`, `personal`, `remove` | operator approval on each computer; actual invitation/operation |
+| Pair your computers | `vox computer status`, `pair`, `approve`, `personal`, `remove` | operator approval on each computer; actual pairing code/operation |
 | Room anchors | `vox room anchors`, `vox room create --room-anchor` | room creator/admin; actual anchor identity/address |
 | Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | actual harness; known `--node` where required |
 | Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | Drive for private activity and controls |
@@ -85,9 +85,9 @@ passphrase in a constructed command.
 ## Pairing your computers
 
 Computer pairing is an operator action on **both** computers. On the first, run
-`vox computer invite` or open Settings → Add Computer… in Vox. Transfer its one-time link
+`vox computer pair` or open Settings → Add Computer… in Vox. Transfer its one-time link
 privately to the other computer. There, run the complete `vox computer pair` command printed
-with the invitation, review the authenticated computer identity and policy, and answer `yes`
+with the pairing code, review the authenticated computer identity and policy, and answer `yes`
 only if they are correct. In the app, review the computer in My Computers and use
 **Trust This Computer**. On the first computer, `vox computer status` shows the authenticated
 proposal and the exact `vox computer approve` command to run there. Both approvals are required;

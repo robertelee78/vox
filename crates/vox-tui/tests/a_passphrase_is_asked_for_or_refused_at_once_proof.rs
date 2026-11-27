@@ -253,6 +253,7 @@ impl Drop for OnTerminal {
 }
 
 #[test]
+#[ignore = "a real vox daemon and production Argon2id; run on demand, on Linux too"]
 fn a_daemon_on_a_terminal_serves_after_the_passphrase() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
@@ -294,6 +295,7 @@ fn a_daemon_on_a_terminal_serves_after_the_passphrase() {
 }
 
 #[test]
+#[ignore = "real vox daemons, production Argon2id and Equihash; run on demand, on Linux too"]
 fn a_partly_pasted_room_passphrase_joins_without_echoing() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");

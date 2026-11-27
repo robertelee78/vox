@@ -403,7 +403,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(!ok, "PRODUCT (1): a wrong passphrase must not join: {said}");
     assert!(
-        said.contains("refused the join"),
+        said.contains("a member answered but did not accept the join"),
         "PRODUCT (staging) (1): the join with a wrong passphrase was not refused by a member, so \
          the exchange was not where it failed: {said}"
     );
@@ -771,8 +771,9 @@ fn a_holder_runs_without_its_control_socket() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: harness step failed");
     let quick = Duration::from_secs(90);
-    // A profile path too long for a socket address, so the socket falls back to
-    // `$TMPDIR/vox-<uid>`; and there, a plain file where that directory should be.
+    // A profile path too long for a socket address, so the socket falls back to the short
+    // directory the product derives from it, `/tmp/vox-<uid>-<16 hex>`, whatever the caller's
+    // TMPDIR (362a3f984); and there, a plain file where that directory should be.
     let long = |n: &str| {
         let d = tmp.path().join(format!("{n}-{}", "p".repeat(120)));
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness step failed");
@@ -781,20 +782,27 @@ fn a_holder_runs_without_its_control_socket() {
     let (host_dir, guest_dir) = (long("host"), long("guest"));
     let anchor_dir = tmp.path().join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: harness step failed");
-    let blocked_tmp = tmp.path().join("t");
-    std::fs::create_dir_all(&blocked_tmp).expect("APPARATUS: harness step failed");
-    let uid = String::from_utf8(
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .expect("APPARATUS: harness step failed")
-            .stdout,
+    let squat = vox_core::node::paths::socket_path_in(
+        &host_dir.join(vox_core::node::paths::DAEMON_DIR),
+        vox_core::node::paths::DAEMON_SOCKET_FILE,
     )
-    .expect("APPARATUS: harness step failed");
-    let squat = blocked_tmp.join(format!("vox-{}", uid.trim()));
+    .parent()
+    .expect("APPARATUS: the socket has a directory")
+    .to_owned();
+    assert!(
+        !squat.starts_with(&host_dir) && !squat.exists(),
+        "APPARATUS (staging): {} is not a fresh fallback socket directory",
+        squat.display()
+    );
     std::fs::write(&squat, "not a directory\n").expect("APPARATUS: harness step failed");
-    let tmpdir = format!("{}/", blocked_tmp.display());
-    let env = [("TMPDIR", tmpdir.as_str())];
+    // The squat is outside the scratch directory: removed however this proof ends.
+    struct Removed(std::path::PathBuf);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _removed = Removed(squat.clone());
 
     let anchor = Proc::spawn(
         "anchor",
@@ -810,7 +818,7 @@ fn a_holder_runs_without_its_control_socket() {
         .trim()
         .to_owned();
     for d in [&host_dir, &guest_dir] {
-        let (ok, said, _) = must("vox id", vox_env(d, &["id"], "", quick, &env));
+        let (ok, said, _) = must("vox id", vox(d, &["id"], "", quick));
         assert!(ok, "PRODUCT (staging): `vox id` failed: {said}");
     }
     let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: harness step failed");
@@ -819,7 +827,7 @@ fn a_holder_runs_without_its_control_socket() {
         .expect("APPARATUS: harness step failed")
         .port()
         .to_string();
-    let mut host = Proc::spawn_env(
+    let mut host = Proc::spawn(
         "host",
         &host_dir,
         &[
@@ -831,7 +839,6 @@ fn a_holder_runs_without_its_control_socket() {
             "127.0.0.1:0",
         ],
         "",
-        &env,
     );
     // Since ADR-026 the account socket is how every verb reaches its node, so a daemon that cannot
     // bind it serves nobody: `vox serve` starts one, which refuses the squatted directory, and
@@ -1598,15 +1605,25 @@ fn a_request_ended_without_a_reply_is_in_the_daemons_log() {
          this is not a request ended without a reply"
     );
 
+    // The daemon's log counts a repeated line in place: one line, its time and its count
+    // updated (ADR-034 LG-1-LG-2, 8fc345cf6, #704).
+    let count = |l: &str| -> u64 {
+        l.rsplit_once("[count=")
+            .and_then(|(_, n)| n.trim_end_matches(']').parse().ok())
+            .unwrap_or(0)
+    };
     let t0 = Instant::now();
     let mut line = String::new();
+    let mut opened = 0;
     while t0.elapsed() < Duration::from_secs(10) {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         if let Some(l) = text[before.min(text.len())..]
             .lines()
             .find(|l| l.contains("a client's request was ended without a reply"))
         {
-            line = l.to_owned();
+            // Each line of the daemon's log starts with its time, then what the daemon said.
+            line = l.split_once(' ').map_or(l, |(_, said)| said).to_owned();
+            opened = count(l);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1635,7 +1652,6 @@ fn a_request_ended_without_a_reply_is_in_the_daemons_log() {
     );
     assert!(ok, "APPARATUS (staging): vox node attach default: {said}");
     let pid = daemon_pid_of(&dir);
-    let before = std::fs::read_to_string(&log).unwrap_or_default().len();
     let mut s = UnixStream::connect(dir.join(".daemon").join("vox.sock"))
         .expect("APPARATUS: connect to the daemon's socket");
     s.set_read_timeout(Some(Duration::from_secs(10)))
@@ -1674,15 +1690,15 @@ fn a_request_ended_without_a_reply_is_in_the_daemons_log() {
         "APPARATUS (staging): the daemon replied ({replied} bytes) to the oversized frame on the \
          node's connection, so this is not a request ended without a reply"
     );
+    // The same words again, so said on the same line, counted once more.
     let t0 = Instant::now();
     let mut line = String::new();
     while t0.elapsed() < Duration::from_secs(10) {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        if let Some(l) = text[before.min(text.len())..]
-            .lines()
-            .find(|l| l.contains("a client's request was ended without a reply"))
-        {
-            line = l.to_owned();
+        if let Some(l) = text.lines().find(|l| {
+            l.contains("a client's request was ended without a reply") && count(l) > opened
+        }) {
+            line = l.split_once(' ').map_or(l, |(_, said)| said).to_owned();
             break;
         }
         std::thread::sleep(Duration::from_millis(50));

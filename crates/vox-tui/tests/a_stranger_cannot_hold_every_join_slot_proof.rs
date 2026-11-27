@@ -606,7 +606,8 @@ fn anchor_circuits(s: &Staged) -> (usize, usize) {
     for l in text.lines() {
         if let Some((_, after)) = l
             .strip_prefix("vox node: ")
-            .and_then(|r| r.split_once(" peer(s) connected, "))
+            .and_then(|r| r.split_once(" peer(s) connected ["))
+            .and_then(|(_, r)| r.split_once("], "))
         {
             if let Some(n) = after.split_whitespace().next().and_then(|n| n.parse().ok()) {
                 reports += 1;

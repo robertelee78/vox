@@ -189,7 +189,7 @@ daemon and quits the app, then removes:
 - on a Mac, Vox's login item and LAN helper;
 - the Keychain items stored for your nodes;
 - the agent hooks, plugin and skill pack installed for Claude Code, Codex and OpenCode;
-- the shell completions and the startup-file block;
+- the shell completions and the lines `vox shell-setup` added to startup files;
 - `Vox.app` or the `vox` binary, with its update record and the kept previous copy.
 
 It names and keeps any file you changed or Vox did not write. It refuses a `vox` the installer did

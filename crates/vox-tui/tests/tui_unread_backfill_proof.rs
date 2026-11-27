@@ -42,7 +42,7 @@
 //! **Three levels and a key** (ADR-028 R-8, #484). Then alice, in a second room bob joins
 //! (`chatty`), says something to the room and posts a status, and in `mission` posts to bob
 //! (`--to`). Asserted: mission reads "to you 1", chatty "1 new · 1 coordination" and nothing to
-//! bob, and Ctrl-N opens mission, the room with a message addressed to bob, passing over chatty.
+//! bob.
 //!
 //! **What came while the TUI was closed** (ADR-028 R-8): bob's node, attached by hand, takes
 //! alice's next message to bob while no TUI runs; a TUI opened afterwards must read mission "to
@@ -51,7 +51,7 @@
 //!
 //! Mutations: `--history now` for alice's grant, or the backfill on grant arrival removed —
 //! the row never renders and the badge stays at 0. An addressed message counted as plain new
-//! (`unread_level` never `ToYou`): mission reads "2 new", not "to you 1", and Ctrl-N opens nothing.
+//! (`unread_level` never `ToYou`): mission reads "2 new", not "to you 1".
 //! A TUI that does not count what came while it was closed (no `Request::Unread` at its start):
 //! mission reads nothing once the TUI is opened again.
 
@@ -297,7 +297,7 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     tui.keys(format!("{IDPASS}\r").as_bytes());
     // There is no locked state (ADR-026 N-2): the status bar names the node, attached.
     tui.expect("that its node attached", 90, |t| {
-        t.contains("  ·  attached: ") && !t.contains("(not attached)")
+        t.contains("node default  ·  Ready: ")
     });
 
     // ---- rooms, made over the TUI's own control socket ----
@@ -556,18 +556,21 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
         "PRODUCT: chatty has nothing addressed to bob, and reads {chatty_line:?}"
     );
     println!("[proof] levels: {mission:?} / {chatty_line:?}");
-    // Ctrl-N: the next room with a message addressed to bob is mission, whichever order the list
-    // has; chatty, with only new messages, is passed over.
-    tui.keys(b"\x0e");
-    let shown = tui.expect("a room on screen after Ctrl-N", 10, |t| {
-        !t.contains("Rooms (Enter")
+    // bob opens mission as a person does (selects it, Enter), so its message to him is read
+    // before the TUI closes: the count below stands on that. (Ctrl-N, which opened it here
+    // before, was removed on purpose: `20c456db6`, #842.)
+    for _ in 0..4 {
+        if tui.text().lines().any(|l| l.contains("▶ mission")) {
+            break;
+        }
+        tui.keys(b"\x1b[A"); // Up
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    tui.expect("mission selected", 10, |t| t.contains("▶ mission"));
+    tui.keys(b"\r");
+    tui.expect("mission on screen with alice's message to bob", 10, |t| {
+        t.contains("MISSION-TO-BOB")
     });
-    assert!(
-        shown.contains("MISSION-TO-BOB"),
-        "PRODUCT: Ctrl-N must open the room with a message addressed to bob (mission); the \
-         screen:\n{shown}"
-    );
-    println!("[proof] Ctrl-N opened mission, the room with a message to bob");
 
     // ---- what came while the TUI was closed is counted when it opens (ADR-028 R-8) ----------
     // Bob's node is kept attached by hand, so it takes alice's message while no TUI runs; the TUI

@@ -9200,8 +9200,8 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
         const ATTEMPTS: usize = 3;
         let mut refusals = Vec::new();
         for attempt in 1..=ATTEMPTS {
-            let invite = inviter.vox(None, &["computer", "invite", "--json"]);
-            invite.expect_ok("computer invite");
+            let invite = inviter.vox(None, &["computer", "pair", "--json"]);
+            invite.expect_ok("computer pair");
             let invitation = invite.json();
             let link = invitation["invite_link"]
                 .as_str()

@@ -611,7 +611,7 @@ fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             .collect();
         let w = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(pane_block("Share a service", true));
+            .block(pane_block("Share a service", true, area.width));
         frame.render_widget(w, area);
         return;
     }
@@ -640,6 +640,7 @@ fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     let list = List::new(items).block(pane_block(
         "Services listening on this machine (Enter: preview · Esc: back)",
         true,
+        area.width,
     ));
     frame.render_widget(list, area);
 }
@@ -927,6 +928,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                     "Shared · r: first"
                 },
                 shared_focus,
+                area.width,
             )),
             *area,
         );
@@ -998,7 +1000,10 @@ fn render_session(
     }
     let start = end.saturating_sub(height);
     let shown: Vec<Line> = rows[start..end].to_vec();
-    frame.render_widget(Paragraph::new(shown).block(pane_block(title, focus)), area);
+    frame.render_widget(
+        Paragraph::new(shown).block(pane_block(title, focus, area.width)),
+        area,
+    );
 }
 
 fn tab_label(x: &crate::viewmodel::SessionView, ui: &UiState) -> (String, bool) {
@@ -1082,7 +1087,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, channel: &ChannelView, ui: &UiStat
         channel.members.len()
     );
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(pane_block(&title, focused)),
+        Paragraph::new(Line::from(spans)).block(pane_block(&title, focused, area.width)),
         area,
     );
 }
@@ -1121,7 +1126,7 @@ fn render_ended_menu(frame: &mut Frame, area: Rect, channel: &ChannelView, ui: &
         ratatui::widgets::ListState::default().with_selected(Some(ui.selected_session_row));
     frame.render_widget(ratatui::widgets::Clear, menu);
     frame.render_stateful_widget(
-        List::new(items).block(pane_block("Ended · history page", true)),
+        List::new(items).block(pane_block("Ended · history page", true, menu.width)),
         menu,
         &mut selection,
     );
@@ -1463,7 +1468,7 @@ fn render_timeline<'a>(
             }
         )
     };
-    let p = Paragraph::new(shown).block(pane_block(&title, focus));
+    let p = Paragraph::new(shown).block(pane_block(&title, focus, area.width));
     frame.render_widget(p, area);
     images.retain_visible(&on_screen, area.width.saturating_sub(2));
     // Each image whose rows are all in the window is drawn over them; one cut by its edge is not.
@@ -1574,7 +1579,7 @@ fn render_composer(
     } else {
         format!("Composer — {}", said.join(" · "))
     };
-    let p = Paragraph::new(shown).block(pane_block(&title, focus));
+    let p = Paragraph::new(shown).block(pane_block(&title, focus, area.width));
     frame.render_widget(p, area);
 }
 
@@ -1636,7 +1641,7 @@ fn render_members(
             ListItem::new(lines)
         })
         .collect();
-    let list = List::new(items).block(pane_block("Members", focus));
+    let list = List::new(items).block(pane_block("Members", focus, area.width));
     frame.render_widget(list, area);
 }
 
@@ -1672,10 +1677,29 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
 }
 
 /// A pane's frame, its title said once: "Members", or "Members [focus]" while it holds the focus.
-fn pane_block(title: &str, focus: bool) -> Block<'static> {
+/// The mark is never what a long title loses to the pane's `width`: the title is cut short, ending
+/// "…", so a person always sees which pane has the focus.
+fn pane_block(title: &str, focus: bool, width: u16) -> Block<'static> {
     let b = Block::default().borders(Borders::ALL);
     if focus {
-        focus_block(b.title(format!("{title} [focus]")))
+        const MARK: &str = " [focus]";
+        let room = usize::from(width.saturating_sub(2)).saturating_sub(MARK.len());
+        let mut shown = String::new();
+        if Line::from(title).width() <= room {
+            shown.push_str(title);
+        } else {
+            let mut used = 0;
+            for ch in title.chars() {
+                let w = Span::raw(&*ch.encode_utf8(&mut [0; 4])).width();
+                if used + w + 1 > room {
+                    break;
+                }
+                shown.push(ch);
+                used += w;
+            }
+            shown.push('…');
+        }
+        focus_block(b.title(format!("{shown}{MARK}")))
     } else {
         b.title(title.to_owned())
             .border_style(theme::fg(theme::LINE_HAIR))

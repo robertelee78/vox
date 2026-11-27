@@ -2,7 +2,7 @@
 """tui_attach_notes.py <vox> <data_dir> <config_dir> <identity_pass> <tag>
 
 `vox tui` attaches its node itself, as a person does: the node is on disk and not attached, the TUI
-asks for its passphrase at its "Attach node" prompt, and the passphrase is typed there. What
+asks for its passphrase at its "Unlock node" prompt, and the passphrase is typed there. What
 attaching the node said (a skipped anchors line, "carrying on with no anchor") is then read off the
 TUI's screen, where a person would read it.
 
@@ -43,7 +43,7 @@ try:
         return " ".join(" ".join(r.split()) for r in tui.display()[-6:])
 
     stage("the attach prompt")
-    if not tui.until(lambda: tui.closed or "attach node" in tui.text().lower(), 60):
+    if not tui.until(lambda: tui.closed or "unlock node" in tui.text().lower(), 60):
         print(f"{TAG} RED: PRODUCT: the TUI never asked to attach its node:\n{tui.text()}")
         sys.exit(1)
     stage("attach")

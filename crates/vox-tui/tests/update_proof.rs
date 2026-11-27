@@ -7,7 +7,15 @@
 //!
 //! ## What blocks, and what is opt-in
 //! [`vox_update_replaces_an_install_it_owns_and_refuses_the_rest`] measures this build: its
-//! refusals, the record lookup, `--check`, and `--rollback`. It blocks.
+//! refusals, the record lookup, `--check`, and `--rollback` with nothing to roll back to. It
+//! blocks.
+//!
+//! The journeys that move an install, a daemon or a claim to another genuinely compiled version
+//! need `VOX_PROOF_NEXT_BINARY`, which the release gate does not supply, so they are optional
+//! proofs: [`vox_update_moves_an_install_it_owns_to_another_compiled_version_and_back`],
+//! [`an_update_restarts_its_daemon_and_uses_a_different_local_version`],
+//! [`a_client_uses_another_package_version_with_the_same_control_protocol`] and
+//! [`a_claim_is_still_held_after_the_package_version_changes`].
 //!
 //! [`an_older_release_updates_itself_and_refuses_a_bad_download`] downloads the **published**
 //! previous release and runs *its* `vox update` — the journey a person takes, but measuring an
@@ -39,13 +47,14 @@ mod optional_proof;
 #[path = "support/release_server.rs"]
 mod release_server;
 
+#[cfg(any(target_os = "linux", feature = "optional-proofs"))]
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
 #[path = "support/typed.rs"]
 mod typed;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "optional-proofs"))]
 #[path = "support/dead_candidate.rs"]
 mod dead_candidate;
 optional_proof::not_run!(
@@ -53,6 +62,10 @@ optional_proof::not_run!(
     an_update_and_rollback_leave_one_launchable_vox,
     a_published_install_updates_through_github_with_its_agent_turn,
     a_candidate_source_pair_updates_with_its_agent_turn,
+    vox_update_moves_an_install_it_owns_to_another_compiled_version_and_back,
+    an_update_restarts_its_daemon_and_uses_a_different_local_version,
+    a_client_uses_another_package_version_with_the_same_control_protocol,
+    a_claim_is_still_held_after_the_package_version_changes,
 );
 
 use std::collections::BTreeMap;
@@ -513,6 +526,22 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    bundle_refusal_claim(&mut claims);
+    dispose("vox update proof", &claims, &receipts, true);
+}
+
+/// The half of [`vox_update_replaces_an_install_it_owns_and_refuses_the_rest`] that moves an
+/// install to another genuinely compiled version and back: it needs `VOX_PROOF_NEXT_BINARY`,
+/// which the release gate does not supply, so it is an optional proof
+/// (docs/release/optional-proofs.md) and accepts no gap.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: set VOX_PROOF_NEXT_BINARY to a vox compiled as the next version"]
+fn vox_update_moves_an_install_it_owns_to_another_compiled_version_and_back() {
+    watchdog::arm();
+    let mut claims: Vec<Claim> = Vec::new();
+    let mut receipts: BTreeMap<String, String> = BTreeMap::new();
     {
         let tmp = tmpdir();
         let home = tmp.path();
@@ -542,11 +571,17 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                 said(&out)
             ),
         ));
+        receipts.insert("rollback.honours_the_opt_out".into(), said(&out));
     }
 
     #[cfg(target_os = "macos")]
     bundle_claims(&mut claims, &mut receipts);
-    dispose("vox update proof", &claims, &receipts, true);
+    dispose(
+        "vox update proof, another compiled version",
+        &claims,
+        &receipts,
+        false,
+    );
 }
 
 /// Minimal ad-hoc bundle fixture, not native-app or Apple trust evidence.
@@ -614,7 +649,7 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
 }
 
 /// What a bundle's Info.plist says its version is, or empty.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn app_says(app: &Path) -> String {
     Command::new("/usr/libexec/PlistBuddy")
         .args(["-c", "Print :CFBundleShortVersionString"])
@@ -624,7 +659,7 @@ fn app_says(app: &Path) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
@@ -637,7 +672,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Build a controlled bundle from a genuinely compiled helper.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
     let work = tmpdir();
     let app = app_bundle(work.path(), version, helper);
@@ -645,7 +680,7 @@ fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&st
 }
 
 /// Serve the exact signed bundle bytes; neither the helper nor the plist is rewritten.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str, Option<&str>)]) {
     let triple = target_triple();
     let work = tmpdir();
@@ -723,7 +758,7 @@ fn bundle_install(home: &Path, channel: Option<&str>) -> PathBuf {
 }
 
 /// ADR-014 M-29: a Vox.app install is updated and rolled back as a whole.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String>) {
     test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
     let tree = tmpdir();
@@ -847,28 +882,39 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             ),
         ));
     }
-
-    // ---- a Vox.app install.sh did not make is not touched (M-29) ---------------------------
-    {
-        let tmp = tmpdir();
-        let home = tmp.path();
-        let link = bundle_install(home, None);
-        let out = vox(&link, home, &["update", "--rollback"], &base);
-        let text = said(&out);
-        claims.push(claim(
-            "bundle.refuses_an_app_install_sh_did_not_make",
-            !out.status.success()
-                && text.contains(".vox-standalone.json")
-                && text.contains("install.sh"),
-            format!("a Vox.app with no marker beside it said {text:?}"),
-        ));
-    }
     drop(server);
+}
+
+/// ADR-014 M-29: a Vox.app install.sh did not make is not touched. It needs no other version, so
+/// it stays in the blocking journey; the release source it would read is a closed port.
+#[cfg(target_os = "macos")]
+fn bundle_refusal_claim(claims: &mut Vec<Claim>) {
+    let tmp = tmpdir();
+    let home = tmp.path();
+    let link = bundle_install(home, None);
+    let out = vox(
+        &link,
+        home,
+        &["update", "--rollback"],
+        &[
+            ("VOX_TEST_RELEASE_BASE", "http://127.0.0.1:0"),
+            ("VOX_NO_SHELL_SETUP", "1"),
+        ],
+    );
+    let text = said(&out);
+    claims.push(claim(
+        "bundle.refuses_an_app_install_sh_did_not_make",
+        !out.status.success()
+            && text.contains(".vox-standalone.json")
+            && text.contains("install.sh"),
+        format!("a Vox.app with no marker beside it said {text:?}"),
+    ));
 }
 
 /// A genuinely compiled next-release binary, supplied as proof apparatus. Patching version
 /// strings in a binary cannot change optimized version comparisons, so it proves a different
 /// program. Build this tree with the requested workspace version and supply its path.
+#[cfg(any(target_os = "linux", feature = "optional-proofs"))]
 fn vox_saying(dir: &Path, version: &str) -> Result<PathBuf, String> {
     let fixture = std::env::var_os("VOX_PROOF_NEXT_BINARY")
         .map(PathBuf::from)
@@ -917,6 +963,7 @@ fn standalone_release_of(root: &Path, version: &str, helper: &Path) {
 }
 
 /// Whatever holds a file under `dir` open: the vox processes a proof started for that account.
+#[cfg(any(target_os = "linux", feature = "optional-proofs"))]
 fn holders(dir: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
@@ -955,8 +1002,9 @@ fn holders(dir: &Path) -> Vec<String> {
 }
 
 /// ADR-034 UP-1 and UP-2: the real update journey, isolated from unrelated download cases.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real update, production Argon2id; run in release with test-knobs"]
+#[ignore = "optional: set VOX_PROOF_NEXT_BINARY to a vox compiled as 9.x; run in release with test-knobs"]
 fn an_update_restarts_its_daemon_and_uses_a_different_local_version() {
     watchdog::arm();
     if std::env::var_os("VOX_PROOF_BUNDLE_BEFORE_SWAP").is_none() {
@@ -993,10 +1041,10 @@ fn an_update_restarts_its_daemon_and_uses_a_different_local_version() {
     dispose("daemon update proof", &claims, &receipts, false);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 struct ProofChild(std::process::Child);
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 impl Drop for ProofChild {
     fn drop(&mut self) {
         let _ = Command::new("/bin/kill")
@@ -1007,13 +1055,13 @@ impl Drop for ProofChild {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 struct BundleJob {
     target: String,
     plist: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 impl BundleJob {
     fn state(&self) -> String {
         let out = Command::new("/bin/launchctl")
@@ -1036,7 +1084,7 @@ impl BundleJob {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 impl Drop for BundleJob {
     fn drop(&mut self) {
         let out = Command::new("/bin/launchctl")
@@ -1056,7 +1104,7 @@ impl Drop for BundleJob {
 }
 
 /// The public control greeting is observed without starting a replacement daemon.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn bundle_before_swap_claim(precommit: bool) {
     use std::os::unix::process::CommandExt as _;
     assert_eq!(
@@ -1967,6 +2015,7 @@ fn a_linux_typed_unlock_stays_ready_after_update() {
 }
 
 /// Two genuinely compiled releases, with one private profile and only foreground daemons.
+#[cfg(feature = "optional-proofs")]
 struct VersionProfile {
     home: tempfile::TempDir,
     next: PathBuf,
@@ -1974,6 +2023,7 @@ struct VersionProfile {
     daemon: Option<std::process::Child>,
 }
 
+#[cfg(feature = "optional-proofs")]
 impl VersionProfile {
     fn new() -> Self {
         let home = tempfile::Builder::new()
@@ -2044,14 +2094,16 @@ impl VersionProfile {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 impl Drop for VersionProfile {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two compiled releases and a private daemon; run in release with test-knobs"]
+#[ignore = "optional: set VOX_PROOF_NEXT_BINARY to a vox compiled as 9.x; run in release with test-knobs"]
 fn a_client_uses_another_package_version_with_the_same_control_protocol() {
     watchdog::arm();
     if cfg!(target_os = "macos") {
@@ -2121,8 +2173,9 @@ fn a_client_uses_another_package_version_with_the_same_control_protocol() {
         "PRODUCT: same-protocol clients must use the other package's daemon: {}; watcher={frames:?}", said(&out));
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two compiled releases and a private daemon; run in release with test-knobs"]
+#[ignore = "optional: set VOX_PROOF_NEXT_BINARY to a vox compiled as 9.x; run in release with test-knobs"]
 fn a_claim_is_still_held_after_the_package_version_changes() {
     watchdog::arm();
     if cfg!(target_os = "macos") {
@@ -2214,6 +2267,7 @@ fn a_claim_is_still_held_after_the_package_version_changes() {
 /// standalone binary otherwise), it restarts the running daemon onto the new version. A node it
 /// keeps the passphrase of is attached again; any other attached node is detached, and the update
 /// names it with the command that attaches it again.
+#[cfg(feature = "optional-proofs")]
 fn daemon_restart_claim(
     claims: &mut Vec<Claim>,
     receipts: &mut BTreeMap<String, String>,
@@ -2552,7 +2606,7 @@ fn daemon_restart_claim(
     receipts.insert(id.into(), text);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "optional-proofs"))]
 fn linux_download_refusal_claims(
     claims: &mut Vec<Claim>,
     link: &Path,

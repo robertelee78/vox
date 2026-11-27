@@ -160,6 +160,10 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
+    // A Session claims and posts only once its node has registered it, as its harness's hook
+    // does at the start of a turn (ADR-020 §6.15 RA-3).
+    support::register_sending_session(alice, r, "s1");
+    support::register_sending_session(bob, r, "b1");
 
     // ---- (1) held and unchanged: nothing ----
     claim(alice, "s1", r, "kept", "600");
@@ -504,14 +508,18 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     );
 
     // (b) The stock CLI refuses a session and a to_session that are not one line, and says
-    // why without printing the payload on a line of its own.
-    for (what, args) in [
+    // why without printing the payload on a line of its own. A `--session` is named by a person
+    // in their own terminal: a harness's process may name only its own registered session, and
+    // any other is refused as a conflict first (ADR-020 §6.15 RA-3).
+    for (what, session, args) in [
         (
             "`vox room claim --session` with a newline-led payload",
+            None,
             vec!["room", "claim", r, "anything", "--session", PAYLOAD],
         ),
         (
             "`vox room handoff --to-session` with a newline-led payload",
+            Some("b1"),
             vec![
                 "room",
                 "handoff",
@@ -524,7 +532,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
             ],
         ),
     ] {
-        let o = bob.vox(Some("b1"), &args);
+        let o = bob.vox(session, &args);
         let said = format!("{}{}", o.stdout, o.stderr);
         assert!(
             !o.ok && said.contains("is refused") && payload_lines(&said).is_empty(),

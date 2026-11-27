@@ -271,22 +271,18 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     const BUSY_ITEMS: usize = 70;
     const READS: usize = 5;
-    std::thread::scope(|s| {
-        for t in 0..7 {
-            s.spawn(move || {
-                for i in (t..BUSY_ITEMS).step_by(7) {
-                    let item = format!("busy-item-{i:02}");
-                    let o = as_session(alice, "alice", &["room", "claim", room, &item]);
-                    // Exit 5 says the claim is posted but not yet agreed by every member; the
-                    // quiet-room board read below is what confirms the staging.
-                    assert!(
-                        o.ok || o.code == Some(5),
-                        "APPARATUS (staging): alice's claim of {item} failed: {o:?}"
-                    );
-                }
-            });
-        }
-    });
+    // One claim at a time: the staging is a quiet room in which alice holds them all, and claims
+    // made at once by her own node would be each other's churn while every member is asked.
+    for i in 0..BUSY_ITEMS {
+        let item = format!("busy-item-{i:02}");
+        let o = as_session(alice, "alice", &["room", "claim", room, &item]);
+        // Exit 5 says the claim is posted but not yet agreed by every member; the
+        // quiet-room board read below is what confirms the staging.
+        assert!(
+            o.ok || o.code == Some(5),
+            "APPARATUS (staging): alice's claim of {item} failed: {o:?}"
+        );
+    }
     let held = |o: &support::Out| {
         o.json()["resources"].as_array().map_or(0, |rs| {
             rs.iter()
@@ -336,7 +332,9 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
         // row lists what arrived after it, so a bob-2 post among those rows landed after page 1.
         // That it landed before the last page: its `vox room post` had returned, the row saved,
         // MARGIN before the reader process exited, and the reader exits right after its last
-        // page. Reads continue until one such read is seen, or the deadline names it. The
+        // page. Reads continue until one such read is seen, or the deadline names it. Each read
+        // is looked at once, when a later bob-2 post has been recorded: bob-2 posts one at a
+        // time, so every post that returned before the read ended is in `posted` by then. The
         // posters are stopped before any red, or the scope would wait on them forever.
         const MARGIN: std::time::Duration = std::time::Duration::from_millis(40);
         struct Read {
@@ -344,31 +342,46 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
             last: String,
             entries: u64,
         }
-        let crossed = |reads: &[Read]| -> Option<usize> {
-            let posted = posted.lock().unwrap().clone();
-            reads.iter().position(|r| {
-                let saved: Vec<&str> = posted
+        let crosses = |r: &Read| -> bool {
+            let saved: Vec<String> = posted
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, t)| *t + MARGIN <= r.end)
+                .map(|(h, _)| h.clone())
+                .collect();
+            if saved.is_empty() {
+                return false;
+            }
+            let after = bob.vox(None, &["room", "read", room, "--since", &r.last, "--json"]);
+            after.ok
+                && after
+                    .ndjson()
                     .iter()
-                    .filter(|(_, t)| *t + MARGIN <= r.end)
-                    .map(|(h, _)| h.as_str())
-                    .collect();
-                if saved.is_empty() {
-                    return false;
-                }
-                let after = bob.vox(None, &["room", "read", room, "--since", &r.last, "--json"]);
-                after.ok
-                    && after
-                        .ndjson()
-                        .iter()
-                        .filter_map(|row| row["entry_hash"].as_str())
-                        .any(|h| saved.contains(&h))
-            })
+                    .filter_map(|row| row["entry_hash"].as_str())
+                    .any(|h| saved.iter().any(|s| s == h))
+        };
+        let recorded_after = |r: &Read| {
+            posted
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|(_, t)| *t > r.end)
         };
         let deadline = std::time::Instant::now() + support::TIMEOUT;
         let mut reads: Vec<Read> = Vec::new();
+        let (mut looked, mut inside) = (0usize, None);
         let verdict = loop {
-            if reads.len() >= READS && crossed(&reads).is_some() {
-                break Ok(());
+            while inside.is_none() && looked < reads.len() && recorded_after(&reads[looked]) {
+                if crosses(&reads[looked]) {
+                    inside = Some(looked);
+                }
+                looked += 1;
+            }
+            if reads.len() >= READS {
+                if let Some(inside) = inside {
+                    break Ok(inside);
+                }
             }
             if std::time::Instant::now() >= deadline {
                 break Err(format!(
@@ -411,10 +424,10 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
             });
         };
         stop.store(true, Ordering::Relaxed);
-        if let Err(red) = verdict {
-            panic!("{red}");
-        }
-        let inside = crossed(&reads).unwrap_or(0);
+        let inside = match verdict {
+            Ok(inside) => inside,
+            Err(red) => panic!("{red}"),
+        };
         println!(
             "[proof] {} whole {BUSY_ITEMS}-claim boards read while the room posted; read {inside} \
              (position.last {}) had a bob-2 post arrive between its pages; entries {} -> {}",

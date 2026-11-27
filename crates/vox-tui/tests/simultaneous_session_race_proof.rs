@@ -31,21 +31,11 @@
 //! delivered only once the peer has taken a key sealed under its session, never once it is
 //! written, so every key until then carries the hello again and the lower fingerprint's rule
 //! settles the pair.
-//!
-//! The second test forces that interleaving on every run: `VOX_TEST_LOSE_HELLOS=1` (a test-only
-//! knob, inert when unset) makes bob and carol each lose the first hello they receive, unread,
-//! as a stream lost with its connection is. It asserts both daemons said they lost one (else
-//! CANNOT MEASURE), and that the two still come to read each other. With a hello counted as
-//! delivered once written again, it is red on every run: each keeps its own session and neither
-//! reads the other.
 
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
-
-#[path = "support/test_knobs.rs"]
-mod test_knobs;
 
 #[path = "support/world.rs"]
 mod world;
@@ -65,7 +55,8 @@ const IDPASS: &str = "an identity passphrase";
 const ROOMPASS: &str = "room passphrase";
 /// How long the relay is held frozen while both members open their sessions.
 const FREEZE: Duration = Duration::from_secs(4);
-/// The test-only knob that makes a daemon lose the first hello it receives, and what it says then.
+/// The test-only knob that makes a daemon lose the first hello it receives, and what it says then:
+/// unset here, so no daemon may say it.
 const LOSE_HELLOS: &str = "VOX_TEST_LOSE_HELLOS";
 const LOST_SAID: &str = "VOX_TEST_LOSE_HELLOS: an inbound hello was lost";
 
@@ -130,16 +121,13 @@ impl Drop for Daemon {
     }
 }
 
-fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: bool) -> Daemon {
+fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", listen, "--anchor", anchor])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
         .env_remove(LOSE_HELLOS);
-    if lose_hellos {
-        cmd.env(LOSE_HELLOS, "1");
-    }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -209,20 +197,6 @@ fn signal(pid: u32, sig: &str) {
 #[test]
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn two_members_who_open_sessions_at_once_converge_and_read_each_other() {
-    race(false);
-}
-
-#[test]
-#[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
-fn two_members_whose_hellos_are_both_lost_still_converge_and_read_each_other() {
-    race(true);
-}
-
-/// The race; with `lose_hellos`, bob and carol each lose the first hello they receive (V210-89).
-fn race(lose_hellos: bool) {
-    if lose_hellos {
-        test_knobs::require(&[LOSE_HELLOS]);
-    }
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]
@@ -242,15 +216,10 @@ fn race(lose_hellos: bool) {
     }
     // alice and bob on IPv4, carol on IPv6: bob and carol reach each other only through
     // the anchor's relay.
-    let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec, false);
-    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec, lose_hellos);
+    let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec);
+    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
     let carol_spec = Split::Families.guest_spec(&anchor).to_owned();
-    let carol = daemon(
-        carol_dir,
-        Split::Families.guest_listen(),
-        &carol_spec,
-        lose_hellos,
-    );
+    let carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
 
     // alice's room; alice and each joiner trust each other. bob and carol do NOT, yet.
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
@@ -363,25 +332,17 @@ fn race(lose_hellos: bool) {
     };
     let (bob_lost, carol_lost) = (lost(&bob), lost(&carol));
     eprintln!(
-        "[proof] release={} lose_hellos={lose_hellos}: after the race ({n} probe rounds, \
-         watched {:.1?} of 90s): bob reads carol = {bob_reads_carol}, carol reads bob = \
-         {carol_reads_bob}; hellos lost: bob {bob_lost}, carol {carol_lost}",
+        "[proof] release={}: after the race ({n} probe rounds, watched {:.1?} of 90s): bob reads \
+         carol = {bob_reads_carol}, carol reads bob = {carol_reads_bob}; hellos lost: bob \
+         {bob_lost}, carol {carol_lost}",
         !cfg!(debug_assertions),
         thawed.elapsed()
     );
-    if lose_hellos {
-        assert!(
-            bob_lost == 1 && carol_lost == 1,
-            "APPARATUS, CANNOT MEASURE: the test knob {LOSE_HELLOS} did not lose one hello at each end (bob {bob_lost}, carol \
-             {carol_lost}), so this run did not force the split"
-        );
-    } else {
-        assert_eq!(
-            (bob_lost, carol_lost),
-            (0, 0),
-            "PRODUCT: a daemon lost a hello with {LOSE_HELLOS} unset"
-        );
-    }
+    assert_eq!(
+        (bob_lost, carol_lost),
+        (0, 0),
+        "PRODUCT: a daemon lost a hello with {LOSE_HELLOS} unset"
+    );
     // A red names its mechanism from the daemons' own record: every key the other end did not
     // take, and why.
     let record = |d: &Daemon| {

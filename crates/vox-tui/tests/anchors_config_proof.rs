@@ -11,9 +11,11 @@
 //! **separate** `vox` process in the same profile reaches a room through that anchor with
 //! no `--anchor` anywhere on its command line.
 //!
-//! The host's invite names the anchor by the very fingerprint `vox node` wrote to the file, and
-//! nothing else could have told the host about that anchor (there is no `--anchor` anywhere), so
-//! what the proof shows is the file being read. There is no "no anchors file" control: an anchor
+//! The host says it connected to the anchor by the very fingerprint `vox node` wrote to the file,
+//! and nothing else could have told the host about that anchor (there is no `--anchor` anywhere),
+//! so what the proof shows is the file being read. (It was the host's invite until the machine
+//! anchor inventory, #779: a machine's anchors never enter a room's address.) There is no "no
+//! anchors file" control: an anchor
 //! only bridges hosts that cannot otherwise find each other, so a host with no anchors file must
 //! still serve, and refusing for want of one is a defect (#302), not a control.
 
@@ -247,11 +249,35 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
         &host.expect_line("the passphrase", |l| l.starts_with("passphrase ")),
         "passphrase",
     );
-    assert!(
-        address.contains(&format!("?a={file_fp}&b=")),
-        "PRODUCT: the invite must carry the anchor the host learned from the file ({file_fp}), so \
-         a guest elsewhere can reach it: {address}"
+    // The host learned the anchor from the file: it says it connected to the very anchor `vox
+    // node` wrote there. Since the machine anchor inventory (#779, 445b3e35c) a machine's anchors
+    // never enter a room's address, so the invite no longer shows it; the host's own line does.
+    let reached = format!(
+        "connection to {} — connected to this anchor",
+        file_fp.get(..26).unwrap_or(&file_fp)
     );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !host.seen.iter().any(|l| l.contains(&reached)) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "PRODUCT: within 60 s the host never said it connected to the anchor it learned from \
+             the file ({file_fp}). It said:\n{}",
+            host.seen.join("\n")
+        );
+        match host.lines.recv_timeout(left) {
+            Ok(l) => {
+                eprintln!("[host] {l}");
+                host.seen.push(l);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "PRODUCT: the host exited before connecting to the anchor it learned from the \
+                 file ({file_fp}). It said:\n{}",
+                host.seen.join("\n")
+            ),
+        }
+    }
 
     // The proof: a guest in its own profile, sharing only the machine-wide config, joins
     // with **no `--anchor` argument anywhere**.
@@ -359,13 +385,41 @@ fn an_anchor_named_by_hostname_carries_a_join() {
             "127.0.0.1:0".into(),
         ],
     );
-    let address = after_label(
-        &host.expect_line("the vox:// address", |l| l.starts_with("address ")),
-        "address",
+    let room = after_label(
+        &host.expect_line("the room", |l| l.starts_with("room ")),
+        "room",
     );
     let passphrase = after_label(
         &host.expect_line("the passphrase", |l| l.starts_with("passphrase ")),
         "passphrase",
+    );
+    // The room's anchor, set by its creator by the same name: since the machine anchor inventory
+    // (#779, 445b3e35c) the anchors file gives the machine's anchors, which never enter a room's
+    // address; a room's own come from `vox room anchors`.
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &host_cfg,
+        &[
+            "room".into(),
+            "anchors".into(),
+            room.clone(),
+            "add".into(),
+            by_name.clone(),
+        ],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the host's `vox room anchors {room} add {by_name}` failed:\n{out}{err}"
+    );
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &host_cfg,
+        &["room".into(), "link".into(), room.clone()],
+    );
+    let address = out.lines().next().unwrap_or_default().trim().to_owned();
+    assert!(
+        ok && address.starts_with("vox://"),
+        "PRODUCT (staging): the host's `vox room link {room}` printed no address:\n{out}{err}"
     );
     assert!(
         address.contains(&format!("a={fp}")),

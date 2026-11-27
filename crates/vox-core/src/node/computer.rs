@@ -2714,9 +2714,21 @@ pub(crate) enum ApplicationReceipt {
 
 /// Whose authority an in-flight Computer write changes, between staging its replacement and
 /// publishing it: every node's, or only these nodes'.
+#[derive(Clone)]
 enum AuthorityChange {
     Every,
     Nodes(BTreeSet<Digest32>),
+}
+
+impl AuthorityChange {
+    /// Whether this change is `node`'s. A change to other nodes' application leaves this node's
+    /// current policy as it was.
+    fn covers(&self, node: &Digest32) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Nodes(nodes) => nodes.contains(node),
+        }
+    }
 }
 
 /// One persistent management identity and transaction domain, owned by its account daemon.
@@ -2740,10 +2752,14 @@ pub struct Computer {
     /// writer. Neither side retains `state` during physical I/O.
     publications: Arc<publication_gate::Gate>,
     pub(crate) state: Mutex<State>,
-    // Existing live room gates, weakly held: a durable policy change invalidates them before
-    // exposing the new revision. Actors republish only after their keyring is reconciled.
+    // Existing live room gates, weakly held with their node: a durable change closes the gates
+    // of the nodes whose authority it changes (every gate for a change to every node's) before
+    // exposing it. Those nodes' actors republish only after their keyring is reconciled.
     reachers: Mutex<
-        Vec<std::sync::Weak<tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>>>,
+        Vec<(
+            Digest32,
+            std::sync::Weak<tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>>,
+        )>,
     >,
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
@@ -3160,21 +3176,29 @@ impl Computer {
     /// Whether the in-flight Computer write, if any, changes `node`'s authority. A write that
     /// changes only other nodes' application leaves this node's current policy readable.
     fn authority_blocked_for(&self, node: &Digest32) -> bool {
-        match &*lock(&self.authority_in_flight) {
-            None => false,
-            Some(AuthorityChange::Every) => true,
-            Some(AuthorityChange::Nodes(nodes)) => nodes.contains(node),
-        }
+        lock(&self.authority_in_flight)
+            .as_ref()
+            .is_some_and(|change| change.covers(node))
     }
 
     pub(crate) fn own_key_settled(&self) -> tokio::sync::watch::Receiver<()> {
         self.own_key_settled.subscribe()
     }
 
+    /// Close every live room gate, as a change to every node's authority does.
     pub(crate) fn invalidate_reachers(&self) {
-        lock(&self.reachers).retain(|weak| {
+        self.invalidate_reachers_of(&AuthorityChange::Every);
+    }
+
+    /// Close the live room gates of the nodes `change` is, and only theirs: another node's gate
+    /// keeps what its actor published under its own unchanged authority, as
+    /// [`Self::authority_blocked_for`] reads it.
+    fn invalidate_reachers_of(&self, change: &AuthorityChange) {
+        lock(&self.reachers).retain(|(node, weak)| {
             if let Some(gate) = weak.upgrade() {
-                crate::node::tunnel::publish_reachers(&gate, Default::default());
+                if change.covers(node) {
+                    crate::node::tunnel::publish_reachers(&gate, Default::default());
+                }
                 true
             } else {
                 false
@@ -4612,8 +4636,8 @@ impl Computer {
                     }
                 }
             }
-            if let Some(change) = authority_change {
-                self.block_own_key_authority(change);
+            if let Some(change) = &authority_change {
+                self.block_own_key_authority(change.clone());
             }
             #[cfg(feature = "test-knobs")]
             let mutant_state_guard =
@@ -4651,8 +4675,8 @@ impl Computer {
                 return Err(error);
             }
             let committed_late = deadline.filter(|deadline| std::time::Instant::now() >= *deadline);
-            if publication_changed {
-                self.invalidate_reachers();
+            if let Some(change) = &authority_change {
+                self.invalidate_reachers_of(change);
             }
             let mut published = lock(&self.state);
             *published = next;
@@ -4882,16 +4906,16 @@ impl Computer {
             } else {
                 None
             };
-            if let Some(change) = authority_change {
-                self.block_own_key_authority(change);
+            if let Some(change) = &authority_change {
+                self.block_own_key_authority(change.clone());
             }
             if let Err(error) = self.save_before(&next, None) {
                 self.storage_failure();
                 self.unblock_own_key_authority();
                 return Err(error);
             }
-            if publication_changed {
-                self.invalidate_reachers();
+            if let Some(change) = &authority_change {
+                self.invalidate_reachers_of(change);
             }
             let mut published = lock(&self.state);
             *published = next;
@@ -4957,8 +4981,11 @@ impl Computer {
     ) {
         let state = lock(&self.state);
         let mut gates = lock(&self.reachers);
-        if !gates.iter().any(|weak| weak.ptr_eq(&Arc::downgrade(gate))) {
-            gates.push(Arc::downgrade(gate));
+        if !gates
+            .iter()
+            .any(|(_, weak)| weak.ptr_eq(&Arc::downgrade(gate)))
+        {
+            gates.push((node, Arc::downgrade(gate)));
         }
         crate::node::tunnel::publish_reachers(
             gate,

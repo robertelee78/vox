@@ -681,6 +681,7 @@ impl Shares {
             &cmd,
             &read,
             &self.post_slots,
+            &self.view,
             channel_id,
             text.to_owned(),
             None,

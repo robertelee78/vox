@@ -251,12 +251,48 @@ impl Tui {
     }
 }
 
+/// Select room `name` in the sidebar of `vox tui` as a person does, a row at a time with `:down`
+/// or `:up`, once the sidebar also lists every room of `others`.
+fn select_room(tui: &mut Tui, name: &str, others: &[&str]) {
+    for other in others {
+        tui.after("", other);
+    }
+    let screen = tui.text();
+    // A room's row in the sidebar: `▶ name  [reach]` when selected, `  name  [reach]` otherwise.
+    let rows: Vec<&str> = screen
+        .lines()
+        .filter_map(|line| line.strip_prefix('│')?.split('│').next())
+        .filter(|cell| (cell.starts_with('▶') || cell.starts_with("  ")) && cell.contains("  ["))
+        .collect();
+    let named = |cell: &str| {
+        cell.trim_start_matches(['▶', ' '])
+            .split_whitespace()
+            .next()
+            == Some(name)
+    };
+    let selected = rows
+        .iter()
+        .position(|cell| cell.starts_with('▶'))
+        .unwrap_or_else(|| panic!("APPARATUS: the sidebar selects no room:\n{screen}"));
+    let wanted = rows
+        .iter()
+        .position(|cell| named(cell))
+        .unwrap_or_else(|| panic!("APPARATUS: the sidebar does not list {name}:\n{screen}"));
+    let step = if wanted > selected { ":down\r" } else { ":up\r" };
+    for _ in 0..wanted.abs_diff(selected) {
+        tui.after(step, "");
+    }
+    tui.after("", &format!("▶ {name} "));
+}
+
 /// Every screen of `vox tui` on the attached node, `(screen, text)`, as a person reaches them.
 fn tui_screens(data: &Path, room: &str) -> Vec<(String, String)> {
     let mut tui = Tui::spawn(data);
-    let mut screens = Vec::new();
-    let steps: [(&str, &str, &str); 11] = [
-        ("the room list", "", "words"),
+    let mut screens = vec![("vox tui: the room list".to_owned(), tui.after("", "words"))];
+    // `vox serve` made a second room, `served`. The sidebar lists rooms in the node's order, not
+    // in the order they were made: select `words` as a person does, before opening it.
+    select_room(&mut tui, "words", &["served"]);
+    let steps: [(&str, &str, &str); 10] = [
         ("a room", "\r", "Timeline"),
         (
             "a same-name rename's exact entry",

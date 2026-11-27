@@ -18,7 +18,7 @@ use super::record::{Descriptor, Field, Key};
 use super::source::EnvelopeInput;
 use super::storage::{Read, Tree};
 
-const CHANGED: &str = "the room's Sessions changed; refresh the listing";
+const CHANGED: &str = crate::node::ipc::SESSIONS_CHANGED;
 const REFRESHING: &str = "the room is refreshing saved Sessions; retry";
 const CANNOT_READ: &str = "this node cannot read that Session";
 const PAGE_ROWS: usize = 64;
@@ -49,7 +49,12 @@ fn opening_fingerprint(read: &Read<'_>, author: &Digest32) -> Result<Option<Dige
 }
 /// What an answer was made from. A continuation naming another basis is told CHANGED and
 /// re-reads: the basis changes when the fold publishes new inputs, when the drive authority
-/// it answered for changes, and when an author it could not answer becomes current.
+/// it answered for changes, and when an author it could not answer becomes current. A row
+/// read after its page (its text, validity and summary) is told CHANGED only when its room,
+/// the drive authority or its member changed, or that row changed: no longer retained, its
+/// author no longer a member or gone, ended unlike listed, or its own text no longer the one
+/// the page listed. A fold publishing other Sessions in between leaves the row as listed, and
+/// refusing it refused every page read while thousands of Sessions fold (ADR-037 R4).
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
@@ -178,7 +183,11 @@ pub(crate) enum Query {
         revision: Option<Revision>,
         limit: usize,
     },
+    /// The listed row (`opening`, and its end as listed: `None` while it was open) is still
+    /// that row: retained, its author still a member who has not left, ended as listed.
     Validate {
+        opening: Digest32,
+        ended: Option<Digest32>,
         revision: Revision,
     },
     Lookup {
@@ -197,6 +206,8 @@ pub(crate) enum Query {
     Text {
         opening: Digest32,
         field: FieldKind,
+        /// The field as the page listed it; another text under the opening is CHANGED.
+        listed: Text,
         after: Option<u64>,
         revision: Revision,
     },
@@ -442,10 +453,26 @@ impl ChannelState {
                     Err(error) => return Err(error),
                 },
             };
-            if newest
-                .is_none_or(|generation| self.drive.receivers.contains_key(&(author, generation)))
-                || self.key_packages.pending_from(&author)
-            {
+            // This node drives the author's Sessions while the author has not changed its key
+            // away from it (ADR-029 CL-3, SC-2b): it holds the newest generation, or the author's
+            // signed floor names it at that generation (committed before the release is sent),
+            // so keeping drive while another member loses it is never shown lost and regained.
+            // A key-package still to be opened says nothing by itself: it may carry a
+            // generation the author has since changed away from this node.
+            let kept = match newest {
+                None => true,
+                Some(generation) => {
+                    self.drive.receivers.contains_key(&(author, generation))
+                        || super::floor_index::newest_names(
+                            view.snapshot(),
+                            &self.sek,
+                            &self.channel_id,
+                            (&author, &me),
+                            generation,
+                        )?
+                }
+            };
+            if kept {
                 known.insert(author);
             }
         }
@@ -689,12 +716,20 @@ impl ChannelState {
             refreshing: refreshing.clone(),
             provisional,
         };
-        let check = |previous: &Revision| -> Answer<()> {
+        // A row read after its page: its room, the drive authority and its member.
+        let still = |previous: &Revision| -> Answer<()> {
             if !Arc::ptr_eq(&previous.incarnation, &revision.incarnation)
-                || previous.published != revision.published
                 || previous.drive != revision.drive
                 || previous.member.is_some_and(|node| !self.is_member(&node))
             {
+                return Err(Failure::Request(CHANGED));
+            }
+            Ok(())
+        };
+        // A continuing page: also the fold its earlier pages were selected from.
+        let check = |previous: &Revision| -> Answer<()> {
+            still(previous)?;
+            if previous.published != revision.published {
                 return Err(Failure::Request(CHANGED));
             }
             Ok(())
@@ -744,10 +779,6 @@ impl ChannelState {
                         revision,
                     })
                 }
-                Query::Validate { revision: previous } => {
-                    check(&previous)?;
-                    Ok(Reply::Valid)
-                }
                 Query::Join { node } => {
                     if node != me
                         && self.is_member(&node)
@@ -772,7 +803,9 @@ impl ChannelState {
                     readable(&node)?;
                     Err(Failure::Request(REFRESHING))
                 }
-                Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
+                Query::Summary { .. } | Query::Text { .. } | Query::Validate { .. } => {
+                    Err(Failure::Request(CHANGED))
+                }
             };
         };
         let mut retired_remaining = PAGE_ROWS;
@@ -782,7 +815,7 @@ impl ChannelState {
                 opening,
                 revision: previous,
             } => {
-                check(&previous)?;
+                still(&previous)?;
                 let descriptor_id = read
                     .find(Tree::OpeningHash, &hash_key(&opening))?
                     .ok_or(Failure::Request(CHANGED))?;
@@ -1122,8 +1155,22 @@ impl ChannelState {
                     revision,
                 })
             }
-            Query::Validate { revision: previous } => {
-                check(&previous)?;
+            Query::Validate {
+                opening,
+                ended,
+                revision: previous,
+            } => {
+                still(&previous)?;
+                let id = read
+                    .find(Tree::OpeningHash, &hash_key(&opening))?
+                    .ok_or(Failure::Request(CHANGED))?;
+                let row = live_descriptor(&read, id)?.ok_or(Failure::Request(CHANGED))?;
+                if !self.authors.contains_key(&row.node)
+                    || self.has_left(&row.node)
+                    || row.ended.map(|end| end.position.hash) != ended
+                {
+                    return Err(Failure::Request(CHANGED));
+                }
                 Ok(Reply::Valid)
             }
             Query::Exact { node, id } => {
@@ -1176,10 +1223,11 @@ impl ChannelState {
             Query::Text {
                 opening,
                 field,
+                listed,
                 after,
                 revision: previous,
             } => {
-                check(&previous)?;
+                still(&previous)?;
                 let id = read
                     .find(Tree::OpeningHash, &hash_key(&opening))?
                     .ok_or(Failure::Request(CHANGED))?;
@@ -1195,11 +1243,10 @@ impl ChannelState {
                     FieldKind::Harness => row.harness,
                     FieldKind::Cwd => row.cwd,
                 };
-                let Some(field) = field else {
-                    return Ok(Reply::Text(TextPage {
-                        bytes: Vec::new(),
-                        next: None,
-                    }));
+                let Some(field) =
+                    field.filter(|f| f.bytes == listed.bytes && f.hash == listed.hash)
+                else {
+                    return Err(Failure::Request(CHANGED));
                 };
                 if !read.retained(field.envelope.first)? {
                     return Err(Failure::Request(CHANGED));

@@ -11,7 +11,10 @@
 //! admitted with `vox trust add`, ready once each has rendered a post by the other. Bob's
 //! session registers with his daemon **the way a harness does it**: its turn-start hook
 //! runs `vox agent hook --room …` with Claude Code's hook JSON on stdin and the harness's
-//! `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` in its environment. The one thing that is not `vox` is
+//! `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` in its environment, with the
+//! `VOX_CLAUDE_NATIVE_ATTENTION` that `vox agent plugin claude` puts in Claude's settings: since
+//! ADR-020 §6.15 RA-5 (8cade3da0) only a session registered with that live native route is sent a
+//! notice. The one thing that is not `vox` is
 //! that messaging socket: a stand-in for Claude Code's, recording what the daemon writes to it,
 //! because no `vox` command plays a harness session. Alice posts with `vox room post` on her own
 //! daemon; nothing reaches bob but by sync.
@@ -30,61 +33,61 @@
 //! read back and required to name the test's own endpoint before anything is posted.
 //!
 //! **A wake announces; the message arrives once, through the room read** (V030-15). The wake
-//! is a notice — how many urgent messages, from whom, in which room — and no byte of any
-//! message. Claude Code runs its `UserPromptSubmit` hook for a message written to its messaging
-//! socket, with that message as the hook's `prompt`, idle, mid-generation or between tool calls
+//! is a notice — how many messages, from whom, in which room — and no byte of any
+//! message. Claude Code runs its `UserPromptSubmit` hooks for a message written to its messaging
+//! socket, with that message as the hooks' `prompt`, idle, mid-generation or between tool calls
 //! (measured against a live Claude Code 2.1.287), so the drain runs in the turn the wake starts.
-//! Here bob's hook runs on the wake it received exactly as his harness would.
+//! Here bob's hooks run on the wake it received exactly as his harness runs the two Vox installs:
+//! the ordinary drain and `--native-attention`, which admits a Vox notice and drains for it.
+//!
+//! Since ADR-020 §6.15 (d1dec07b3, #812) a person's ordinary message addressed to bob or to
+//! nobody (RA-1) and a session's directed `ask`/`assign` (RA-2a) are offered to his session too,
+//! urgent or not; so the messages below that must wake nothing, and the filler, are said by
+//! alice's registered session.
 //!
 //! `an_urgent_message_from_another_node_interrupts_its_addressee` asserts, **each for a message
 //! that arrived by sync**:
 //!
 //! 1. addressed to bob and urgent — bob's session is woken, exactly once, by a notice naming
-//!    one urgent message from alice; **no byte of any message body** reaches the wake endpoint
+//!    one message from alice; **no byte of any message body** reaches the wake endpoint
 //!    (each body carries a canary);
 //! 2. urgent but addressed to someone else — nothing;
-//! 3. addressed to bob but not urgent — nothing;
+//! 3. addressed to bob but not urgent, and neither ordinary conversation nor a directed request —
+//!    nothing;
 //! 5. the turn the wake starts reads the urgent message **once**, first, ahead of the two older
 //!    ones that woke nothing, which it also reads once each;
 //! 6. **one notice outstanding at a time**: a second urgent message, while the first one's notice
-//!    is unread, wakes nothing, and the daemon says it held it;
+//!    has not been taken by a turn, wakes nothing (RA-8);
 //! 7. **recounted before it fires**: once the session's read has taken that message, nothing
-//!    is sent for it, and the daemon says it was already read;
-//! 4. a wedged session (an OpenCode plugin's wake socket, registered by `vox agent hook
-//!    --session` with `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN`, that accepts and never answers) does
-//!    not stall bob's wakes;
-//! 9. **a notice that is not taken stays owed**: a plugin socket that refuses the first prompt
-//!    gets the notice again once the hold (the profile's `agent_wake_hold`, here 6 s) has passed.
+//!    is sent for it;
+//! 4. a wedged session (an OpenCode client listed by the Vox TUI plugin whose attention socket
+//!    accepts and never answers) does not stall bob's wakes;
 //! 10. **an urgent message addressed to nobody wakes nobody** (RP-01, ADR-020 §6): posted the way a
 //!     person does it, `vox room post --urgent` with no `--to`, it reaches bob's node and his
 //!     session gets no notice — or one agent could interrupt the whole room.
 //!
 //! `an_idle_agent_is_told_when_a_reply_to_it_is_waiting` (V030-20): bob's session `asker` asks
-//! alice something, and alice answers (`--re`), each answer carrying a canary. The schedule is
-//! the profile's real setting, shortened here (`agent_reply_nudges = 4s 8s 12s` in bob's
-//! settings file); its default is 5, 20 and 60 minutes.
+//! alice something, and alice answers (`--re`), each answer carrying a canary. An answer to a
+//! session's addressed question is offered to it (ADR-020 §6.15, `attention_eligible`'s
+//! `answers`). V030-20's busy gate and its repeated series of notices (`agent_reply_nudges`,
+//! `agent_wake_hold`) left the product with `d1dec07b3` (#812): RA-8 presents a request once per
+//! recipient and lets no timeout start another turn, and RA-5 leaves a busy Claude session's
+//! boundary to Claude (`priority: later`).
 //!
-//! 1. while the session is **busy** (its turn started and has not ended) — no notice;
-//! 2. at its **end of turn** (Claude Code's `Stop` hook, run as `vox agent hook`, printing
-//!    nothing) — exactly one notice, naming one reply from alice, with no canary byte;
-//! 3. then one after each wait of the schedule, **each held while a notice is outstanding**
-//!    (`agent_wake_hold = 6s` here): the 4 s wait becomes 6 s, then 8 s;
-//! 4. **a daemon restart resumes the series**: restarted after the third notice, the fourth still
-//!    comes, no sooner than 12 s after the third; then no more;
-//! 5. **a fresh reply starts it again**; and a fresh reply's first notice is a wake too: posted
-//!    just after an unread notice, it is announced only once the 6 s hold has passed;
-//! 6. the turn that notice starts reads each answer **once**; and an answer the session read
-//!    before going idle again is **never announced**;
+//! 2. once alice has answered (its turn over: Claude Code's `Stop` hook, run as `vox agent hook`,
+//!    printing nothing) — exactly one notice, naming one message from alice, with no canary byte;
+//! 6. the turn that notice starts reads the answer **once**;
 //! 7. `SessionEnd` removes the registration: a later answer wakes nothing;
 //! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries;
 //! 9. **what lands while the daemon is down is announced when it starts**: bob's daemon stopped,
 //!    alice answers an idle session's question and sends it an urgent message; once the daemon
-//!    is back, both are counted in a notice. They reach bob's node by sync after it starts, so
+//!    is back, the session is woken and the turns its notices start read each once (one notice
+//!    is outstanding at a time, RA-8). They reach bob's node by sync after it starts, so
 //!    this does not exercise the daemon's startup count (which guards only a crash between a row
 //!    landing and the next sweep, and is unproven by mutant); it goes red if what arrives after a
 //!    restart is not announced;
 //! 10. **what is not a reply**: an `ack`, `status`, `hello`, `bye`, `ping` or `pong` answering
-//!     the session's question is never announced, and a real answer after them counts one reply.
+//!     the session's question is never announced, and a real answer after them counts one.
 //!
 //! (8) of the first test: sixty older messages and one urgent, more than one turn's 50: the turn
 //! the wake starts shows the urgent one first and 49 others, a second urgent wake counts only the
@@ -243,6 +246,61 @@ fn post(alice: &Worker, room: &str, text: &str) {
     assert!(o.ok, "PRODUCT (staging): alice could not post: {o:?}");
 }
 
+/// `w`'s registered Session `session` posts `text` exactly as given: a post with session origin
+/// (ADR-020 §6.15 RA-2, RA-3), which no other session is offered unless it is addressed and urgent,
+/// or a directed `ask`/`assign` (RA-2a).
+fn post_as(w: &Worker, session: &str, room: &str, text: &str) {
+    let o = w.vox_in(Some(session), &["room", "post", room, "-"], Some(text));
+    assert!(
+        o.ok,
+        "PRODUCT (staging): {}'s session {session} could not post: {o:?}",
+        w.name
+    );
+}
+
+/// What Claude Code gives Vox's hooks once `vox agent plugin claude` is installed: its settings'
+/// `VOX_CLAUDE_NATIVE_ATTENTION`. A Claude session is offered automatic notices only when its hook
+/// registered it with that live native route (8cade3da0; ADR-020 §6.15 RA-5).
+fn native_attention(w: &Worker) -> String {
+    let o = w.vox(None, &["agent", "plugin", "claude", "--node", "default"]);
+    assert!(o.ok, "PRODUCT (staging): `vox agent plugin claude`: {o:?}");
+    o.json()["env"]["VOX_CLAUDE_NATIVE_ATTENTION"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): Claude's generated settings must enable native attention: {}",
+                o.stdout
+            )
+        })
+        .to_owned()
+}
+
+/// A Claude Code turn starting on `prompt`, as Vox's installed settings run it: both of its
+/// `UserPromptSubmit` commands, the ordinary drain and `--native-attention`, which admits a Vox
+/// attention notice and drains for it (each prints nothing for the other's prompts). What they
+/// inject.
+fn claude_turn(
+    w: &Worker,
+    env: &[(&str, &str)],
+    room: &str,
+    session: &str,
+    prompt: &str,
+) -> String {
+    let input = hook_json("UserPromptSubmit", session, Some(prompt));
+    let ordinary = ["agent", "hook", "--node", "default", "--room", room];
+    let native = [&ordinary[..], &["--native-attention"]].concat();
+    let mut given = injected(&hook(w, env, &ordinary, Some(&input)));
+    let out = hook(w, env, &native, Some(&input));
+    if out.contains("\"decision\"") {
+        eprintln!(
+            "[receipt] the native-attention hook blocked the turn: {}",
+            out.trim()
+        );
+    }
+    given.push_str(&injected(&out));
+    given
+}
+
 /// Everything bob's stand-in session receives within `within`, stopping early once `done`, and
 /// the apparatus clock: the longest the collecting loop itself went between two of its own
 /// half-second waits. A loop that stalled for a large part of the window cannot say a wake did
@@ -283,39 +341,65 @@ fn contents(frames: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A stand-in for the Vox OpenCode plugin's wake socket that **refuses** its first `refuse`
-/// prompts, as the plugin does when OpenCode will not take one (`{"error":…}`, not gone), and
-/// takes the rest. Each prompt's text, when it arrived, and whether it was taken.
-fn flaky(path: &std::path::Path, refuse: usize) -> mpsc::Receiver<(Instant, String, bool)> {
-    use std::io::{BufRead as _, Write as _};
-    let listener = UnixListener::bind(path).expect("APPARATUS: bind the stand-in plugin socket");
-    let (tx, rx) = mpsc::channel();
+/// A stand-in for an OpenCode client of the Vox TUI plugin (`assets/opencode-tui-plugin.js`)
+/// that is **wedged**: its descriptor is listed where the plugin lists the clients of `node`'s
+/// sessions started in `directory` (`/tmp/vox-oc-clients-<scope>/client-<id>/client.json`), and
+/// its attention socket accepts and never answers. Removed when dropped.
+struct WedgedClient(std::path::PathBuf);
+impl Drop for WedgedClient {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn wedged_client(node: &str, directory: &std::path::Path) -> WedgedClient {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let directory = std::fs::canonicalize(directory).expect("APPARATUS: canonical directory");
+    let directory = directory
+        .to_str()
+        .expect("APPARATUS: a UTF-8 directory")
+        .to_owned();
+    let scope = serde_json::to_vec(&[node, directory.as_str()]).expect("APPARATUS: scope");
+    let scope: String = vox_core::hash::sha256(&scope)[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let registry = std::path::PathBuf::from("/tmp").join(format!("vox-oc-clients-{scope}"));
+    let mut private = std::fs::DirBuilder::new();
+    private.mode(0o700);
+    if !registry.exists() {
+        private
+            .create(&registry)
+            .expect("APPARATUS: the client registry");
+    }
+    let dir = registry.join(format!("client-w{:05}", std::process::id() % 100_000));
+    private
+        .create(&dir)
+        .expect("APPARATUS: the wedged client's directory");
+    let guard = WedgedClient(dir.clone());
+    let socket = dir.join("attention.sock");
+    let listener = UnixListener::bind(&socket).expect("APPARATUS: bind the wedged client socket");
     std::thread::spawn(move || {
-        for (n, stream) in listener.incoming().enumerate() {
-            let Ok(stream) = stream else { continue };
-            let mut reader = std::io::BufReader::new(&stream);
-            let (mut auth, mut prompt) = (String::new(), String::new());
-            if reader.read_line(&mut auth).is_err() || reader.read_line(&mut prompt).is_err() {
-                continue;
-            }
-            let text = serde_json::from_str::<serde_json::Value>(prompt.trim())
-                .ok()
-                .and_then(|v| v["text"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let taken = n >= refuse;
-            let answer = if taken {
-                r#"{"ok":true}"#
-            } else {
-                r#"{"error":"the session would not take it"}"#
-            };
-            let _ = writeln!(&stream, "{answer}");
-            eprintln!("[receipt] the plugin socket got (taken {taken}): {text}");
-            if tx.send((Instant::now(), text, taken)).is_err() {
-                return;
-            }
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s); // accepted, never read, never answered
         }
     });
-    rx
+    let descriptor = serde_json::json!({
+        "version": 1, "node": node, "directory": directory,
+        "socket": socket.to_str().expect("APPARATUS: a UTF-8 socket path"),
+        "token": "a".repeat(64), "client": "b".repeat(64),
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("client.json"))
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(descriptor.to_string().as_bytes())
+        })
+        .expect("APPARATUS: write the wedged client's descriptor");
+    guard
 }
 
 /// The next notice `inbox` receives within `within`, and when it arrived.
@@ -436,19 +520,14 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let sock = tmp.path().join("session.sock");
     let inbox = listen(&sock);
     let sock_s = sock.to_string_lossy().into_owned();
+    let native = native_attention(bob);
     let bob_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
     ];
-    // bob's harness, starting a turn on `prompt`: its drain's injection.
-    let turn = |prompt: &str| {
-        injected(&hook(
-            bob,
-            &bob_env,
-            &["agent", "hook", "--node", "default", "--room", &room],
-            Some(&hook_json("UserPromptSubmit", "session-bob", Some(prompt))),
-        ))
-    };
+    // bob's harness, starting a turn on `prompt`: its drains' injection.
+    let turn = |prompt: &str| claude_turn(bob, &bob_env, &room, "session-bob", prompt);
     let _ = turn("hi");
     let reg = registered_endpoint(bob, "session-bob");
     assert_eq!(
@@ -459,8 +538,13 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
 
     // Bob's daemon must be in sync with alice, and his session must have read everything so far,
-    // before the cases mean anything.
-    post(alice, &room, "SYNC-MARKER");
+    // before the cases mean anything. Alice's session posts the marker: a person's bare post to
+    // nobody is ordinary room conversation, offered to every session in the room (ADR-020 §6.15
+    // RA-1), and its notice is not what these cases measure.
+    // A Session posts only once its node has registered it, as its harness's hook does at the
+    // start of a turn (ADR-020 §6.15 RA-3).
+    support::register_sending_session(alice, &room, "session-alice");
+    post_as(alice, "session-alice", &room, "SYNC-MARKER");
     until(
         bob,
         None,
@@ -522,11 +606,15 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             alice,
         ),
     );
-    post(
+    // (3) is said by alice's session: since ADR-020 §6.15 (d1dec07b3) a person's ordinary message
+    // to bob (RA-1) and a session's directed `ask`/`assign` (RA-2a) are offered to his session
+    // without urgency; every other message waits for its next turn (§6.2 as amended).
+    post_as(
         alice,
+        "session-alice",
         &room,
         &to_node(
-            r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
+            r#"{"v":1,"type":"say","to":["bob"],"body":"bob: NOT-URGENT"}"#,
             bob,
         ),
     );
@@ -570,11 +658,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     check(
         &mut failures,
         wakes.len() == 1
-            && wakes[0].contains("1 urgent message addressed to you from alice")
+            && wakes[0].contains("1 unread room message(s) from alice")
             && all.contains("a-token"),
         format!(
             "PRODUCT (1): one urgent message from alice must wake bob's session once, with a \
-             notice naming one urgent message from alice and the registered token; received \
+             notice naming one message from alice and the registered token; received \
              {frames:?}; bob's daemon:\n{}",
             bob_err()
         ),
@@ -646,14 +734,13 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let got = contents(&collect(&inbox, Duration::from_secs(30), |g| g.contains("\"user\"")).0);
     println!(
         "[proof] (6) after the session read the first notice, a second urgent message woke it \
-         {} time(s) (the hold is 10 minutes; only the moved cursor can end it)",
+         {} time(s)",
         got.len()
     );
     assert!(
         got.len() == 1,
-        "PRODUCT (6): a session that has read its notice (its cursor moved) must be woken by the \
-         next urgent message at once: the hold ends when the cursor moves, not only after 10 \
-         minutes; got {got:?}; bob's daemon:\n{}",
+        "PRODUCT (6): a session whose turn took its notice must be woken by the next urgent \
+         message at once; got {got:?}; bob's daemon:\n{}",
         bob_err()
     );
     let second = got[0].clone();
@@ -673,27 +760,16 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         |o| o.stdout.contains("CANARY-URGENT-3"),
     );
     let held = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
-    let said_held = bob_err().contains("not waking session session-bob again yet");
     println!(
-        "[proof] (6) with a notice outstanding, a further urgent message woke bob {} time(s); \
-         the daemon said it held it: {said_held}",
+        "[proof] (6) with a notice outstanding, a further urgent message woke bob {} time(s)",
         held.len()
     );
     check(
         &mut failures,
         held.is_empty(),
         format!(
-            "PRODUCT (6): no further wake while the first notice is outstanding (unread, inside \
-             the hold); got {held:?}"
-        ),
-    );
-    check(
-        &mut failures,
-        said_held,
-        format!(
-            "PRODUCT (6): the daemon must say it held the notice for the third message; its \
-             stderr:\n{}",
-            bob_err()
+            "PRODUCT (6): no further wake while the first notice is outstanding (its turn has \
+             not taken it); got {held:?}"
         ),
     );
 
@@ -704,25 +780,26 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         "PRODUCT (staging) (7): the session's read must take both held messages first: {read}"
     );
     let after = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
-    let said_read = bob_err().contains("it already read the urgent message(s)");
     println!(
-        "[proof] (7) once the session had read them, the daemon woke it {} time(s); it said \
-         they were already read: {said_read}",
+        "[proof] (7) once the session had read them, the daemon woke it {} time(s)",
         after.len()
     );
     check(
         &mut failures,
-        after.is_empty() && said_read,
+        after.is_empty(),
         format!(
-            "PRODUCT (7): a held urgent message the session read first must wake nothing, and \
-             the daemon must say it was already read; got {after:?}; bob's daemon:\n{}",
+            "PRODUCT (7): a held urgent message the session read first must wake nothing; got \
+             {after:?}; bob's daemon:\n{}",
             bob_err()
         ),
     );
 
     // ---- (4) a wedged session must not stall anybody else's wake ----
-    // An OpenCode plugin's wake socket that accepts and never answers: its wake would wait
-    // for ever.
+    // An OpenCode session whose client accepts and never answers: its wake would wait for ever.
+    // Since ADR-020 §6.15 RA-5 (d1dec07b3, 0a45c7c0c) an OpenCode wake goes only to the client
+    // the Vox TUI plugin lists for the session's node and directory, never to the server
+    // plugin's socket; the wedged one is that client.
+    let _wedged = wedged_client("default", &std::env::current_dir().expect("APPARATUS: cwd"));
     let wedge_path = tmp.path().join("wedge.sock");
     let wedge = UnixListener::bind(&wedge_path)
         .unwrap_or_else(|e| panic!("APPARATUS: bind the wedged session socket: {e}"));
@@ -792,7 +869,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     check(
         &mut failures,
         got.iter()
-            .any(|c| c.contains("1 urgent message addressed to you from alice")),
+            .any(|c| c.contains("1 unread room message(s) from alice")),
         format!(
             "PRODUCT (4): a wedged session stalled another session's wake; received {got:?}; \
              bob's daemon:\n{}",
@@ -805,8 +882,9 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     // shows the urgent one first and 49 of the others; the next shows the rest. Each once.
     let _ = turn("catch up");
     let _ = collect(&inbox, Duration::from_secs(3), |_| false);
+    // Alice's session posts them: a person's bare posts would each be offered (RA-1).
     for i in 0..60 {
-        post(alice, &room, &format!("BULK-{i:02}-ROW"));
+        post_as(alice, "session-alice", &room, &format!("BULK-{i:02}-ROW"));
     }
     post(
         alice,
@@ -870,7 +948,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     println!("[proof] (8) the wake after turn 1: {w2:?}");
     check(
         &mut failures,
-        w2.len() == 1 && w2[0].contains("1 urgent message addressed to you"),
+        w2.len() == 1 && w2[0].contains("1 unread room message(s) from alice"),
         format!(
             "PRODUCT (8): a message already shown ahead of the cursor must not be counted again: \
              {w2:?}; bob's daemon:\n{}",
@@ -904,110 +982,6 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         ),
     );
 
-    // ---- (9) a notice that does not arrive stays owed, and is sent again after the hold ----
-    // The hold is the profile's own setting, shortened to 6 s (its default is 10 minutes).
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(bob.paths.config_file())
-            .expect("APPARATUS: open bob's settings file");
-        writeln!(f, "\nagent_wake_hold = 6s").expect("APPARATUS: write bob's settings file");
-    }
-    let flaky_path = tmp.path().join("flaky.sock");
-    let attempts = flaky(&flaky_path, 1);
-    let flaky_s = flaky_path.to_string_lossy().into_owned();
-    hook(
-        bob,
-        &[
-            ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
-            ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
-        ],
-        &[
-            "agent",
-            "hook",
-            "--node",
-            "default",
-            "--room",
-            &room,
-            "--session",
-            "session-flaky",
-        ],
-        None,
-    );
-    assert_eq!(
-        registered_endpoint(bob, "session-flaky"),
-        ("opencode".to_owned(), flaky_s.clone()),
-        "PRODUCT (staging): session-flaky must be registered at the test's own socket"
-    );
-    // A new session starts behind by everything this room holds, more than one turn's bound
-    // (V210-120), so it catches up first: what (9) counts is the one message posted next.
-    for _ in 0..10 {
-        // With its harness's variables, as every turn of it runs: a turn without them registers
-        // the session again with nowhere to wake it.
-        let o = bob.vox_env(
-            None,
-            &[
-                ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
-                ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
-            ],
-            &[
-                "agent",
-                "hook",
-                "--node",
-                "default",
-                "--room",
-                &room,
-                "--format",
-                "text",
-                "--session",
-                "session-flaky",
-            ],
-            None,
-        );
-        if o.stdout.trim().is_empty() {
-            break;
-        }
-    }
-    post(
-        alice,
-        &room,
-        &to_node(
-            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"flaky: CANARY-RETRY"}"#,
-            bob,
-        ),
-    );
-    let Ok(refused) = attempts.recv_timeout(Duration::from_secs(30)) else {
-        panic!(
-            "PRODUCT (staging) (9): the urgent message never reached session-flaky's socket, so its \
-             refusal was never staged; bob's daemon:\n{}",
-            bob_err()
-        );
-    };
-    let retried = attempts.recv_timeout(Duration::from_secs(30)).ok();
-    let gap = retried.as_ref().map(|r| (r.0 - refused.0).as_secs_f64());
-    println!(
-        "[proof] (9) the first notice was refused; tried again {}s later, taken {}; the daemon \
-         said it stays owed: {}",
-        gap.map_or("never".to_owned(), |g| format!("{g:.1}")),
-        retried.as_ref().is_some_and(|r| r.2),
-        bob_err().contains("it stays owed")
-    );
-    check(
-        &mut failures,
-        retried.as_ref().is_some_and(|r| {
-            r.2 && r.1.contains("1 urgent message addressed to you from alice")
-                && !r.1.contains("CANARY-RETRY")
-        }) && gap.is_some_and(|g| g >= 5.5),
-        format!(
-            "PRODUCT (9): a notice that was not taken must stay owed and be sent again once the \
-             6 s hold has passed; refused at once, then {:?} after {gap:?} s; bob's daemon:\n{}",
-            retried.map(|r| r.1),
-            bob_err()
-        ),
-    );
-
     assert!(
         failures.is_empty(),
         "PRODUCT: {} claim(s) failed:\n- {}",
@@ -1030,25 +1004,6 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let room = r.id.clone();
     let bob_err = || daemon_err(tmp.path(), "bob");
     let mut failures = Vec::new();
-
-    // The schedule is the profile's own setting, shortened: 4, 8 and 12 s, not 5, 20 and 60
-    // minutes. Three different waits, so a notice sent on the wrong step's wait shows.
-    {
-        use std::io::Write as _;
-        let cfg = r.workers[1].paths.config_file();
-        std::fs::create_dir_all(
-            cfg.parent()
-                .expect("APPARATUS: a settings file has a directory"),
-        )
-        .expect("APPARATUS: create bob's settings directory");
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cfg)
-            .expect("APPARATUS: open bob's settings file");
-        writeln!(f, "\nagent_reply_nudges = 4s 8s 12s\nagent_wake_hold = 6s")
-            .expect("APPARATUS: write bob's settings file");
-    }
 
     // ---- (8) the entries a person merges into Claude Code's settings ----
     let printed = r.workers[1].vox(None, &["agent", "plugin", "claude", "--node", "default"]);
@@ -1077,17 +1032,22 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let sock = tmp.path().join("asker.sock");
     let inbox = listen(&sock);
     let sock_s = sock.to_string_lossy().into_owned();
+    let native = native_attention(&r.workers[1]);
     let env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "asker-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
     ];
-    let event = |bob: &Worker, name: &str, prompt: Option<&str>| {
-        hook(
+    // A turn starts as Claude Code starts it with Vox installed (both prompt hooks, their
+    // injection); every other event is one hook (its stdout).
+    let event = |bob: &Worker, name: &str, prompt: Option<&str>| match prompt {
+        Some(prompt) => claude_turn(bob, &env, &room, "asker", prompt),
+        None => hook(
             bob,
             &env,
             &["agent", "hook", "--node", "default", "--room", &room],
-            Some(&hook_json(name, "asker", prompt)),
-        )
+            Some(&hook_json(name, "asker", None)),
+        ),
     };
     let _ = event(&r.workers[1], "UserPromptSubmit", Some("ask alice"));
     assert_eq!(
@@ -1118,6 +1078,9 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         &["room", "read", &room],
         |o| o.stdout.contains("What is the build number?"),
     );
+    // A Session posts only once its node has registered it, as its harness's hook does at the
+    // start of a turn (ADR-020 §6.15 RA-3).
+    support::register_sending_session(&r.workers[0], &room, "alice-s");
     let answer = |alice: &Worker, bob: &Worker, canary: &str| {
         let o = alice.vox_in(
             Some("alice-s"),
@@ -1134,24 +1097,16 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         );
     };
 
-    // ---- (1) busy: an answer waits, and nothing is sent ----
+    // ---- (2) an answer to its question, its turn ended: exactly one notice, carrying no
+    // canary byte ----
     answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-1");
-    let busy = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
-    println!("[proof] (1) while busy, asker got {} notice(s)", busy.len());
-    check(
-        &mut failures,
-        busy.is_empty(),
-        format!("PRODUCT (1): a busy session must get no reply notice: {busy:?}"),
-    );
-
-    // ---- (2) its turn ends: exactly one notice, carrying no canary byte ----
     let stop = event(&r.workers[1], "Stop", None);
     check(
         &mut failures,
         stop.is_empty(),
         format!("PRODUCT (2): the Stop hook must print nothing: {stop:?}"),
     );
-    let Some((t1, first)) = next_notice(&inbox, Duration::from_secs(15)) else {
+    let Some((_, first)) = next_notice(&inbox, Duration::from_secs(15)) else {
         panic!(
             "PRODUCT (2): an idle session with an unread reply got no notice; {} claim(s) \
              failed:\n- {}\nbob's daemon:\n{}",
@@ -1163,7 +1118,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     println!("[proof] (2) at the end of its turn, asker got {first:?}");
     check(
         &mut failures,
-        first.contains("1 reply to your messages from alice"),
+        first.contains("1 unread room message(s) from alice"),
         format!("PRODUCT (2): the notice must name one reply from alice: {first:?}"),
     );
     check(
@@ -1172,142 +1127,18 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         format!("PRODUCT (2): no byte of the reply may reach the wake endpoint: {first:?}"),
     );
 
-    // ---- (3)/(4) one notice after each wait of the schedule, and a restart resumes it ----
-    let (t2, t3) = match (
-        next_notice(&inbox, Duration::from_secs(15)),
-        next_notice(&inbox, Duration::from_secs(20)),
-    ) {
-        (Some((t2, _)), Some((t3, _))) => (t2, t3),
-        other => panic!(
-            "PRODUCT (3): the second and third notices of the series must come; got {other:?}; \
-             bob's daemon:\n{}",
-            bob_err()
-        ),
-    };
-    r.restart(1);
-    let fourth = next_notice(&inbox, Duration::from_secs(45));
-    let gaps: Vec<f64> = [Some(t1), Some(t2), Some(t3), fourth.as_ref().map(|f| f.0)]
-        .windows(2)
-        .filter_map(|w| Some((w[1]? - w[0]?).as_secs_f64()))
-        .collect();
-    println!(
-        "[proof] (3)/(4) gaps between notices {gaps:.1?} s (6, 8, 12 due: the first wait, 4 s, is \
-         held to the 6 s hold, since the session did not read; the daemon restarted after the \
-         third); a fourth {}",
-        fourth.is_some()
-    );
-    // The tick is 2 s, so a notice comes up to 2 s after it is due.
-    let within = |g: f64, due: f64| (due - 0.5..due + 3.0).contains(&g);
-    check(
-        &mut failures,
-        gaps.len() >= 2 && within(gaps[0], 6.0) && within(gaps[1], 8.0),
-        format!(
-            "PRODUCT (3): the notices must follow the schedule, each held while one is outstanding: \
-             6 s (the 4 s wait, held to the 6 s hold), then 8 s: {gaps:?}"
-        ),
-    );
-    check(
-        &mut failures,
-        gaps.len() == 3 && gaps[2] >= 11.5,
-        format!(
-            "PRODUCT (3)/(4): a restarted daemon must resume the series — the fourth notice no \
-             sooner than 12 s after the third; gaps {gaps:?}; bob's daemon:\n{}",
-            bob_err()
-        ),
-    );
-
-    // ---- (3) then no more: the series has sent its last notice ----
-    let fifth = next_notice(&inbox, Duration::from_secs(14));
-    println!(
-        "[proof] (3) after the fourth: a fifth {:?}",
-        fifth.as_ref().map(|f| &f.1)
-    );
-    check(
-        &mut failures,
-        fourth.is_some() && fifth.is_none(),
-        format!("PRODUCT (3): after its last wait the series must stop; a fifth {fifth:?}"),
-    );
-
-    // ---- (5) a fresh reply starts the series again, its first notice held like any wake ----
-    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2");
-    let restart_notice = next_notice(&inbox, Duration::from_secs(15));
-    // Posted at once after that notice, which the session has not read: this fresh reply's first
-    // notice must wait for the 6 s hold, then come.
-    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2B");
-    let held = next_notice(&inbox, Duration::from_secs(20));
-    let after = match (&restart_notice, &held) {
-        (Some(a), Some(b)) => Some((b.0 - a.0).as_secs_f64()),
-        _ => None,
-    };
-    println!(
-        "[proof] (5) a fresh reply after the series ended: {:?}; another at once after it: {:?}, \
-         {after:.1?} s later (the hold is 6 s)",
-        restart_notice.as_ref().map(|f| &f.1),
-        held.as_ref().map(|f| &f.1)
-    );
-    check(
-        &mut failures,
-        restart_notice
-            .as_ref()
-            .is_some_and(|f| f.1.contains("2 replies to your messages from alice")),
-        format!(
-            "PRODUCT (5): a fresh reply must start the series again with a notice naming both \
-             replies; got {restart_notice:?}; bob's daemon:\n{}",
-            bob_err()
-        ),
-    );
-    check(
-        &mut failures,
-        held.as_ref()
-            .is_some_and(|f| f.1.contains("3 replies to your messages from alice"))
-            && after.is_some_and(|g| within(g, 6.0)),
-        format!(
-            "PRODUCT (5): a fresh reply's first notice is a wake, held while one is outstanding: \
-             6 s after the unread notice before it; got {held:?}, {after:?} s after it; bob's \
-             daemon:\n{}",
-            bob_err()
-        ),
-    );
-    let fresh: Vec<String> = held.into_iter().map(|f| f.1).collect();
-
     // ---- (6) the notice's turn reads each answer once; one read before idling is never told ----
-    let prompt = fresh.first().cloned().unwrap_or_else(|| "a notice".into());
-    let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some(&prompt)));
+    let read = event(&r.workers[1], "UserPromptSubmit", Some(&first));
     println!(
-        "[proof] (6) the notice's turn read reply 1 {} time(s), reply 2 {} time(s), reply 2B {} \
-         time(s)",
-        read.matches("CANARY-REPLY-1").count(),
-        read.matches("CANARY-REPLY-2:").count(),
-        read.matches("CANARY-REPLY-2B").count()
+        "[proof] (6) the notice's turn read reply 1 {} time(s)",
+        read.matches("CANARY-REPLY-1").count()
     );
     check(
         &mut failures,
-        read.matches("CANARY-REPLY-1").count() == 1
-            && read.matches("CANARY-REPLY-2:").count() == 1
-            && read.matches("CANARY-REPLY-2B").count() == 1,
-        format!("PRODUCT (6): the turn a notice starts must read each answer once: {read}"),
-    );
-    // Busy now. Another answer lands, and the session reads it before its turn ends.
-    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-3");
-    let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some("go on")));
-    assert!(
-        read.contains("CANARY-REPLY-3"),
-        "PRODUCT (staging) (6): the session's own read must take the third answer: {read}"
+        read.matches("CANARY-REPLY-1").count() == 1,
+        format!("PRODUCT (6): the turn a notice starts must read the answer once: {read}"),
     );
     let _ = event(&r.workers[1], "Stop", None);
-    let after = contents(&collect(&inbox, Duration::from_secs(12), |_| false).0);
-    println!(
-        "[proof] (6) answers read, then idle: asker got {} notice(s)",
-        after.len()
-    );
-    check(
-        &mut failures,
-        after.is_empty(),
-        format!(
-            "PRODUCT (6): an idle session that has read every answer must get no notice; got \
-             {after:?}"
-        ),
-    );
 
     // ---- (10) acknowledgements, progress and presence are not replies ----
     // The session is idle and has read everything; each of these answers its question with `re`.
@@ -1347,13 +1178,13 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         quiet.is_empty()
             && control
                 .as_ref()
-                .is_some_and(|c| c.contains("1 reply to your messages from alice")),
+                .is_some_and(|c| c.contains("1 unread room message(s) from alice")),
         format!(
             "PRODUCT (10): an ack, status, hello, bye, ping or pong is never announced as a reply, \
              nor counted in one; got {quiet:?}, then {control:?}"
         ),
     );
-    let _ = event(&r.workers[1], "UserPromptSubmit", Some("read"));
+    let _ = event(&r.workers[1], "UserPromptSubmit", control.as_deref());
     let _ = event(&r.workers[1], "Stop", None);
 
     // ---- (7) SessionEnd removes the registration ----
@@ -1381,20 +1212,20 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let late_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", late_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "late-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
     ];
-    let late = |w: &Worker, name: &str| {
+    let late = |w: &Worker, name: &str, prompt: &str| {
+        if name == "UserPromptSubmit" {
+            return claude_turn(w, &late_env, &room, "late", prompt);
+        }
         hook(
             w,
             &late_env,
             &["agent", "hook", "--node", "default", "--room", &room],
-            Some(&hook_json(
-                name,
-                "late",
-                (name == "UserPromptSubmit").then_some("hi"),
-            )),
+            Some(&hook_json(name, "late", None)),
         )
     };
-    let _ = late(&r.workers[1], "UserPromptSubmit");
+    let _ = late(&r.workers[1], "UserPromptSubmit", "hi");
     let o = r.workers[1].vox_in(
         Some("late"),
         &[
@@ -1417,7 +1248,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         &["room", "read", &room],
         |o| o.stdout.contains("Is the late build out?"),
     );
-    let _ = late(&r.workers[1], "Stop");
+    let _ = late(&r.workers[1], "Stop", "");
     r.stop(1);
     let o = r.workers[0].vox_in(
         Some("alice-s"),
@@ -1441,25 +1272,42 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let started = Instant::now();
     r.restart(1);
     let up = started.elapsed().as_secs_f64();
-    let (frames, _stall) = collect(&late_inbox, Duration::from_secs(20), |g| {
-        g.contains("urgent message") && g.contains("repl")
-    });
-    let told = contents(&frames).join("\n");
+    // The two may reach bob's restarted node in separate syncs, and one notice is outstanding at
+    // a time (ADR-020 §6.15 RA-8): what lands behind an outstanding notice is counted in the next,
+    // or read by the turn the first one starts. So each notice's turn is taken, as its harness
+    // takes it, until those turns have read both.
+    let (mut frames, mut told, mut read) = (Vec::new(), Vec::new(), String::new());
+    while !(read.contains("CANARY-START-R") && read.contains("CANARY-START-U")) {
+        let (got, _stall) = collect(&late_inbox, Duration::from_secs(20), |g| {
+            g.contains("Notice reference")
+        });
+        let Some(notice) = contents(&got).into_iter().next() else {
+            break;
+        };
+        frames.extend(got);
+        read.push_str(&late(&r.workers[1], "UserPromptSubmit", &notice));
+        told.push(notice);
+    }
     println!(
-        "[proof] (9) after a restart ({up:.1}s to come back): urgent counted {}, reply counted {}, \
-         message bytes at the socket {}",
-        told.contains("urgent message addressed to you from alice"),
-        told.contains("repl"),
+        "[proof] (9) after a restart ({up:.1}s to come back): notices {told:?}; their turns read \
+         the reply {} and the urgent message {}; message bytes at the socket {}",
+        read.matches("CANARY-START-R").count(),
+        read.matches("CANARY-START-U").count(),
         frames.join("\n").contains("CANARY-START")
     );
     check(
         &mut failures,
-        told.contains("urgent message addressed to you from alice")
-            && told.contains("repl")
+        !told.is_empty()
+            && told
+                .iter()
+                .all(|n| n.contains("unread room message(s) from alice"))
+            && read.matches("CANARY-START-R").count() == 1
+            && read.matches("CANARY-START-U").count() == 1
             && !frames.join("\n").contains("CANARY-START"),
         format!(
             "PRODUCT (9): an urgent message and a reply that landed while the daemon was down \
-             must be announced once it is back; got {told:?}; bob's daemon:\n{}",
+             must be announced once it is back, and the turns the notices start must read each \
+             once; got {told:?}, read {read:?}; bob's daemon:\n{}",
             bob_err()
         ),
     );
@@ -1502,18 +1350,25 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         .iter()
         .map(|s| s.3.to_string_lossy().into_owned())
         .collect();
+    let native = native_attention(&r.workers[0]);
+    // A turn starts as Claude Code starts it with Vox installed (both prompt hooks); `Stop` is one
+    // hook.
     let event = |i: usize, name: &str, prompt: Option<&str>| {
         let (w, me, _, _) = &sides[i];
         let env = [
             ("CLAUDE_CODE_MESSAGING_SOCKET", socks[i].as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "pp-token"),
+            ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
         ];
-        hook(
-            w,
-            &env,
-            &["agent", "hook", "--node", "default", "--room", &room],
-            Some(&hook_json(name, me, prompt)),
-        )
+        match prompt {
+            Some(prompt) => claude_turn(w, &env, &room, me, prompt),
+            None => hook(
+                w,
+                &env,
+                &["agent", "hook", "--node", "default", "--room", &room],
+                Some(&hook_json(name, me, None)),
+            ),
+        }
     };
     // Each side answers what it was told, addressed back, as its model would; then its turn ends.
     let answer = |i: usize, re: Option<&str>, body: &str| -> String {
@@ -1633,6 +1488,9 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
     let room = r.id.clone();
 
     // ---- bob's Codex-shaped session takes part in work coordination, so it says hello ----
+    // A Session posts only once its node has registered it, as its harness's hook does at the
+    // start of a turn (ADR-020 §6.15 RA-3); so does alice's below.
+    support::register_sending_session(bob, &room, "codex-thread-1");
     let o = bob.vox_env(
         Some("codex-thread-1"),
         &[("VOX_HARNESS", "codex")],
@@ -1699,6 +1557,7 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
     );
 
     // ---- (2)-(4) alice addresses bob's node, and carol's, where no session announced itself ----
+    support::register_sending_session(alice, &room, "alice-session");
     let o = alice.vox_in(
         Some("alice-session"),
         &[
@@ -1789,18 +1648,14 @@ fn a_wake_owed_when_the_daemon_died_is_sent_after_it_restarts() {
     let sock = tmp.path().join("session.sock");
     let inbox = listen(&sock);
     let sock_s = sock.to_string_lossy().into_owned();
+    let native = native_attention(&r.workers[1]);
     let bob_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native.as_str()),
     ];
-    let turn = |bob: &Worker, prompt: &str| {
-        injected(&hook(
-            bob,
-            &bob_env,
-            &["agent", "hook", "--node", "default", "--room", &room],
-            Some(&hook_json("UserPromptSubmit", "session-bob", Some(prompt))),
-        ))
-    };
+    let turn =
+        |bob: &Worker, prompt: &str| claude_turn(bob, &bob_env, &room, "session-bob", prompt);
     let _ = turn(&r.workers[1], "hi");
     assert_eq!(
         registered_endpoint(&r.workers[1], "session-bob"),
@@ -1808,7 +1663,10 @@ fn a_wake_owed_when_the_daemon_died_is_sent_after_it_restarts() {
         "PRODUCT (staging): bob's session must be registered at the test's own socket, never a \
          real session's"
     );
-    post(&r.workers[0], &room, "SYNC-MARKER");
+    // Said by alice's session, so that it is not ordinary conversation offered to bob's session
+    // (ADR-020 §6.15 RA-1): the only notice this measures is the one owed after the restart.
+    support::register_sending_session(&r.workers[0], &room, "session-alice");
+    post_as(&r.workers[0], "session-alice", &room, "SYNC-MARKER");
     until(
         &r.workers[1],
         None,
@@ -1883,7 +1741,7 @@ fn a_wake_owed_when_the_daemon_died_is_sent_after_it_restarts() {
     );
     assert!(
         wakes.len() == 1
-            && wakes[0].contains("1 urgent message addressed to you from alice")
+            && wakes[0].contains("1 unread room message(s) from alice")
             && !all.contains("CANARY-OWED"),
         "PRODUCT: an urgent message bob's node stored but never judged before its daemon was \
          killed must wake his session once its daemon is back — the startup count — with a \

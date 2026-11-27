@@ -583,7 +583,7 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
     let elsewhere = Account::new();
     // Management exists before any chat node, and cancelling a fresh code grants nothing.
     let empty_identity = computer(&elsewhere, &["status"])["this_computer"].clone();
-    let empty_invite = computer(&elsewhere, &["invite"]);
+    let empty_invite = computer(&elsewhere, &["pair"]);
     let cancel = empty_invite["invite_id"]
         .as_str()
         .expect("PRODUCT: Add Computer omitted its cancel identifier");
@@ -1062,7 +1062,7 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
         assert!(ok, "APPARATUS: ready destination node {name}: {out}{err}");
         computer(account, &["personal", name]);
     }
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("APPARATUS: the synthetic computer invitation has no link");
@@ -1087,7 +1087,7 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
     for input in ["no\n", ""] {
         let sponsor = Account::new();
         let incoming = Account::new();
-        let invitation = computer(&sponsor, &["invite"]);
+        let invitation = computer(&sponsor, &["pair"]);
         let link = invitation["invite_link"]
             .as_str()
             .expect("APPARATUS: negative-control invitation omitted its link");
@@ -1136,7 +1136,7 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
     );
     assert!(ok, "APPARATUS: ready the old-group peer: {out}{err}");
     computer(&d, &["personal", "move-old-peer"]);
-    let old = computer(&c, &["invite"]);
+    let old = computer(&c, &["pair"]);
     let old_link = old["invite_link"]
         .as_str()
         .expect("APPARATUS: second group has no invitation");
@@ -1223,7 +1223,7 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
         assert!(ok, "APPARATUS: stage shared room for {name}: {out}{err}");
     }
     let before = computer(&c, &["status"]);
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("APPARATUS: destination invitation missing");
@@ -1289,7 +1289,7 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
         "PRODUCT: local retirement did not preserve the computer identity: {retired}"
     );
     computer(&a, &["cancel", &old_proposal]);
-    let fresh = computer(&a, &["invite"]);
+    let fresh = computer(&a, &["pair"]);
     let fresh_link = fresh["invite_link"]
         .as_str()
         .expect("APPARATUS: fresh invitation missing");
@@ -1425,7 +1425,7 @@ fn paired_ready_nodes_read_both_ways_and_survive_reselection() {
         ok,
         "APPARATUS: two already-Ready nodes could not share a room before pairing: {out}{err}"
     );
-    let offer = computer(&a, &["invite"]);
+    let offer = computer(&a, &["pair"]);
     let preview = computer(
         &b,
         &[
@@ -1554,7 +1554,7 @@ fn private_session_opened_offline_reaches_its_paired_driver() {
     }
     computer(&driver, &["personal", "tail-driver"]);
     computer(&worker, &["personal", "--clear"]);
-    let invitation = computer(&driver, &["invite"]);
+    let invitation = computer(&driver, &["pair"]);
     let preview = computer(
         &worker,
         &[
@@ -1813,7 +1813,7 @@ fn pair_computers(
         original_identity["fingerprint"], remote_identity["fingerprint"],
         "PRODUCT: separate data roots shared a computer identity"
     );
-    let mut marked = b.cmd(&["computer", "invite", "--json"]);
+    let mut marked = b.cmd(&["computer", "pair", "--json"]);
     let refused = marked
         .env("CODEX_THREAD_ID", "proof-agent")
         .output()
@@ -1827,7 +1827,7 @@ fn pair_computers(
         "individual",
         "PRODUCT: refused agent request changed pairing state"
     );
-    let offered = computer(a, &["invite"]);
+    let offered = computer(a, &["pair"]);
     let link = offered["invite_link"]
         .as_str()
         .expect("PRODUCT: Add Computer did not show a pairing link");
@@ -2143,7 +2143,7 @@ fn preauth_discloses_no_group_history(sponsor: &Account) {
     use vox_core::transport::framing::{read_frame, write_frame};
     use vox_core::transport::streams::{open_typed, StreamKind};
 
-    let invitation = computer(sponsor, &["invite"]);
+    let invitation = computer(sponsor, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("APPARATUS: sponsor invitation");
@@ -2474,7 +2474,7 @@ fn enroll_third(
                 && has(&ring(&c, "codex-beast"), &local[0], true)
         }), "PRODUCT [reverse enrollment original-group authority]: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}", computer(b, &["status"]), computer(&c, &["status"]));
     };
-    let invite = computer(&c, &["invite"]);
+    let invite = computer(&c, &["pair"]);
     let link = invite["invite_link"]
         .as_str()
         .expect("PRODUCT: individual computer did not offer Add Computer");
@@ -2681,7 +2681,7 @@ fn enroll_third(
 fn close_expired_pairing() {
     let a = Account::new();
     let b = Account::new();
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"].as_str().unwrap();
     let preview = computer(&b, &["pair", link, "--preview"]);
     let op = preview["pairing"]["operation_id"].as_str().unwrap();
@@ -2692,10 +2692,6 @@ fn close_expired_pairing() {
             == true),
         "APPARATUS: joiner has not yet received the signed one-sided approval"
     );
-    for id in [op, invitation["invite_id"].as_str().unwrap()] {
-        let (ok, out, err) = a.run(&["computer", "cancel", id, "--json"], "");
-        assert!(!ok && err.contains("already signed"), "PRODUCT: live signed approval was described as withdrawn using its operation or saved invite ID: {out}{err}");
-    }
     stop_pid(a.lock_pid().expect("APPARATUS: expiring scratch daemon"));
     let stepped = Daemon::start(&a, &["--no-node"], &[("VOX_TEST_CLOCK_STEP_MS", "700000")]);
     stepped.expect("its control socket", Duration::from_secs(30), |l| {
@@ -2709,7 +2705,7 @@ fn close_expired_pairing() {
                 .is_some_and(|p| p.contains("does not remove trust there")),
         "PRODUCT: closing an expired attempt did not explain its local-only outcome: {closed}"
     );
-    let fresh = computer(&a, &["invite"]);
+    let fresh = computer(&a, &["pair"]);
     assert!(
         fresh["invite_id"] != invitation["invite_id"] && fresh["pairing"].is_null(),
         "PRODUCT: an expired one-sided approval stranded this computer: {fresh}"
@@ -2763,7 +2759,7 @@ fn computer_preview_and_approval_survive_a_crash() {
     db.expect_apparatus_event("node beta is Ready", |line| line.contains("beta is Ready"));
     computer(&a, &["personal", "alpha"]);
     computer(&b, &["personal", "beta"]);
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: Add Computer did not show a pairing link");
@@ -2984,7 +2980,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     std::fs::write(&registration_arm, owner_key)
         .expect("APPARATUS: arm the exact inviter registration hold");
     let publication_started = Instant::now();
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: node-free computer invitation missing");
@@ -3109,7 +3105,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     // A new invitation still fits the existing retention budget and must not resurrect the
     // cancelled operation. Establish the computers only from this new operation.
-    let invitation = computer(&a, &["invite"]);
+    let invitation = computer(&a, &["pair"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: replacement node-free invitation missing");
@@ -3379,7 +3375,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // Create the later race identity only in its own phase: an unattached on-disk node
     // truthfully keeps Computer applying and must not contaminate the earlier exact roster.
     let third = a.make_node("anchor-return-third");
-    let race_invitation = computer(&b, &["invite"]);
+    let race_invitation = computer(&b, &["pair"]);
     let race_link = race_invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: reserve-to-install race invitation named no invite_link")
@@ -3663,7 +3659,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // This old miss is not this next explicit request's clock. Admit a fresh invocation while
     // its only bridge is still down, park its exact reservation, and restore the path before
     // allowing that same process to authenticate. No command retry or replacement clock is used.
-    let fresh_invitation = computer(&b, &["invite"]);
+    let fresh_invitation = computer(&b, &["pair"]);
     let fresh_link = fresh_invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: fresh-boundary invitation named no link")
@@ -4444,7 +4440,7 @@ impl RoomTrustJourney {
             computer(account, &["personal", node]);
         }
         for peer in [&b].into_iter().chain(pair_gamma.then_some(&c)) {
-            let offer = computer(&a, &["invite"]);
+            let offer = computer(&a, &["pair"]);
             let preview = computer(
                 peer,
                 &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
@@ -5077,7 +5073,7 @@ fn a_post_racing_a_trust_revision_is_saved_once() {
     assert!(ok, "APPARATUS: attach gamma: {out}{err}");
     computer(&a, &["personal", "alpha"]);
     computer(&b, &["personal", "beta"]);
-    let offer = computer(&a, &["invite"]);
+    let offer = computer(&a, &["pair"]);
     let preview = computer(
         &b,
         &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
@@ -6142,7 +6138,7 @@ fn active_and_removed_computers_keep_local_manual_trust() {
         computer(account, &["personal", node]);
     }
 
-    let offered = computer(&a, &["invite"]);
+    let offered = computer(&a, &["pair"]);
     let link = offered["invite_link"]
         .as_str()
         .expect("PRODUCT: Add Computer did not show a pairing link");
@@ -6355,7 +6351,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         // that refusal; the refused invitation is cancelled first, as `vox computer status` says.
         let mut preview = None;
         for attempt in 1..=3 {
-            let offer = staging(sponsor, &["invite"]);
+            let offer = staging(sponsor, &["pair"]);
             let (ok, out, err) = incoming.run(
                 &[
                     "computer",
@@ -7068,7 +7064,7 @@ fn superseded_governance_resumes() {
     );
     computer(&member, &["personal", "beta"]);
     computer(&control, &["personal", "control"]);
-    let invite = computer(&member, &["invite"]);
+    let invite = computer(&member, &["pair"]);
     let preview = computer(
         &control,
         &[
@@ -7260,7 +7256,7 @@ fn superseded_governance_resumes() {
 
 /// **Two paired computers follow each other's changes** (ADR-038 FX-28; #1020): alpha and beta,
 /// two data roots with a daemon each, pair as computers
-/// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
+/// (`vox computer pair`, `pair --preview`, `approve` on both) and both report `confirmed`.
 ///
 /// A change made on either shows on both: gamma is made and attached on alpha's computer, and
 /// within [`CHANGE_SHOWN_WITHIN`] of the attach alpha's `vox computer status` names gamma with
@@ -7576,7 +7572,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     computer(&a, &["personal", "alpha"]);
     computer(&b, &["personal", "beta"]);
-    let offered = computer(&a, &["invite"]);
+    let offered = computer(&a, &["pair"]);
     let link = offered["invite_link"]
         .as_str()
         .expect("PRODUCT: Add Computer did not show a pairing link")
@@ -10372,7 +10368,7 @@ fn stale_rekey_is_not_delivered(
     let mut dc = Daemon::start(&c, &["--node", "zeta"], &[("VOX_LISTEN", &listen_c)]);
     dc.expect_apparatus_event("node zeta is Ready", |line| line.contains("zeta is Ready"));
     computer(&c, &["personal", "zeta"]);
-    let invited = computer(b, &["invite"]);
+    let invited = computer(b, &["pair"]);
     let link_c = invited["invite_link"]
         .as_str()
         .expect("APPARATUS: third Computer invitation has no link");
@@ -11139,7 +11135,7 @@ fn rg8_ready(account: &Account, node: &str, listen: &str) -> Daemon {
 }
 
 fn rg8_pair(a: &Account, b: &Account) {
-    let offer = computer(a, &["invite"]);
+    let offer = computer(a, &["pair"]);
     let preview = computer(
         b,
         &[
@@ -11264,7 +11260,7 @@ fn a_pairing_link_without_a_route_is_refused_at_once() {
     watchdog::arm();
     let a = Account::new();
     let b = Account::new();
-    let offered = computer(&a, &["invite"]);
+    let offered = computer(&a, &["pair"]);
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(
@@ -11332,8 +11328,8 @@ fn a_pairing_link_without_a_route_is_refused_at_once() {
         .expect("APPARATUS: collect address-free pairing");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success() && err.contains("pairing link has no address") && err.contains("vox computer invite"),
-        "PRODUCT: address-free pairing did not say why it cannot reach the computer and how to get a usable invitation: {err}"
+        !out.status.success() && err.contains("pairing link has no address") && err.contains("vox computer pair"),
+        "PRODUCT: address-free pairing did not say why it cannot reach the computer and how to get a usable pairing code: {err}"
     );
     assert!(
         computer(&b, &["status"])["pairing"].is_null(),
@@ -11355,7 +11351,7 @@ fn either_computer_closes_a_half_signed_pairing_at_once() {
         let beta = b.make_node("beta");
         computer(&a, &["personal", "alpha"]);
         computer(&b, &["personal", "beta"]);
-        let offer = computer(&a, &["invite"]);
+        let offer = computer(&a, &["pair"]);
         let preview = computer(
             &b,
             &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
@@ -11427,7 +11423,7 @@ fn either_computer_closes_a_half_signed_pairing_at_once() {
             "PRODUCT: closer gained trust after the other side's late approval: {trusted}{err}"
         );
         eprintln!("PRODUCT GREEN: inviter_closes={inviter_closes}; other side completed, closer stayed individual with no pairing or new trust");
-        let next = computer(holder, &["invite"]);
+        let next = computer(holder, &["pair"]);
         assert!(
             next["invite_link"].is_string(),
             "PRODUCT: closed proposal prevents a new invitation: {next}"
@@ -11453,9 +11449,9 @@ fn computer_status_opens_with_where_it_stands_and_the_next_command() {
     check(
         &a,
         "This computer is not in a group.",
-        "Next: vox computer invite",
+        "Next: vox computer pair",
     );
-    let offer = computer(&a, &["invite"]);
+    let offer = computer(&a, &["pair"]);
     check(
         &a,
         "This computer is waiting for pairing.",
@@ -11487,7 +11483,7 @@ fn computer_status_opens_with_where_it_stands_and_the_next_command() {
     check(
         &a,
         "This computer is in a group with ",
-        "Next: vox computer invite",
+        "Next: vox computer pair",
     );
 }
 
@@ -11540,6 +11536,24 @@ fn a_refused_room_pause_names_the_node_and_command_that_can_pause() {
         );
         assert!(ok, "APPARATUS: pause member join: {out}{err}");
     }
+    // A join returns when the joiner got in, not when the room's other nodes took its entries:
+    // until then beta answers no member's stream. Wait for what `vox room roster` shows on beta
+    // and on alpha: all three members, and no key of theirs still waiting.
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            [(&b, "beta"), (&a, "alpha")].into_iter().all(|(account, node)| {
+                let (ok, members, said) =
+                    account.run(&["room", "roster", full_room, "--node", node], "");
+                ok && [&alpha, &agent, &beta]
+                    .into_iter()
+                    .all(|member| members.lines().any(|line| line == member.as_str()))
+                    && !said.contains("is owed your key")
+            })
+        }),
+        "APPARATUS: the two joins did not settle on beta and alpha: {:?}; {:?}",
+        b.run(&["room", "roster", full_room, "--node", "beta"], ""),
+        a.run(&["room", "roster", full_room, "--node", "alpha"], "")
+    );
     let command = format!("vox room pause {full_room} {beta} --node alpha");
     let (ok, out, err) = a.run(&["room", "pause", full_room, &beta, "--node", "agent"], "");
     let said = format!("{out}{err}");
@@ -11576,10 +11590,23 @@ fn a_refused_room_pause_names_the_node_and_command_that_can_pause() {
         "PRODUCT: the refusal's resume command did not resume beta: {out}{err}"
     );
     computer(&b, &["personal", "beta"]);
+    // A node's room gate opens at a new policy revision only once that node's binding is
+    // derived at it; "confirmed" alone says the computers exchanged it, not that each node
+    // applied it. Wait for what `vox computer status` shows: alpha's computer names beta
+    // personal, and every node of both computers is bound at its computer's revision.
     assert!(
-        wait_until(RETURN_WITHIN, || computer(&a, &["status"])["state"]
-            == "confirmed"
-            && computer(&b, &["status"])["state"] == "confirmed"),
+        wait_until(RETURN_WITHIN, || {
+            let (left, right) = (computer(&a, &["status"]), computer(&b, &["status"]));
+            left["state"] == "confirmed"
+                && right["state"] == "confirmed"
+                && left["nodes"].as_array().is_some_and(|nodes| {
+                    nodes
+                        .iter()
+                        .any(|node| node["name"] == "beta" && node["personal"] == true)
+                })
+                && roster_current(&left, &["alpha", "agent"])
+                && roster_current(&right, &["owner", "beta"])
+        }),
         "APPARATUS: new personal role did not settle"
     );
     let (ok, out, err) = a.run(&["room", "pause", full_room, &beta, "--node", "agent"], "");

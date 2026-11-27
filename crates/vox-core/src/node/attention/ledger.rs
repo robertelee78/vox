@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 const KIND: SegmentKind = SegmentKind::SessionAttention;
 const RECORD_BYTES: usize = 16 * 1024;
+/// How many open wakes a Session's record keeps: far more than a Session leaves unanswered, and
+/// small enough that the record stays inside `RECORD_BYTES` beside a full page's notice.
+const WOKE_KEPT: usize = 16;
 type Key = [u8; 64];
 type MaintenancePage = (
     Option<(Digest32, u64)>,
@@ -47,6 +50,10 @@ struct Session {
     // A native prompt hook consumes an existing notice, never a second queue entry.
     #[serde(default)]
     notice_admitted: bool,
+    // The sources of notices this Session's own prompt hook admitted that it has not replied to
+    // (`re`) yet, oldest first, at most `WOKE_KEPT` (ADR-020 §9.4, V210-121).
+    #[serde(default)]
+    woke: Vec<Digest32>,
     uncertain: bool,
     reason: Option<String>,
     wait: Option<Wait>,
@@ -74,6 +81,7 @@ impl Session {
             cursor: 0,
             attempt: None,
             notice_admitted: false,
+            woke: Vec::new(),
             uncertain: false,
             reason: None,
             wait: None,
@@ -701,10 +709,33 @@ impl<'a, 's> Ledger<'a, 's> {
         notice_id: [u8; 16],
         route: Digest32,
     ) -> Result<()> {
-        self.notice(recipient, notice_id, route)?;
+        let notice = self.notice(recipient, notice_id, route)?;
         let (id, mut session) = self.session(recipient)?;
         session.notice_admitted = true;
+        // **A wake is a notice the Session's own hook admitted** (ADR-020 §9.4, V210-121): what
+        // it announced stays open until the Session replies to it, so the Session's next post
+        // with no `--re` answers it rather than starting a chain at a fresh hop budget.
+        for source in notice.sources {
+            session.woke.retain(|open| *open != source);
+            session.woke.push(source);
+        }
+        let dropped = session.woke.len().saturating_sub(WOKE_KEPT);
+        session.woke.drain(..dropped);
         self.save_session(id, session)
+    }
+    /// The Session posted a reply to `source` (its `re`): that wake is answered.
+    pub(crate) fn replied(&mut self, recipient: &Recipient, source: &Digest32) -> Result<()> {
+        let (id, mut session) = self.session(recipient)?;
+        let open = session.woke.len();
+        session.woke.retain(|woke| woke != source);
+        if session.woke.len() != open {
+            self.write_session(id, session)?;
+        }
+        Ok(())
+    }
+    /// The admitted wakes this Session has not replied to, oldest first.
+    pub(crate) fn woke(&self, recipient: &Recipient) -> Result<Vec<Digest32>> {
+        Ok(self.session(recipient)?.1.woke)
     }
     pub(crate) fn dispatch(&mut self, a: &Attempt, outcome: DispatchOutcome) -> Result<()> {
         let (id, mut s) = self.session(&a.recipient)?;

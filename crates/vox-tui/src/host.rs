@@ -217,6 +217,17 @@ struct MachineAnchors {
     inputs: Vec<(String, String)>,
     set: BootstrapSet,
     skipped: Vec<String>,
+    /// Each hostname input's last resolution, as numeric specs: what is kept for that input, and
+    /// only for it, while it is looked up again.
+    resolved: BTreeMap<(Digest32, String), Vec<String>>,
+}
+
+/// The key of a hostname anchor input in [`MachineAnchors::resolved`]: its fingerprint and its
+/// address as written.
+fn hostname_key(spec: &str) -> Option<(Digest32, String)> {
+    let (id, address) = spec.split_once('@')?;
+    let id = vox_core::node::link::fingerprint_input(id, "anchor").ok()?;
+    Some((id, address.trim().to_owned()))
 }
 
 /// A member's answer as the sink took it: handed to the harness, or why not.
@@ -833,6 +844,7 @@ impl Router {
                         inputs: Vec::new(),
                         set: defaults.anchors.clone(),
                         skipped: Vec::new(),
+                        resolved: BTreeMap::new(),
                     }),
                     manual_refresh: Arc::new(tokio::sync::Mutex::new(())),
                     defaults,
@@ -963,7 +975,7 @@ impl Router {
                 skipped.push(format!("{label} is skipped: {error}"));
             }
         }
-        let (revision, interim) = {
+        let (revision, interim, cached) = {
             let mut state = self.inner.manual_anchors.lock().await;
             let mut interim = numeric.clone();
             {
@@ -976,17 +988,15 @@ impl Router {
                         ],
                     );
                 }
-                // Keep still-authorized hostname hints from the latest published set, never
-                // the pre-read snapshot: another refresh may have resolved a newer endpoint.
+                // Keep each hostname's last resolution from the latest published state, never
+                // the pre-read snapshot (another refresh may have resolved a newer endpoint), and
+                // only that: an address the configuration no longer names is not kept because a
+                // hostname line names the same anchor.
                 for (_, spec) in &names {
-                    if let Some(id) = spec.split_once('@').and_then(|(id, _)| {
-                        vox_core::node::link::fingerprint_input(id, "anchor").ok()
-                    }) {
-                        if let Some(node) = state.set.get(&id) {
-                            for spec in vox_core::node::link::anchor_specs(node) {
-                                let _ =
-                                    vox_core::node::link::merge_anchor_spec(&mut interim, &spec);
-                            }
+                    if let Some(specs) = hostname_key(spec).and_then(|key| state.resolved.get(&key))
+                    {
+                        for spec in specs {
+                            let _ = vox_core::node::link::merge_anchor_spec(&mut interim, spec);
                         }
                     }
                 }
@@ -1003,7 +1013,7 @@ impl Router {
                 state.skipped = skipped.clone();
             }
             self.deliver_manual_anchors(&state).await;
-            (state.revision, interim)
+            (state.revision, interim, state.resolved.clone())
         };
         if names.is_empty() {
             return (interim, skipped);
@@ -1014,28 +1024,37 @@ impl Router {
             );
             return (interim, skipped);
         };
-        let cached = interim.clone();
         let resolved = tokio::task::spawn_blocking(move || {
             let mut set = numeric;
+            let mut resolved = BTreeMap::new();
             for (label, spec) in names {
-                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, &spec) {
-                    skipped.push(format!("{label} is skipped: {error}"));
-                    if let Some(id) = spec.split_once('@').and_then(|(id, _)| {
-                        vox_core::node::link::fingerprint_input(id, "anchor").ok()
-                    }) {
-                        if let Some(node) = cached.get(&id) {
-                            for spec in vox_core::node::link::anchor_specs(node) {
-                                let _ = vox_core::node::link::merge_anchor_spec(&mut set, &spec);
-                            }
-                        }
+                let mut one = BootstrapSet::new();
+                let specs = match vox_core::node::link::merge_anchor_spec(&mut one, &spec) {
+                    Ok(()) => Some(
+                        one.nodes()
+                            .iter()
+                            .flat_map(vox_core::node::link::anchor_specs)
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(error) => {
+                        skipped.push(format!("{label} is skipped: {error}"));
+                        hostname_key(&spec).and_then(|key| cached.get(&key).cloned())
+                    }
+                };
+                if let Some(specs) = specs {
+                    for spec in &specs {
+                        let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                    }
+                    if let Some(key) = hostname_key(&spec) {
+                        resolved.insert(key, specs);
                     }
                 }
             }
             // Hold the refresh guard through publication, not just resolution. A completed
             // older refresh must not overwrite a newer same-revision refresh out of order.
-            (set, skipped, refresh)
+            (set, skipped, resolved, refresh)
         });
-        let (set, skipped, _refresh) = match tokio::time::timeout(Duration::from_secs(3), resolved).await {
+        let (set, skipped, resolved, _refresh) = match tokio::time::timeout(Duration::from_secs(3), resolved).await {
             Ok(Ok(resolved)) => resolved,
             Ok(Err(error)) => return (interim, vec![format!("machine anchor refresh did not finish: {error}")]),
             Err(_) => return (interim, vec!["machine anchor DNS did not finish within 3 seconds; numeric endpoints are available, retrying".into()]),
@@ -1056,6 +1075,7 @@ impl Router {
             }
             state.set = set;
             state.skipped = skipped;
+            state.resolved = resolved;
         }
         self.deliver_manual_anchors(&state).await;
         (state.set.clone(), state.skipped.clone())
@@ -1091,6 +1111,7 @@ impl Router {
             }
             None => (None, None),
         };
+        let added = add.as_deref().and_then(hostname_key);
         let mut state = self.inner.manual_anchors.lock().await;
         let account = self.inner.account.clone();
         let extra = state.specs.clone();
@@ -1116,10 +1137,15 @@ impl Router {
             if let Some(node) = resolved_add.filter(|_| current.as_deref().copied() == generation) {
                 // The lookup finished before the writer lock. These are numeric multiaddrs,
                 // so neither publication nor another node's attachment waits for DNS here.
-                for spec in vox_core::node::link::anchor_specs(&node) {
-                    vox_core::node::link::merge_anchor_spec(&mut state.set, &spec).map_err(
+                let specs = vox_core::node::link::anchor_specs(&node);
+                for spec in &specs {
+                    vox_core::node::link::merge_anchor_spec(&mut state.set, spec).map_err(
                         |error| format!("manual anchor saved but endpoint update failed: {error}"),
                     )?;
+                }
+                // The refresh that follows keeps this resolution while it looks the name up.
+                if let Some(key) = added {
+                    state.resolved.insert(key, specs);
                 }
             }
         }

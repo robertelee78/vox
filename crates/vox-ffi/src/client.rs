@@ -1089,13 +1089,17 @@ pub struct FfiSession {
     pub node_fingerprint: String,
     /// This node's name for that node (ADR-028 K-3); empty for none.
     pub node_alias: String,
-    /// The harness's own session id, as its node claims it.
+    /// The harness's own session id, as its node claims it: what selects it; show `shown_id`.
     pub session_id: String,
+    /// That id as a reader is shown it, the way `name` is (`session_shown`): where there is no
+    /// name to show.
+    pub shown_id: String,
     /// The authenticated opening of this exact Session incarnation.
     pub opening: String,
     /// The first 8 characters of the id.
     pub short_id: String,
-    /// The session's current name, as its node last gave it.
+    /// The session's current name, as its node last gave it, shown as its label shows it
+    /// (`vox_agentcomms::envelope::session_shown`): one line, nothing hidden or reordering.
     pub name: Option<String>,
     /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
     pub label: String,
@@ -1126,8 +1130,12 @@ fn ffi_session(
         label: known.label(s),
         can_stop: s.harness != "omp",
         session_id: s.id.clone(),
+        shown_id: vox_agentcomms::envelope::session_shown(&s.id),
         opening: b32_encode(&s.opening),
-        name: s.name.clone(),
+        name: s
+            .name
+            .as_deref()
+            .map(vox_agentcomms::envelope::session_shown),
         open: s.open,
         opened_at_ms: s.opened_millis,
         ended_at_ms: s.ended_millis,
@@ -1385,6 +1393,11 @@ fn session_entry(
                 .map(|(text, options)| FfiQuestion {
                     text: text.clone(),
                     options: options.clone(),
+                    shown_text: vox_agentcomms::envelope::session_shown(text),
+                    shown_options: options
+                        .iter()
+                        .map(|o| vox_agentcomms::envelope::session_shown(o))
+                        .collect(),
                 })
                 .collect(),
             state: q.state.clone(),
@@ -1419,17 +1432,22 @@ pub struct FfiRequest {
     /// A question's parts; none for an approval.
     pub questions: Vec<FfiQuestion>,
     /// `None` while it is open and may be answered from Vox; otherwise what became of it, in the
-    /// line's words: "approved here", "answered in Vox by ann: blue", "not answerable from Vox: …".
+    /// line's words, revealed as the line is: "approved here", "answered in Vox by ann: blue",
+    /// "not answerable from Vox: …".
     pub state: Option<String>,
 }
 
 /// One part of a question.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiQuestion {
-    /// What it asks.
+    /// What it asks, as the session wrote it: what an answer names. Show `shown_text`.
     pub text: String,
-    /// Its options' labels, in order.
+    /// Its options' labels, in order, as written: what an answer gives. Show `shown_options`.
     pub options: Vec<String>,
+    /// `text` as a reader is shown it (`session_shown`): one line, nothing hidden or reordering.
+    pub shown_text: String,
+    /// `options`, each as a reader is shown it, in the same order.
+    pub shown_options: Vec<String>,
 }
 
 /// How the app names nodes in a Session's words, as the CLI does: its alias for a node, `you` for
@@ -1525,7 +1543,9 @@ async fn sessions_addressable(
 }
 
 /// One logical metadata page. A member-written field is returned whole (ADR-034 FR-7/8),
-/// so the one-large-row exception is distinct from accumulating a room's history.
+/// so the one-large-row exception is distinct from accumulating a room's history. A page the
+/// room's Sessions changed under while it was read is read again
+/// ([`IpcClient::session_selection`]), so no caller keeps rows from before the change.
 async fn room_sessions_page(
     c: &mut IpcClient,
     channel_id: Digest32,
@@ -1538,7 +1558,10 @@ async fn room_sessions_page(
     ),
     VoxError,
 > {
-    match c.sessions_page(channel_id, after).await {
+    match c
+        .session_selection(&Request::SessionsPage { channel_id, after })
+        .await
+    {
         Ok(Frame::SessionsPage {
             sessions,
             summaries,
@@ -1572,7 +1595,12 @@ async fn exact_session(
     ),
     VoxError,
 > {
-    match c.session_lookup(room, node, id.to_owned()).await {
+    let lookup = Request::SessionLookup {
+        channel_id: room,
+        node,
+        id: id.to_owned(),
+    };
+    match c.session_selection(&lookup).await {
         Ok(Frame::SessionsPage {
             sessions,
             summaries,
@@ -5294,7 +5322,11 @@ impl VoxClient {
             full_history: false,
             drive,
         };
-        on_held!(self, |c| done(c, &req).await)
+        // A saved trust whose key is still being delivered succeeded: nothing is left to do.
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Ok | Frame::TrustedKeyPending => Ok(()),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// The trust keyring.
@@ -6009,7 +6041,9 @@ impl VoxClient {
         })
     }
 
-    /// The Sessions of `room`, oldest opening first (ADR-029; `vox room sessions`).
+    /// The Sessions of `room`, oldest opening first (ADR-029; `vox room sessions`). A page the
+    /// room's Sessions changed under while it was read is read again here, not refused as
+    /// changed.
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (a room not open).
@@ -6038,7 +6072,8 @@ impl VoxClient {
     }
 
     /// One indexed page of all currently drivable open Sessions. Continue through `next`
-    /// to discover every live tab; ended Session history is not scanned or accumulated.
+    /// to discover every live tab; ended Session history is not scanned or accumulated. Read
+    /// again here when the Sessions changed while it was read, as `sessions_page` is.
     pub async fn sessions_open_page(
         &self,
         room: String,
@@ -6050,16 +6085,20 @@ impl VoxClient {
             .map(|id| digest(id, "Session opening"))
             .transpose()?;
         on_held!(self, |c| {
-            let (sessions, summaries, more) =
-                match ask(c, &Request::SessionsOpenPage { channel_id, after }).await? {
-                    Frame::SessionsPage {
-                        sessions,
-                        summaries,
-                        more,
-                        ..
-                    } if sessions.len() == summaries.len() => (sessions, summaries, more),
-                    other => return Err(unexpected(&other)),
-                };
+            let request = Request::SessionsOpenPage { channel_id, after };
+            let answer = c
+                .session_selection(&request)
+                .await
+                .map_err(|e| listing_failed("a room's open Sessions", e))?;
+            let (sessions, summaries, more) = match answered(answer)? {
+                Frame::SessionsPage {
+                    sessions,
+                    summaries,
+                    more,
+                    ..
+                } if sessions.len() == summaries.len() => (sessions, summaries, more),
+                other => return Err(unexpected(&other)),
+            };
             if sessions
                 .iter()
                 .any(|session| !session.open || !session.can_drive)
@@ -7588,15 +7627,15 @@ impl VoxClient {
             let name =
                 vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
             let ordinary = format!("{name} joined. {}", vox_text::offer::trusted_by(&trusters));
-            let session = match ask(
-                c,
-                &Request::SessionJoin {
-                    channel_id,
-                    node: who,
-                },
-            )
-            .await?
-            {
+            let request = Request::SessionJoin {
+                channel_id,
+                node: who,
+            };
+            let answer = c
+                .session_selection(&request)
+                .await
+                .map_err(|e| listing_failed("a joined member's Session", e))?;
+            let session = match answered(answer)? {
                 Frame::SessionsPage {
                     mut sessions,
                     summaries,
@@ -7834,9 +7873,14 @@ impl VoxClient {
                 open.held.iter().map(|(id, _)| b32_encode(id)).collect(),
             )
             .await?;
+        // The footers cover every recent message of this node's; only those someone pulled are
+        // answered, as `read_by` answers only messages someone read. A row with more recipients
+        // to page is kept even when its first page is empty (a recovered receipt ledger can skip
+        // duplicates there), so it reaches the completeness check below instead of vanishing.
         result
             .rows
             .into_iter()
+            .filter(|row| !row.pulled_by.is_empty() || row.pulled_after.is_some())
             .map(|row| {
                 if row.pulled_after.is_some() {
                     return Err(failed(
@@ -8412,7 +8456,11 @@ async fn follow(
                     .into_iter()
                     .collect()
             }
-            Ok(Some(Frame::Event(ev @ NodeEvent::ChannelOpened { channel_id }))) => {
+            // A join opens the room on this node as an open does; the node says `Joined` for it.
+            Ok(Some(Frame::Event(
+                ev @ (NodeEvent::ChannelOpened { channel_id }
+                | NodeEvent::Joined { channel_id, .. }),
+            ))) => {
                 let Some(previous) = cursors.get(&channel_id) else {
                     return Err(
                         "a room opened; refreshing its history and restarting observation".into(),
@@ -8445,6 +8493,11 @@ async fn follow(
                 Vec::new()
             }
             Ok(Some(Frame::Event(NodeEvent::SessionEntry { channel_id, .. }))) => {
+                // The node's word that the room's Sessions changed is itself the invalidation:
+                // the token compared below is read from the node's published view, which the
+                // node may publish only after it said this, so an unchanged token here does not
+                // mean nothing changed.
+                seen.remove(&channel_id);
                 sessions_in.push(channel_id);
                 Vec::new()
             }

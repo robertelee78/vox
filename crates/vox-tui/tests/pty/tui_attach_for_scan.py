@@ -6,7 +6,7 @@ the environment the proof names (each K=V), and gives its node's passphrase at t
 attaches it (V210-94, ADR-026 N-2). The proof talks to it through files in <cue_dir>:
 
 - this driver writes `pid` (the TUI's process id) once the TUI runs, then types the identity
-  passphrase at its "Attach node" prompt and writes `typed`; once the proof writes `submit` it
+  passphrase at its "Unlock node" prompt and writes `typed`; once the proof writes `submit` it
   presses Enter, and writes `attached` once the TUI's status bar names its node attached;
 - the proof may write `hup`: this driver then sends the TUI SIGHUP, which stops it cleanly and
   does nothing to its node (S-4), and writes `gone` once the TUI has exited;
@@ -66,7 +66,7 @@ try:
         return "\n".join(r.rstrip() for r in tui.display()[-3:])
 
     stage("the attach prompt")
-    if not tui.until(lambda: tui.closed or "Attach node" in tui.text(), 60, 0.1):
+    if not tui.until(lambda: tui.closed or "Unlock node" in tui.text(), 60, 0.1):
         print(f"{TAG} RED: PRODUCT: the TUI never asked for its node's passphrase:\n{tui.text()}")
         code = 1
         sys.exit(code)

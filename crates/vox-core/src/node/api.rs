@@ -2235,6 +2235,10 @@ pub enum Outcome {
     /// the members that hold it: it reads now and posts once that has finished
     /// ([`Outcome::RECOVERING`]).
     JoinedRecovering,
+    /// A trust was saved, and a key it owes a member could not be delivered yet; the node's own
+    /// delivery passes keep sending it ([`Outcome::KEY_PENDING`]). The request succeeded: nothing
+    /// is left for the person to do.
+    TrustedKeyPending,
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -2268,6 +2272,11 @@ impl Outcome {
         needs members that hold the history and may remain pending (`vox status` reports its \
         current state)";
 
+    /// What a person is told after a trust whose key delivery is still pending
+    /// ([`Outcome::TrustedKeyPending`]): a note, not an error.
+    pub const KEY_PENDING: &'static str = "the trust was saved; key delivery is pending\n       \
+        nothing to repeat: this node continues delivery automatically";
+
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
@@ -2278,6 +2287,7 @@ impl Outcome {
                 | Outcome::OwnRetention { .. }
                 | Outcome::Appended(_)
                 | Outcome::JoinedRecovering
+                | Outcome::TrustedKeyPending
         )
     }
 }
@@ -2295,6 +2305,7 @@ impl std::fmt::Display for Outcome {
                 "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
             ),
             Outcome::JoinedRecovering => f.write_str(Outcome::RECOVERING),
+            Outcome::TrustedKeyPending => f.write_str(Outcome::KEY_PENDING),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }

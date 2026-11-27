@@ -86,11 +86,13 @@ try {
 }
 
 // One line per notice the client submitted, said once at exit, so a proof can tell a
-// submission that never came from one that came and was not delivered.
+// submission that never came from one that came and was not delivered. The plugin's cleanup
+// runs then too, as the TUI runs it when the plugin unloads: never right after setup, which
+// disposed the receiver before the daemon could ever find it.
 process.on("exit", () => {
+  try { cleanup?.() } catch {}
   try { say({ kind: "client", submitted }) } catch {}
 })
-try { await cleanup?.() } catch {}
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
     try { cleanup?.() } catch {}

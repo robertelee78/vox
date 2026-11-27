@@ -148,7 +148,7 @@
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
 //!   In each the words are as in truecolour and the accent is on the focused border alone.
 //! - `copies`: Alice shares an ssh stand-in; Bob's Shared pane lists it, and `y` on it puts
-//!   `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full under the
+//!   `ssh <its canonical address>` on the clipboard by OSC 52, prints it in full under the
 //!   service and says "copied" on the status line, the address Alice's `vox service list --json`
 //!   gives (ADR-028 S-3, #490);
 //! - `inline`: in a TUI run as kitty, an image Bob's node pulled whose copy the driver then

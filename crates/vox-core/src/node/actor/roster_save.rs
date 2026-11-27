@@ -286,7 +286,15 @@ impl Node {
         .await;
     }
 
-    pub(super) async fn complete_join_task(
+    pub(super) fn complete_join_task(
+        &mut self,
+        returned: std::result::Result<AnsweredJoin, tokio::task::JoinError>,
+    ) -> Boxed<'_, ()> {
+        Box::pin(self.complete_join_task_unboxed(returned))
+    }
+
+    /// [`Self::complete_join_task`], unboxed: see [`Boxed`].
+    async fn complete_join_task_unboxed(
         &mut self,
         returned: std::result::Result<AnsweredJoin, tokio::task::JoinError>,
     ) {
@@ -359,12 +367,14 @@ impl Node {
             }
         };
         if !next.attached(self, &room) || lifetime.publish(|| ()).is_none() {
-            self.reject_owned_roster(
-                room,
-                Error::Profile("roster room authority changed"),
-                next,
-                reply,
-            );
+            // A join this save admitted is not refused: it was saved, so its joiner is told no
+            // definite refusal, and withdraws as for a lost answer.
+            let error = if saved.result.is_ok() && saved.joined.is_some() {
+                Error::JoinAdmissionUnsettled
+            } else {
+                Error::Profile("roster room authority changed")
+            };
+            self.reject_owned_roster(room, error, next, reply);
             return;
         }
         let after = match next.after {
@@ -379,9 +389,8 @@ impl Node {
                         })
                     }
                     (Err(error), _) => Err(error),
-                    (Ok(()), None) => Err(Error::Profile(
-                        "native join admission returned no durable receipt",
-                    )),
+                    // The run reported success: whatever it saved is not known to be nothing.
+                    (Ok(()), None) => Err(Error::JoinAdmissionUnsettled),
                 };
                 let _ = ack.send(admitted);
                 return;
@@ -472,13 +481,19 @@ pub(super) fn retire_detached(
 ) {
     match next.after {
         After::JoinAdmit(ack) => {
-            let result = result.and_then(|saved| match saved {
-                maintenance_save::Saved::Roster(saved) => saved.result,
-                _ => Err(Error::Profile("unexpected native join admission result")),
-            });
-            let _ = ack.send(Err(result.err().unwrap_or(Error::Profile(
-                "join admission lost its live room attachment",
-            ))));
+            // A save that ran to its end admitted the joiner (`joined`): not refused, only
+            // unconfirmed. A run that failed says itself whether it may have committed
+            // (`Error::JoinAdmissionUnsettled`, from `pending_roster`'s commit or a stopped run).
+            let error = match result {
+                Ok(maintenance_save::Saved::Roster(saved)) => match saved.result {
+                    Ok(()) if saved.joined.is_some() => Error::JoinAdmissionUnsettled,
+                    Ok(()) => Error::Profile("join admission lost its live room attachment"),
+                    Err(error) => error,
+                },
+                Ok(_) => Error::Profile("unexpected native join admission result"),
+                Err(error) => join_answer(error),
+            };
+            let _ = ack.send(Err(error));
             return;
         }
         after => reject_after(
@@ -503,9 +518,23 @@ fn reject_after(after: After, error: Error) {
     match after {
         After::Sync(sync) => refuse(sync),
         After::JoinAdmit(ack) => {
-            let _ = ack.send(Err(error));
+            let _ = ack.send(Err(join_answer(error)));
         }
         After::News | After::Port(_) => {}
+    }
+}
+
+/// What a joiner's admission answers for a save that failed outside its run. A save worker or
+/// its owner that stopped may have stopped after the run committed the join (the run's own stop
+/// is caught inside it, so these come from around it: the notice published after the run, or a
+/// worker cancelled while its blocking run went on), so it is not evidence that nothing was
+/// saved. Every other such error precedes the run, and so its commit.
+fn join_answer(error: Error) -> Error {
+    match error {
+        Error::Profile("native save worker stopped" | "native save owner stopped") => {
+            Error::JoinAdmissionUnsettled
+        }
+        error => error,
     }
 }
 

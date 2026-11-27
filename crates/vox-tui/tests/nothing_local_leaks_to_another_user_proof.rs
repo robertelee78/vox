@@ -1115,10 +1115,12 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         qd.exited_within(Duration::from_secs(30)).is_some(),
         "PRODUCT (staging): q's daemon did not stop"
     );
-    assert!(
-        std::fs::symlink_metadata(&q_sock).is_err(),
-        "PRODUCT (staging): q's socket was left behind"
-    );
+    // A stopped daemon leaves its socket's path behind on purpose: a successor may already have
+    // replaced it, so teardown never unlinks it, and the next owner removes the stale one when it
+    // binds (`50edee8b6`, `IpcServer`'s drop). The planted symlink takes its place here.
+    if std::fs::symlink_metadata(&q_sock).is_ok() {
+        std::fs::remove_file(&q_sock).expect("APPARATUS: removing q's stale socket");
+    }
     std::os::unix::fs::symlink(&sock, &q_sock).expect("APPARATUS: planting the symlink");
     let (ok, out, err) = q.vox(&["room", "list"]);
     eprintln!("[proof] room list at a planted symlink: ok={ok} stdout={out:?} stderr={err:?}");

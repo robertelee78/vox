@@ -286,6 +286,16 @@ fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     // ---- control: 29 days on, the hold still runs -------------------------------------
     drop(a);
     let a = daemon(&alice, "alice-29d", 29 * DAY_MS);
+    // The daemon answers before it has opened the room again; the prune ticks this control
+    // reads run on the open room, so the window starts once `vox status` reports it.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while generations(&alice).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice's restarted daemon never reported the room in 90 s"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let control = readings_over(&alice, 10);
     println!("[proof] +29 days: alice's generations over 10 s: {control:?}");
     assert!(

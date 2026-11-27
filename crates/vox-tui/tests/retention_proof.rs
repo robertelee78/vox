@@ -1996,6 +1996,9 @@ optional_proof::not_run!(
     a_room_stays_readable_while_messages_keep_expiring,
     a_partly_expired_room_counts_pages_and_threads_only_what_remains,
     a_hook_continuation_read_skips_expired_messages,
+    old_small_rows_move_atomically_when_their_room_opens,
+    old_128_item_locator_pages_read_and_split_when_rewritten,
+    a_failed_small_row_move_keeps_the_room_readable_and_retries,
 );
 
 #[cfg(feature = "optional-proofs")]
@@ -3691,8 +3694,9 @@ fn locator_pages_fit_one_physical_page() {
         "PRODUCT: a locator page needs more than one 4096-byte leaf after sealing/key overhead: {pages:?}");
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binary interrupted old-store move; needs VOX_PROOF_OLD_STORE fixture"]
+#[ignore = "optional: needs VOX_PROOF_OLD_STORE, a stopped store a v0.4.30-layout vox wrote"]
 fn old_small_rows_move_atomically_when_their_room_opens() {
     watchdog::arm();
     let fixture = PathBuf::from(
@@ -3790,12 +3794,15 @@ fn old_small_rows_move_atomically_when_their_room_opens() {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 type SmallRowKey = ([u8; 32], u8, u64);
+#[cfg(feature = "optional-proofs")]
 struct SmallRowSnapshot {
     rows: std::collections::BTreeMap<SmallRowKey, Vec<u8>>,
     duplicate: Vec<SmallRowKey>,
 }
 
+#[cfg(feature = "optional-proofs")]
 fn small_row_snapshot(store: &Path) -> SmallRowSnapshot {
     use redb::{ReadableDatabase, ReadableTable, TableDefinition};
     let tmp = tempfile::tempdir().unwrap();
@@ -3822,6 +3829,7 @@ fn small_row_snapshot(store: &Path) -> SmallRowSnapshot {
     SmallRowSnapshot { rows, duplicate }
 }
 
+#[cfg(feature = "optional-proofs")]
 fn assert_small_row_integrity(before: &SmallRowSnapshot, after: &SmallRowSnapshot) {
     assert!(
         after.duplicate.is_empty(),
@@ -3885,8 +3893,9 @@ fn small_row_custom_posts(root: &Path, cid: &[u8; 32], rows: std::ops::Range<usi
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binary old 128-item pages; needs VOX_PROOF_OLD_LOCATORS baseline fixture"]
+#[ignore = "optional: needs VOX_PROOF_OLD_LOCATORS, a stopped store with 128-item locator pages a v0.4.30-layout vox wrote"]
 fn old_128_item_locator_pages_read_and_split_when_rewritten() {
     watchdog::arm();
     let fixture = PathBuf::from(
@@ -3940,8 +3949,9 @@ fn old_128_item_locator_pages_read_and_split_when_rewritten() {
 }
 
 /// A failed optional layout conversion must not hide saved readable history.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binary and a file-armed store write failure; run with test-knobs"]
+#[ignore = "optional: needs VOX_PROOF_OLD_STORE, a stopped store a v0.4.30-layout vox wrote; run with test-knobs"]
 fn a_failed_small_row_move_keeps_the_room_readable_and_retries() {
     watchdog::arm();
     let fixture = PathBuf::from(

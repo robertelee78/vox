@@ -62,15 +62,19 @@
 //! explicit root is refused. Mutant: omit `Draft.thread` in `post_structured`; the reply's
 //! `room read --json` has no root and the thread assertion is PRODUCT red.
 //!
-//! **A room made before Vox's times were milliseconds still opens, reads and takes a post**
-//! ([`a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post`], #562). The
-//! fixture `fixtures/seconds-format-room.tar.gz` is a node's data directory made by `vox` at
-//! integrate 48b1c743, the last build that wrote a room's genesis, its idle end and its retention
-//! change in seconds (format 1): room `before`, idle end one month, retention one week, and one
-//! post. The shipped `vox` opens it: the room keeps its id (its genesis hash, so the genesis is
-//! encoded exactly as it was written), its post reads, its retention is still one week, and a new
-//! post is taken. Mutants: read a format-1 time as milliseconds (red: the room's id, or the room
-//! does not open); refuse format 1 (red: the room does not open).
+//! **A room in a retired format is refused, never misread, and its data is kept**
+//! ([`a_room_in_a_retired_format_is_refused_never_misread_and_its_data_is_kept`]). The fixture
+//! `fixtures/seconds-format-room.tar.gz` is a node's data directory made by `vox` at integrate
+//! 48b1c743 (#562): room `before`, written when times were seconds and before the authenticated
+//! history genesis (`8ec3e4379`), with one post. Such a room is refused on purpose
+//! (`channel.rs` `UNSUPPORTED_ROOM_FORMAT`; legacy recovery retired in `2970ba258`). What a person
+//! gets: `room list` shows it closed with the node's sentence saying it uses an unsupported format
+//! and what to do; `room read` and `room post` are refused with that sentence and show nothing
+//! of it; every record the node's store holds for the room is byte for byte unchanged after the
+//! daemon ran and stopped, so the data is still there for a version that can read it; and the
+//! node's other rooms work (a new one takes a post and reads it). Mutants: open the room by
+//! reading the old genesis anyway (red: listed open, or a read shows it); clean up the refused
+//! room's data (red: its records).
 //!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
 //!
@@ -1843,9 +1847,60 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
 /// The room the fixture holds, as `vox` at integrate 48b1c743 made it: its id is its genesis hash.
 const SECONDS_ROOM: &str = "oku2e2lomuokl6rfrzsifpq72o5i2n3ejc4kdm3bu73khltiinga";
 
+/// What the node says of a room in a format it cannot read (`channel.rs` `UNSUPPORTED_ROOM_FORMAT`).
+const UNSUPPORTED: &str =
+    "This room uses an unsupported room or history format; leave it and create a new one.";
+
+/// Every record the node's store holds for `room` (its rows of `segments` and `small_segments`,
+/// and its `sek_wraps` entry), each with the SHA-256 of its bytes: the room's saved data. The store
+/// is the node's, shared by its rooms, so the room's data is its rows, not the whole file. Read
+/// only from a stopped node's committed file, as `a_room_can_be_left_and_ended_proof` reads it.
+fn room_records(store: &Path, room: &[u8; 32]) -> std::collections::BTreeMap<String, String> {
+    use redb::ReadableDatabase as _;
+    use sha2::{Digest as _, Sha256};
+    let db = redb::Database::builder()
+        .open_read_only(store)
+        .unwrap_or_else(|e| panic!("APPARATUS: open {} read-only: {e}", store.display()));
+    let read = db.begin_read().expect("APPARATUS: read the stopped store");
+    let mut out = std::collections::BTreeMap::new();
+    for name in ["segments", "small_segments"] {
+        let table = match read.open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+            name,
+        )) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(e) => panic!("APPARATUS: open {name}: {e}"),
+        };
+        for row in table
+            .range((*room, 0, 0)..=(*room, u8::MAX, u64::MAX))
+            .unwrap_or_else(|e| panic!("APPARATUS: range the room's rows in {name}: {e}"))
+        {
+            let (key, value) = row.expect("APPARATUS: read a room row");
+            let (_, kind, id) = key.value();
+            out.insert(
+                format!("{name} {kind} {id}"),
+                format!("{:x}", Sha256::digest(value.value())),
+            );
+        }
+    }
+    let wraps = read
+        .open_table(redb::TableDefinition::<[u8; 32], &[u8]>::new("sek_wraps"))
+        .expect("APPARATUS: open sek_wraps");
+    if let Some(wrap) = wraps
+        .get(*room)
+        .expect("APPARATUS: read the room's SEK wrap")
+    {
+        out.insert(
+            "sek_wraps".to_owned(),
+            format!("{:x}", Sha256::digest(wrap.value())),
+        );
+    }
+    out
+}
+
 #[test]
 #[ignore = "production Argon2id to unlock the fixture's identity; CI runs it in release"]
-fn a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post() {
+fn a_room_in_a_retired_format_is_refused_never_misread_and_its_data_is_kept() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let fixture = concat!(
@@ -1863,61 +1918,118 @@ fn a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post() {
     );
     let data = tmp.path().join("data");
     let cfg = data.join("cfg");
+    let store = data.join("nodes").join("default").join("store.redb");
+    let room = vox_core::node::link::b32_decode(SECONDS_ROOM, "the fixture's room id")
+        .expect("APPARATUS: the fixture's room id");
     let pass = tmp.path().join("identity.pass");
     std::fs::write(&pass, "identity passphrase\n")
         .unwrap_or_else(|e| panic!("APPARATUS: cannot write the passphrase file: {e}"));
-    let _d = daemon(&data, &cfg, &pass, &tmp.path().join("daemon.err"));
+    let before = room_records(&store, &room);
+    assert!(
+        before.keys().any(|k| k.starts_with("segments ")) && before.contains_key("sek_wraps"),
+        "APPARATUS: the fixture's store holds no saved room {SECONDS_ROOM}: {before:?}"
+    );
+    let mut d = daemon(&data, &cfg, &pass, &tmp.path().join("daemon.err"));
 
+    // (a) What a person sees: the room is listed, closed, with the reason and what to do.
     let (ok, list, err) = vox(&data, &cfg, &["room", "list"], None);
     println!("[proof] the seconds-era node's rooms:\n{list}");
+    let line = list.lines().find(|l| l.contains(&SECONDS_ROOM[..12]));
     assert!(
-        ok && list.contains(&SECONDS_ROOM[..12]) && list.contains("before"),
-        "PRODUCT: a room made when times were seconds must still be held and listed; `vox room \
-         list` said: {list}{err}"
+        ok && line.is_some_and(|l| l.contains("[closed: ") && l.contains(UNSUPPORTED)),
+        "PRODUCT: a room in a retired format must be listed as closed, saying {UNSUPPORTED:?}; \
+         `vox room list` said: {list}{err}"
     );
-    let (ok, link, err) = vox(&data, &cfg, &["room", "link", &SECONDS_ROOM[..12]], None);
+    // (b) Never misread: a read and a post are refused, for that reason.
+    for (args, what) in [
+        (&["room", "read", SECONDS_ROOM][..], "read"),
+        (
+            &["room", "post", SECONDS_ROOM, "said after the refusal"][..],
+            "post",
+        ),
+    ] {
+        let (ok, out, err) = vox(&data, &cfg, args, None);
+        println!("[proof] `vox room {what}` said: {out}{err}");
+        assert!(
+            !ok && err.contains(UNSUPPORTED) && !out.contains("said while times were seconds"),
+            "PRODUCT: `vox room {what}` of a room in a retired format must be refused, saying \
+             {UNSUPPORTED:?}, and show nothing of it; it said: {out}{err}"
+        );
+    }
+
+    // (c) Never deleted or reset: after the daemon ran and stopped, every record the store holds
+    // for the room is byte for byte what it was, and none is gone or added: the data is still
+    // there for the version that can read it.
+    let stopped = Command::new("kill")
+        .args(["-TERM", &d.0.id().to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(stopped, "APPARATUS: cannot send TERM to the daemon");
+    let status =
+        d.0.wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot wait for the daemon: {e}"));
+    println!("[proof] the daemon stopped: {status}");
+    drop(d);
+    let after = room_records(&store, &room);
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
     assert!(
-        ok && link.trim().starts_with(&format!("vox://{SECONDS_ROOM}?")),
-        "PRODUCT: the room must keep its id ({SECONDS_ROOM}), the hash of its genesis as it was \
-         written; `vox room link` said: {link}{err}"
+        changed.is_empty(),
+        "PRODUCT: running a daemon on a node holding a room in a retired format changed, removed \
+         or added the room's saved records: {changed:?}"
     );
-    let (ok, read, err) = vox(&data, &cfg, &["room", "read", SECONDS_ROOM], None);
-    println!("[proof] its messages:\n{read}");
-    assert!(
-        ok && read.contains("said while times were seconds"),
-        "PRODUCT: the room's post from before must still read; `vox room read` said: {read}{err}"
+    println!(
+        "[proof] all {} saved records of the room are unchanged",
+        before.len()
     );
-    let (ok, status, err) = vox(&data, &cfg, &["status", "--json"], None);
-    let retention = serde_json::from_str::<serde_json::Value>(&status)
-        .ok()
-        .and_then(|v| {
-            v["rooms"]
-                .as_array()?
-                .iter()
-                .find(|r| r["id"] == SECONDS_ROOM)
-                .and_then(|r| r["retention"].as_u64())
-        });
-    println!("[proof] its retention, as `vox status --json` says: {retention:?}");
-    assert!(
-        ok && retention == Some(7 * 24 * 60 * 60),
-        "PRODUCT: the room's retention, changed to one week when times were seconds, must still be \
-         one week (604800 s); `vox status --json` said {retention:?}{err}"
-    );
-    let (ok, out, err) = vox(
+
+    // (d) The node's other rooms work: a new room takes a post and reads it, and the old room
+    // is still listed as it was.
+    let _d = daemon(&data, &cfg, &pass, &tmp.path().join("daemon-again.err"));
+    let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["room", "post", SECONDS_ROOM, "said after milliseconds"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "made-after",
+        ],
+        Some("channel passphrase"),
+    );
+    assert!(ok, "PRODUCT: the node could not create another room: {err}");
+    let (ok, list, err) = vox(&data, &cfg, &["room", "list"], None);
+    let room = list
+        .lines()
+        .find(|l| l.contains("made-after"))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_owned)
+        .filter(|_| ok)
+        .unwrap_or_else(|| panic!("PRODUCT: the node does not list the room it made: {list}{err}"));
+    assert!(
+        list.lines()
+            .find(|l| l.contains(&SECONDS_ROOM[..12]))
+            .is_some_and(|l| l.contains(UNSUPPORTED)),
+        "PRODUCT: the room in a retired format must still be listed, closed, beside the new \
+         one: {list}"
+    );
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "post", &room, "said in the new room"],
         None,
     );
+    assert!(ok, "PRODUCT: the new room must take a post: {err}");
+    let (ok, read, err) = vox(&data, &cfg, &["room", "read", &room], None);
+    println!("[proof] the new room:\n{read}");
     assert!(
-        ok,
-        "PRODUCT: the room must take a new post; `vox room post` said: {out}{err}"
-    );
-    let (ok, read, err) = vox(&data, &cfg, &["room", "read", SECONDS_ROOM], None);
-    println!("[proof] after a new post:\n{read}");
-    assert!(
-        ok && read.contains("said while times were seconds") && read.contains("said after milliseconds"),
-        "PRODUCT: the room must read its old post and the new one; `vox room read` said: {read}{err}"
+        ok && read.lines().any(|l| l.ends_with(" said in the new room")),
+        "PRODUCT: the new room must read its post: {read}{err}"
     );
 }
 

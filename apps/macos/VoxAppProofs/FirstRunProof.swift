@@ -2526,7 +2526,7 @@ final class FirstRunProof: XCTestCase {
         _ = try computerCommand(computerD, ["personal", "old-native-peer"])
         _ = try computerCommand(computerB, ["personal", "protected"])
         _ = try computerCommand(computerC, ["personal", "move-native"])
-        let oldOffer = try computerCommand(computerC, ["invite"])
+        let oldOffer = try computerCommand(computerC, ["pair"])
         guard let oldCode = oldOffer["invite_link"] as? String else {
             throw Apparatus("the old group did not produce an invitation")
         }
@@ -2593,7 +2593,7 @@ final class FirstRunProof: XCTestCase {
                       "an offline peer's application must remain distinct from connectivity") else { return }
         try quitComputerAccount()
         _ = try computerCommand(computerC, ["personal", "move-native"])
-        let destinationOffer = try computerCommand(computerA, ["invite"])
+        let destinationOffer = try computerCommand(computerA, ["pair"])
         guard var destinationCode = destinationOffer["invite_link"] as? String else {
             throw Apparatus("the destination did not produce its invitation")
         }
@@ -2622,7 +2622,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNotEqual(rejectedAgain.status, 0,
                           "PRODUCT: a locally closed proposal must not produce a new replacement review")
         _ = try computerCommand(computerA, ["cancel", rejectedOperation])
-        let replacementOffer = try computerCommand(computerA, ["invite"])
+        let replacementOffer = try computerCommand(computerA, ["pair"])
         guard let replacementCode = replacementOffer["invite_link"] as? String else {
             throw Apparatus("the destination did not provide a replacement review invitation")
         }
@@ -2670,7 +2670,7 @@ final class FirstRunProof: XCTestCase {
         guard closeRejected.status == 0 else {
             throw Product("the inviting computer could not close its rejected proposal: \(closeRejected.out)")
         }
-        let freshOffer = try computerCommand(computerA, ["invite"])
+        let freshOffer = try computerCommand(computerA, ["pair"])
         guard let freshCode = freshOffer["invite_link"] as? String else {
             throw Apparatus("the destination did not produce a fresh invitation")
         }
@@ -2787,7 +2787,7 @@ final class FirstRunProof: XCTestCase {
         let pastD = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
                               env: computerD.merging(behind) { $1 }, until: "vox daemon: control socket")
         defer { pastD.terminate() }
-        let invitedC = try staged(vox, ["computer", "invite", "--json"], env: computerC)
+        let invitedC = try staged(vox, ["computer", "pair", "--json"], env: computerC)
         guard let inviteRecord = try JSONSerialization.jsonObject(with: Data(invitedC.utf8)) as? [String: Any],
               let expiredCode = inviteRecord["invite_link"] as? String else {
             throw Apparatus("expiry fixture has no public invitation: \(invitedC)")

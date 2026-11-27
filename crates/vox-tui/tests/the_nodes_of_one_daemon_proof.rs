@@ -205,7 +205,7 @@ impl Root {
     fn is_attached(&self, node: &str) -> bool {
         let (_, out, _) = self.run(&["node", "list"]);
         out.lines()
-            .any(|l| l.split_whitespace().take(2).eq([node, "attached"]))
+            .any(|l| l.split_whitespace().take(2).eq([node, "Ready"]))
     }
 
     fn trust(&self, node: &str, who: &str, name: &str) {
@@ -385,7 +385,8 @@ fn a_one_shot_verb_refuses_an_unattached_node() {
         err.trim()
     );
     assert!(
-        !ok && err.contains("node b is Locked") && err.contains("vox node unlock b"),
+        !ok && err.contains("node b is not attached to this connection")
+            && err.contains("unlock it if Locked: vox node unlock -- b"),
         "PRODUCT: a one-shot verb for an unattached node must refuse, saying how to attach it; \
          ok={ok}: {out}{err}"
     );

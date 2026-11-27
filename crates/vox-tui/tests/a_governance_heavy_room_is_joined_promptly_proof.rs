@@ -352,11 +352,12 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         panic!("PRODUCT: the newcomer could not join");
     };
     let joined = Instant::now();
-    // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
+    // The newcomer's daemon names each step of its join: `vox: node <name>: join got in — board
+    // …, solve …` (the node's name in each line since 8fc345cf6).
     let steps: Vec<String> = newcomer
         .said_since(t_join)
         .into_iter()
-        .filter(|l| l.contains("vox: join "))
+        .filter(|l| l.contains(": join "))
         .collect();
     println!(
         "[proof] the newcomer's join returned in {:?} after {tries} attempt(s); its steps: \

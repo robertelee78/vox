@@ -950,8 +950,10 @@ fn net_event_name(e: &NetEvent) -> &'static str {
 /// alike, and the actor's dispatchers await dozens: `handle_net`'s poll frame came to 815 KiB
 /// and `Node::run`'s to 471 KiB, so `vox room create` in a debug `vox daemon` overflowed its
 /// 2 MiB worker stack once the record it signs derived the ML-DSA key on top
-/// ("thread 'tokio-rt-worker' has overflowed its stack"). Each step below is a plain fn that makes
-/// its body's future in its own frame and boxes it, so its callers hold a pointer instead.
+/// ("thread 'tokio-rt-worker' has overflowed its stack"). Later the steps `run_loop` awaits grew,
+/// and its poll frame came to 1.7 MiB, so a debug daemon overflowed as soon as it served. Each
+/// step below is a plain fn that makes its body's future in its own frame and boxes it, so its
+/// callers hold a pointer instead.
 type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
@@ -5039,11 +5041,15 @@ impl Joiner {
                         why.push(format!("{short}: exchange: {e}"));
                     }
                     if prepared.load(std::sync::atomic::Ordering::Acquire) {
-                        // These typed refusals precede admission. NotAdmitted is not included:
-                        // completion can fail after its membership save has committed.
+                        // These typed refusals precede admission: nothing was saved. A
+                        // responder whose admission may have been saved sends none of them
+                        // (`Error::JoinAdmissionUnsettled`), so that stays uncertain.
                         if !matches!(
                             &e,
-                            Error::RoomFull { .. } | Error::SeatTaken | Error::SeatNotAgreed { .. }
+                            Error::RoomFull { .. }
+                                | Error::SeatTaken
+                                | Error::SeatNotAgreed { .. }
+                                | Error::JoinNotAdmitted
                         ) {
                             why.push(if accepted.load(std::sync::atomic::Ordering::Acquire) {
                                 "admission was accepted and retained; local completion remains pending".to_owned()
@@ -5382,10 +5388,12 @@ async fn apply_post_attempt(
 /// the room's publication scratch briefly; wait outside the actor while that work advances.
 /// Only pre-mutation publication/readiness refusals are retried, so a lost success can never
 /// duplicate a post. This gives direct app/TUI clients the same just-joined patience as IPC.
+/// A Session's accepted reply settles the wake it answers before the post is acknowledged.
 pub(crate) async fn apply_post_command(
     cmd_tx: &mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     read_tx: &mpsc::Sender<ReadRequest>,
     post_slots: &Arc<Semaphore>,
+    view: &watch::Receiver<NodeView>,
     channel_id: Digest32,
     text: String,
     instance: Option<[u8; 16]>,
@@ -5438,8 +5446,57 @@ pub(crate) async fn apply_post_command(
                 )
                 .await;
             }
+            Outcome::Done => {
+                settle_reply(cmd_tx, view, channel_id, instance, &text).await;
+                return Outcome::Done;
+            }
             outcome => return outcome,
         }
+    }
+}
+
+/// **A Session's reply settles the wake it answers before its post is acknowledged** (ADR-020
+/// §9.4, V210-121): a post this node accepted with a Session's `from` and a `re` removes that
+/// source from the Session's open wakes in this room. Left to the attention scan, which reads
+/// the room later, the Session's next post could still inherit the wake it had just answered, or
+/// count it as a second one open and be refused. That scan still settles any reply this could
+/// not (the Session not open, the node locking); the post itself has succeeded either way.
+async fn settle_reply(
+    cmd_tx: &mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    view: &watch::Receiver<NodeView>,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    text: &str,
+) {
+    let Ok(env) = vox_agentcomms::envelope::Envelope::parse(text) else {
+        return;
+    };
+    let Some(source) = env
+        .re
+        .as_deref()
+        .and_then(|re| crate::node::link::b32_decode(re.trim(), "re").ok())
+    else {
+        return;
+    };
+    let Some(owner) = view.borrow().identity.as_ref().map(|i| i.fingerprint) else {
+        return;
+    };
+    if env.from.trim().is_empty() {
+        return;
+    }
+    let (reply, settled) = oneshot::channel();
+    let command = NodeCommand::Attention {
+        channel_id,
+        by: owner,
+        expected_instance: Some(instance),
+        operation: crate::node::attention::Operation::Replied {
+            session: env.from,
+            source,
+        },
+        reply,
+    };
+    if apply_command(cmd_tx, command).await.is_done() {
+        let _ = settled.await;
     }
 }
 
@@ -6123,6 +6180,7 @@ impl NodeHandle {
                     &self.cmd_tx,
                     &self.read_tx,
                     &self.post_slots,
+                    &self.view_rx,
                     channel_id,
                     text,
                     None,
@@ -6138,6 +6196,7 @@ impl NodeHandle {
                     &self.cmd_tx,
                     &self.read_tx,
                     &self.post_slots,
+                    &self.view_rx,
                     channel_id,
                     text,
                     Some(instance),
@@ -7145,6 +7204,7 @@ pub struct Node {
     channels: BTreeMap<Digest32, SharedChannel>,
     pending_posts: BTreeMap<Digest32, post_save::Pending>,
     parked_private_drives: BTreeMap<Digest32, private_save::ParkedPrivateDrive>,
+    parked_consents: consent_release::ParkedConsents,
     pending_policy: Option<policy_save::Pending>,
     parked_construction: Option<construction_save::Parked>,
     failed_construction_policy: Option<computer::ComputerPolicyGuard>,
@@ -7639,6 +7699,7 @@ impl Node {
             channels: BTreeMap::new(),
             pending_posts: BTreeMap::new(),
             parked_private_drives: BTreeMap::new(),
+            parked_consents: consent_release::ParkedConsents::default(),
             pending_policy: None,
             parked_construction: None,
             failed_construction_policy: None,
@@ -13259,22 +13320,34 @@ impl Node {
                         .ok_or("room not open")?;
                     let profile = self.profile.as_ref().ok_or("the node is locked")?;
                     let channel = shared.lock().await;
-                    let share = channel
-                        .shared_service(profile.store(), &target.host, &target.service)
-                        .map_err(|e| e.to_string())?;
-                    // Sparse settlement only establishes that our own feed is safe to write;
-                    // it does not mean the sharing member's feed has ever arrived. A completed
-                    // role head is durable evidence that this member's source has been read.
-                    if share.is_none()
-                        && target.host != channel.me()
-                        && channel
-                            .uses_sparse_history(profile.store())
-                            .map_err(|e| e.to_string())?
-                        && channel
-                            .history_role_head(profile.store(), &target.host)
-                            .map_err(|e| e.to_string())?
-                            .is_none()
-                    {
+                    let read = (|| -> crate::error::Result<_> {
+                        let share = channel.shared_service(
+                            profile.store(),
+                            &target.host,
+                            &target.service,
+                        )?;
+                        // Sparse settlement only establishes that our own feed is safe to write;
+                        // it does not mean the sharing member's feed has ever arrived. A completed
+                        // role head is durable evidence that this member's source has been read.
+                        let unread = share.is_none()
+                            && target.host != channel.me()
+                            && channel.uses_sparse_history(profile.store())?
+                            && channel
+                                .history_role_head(profile.store(), &target.host)?
+                                .is_none();
+                        Ok((share, unread))
+                    })();
+                    let (share, unknown) = match read {
+                        Ok(read) => read,
+                        // Governance still folding what this node just admitted cannot say yet
+                        // whether the share is stated: the room's copy is not yet known, as before
+                        // its first sync. Not a refusal: the host decides the dial (V030-25), and
+                        // refusing here turned away sessions the host carries (`vox up` refused a
+                        // session right after a join, `the_tunnel_cap_holds_across_a_path_upgrade`).
+                        Err(e) if ChannelState::governance_refreshing(&e) => (None, true),
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    if unknown {
                         names.set_synced(target.channel_id, false);
                     }
                     if let Some(share) = share {
@@ -13943,9 +14016,10 @@ impl Node {
                             let answer = if sent {
                                 // A request made is answered, past the patience too: it may have
                                 // admitted. A dropped sender resolves this as well, so a
-                                // shutting-down actor cannot strand a joiner mid-exchange; nothing
-                                // admitted it, so it is refused.
-                                wait.await.unwrap_or_else(|_| Err(stopped()))
+                                // shutting-down actor cannot strand a joiner mid-exchange; its save
+                                // may have run, so the joiner is told no definite refusal.
+                                wait.await
+                                    .unwrap_or_else(|_| Err(Error::JoinAdmissionUnsettled))
                             } else {
                                 Err(refused.take().unwrap_or_else(stopped))
                             };
@@ -14705,7 +14779,17 @@ impl Node {
     }
 
     /// Production join authentication on a direct local connection, without admission.
-    async fn begin_room_validation(
+    fn begin_room_validation(
+        &mut self,
+        room: Digest32,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) -> Boxed<'_, ()> {
+        Box::pin(self.begin_room_validation_unboxed(room, passphrase, reply))
+    }
+
+    /// [`Self::begin_room_validation`], unboxed: see [`Boxed`].
+    async fn begin_room_validation_unboxed(
         &mut self,
         room: Digest32,
         passphrase: Secret,
@@ -15063,7 +15147,17 @@ impl Node {
         });
     }
 
-    async fn begin_join_channel(
+    fn begin_join_channel(
+        &mut self,
+        link: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) -> Boxed<'_, ()> {
+        Box::pin(self.begin_join_channel_unboxed(link, passphrase, reply))
+    }
+
+    /// [`Self::begin_join_channel`], unboxed: see [`Boxed`].
+    async fn begin_join_channel_unboxed(
         &mut self,
         link: String,
         passphrase: Secret,
@@ -18198,6 +18292,7 @@ impl Node {
         self.session_ingress_scan = 0;
         self.retire_parked_construction(Fault::Locked);
         self.retire_parked_private_drives(Fault::Locked);
+        self.retire_parked_consents();
         self.retire_identity_startup();
         self.retire_pending_posts();
         if let Some(pending) = self.pending_policy.take() {
@@ -18431,7 +18526,16 @@ impl Node {
     /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
     /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
     /// Check the identity passphrase on a blocking thread and answer `reply` from there.
-    async fn begin_verify_passphrase(
+    fn begin_verify_passphrase(
+        &mut self,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) -> Boxed<'_, ()> {
+        Box::pin(self.begin_verify_passphrase_unboxed(passphrase, reply))
+    }
+
+    /// [`Self::begin_verify_passphrase`], unboxed: see [`Boxed`].
+    async fn begin_verify_passphrase_unboxed(
         &mut self,
         passphrase: Secret,
         reply: oneshot::Sender<Outcome>,
@@ -18473,7 +18577,19 @@ impl Node {
         });
     }
 
-    async fn begin_create_channel(
+    fn begin_create_channel(
+        &mut self,
+        room_name: String,
+        passphrase: Secret,
+        anchors: BootstrapSet,
+        service: Option<(String, SocketAddr)>,
+        reply: oneshot::Sender<Outcome>,
+    ) -> Boxed<'_, ()> {
+        Box::pin(self.begin_create_channel_unboxed(room_name, passphrase, anchors, service, reply))
+    }
+
+    /// [`Self::begin_create_channel`], unboxed: see [`Boxed`].
+    async fn begin_create_channel_unboxed(
         &mut self,
         room_name: String,
         passphrase: Secret,
@@ -18896,7 +19012,12 @@ impl Node {
 
     /// One room, one bounded storage turn. The main select loop services commands,
     /// lock/close and network work between turns; no room is published half recovered.
-    async fn advance_room_preparation(&mut self) {
+    fn advance_room_preparation(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.advance_room_preparation_unboxed())
+    }
+
+    /// [`Self::advance_room_preparation`], unboxed: see [`Boxed`].
+    async fn advance_room_preparation_unboxed(&mut self) {
         self.advance_room_publication().await;
         use std::ops::Bound::{Excluded, Unbounded};
         let now = std::time::Instant::now();

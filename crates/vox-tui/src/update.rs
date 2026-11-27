@@ -94,6 +94,13 @@ const MAX_VERSION_OUTPUT_BYTES: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECORD_TIMEOUT: Duration = Duration::from_secs(60);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a candidate, or the retained previous a rollback puts back, has to answer
+/// `--version` (ADR-051 LB-5 raised the run check's 5 s to 20 s for these uses).
+#[cfg(not(target_os = "macos"))]
+const ANSWERS_WITHIN: Duration = Duration::from_secs(20);
+/// How long an interrupted rollback's leftover has to answer `--version` before it is not a
+/// `vox` (V210-59, #247); ADR-051 leaves that recovery unchanged.
+const RUNS_WITHIN: Duration = Duration::from_secs(5);
 
 fn usage(message: impl Into<String>) -> AppError {
     AppError::Usage(message.into())
@@ -791,7 +798,7 @@ fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Resul
 /// record's digest alone. Stated here rather than silently skipped — see the module docs.
 #[cfg(not(target_os = "macos"))]
 fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Result<(), AppError> {
-    let checked = run_check(candidate, Some(version));
+    let checked = run_check(candidate, Some(version), ANSWERS_WITHIN);
     if checked.verdict == RunVerdict::Ran {
         return Ok(());
     }
@@ -829,7 +836,7 @@ fn captured(mut pipe: impl std::io::Read, maximum: usize) -> Vec<u8> {
     bytes
 }
 
-fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
+fn run_check(path: &Path, expected: Option<&str>, within: Duration) -> RunCheck {
     use std::os::unix::process::CommandExt as _;
     #[cfg(target_os = "macos")]
     let _ = expected;
@@ -877,9 +884,7 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
+            Ok(None) if started.elapsed() < within => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -1568,7 +1573,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let checked = run_check(&previous, None);
+        let checked = run_check(&previous, None, ANSWERS_WITHIN);
         if checked.verdict != RunVerdict::Ran {
             return Err(not_running(&checked, &active, None, true));
         }
@@ -1600,7 +1605,7 @@ fn restart_onto(active: &Path) -> Result<Vec<vox_core::node::paths::NodeName>, A
 
 /// Whether an interrupted rollback's retained binary is a runnable vox.
 fn runs_as_vox(path: &Path) -> bool {
-    let checked = run_check(path, None);
+    let checked = run_check(path, None, RUNS_WITHIN);
     checked.success && says_vox_version(&checked.stdout)
 }
 
@@ -1632,7 +1637,7 @@ fn says_vox_version(out: &[u8]) -> bool {
 fn binary_version(path: &Path) -> Option<String> {
     #[cfg(not(target_os = "macos"))]
     {
-        let checked = run_check(path, None);
+        let checked = run_check(path, None, ANSWERS_WITHIN);
         (checked.verdict == RunVerdict::Ran).then(|| {
             String::from_utf8_lossy(&checked.stdout)
                 .trim()

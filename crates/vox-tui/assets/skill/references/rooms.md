@@ -179,7 +179,7 @@ if the first attempt's response was lost.
 Post an `ask` using the actual bound room, your node, the holder from the board in `--to`,
 the exact item in `--work`, and your question. Do not invent a holder or work key.
 
-**When you are asked about your own work**, answer in the room, briefly, with `--re`:
+**When you are asked about your own work**, answer in the room, briefly, with `vox room post` and `--re`:
 what you are doing, and whether you are stuck. The proofs are on the issue; point to
 it rather than repeat them.
 
@@ -260,7 +260,7 @@ message does not establish that they can read yours. Confirm that the worker can
 candidate and proof artifacts, not merely that a temporary path exists on your machine.
 
 If there is no model acceptance and the board shows the work is unclaimed and unreserved, explicitly
-close/cancel that offer with a post in this room, as your node, replying to the offer's actual
+close/cancel that offer with a `vox room post` in this room, as your node, replying to the offer's actual
 entry hash with `--re` and saying "offer closed", before redirecting it.
 Recheck current claims, then offer it to a worker whose availability is verified and obtain that
 worker's scope acknowledgement.

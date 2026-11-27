@@ -296,16 +296,19 @@ impl Node {
                         .and_modify(|pending| *pending |= replay)
                         .or_insert(replay);
                 }
-                if attached
+                // Opened again by itself once the room's governance is applied
+                // (`governance_save`, `key_package_governance_wait`): a wait, not a fault, so
+                // nothing is said of it.
+                let waits_governance = attached
                     && matches!(continuation.stage, Stage::Open | Stage::Install)
-                    && matches!(fault_of(&error), Fault::GovernanceRefreshing)
-                {
+                    && matches!(fault_of(&error), Fault::GovernanceRefreshing);
+                if waits_governance {
                     self.key_package_governance_wait.insert(room);
                     self.key_package_retry_at
                         .insert(room, std::time::Instant::now() + super::PREPARE_WAIT);
                     self.governance_work.wake_room(room);
                 }
-                if attached && !publication_busy {
+                if attached && !publication_busy && !waits_governance {
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
                         note: format!(
                             "room {} could not read its saved key deliveries: {error}",

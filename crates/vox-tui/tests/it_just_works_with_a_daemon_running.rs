@@ -230,7 +230,18 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     // Deliberately not the room id and not the name — just the passphrase, which is all
     // an operator has in front of them after a reboot.
     let _d = daemon(&data, &cfg, &format!("{IDENTITY}\n{ROOMPASS}\n"));
-    let listed = until_attached(&data, &cfg, "PRODUCT");
+    let mut listed = until_attached(&data, &cfg, "PRODUCT");
+    // The daemon answers before the room it opened has finished preparing its saved history, and
+    // `room list` says so (`[preparing history]`, no name yet): a person looks again. Looked at
+    // for as long as a verb waits on a preparing room (`daemon_client::START_WITHIN`, 15 s); a
+    // room still preparing then is the red below.
+    let preparing_since = std::time::Instant::now();
+    while listed.contains("[preparing history")
+        && preparing_since.elapsed() < std::time::Duration::from_secs(15)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        listed = until_attached(&data, &cfg, "PRODUCT");
+    }
     assert!(
         listed.contains("mission") && !listed.contains("[closed]"),
         "PRODUCT: a daemon given only the room passphrase must open the room it opens: `room list` \

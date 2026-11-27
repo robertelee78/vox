@@ -29,8 +29,9 @@
 //! 4. S1 closes and is resumed under its id (`codex resume`): its second turn's reply reaches the
 //!    Session.
 //! 5. `person --say` to S1 reaches S1's thread alone as `turn/start`; `--slash /clear` is refused
-//!    (it would start a new thread, DR-7); `watcher --say` is refused (no drive, DR-2), naming
-//!    the agent's node as the watcher knows it, never by the node's own name.
+//!    (it would start a new thread, DR-7); `watcher --say` is refused (no drive, DR-2): a member
+//!    without drive sees none of the node's Sessions (ADR-031 SA-1, SA-2; e4f23581b), so it is
+//!    told no Session of the room has that name, and nothing of S1, not even its name, is shown.
 //! 6. The app-server goes away: `--say` to S1 is refused and says why (DR-5, DR-6).
 //!
 //! Between 4 and 5, Codex renames S1's thread (`thread/name/updated`): Session S1 reads the new
@@ -769,10 +770,11 @@ fn a_codex_session_is_mirrored_and_driven() {
     let (ok, said) = w.drive(WATCHER, S1, &["--say", "may I?"]);
     println!("[proof] (5) watcher --say: {said}");
     assert!(
-        !ok && said.contains(&format!("seen-{CODEX} does not trust you with drive")),
-        "PRODUCT: {WATCHER}, trusted to read only, must be refused and told it lacks drive \
-         (DR-2), naming {CODEX}'s node as the watcher knows it (seen-{CODEX}), never by the \
-         node's own name; it said: {said}"
+        !ok && said.contains(&format!("no Session in this room is named {S1}"))
+            && !said.contains("codex renamed"),
+        "PRODUCT: {WATCHER}, trusted to read only, must be refused (DR-2) and, seeing none of \
+         {CODEX}'s Sessions (ADR-031 SA-1), be told no Session of the room has that name, \
+         without S1's name; it said: {said}"
     );
     let stray = app.received(Duration::from_secs(2), |v| {
         v["method"] == "turn/start" && v.pointer("/params/input/0/text") == Some(&json!("may I?"))
