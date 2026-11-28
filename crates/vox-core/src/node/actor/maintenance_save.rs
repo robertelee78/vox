@@ -870,6 +870,18 @@ impl Node {
             let held = Arc::clone(&lifetime);
             let saved = tokio::task::spawn_blocking(move || {
                 let input_owner = Arc::clone(&worker_owner);
+                // Ruling condition 4: this node's own trust and consent changes (a withdrawal and
+                // the key change it owes among them) and Session maintenance get the room's next
+                // pending write as a member's own post does (`post_save`): registered as waiting
+                // before they first look, until they hold it, so an entry admission operation
+                // stands aside (`history_stream::source`); and they wait for an unfinished
+                // history publication to end, whose own step goes on meanwhile, rather than
+                // being refused by it.
+                let waiting = matches!(
+                    &work,
+                    Work::Trust(_) | Work::Consent(_) | Work::Session(_) | Work::DirectSession(_)
+                )
+                .then(|| worker_instance.blocking_lock().authored_save_waiting());
                 let (prepared, input_epoch, input_instance) = loop {
                     let mut channel = worker_instance.blocking_lock();
                     if held.publication.is_some()
@@ -881,7 +893,9 @@ impl Node {
                     if *attachment.borrow() != epoch {
                         return Err(Error::AtRestLocked);
                     }
-                    if !channel.post_pending() {
+                    if !channel.post_pending()
+                        && (waiting.is_none() || !channel.history_publication_busy(&held.store)?)
+                    {
                         let input_epoch = channel.epoch();
                         let input_instance = channel.generation();
                         let fresh = crate::time::Ms(clock());
@@ -893,6 +907,8 @@ impl Node {
                             preparation_now.unwrap_or(fresh),
                             fresh,
                         )?;
+                        // Registered no longer: the save holds the room's pending write.
+                        drop(waiting);
                         break (prepared, input_epoch, input_instance);
                     }
                     // Another native owner may win between causal stages. Keep the selected

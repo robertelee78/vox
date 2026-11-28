@@ -222,7 +222,14 @@ impl HistoryAdmissionRoom for HistoryAdmission<'_> {
         let mut index = self
             .entries
             .write(&mut batch, self.sek, &self.pending.room)?;
+        let segments = index.segments_written();
         let result = operation(&mut index)?;
+        // A derived write that changed nothing commits nothing (JoinDesign S2): no revision
+        // moves, no reader's cache is emptied. A durable one still commits: its flush carries
+        // earlier commits with it.
+        if !durable && index.unchanged(segments) {
+            return Ok(result);
+        }
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
@@ -290,7 +297,7 @@ impl PendingHistorySource {
         self.sek.with(|sek| {
             let mut batch = store.received_batch(received)?;
             check_binding(&batch)?;
-            let published = self.publish_in(&mut batch, sek, entry, binding, now)?;
+            let published = self.publish_in(&mut batch, sek, entry, binding, now, None)?;
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             Ok(published)
@@ -308,6 +315,7 @@ impl PendingHistorySource {
         entry: &Entry,
         binding: entry_store::sparse::CursorBinding,
         now: crate::time::Ms,
+        signed_under: Option<(Digest32, Digest32)>,
     ) -> Result<PublishedHistorySource> {
         let entries = entry_store::EntryIndex::default();
         let input = entries.in_batch(batch, sek, &self.room)?;
@@ -350,6 +358,7 @@ impl PendingHistorySource {
             self.log,
             entry,
             self.late,
+            signed_under,
         )?;
         // Preserve the source transaction's original promotion: current consent/presence
         // flushes here; other received facts remain owned by this Flow until settlement.
@@ -685,8 +694,10 @@ impl ChannelState {
     /// lowest post of each run is read as its row is ([`Self::key_opens`]): one no key held here
     /// opens is counted (`unreadable`), this node's own runs too, and its walk goes on, since
     /// nothing this node holds says it was written before its author trusted this node. An author
-    /// already owed a page (`fetching`) gets no second one. Authors whose run ends at the newest
-    /// row are served
+    /// already owed a page (`fetching`: the lowest position its open requests owe) gets the page
+    /// just below that position, which its run reaches once they land: what the person asked for
+    /// is owed now, never left waiting on a request that does not cover it, and no position is
+    /// owed twice. Authors whose run ends at the newest row are served
     /// first, at most `limit` of them (the requests this node may still keep); the others are
     /// counted (`left_out`). The row named (`before`) is where the person reads; it does not
     /// decide what is selected.
@@ -694,7 +705,7 @@ impl ChannelState {
         &self,
         store: &Store,
         before: &Digest32,
-        fetching: &BTreeSet<Digest32>,
+        fetching: &std::collections::BTreeMap<Digest32, u64>,
         limit: usize,
     ) -> Result<OlderPage> {
         let read = self.history_read(store)?;
@@ -734,11 +745,9 @@ impl ChannelState {
             if row.window().is_some() {
                 page.arriving += 1;
             }
-            if fetching.contains(author) {
-                continue;
-            }
-            let lowest = run_lowest(row);
-            if self.oldest_unreadable(&read, &render, row, author, lowest)? {
+            let owed = fetching.get(author).copied();
+            let lowest = run_lowest(row).min(owed.unwrap_or(u64::MAX));
+            if owed.is_none() && self.oldest_unreadable(&read, &render, row, author, lowest)? {
                 page.unreadable += 1;
             }
             if lowest <= 1 {
@@ -1085,7 +1094,14 @@ impl PendingHistoryBegin {
                     })?;
                     index.seal()?;
                     drop(index);
-                    let published = source.publish_in(&mut batch, sek, entry, binding, now)?;
+                    let published = source.publish_in(
+                        &mut batch,
+                        sek,
+                        entry,
+                        binding,
+                        now,
+                        validated.signed_under(),
+                    )?;
                     batch.commit()?;
                     committed.store(true, std::sync::atomic::Ordering::Release);
                     Ok(HistorySourceStart::Started(published))
@@ -1170,18 +1186,16 @@ impl ChannelState {
 
     /// Source validation has already consumed the shared verifier envelope. This checks the
     /// current room/admission boundary again before starting one unpublished index operation;
-    /// the validation token's binding to this entry is checked in its transaction.
+    /// the validation token's binding to this entry is checked in its transaction. Called only
+    /// inside the owned write that holds the room's pending write, just after this operation
+    /// validated the entry (`history_stream::client` `admit_entry`, under `OwnedRoom`), so no
+    /// other post can be pending.
     pub(crate) fn prepare_history_begin(
         &self,
         store: &Store,
         entry: &Entry,
         request: [u8; 16],
     ) -> Result<PendingHistoryBegin> {
-        if self.post_pending() {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
-        }
         if self.poisoned.get() {
             return Err(self.save_failure());
         }

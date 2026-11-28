@@ -160,7 +160,8 @@ pub(crate) use own_history::confirm_creator_end;
 pub(crate) use own_history::erase_continuity as erase_own_continuity;
 pub(crate) use sparse_history::{
     HistoryAdmission, HistoryAdmissionRoom, HistoryEffectCursor, HistoryEffectProgress,
-    HistoryPayload, HistorySourceStart, PinnedHistory, PublishedHistorySource,
+    HistoryPayload, HistorySourceStart, PendingHistoryAdmission, PinnedHistory,
+    PublishedHistorySource,
 };
 
 pub use diagnostics::SetAside;

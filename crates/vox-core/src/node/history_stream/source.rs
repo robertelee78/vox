@@ -452,6 +452,7 @@ impl Source {
     /// its returned value receives a new charge. Moving the guard into the blocking closure
     /// keeps that existing reservation alive even when the async waiter is cancelled. The
     /// returned value retains the guard as well, including during later actor handoffs.
+    #[cfg(feature = "test-knobs")]
     pub(super) async fn read_precharged<T, G, F>(
         &self,
         job: &Job,
@@ -713,7 +714,9 @@ impl Source {
                     room = self.room.clone().lock_owned() => room,
                 };
                 self.check_write_access(&room)?;
-                if room.post_pending() || room.authored_save_waits() {
+                // A step that finishes the room's unfinished publication does not stand aside
+                // for a waiting save: that save waits for this publication to end in any case.
+                if room.post_pending() || (!publication && room.authored_save_waits()) {
                     let wake = room.history_publication_wake();
                     drop(room);
                     tokio::select! {
@@ -764,7 +767,7 @@ impl Source {
                     Ok(busy) => !publication && busy,
                     Err(error) => return Step::Done(Err(error)),
                 };
-                if room.post_pending() || room.authored_save_waits() || busy {
+                if room.post_pending() || (!publication && room.authored_save_waits()) || busy {
                     return Step::Wait(inputs);
                 }
                 let (admission, prepare, run, install) = inputs;
@@ -870,12 +873,22 @@ impl Source {
                         owner: &owner,
                         instance: room_instance,
                     };
+                    // Ruling condition 2: a callback that committed nothing and whose install
+                    // changed no public governance state (readiness, display, consent facts:
+                    // `governance_public`, read around the install) publishes nothing.
+                    // The store's transaction identity read around it tells (a commit elsewhere
+                    // meanwhile only costs a needless publication, never a missed one). A failed
+                    // callback publishes as before: a failed write may have poisoned the room,
+                    // whose readers keep the pinned view (`publish_history_read`).
+                    let before = source.store.transaction_identity();
                     let saved = input.scope(|| run(pending, &source.store, &owned));
+                    let committed = source.store.transaction_identity() != before;
                     let mut room = source.room.blocking_lock();
                     let owns = room.owns_pending_history_write(&owner);
-                    if owns {
+                    if owns && committed {
                         room.history_index_committed();
                     }
+                    let shown = room.governance_public();
                     let result = saved.and_then(|value| {
                         if !owns {
                             return Err(Error::Unreachable("history publication owner changed"));
@@ -887,8 +900,11 @@ impl Source {
                         }
                         install(&mut room, &source.store, value)
                     });
+                    let installed = room.governance_public() != shown;
                     room.release_pending_text(&owner, false);
-                    let publication = if owns {
+                    // The release above still wakes the pending write's waiters.
+                    let committed = committed || source.store.transaction_identity() != before;
+                    let publication = if owns && (committed || installed || result.is_err()) {
                         let published = room
                             .publish_history_read(Arc::clone(&source.store))
                             .map(|_| ());

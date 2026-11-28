@@ -842,6 +842,17 @@ impl ChannelState {
         store: &Store,
         now: crate::time::Ms,
     ) -> Result<GovernanceProgress> {
+        self.advance_governance_within(store, now, super::FOLD_BUDGET)
+    }
+
+    /// The same turn, its order/evaluation steps bounded by `allowance` (at least one runs): an
+    /// entry admission operation folds within what is left of its own turn target.
+    pub(crate) fn advance_governance_within(
+        &mut self,
+        store: &Store,
+        now: crate::time::Ms,
+        allowance: std::time::Duration,
+    ) -> Result<GovernanceProgress> {
         if self.poisoned.get() {
             return Err(self.save_failure());
         }
@@ -859,6 +870,7 @@ impl ChannelState {
                 &self.me(),
                 now.get(),
                 &mut next_log,
+                allowance,
             );
             self.install_next_log(next_log);
             let state = state?;
@@ -1098,6 +1110,7 @@ impl ChannelState {
             log,
             entry,
             late,
+            None,
         )?;
         // The Batch failure path poisons this ChannelState, so it is safe to advance the
         // in-memory mirror here with the same accepted input: no usable state can outlive a

@@ -1871,13 +1871,17 @@ impl Write<'_, '_> {
     }
     /// The token can only be constructed by the channel's typed effect dispatcher after
     /// its exact signed context and current checks finish. This method grants nothing by
-    /// source-completeness alone; all changes share the effect transaction.
+    /// source-completeness alone; all changes share the effect transaction. A control's effect
+    /// also advances its author's control prefixes (`advance_received_control_prefixes`).
+    /// Returns whether the package catalog changed, and whether the author's controls became
+    /// current here.
     pub(in crate::node::channel) fn finish_history_effect(
         &mut self,
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
         local_id: Digest32,
-    ) -> Result<bool> {
+        work: &mut crate::log::history::WorkBudget,
+    ) -> Result<(bool, bool)> {
         if finished.entry_hash() != entry.entry_hash() {
             return Err(invalid("sparse effect token differs"));
         }
@@ -1890,7 +1894,73 @@ impl Write<'_, '_> {
         if !body_owed_to(entry, &local_id) {
             self.set_missing(&entry.skeleton.author_id, entry.skeleton.seq, false)?;
         }
-        Ok(self.directory.next_package != previous_package)
+        let ready = match &entry.skeleton.v2 {
+            Some(v2) if v2.kind.is_control() => {
+                self.advance_received_control_prefixes(entry, v2.scope, work)?
+            }
+            _ => false,
+        };
+        Ok((self.directory.next_package != previous_package, ready))
+    }
+
+    /// A received control's own effect advances its author's control-source, then
+    /// control-effect prefix toward the author's committed size, with the existing walk
+    /// (`advance_control_receipt`: it stops at a coverage gap, a missing or conflicting source
+    /// and an unfinished effect, and never sets a prefix to a position), each step charged to
+    /// the admission operation's budget. Where it stops, the next entry's admission walks on
+    /// (`admission::advance_prefix`). Returns whether the author's controls became current here.
+    fn advance_received_control_prefixes(
+        &mut self,
+        entry: &Entry,
+        scope: LogScope,
+        work: &mut crate::log::history::WorkBudget,
+    ) -> Result<bool> {
+        let author = entry.skeleton.author_id;
+        let roots = self.directory.active.sparse;
+        let Some(committed) = Source::Batch(self.batch)
+            .sparse_author(self.sek, self.channel, roots, &author, scope)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(false);
+        };
+        let record = Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                roots.objects,
+                &object_key(ObjectKind::Head, &committed),
+            )?
+            .ok_or(invalid("control source head missing"))?;
+        let leaves = SignedHead::from_wire(&Source::Batch(self.batch).sparse_record(
+            self.sek,
+            self.channel,
+            record,
+            MAX_HEADER_BYTES,
+        )?)?
+        .root
+        .leaves;
+        let effect_prefix = |write: &Self| -> Result<u64> {
+            Ok(Source::Batch(&*write.batch)
+                .number(
+                    write.sek,
+                    write.channel,
+                    write.directory.active.sparse.effect_prefixes,
+                    &hashed(&author),
+                )?
+                .unwrap_or(0))
+        };
+        let before = effect_prefix(self)?;
+        for effects in [false, true] {
+            while work.take_control_lookup() {
+                if !matches!(
+                    self.advance_control_receipt(&committed, leaves, effects)?,
+                    SourceProgress::Progress { .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        Ok(before < leaves && effect_prefix(self)? >= leaves)
     }
 
     /// Consume only the opaque token returned by this exact local publication. The caller has

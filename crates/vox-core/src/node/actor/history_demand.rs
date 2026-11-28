@@ -1704,20 +1704,31 @@ impl Node {
         };
         let now = self.now_ms().get();
         if let Action::Older { before } = action {
-            // The room's authors already owed an older page, and what those pages still lack.
-            let owed: Vec<(Digest32, usize, Status)> = self
+            // What the room's record holds now settles the requests it completed, so that what
+            // the person is told below counts only what is still owed.
+            self.settle_archive_progress(room);
+            // The room's authors already owed an older page, the lowest position those pages
+            // owe (a private request's positions are its donor's: its author gets no page here),
+            // and what those pages still lack.
+            let owed: Vec<(Digest32, u64, usize, Status)> = self
                 .history_demand
                 .public
                 .values()
                 .filter(|p| p.status.room == room && !p.settling && !p.fence.is_retired())
-                .map(|p| (p.author, p.status.remaining, p.status.clone()))
+                .map(|p| {
+                    let lo = if p.private.is_some() { 1 } else { p.lo };
+                    (p.author, lo, p.status.remaining, p.status.clone())
+                })
                 .collect();
             // Each page is one saved request; never ask for more than this node may keep.
             let limit = demand::PUBLIC_REQUESTS.saturating_sub(self.history_demand.public.len());
             self.public_task(inputs, Some(reply), move |guard, inputs| {
                 let binding = public_binding(&guard, inputs, instance, now)?;
-                let fetching: std::collections::BTreeSet<Digest32> =
-                    owed.iter().map(|(a, _, _)| *a).collect();
+                let mut fetching = std::collections::BTreeMap::<Digest32, u64>::new();
+                for (author, lo, _, _) in &owed {
+                    let at = fetching.entry(*author).or_insert(*lo);
+                    *at = (*at).min(*lo);
+                }
                 let page = guard
                     .history_older_page(&inputs.store, &before, &fetching, limit)
                     .map_err(|e| e.to_string())?;
@@ -1742,10 +1753,16 @@ impl Node {
                     newest.get_or_insert(status);
                     found.push(saved);
                 }
-                let members = page.owed.len() + owed.len();
-                let remaining = fetched + owed.iter().map(|(_, r, _)| r).sum::<usize>();
+                let members = page
+                    .owed
+                    .iter()
+                    .map(|(_, author, _, _)| *author)
+                    .chain(owed.iter().map(|(author, _, _, _)| *author))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                let remaining = fetched + owed.iter().map(|(_, _, r, _)| r).sum::<usize>();
                 let mut status = newest
-                    .or_else(|| owed.last().map(|(_, _, s)| s.clone()))
+                    .or_else(|| owed.last().map(|(_, _, _, s)| s.clone()))
                     .unwrap_or_else(|| status(room, instance, Phase::Complete, ""));
                 status.remaining = remaining;
                 // Owed is what extends each member's held history downward, down to its first

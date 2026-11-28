@@ -22,8 +22,9 @@ enum Operation {
     Governance,
 }
 
-/// How long one turn keeps running local slices before it yields to the actor.
-const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+/// How long one turn keeps running local slices before it yields to the actor; also the
+/// cooperative target of one entry's admission operation (`admission::Bound`).
+pub(super) const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 /// How many local slices one turn runs at most.
 const LOCAL_SLICES_PER_TURN: u32 = 64;
 /// Fold steps an entry slice may take in one turn before it waits for the actor's fold hook
@@ -123,6 +124,19 @@ pub(crate) struct Flow {
     /// An admission flow's current root, the checked entry the delivering connection holds in
     /// memory, and whether it is settled (`settle_root`).
     admit_root: Option<(super::pull::Ready, bool)>,
+    /// The other authors' controls the current root's last stop found it lacks besides its
+    /// need (`LocalResult::also`): handed to the frontier when the root settles for a need.
+    root_also: Vec<(Digest32, u64)>,
+    /// What each stopped entry operation of the current root's work checked (JoinDesign S1),
+    /// by its continuation's exact request, head and position: handed to that continuation's
+    /// next operation, and to the frontier with the root when the root settles for a need.
+    /// Cleared when the next root is taken; at most one per retained continuation, all within
+    /// the admission's `headroom` (`Flow::keep_checked`).
+    checked: std::collections::HashMap<(RequestId, Digest32, u64), Box<super::admission::Checked>>,
+    /// An admission flow's headroom for what it keeps (`checked`): one assembly charge taken
+    /// before its root leaves the room's ready set (`next_admission_root`) and held while the
+    /// admission runs; released with the flow.
+    headroom: Option<super::pull::CheckedRoom>,
     /// The root this admission held unsettled when it failed (`fail`): owned here, neither
     /// waiting for a head nor fetched again, until the failed flow's retirement ends, then given
     /// back to the room's ready set (`Drop`). The room's admission meanwhile waits for its
@@ -201,6 +215,9 @@ impl Flow {
             frontier: Some(frontier),
             record: Some(record),
             admit_root: None,
+            root_also: Vec::new(),
+            checked: std::collections::HashMap::new(),
+            headroom: None,
             failed: None,
         })
     }
@@ -221,14 +238,53 @@ impl Flow {
             return Ok(());
         };
         self.settle_root(None, None, None);
+        self.root_also.clear();
+        self.checked.clear();
+        if !frontier.has_ready(self.room) {
+            self.admit_root = None;
+            return Ok(());
+        }
+        // The headroom for what this admission keeps of its root's work is taken before the
+        // root leaves the ready set, where it stays sheddable (C5): without room even after
+        // shedding, no root is taken, and the admission waits for the assembly's next release
+        // as it waits for a root, holding none. A running admission never waits for room.
+        let most = super::admission::Checked::headroom();
+        let held = self
+            .headroom
+            .as_ref()
+            .map_or(0, super::pull::CheckedRoom::bytes);
+        if let Some(headroom) = self.headroom.as_mut() {
+            headroom.trim(most);
+        }
+        if held < most {
+            match frontier.reserve_checked_or_wake((self.room, self.peer), most - held) {
+                Ok(more) => match self.headroom.as_mut() {
+                    Some(headroom) => headroom.join(more),
+                    None => self.headroom = Some(more),
+                },
+                Err(wake) => {
+                    self.admit_root = None;
+                    self.waiting = true;
+                    self.slot_wait = Some(wake);
+                    return Ok(());
+                }
+            }
+        }
         let Some(ready) = frontier.take(self.room) else {
             self.admit_root = None;
             return Ok(());
         };
         let (head, seq) = (ready.head, ready.entry.skeleton.seq);
         let body = ready.entry.payload.is_some();
-        self.admit_root = Some((ready, false));
         let request = request_id()?;
+        // What its last operation checked goes on with it, bound to this request, its charge
+        // back in the headroom: one debit, never a second beside the headroom.
+        if let (Some(kept), Some(headroom)) = (ready.take_checked(), self.headroom.as_mut()) {
+            if let Some(checked) = headroom.restore(kept, most) {
+                self.checked.insert((request, head, seq), checked);
+            }
+        }
+        self.admit_root = Some((ready, false));
         self.push(Task {
             request,
             operation: Operation::Local(LocalStep::Entry {
@@ -277,8 +333,124 @@ impl Flow {
             frontier.published(self.room, author, seq);
             return;
         }
+        if need.is_some() {
+            // What the root's last operation checked waits with it (JoinDesign S1).
+            let root = self
+                .checked
+                .keys()
+                .find(|(_, at, s)| *at == ready.head && *s == seq)
+                .copied();
+            if let (Some(checked), Some(headroom)) = (
+                root.and_then(|root| self.checked.remove(&root)),
+                self.headroom.as_mut(),
+            ) {
+                if let Some(kept) = headroom.keep(checked) {
+                    ready.keep_checked(kept);
+                }
+            }
+        }
         let kept = need.as_ref().map(|_| (self.peer, ready.clone()));
-        frontier.settled(self.room, author, seq, need, kept, at);
+        let also = std::mem::take(&mut self.root_also);
+        frontier.settled(self.room, author, seq, need, kept, at, also);
+    }
+
+    /// The root waits for position `seq` under `head` when that position is a control handed
+    /// here and not admitted yet (`pull::Frontier::wait_at_held`), with the other controls its
+    /// stop noted (`root_also`). Returns whether it waits.
+    async fn wait_root_at_held(&mut self, head: Digest32, seq: u64) -> Result<bool> {
+        let Some(frontier) = self.frontier.clone() else {
+            return Ok(false);
+        };
+        let author = {
+            let room = Arc::clone(&self.shared).lock_owned().await;
+            let read = room.history_read(&self.cleanup_store)?;
+            read.history_head(&head)?.map(|head| head.binding.author)
+        };
+        let Some(author) = author else {
+            return Ok(false);
+        };
+        let Some((ready, settled)) = self.admit_root.as_mut().filter(|(_, settled)| !settled)
+        else {
+            return Ok(false);
+        };
+        let root = (ready.entry.skeleton.author_id, ready.entry.skeleton.seq);
+        if root == (author, seq) {
+            return Ok(false);
+        }
+        // What the root's last operation checked waits with it (JoinDesign S1); back to its
+        // continuation if it does not wait.
+        let key = self
+            .checked
+            .keys()
+            .find(|(_, at, s)| *at == ready.head && *s == root.1)
+            .copied();
+        if let (Some(checked), Some(headroom)) = (
+            key.and_then(|key| self.checked.remove(&key)),
+            self.headroom.as_mut(),
+        ) {
+            if let Some(kept) = headroom.keep(checked) {
+                ready.keep_checked(kept);
+            }
+        }
+        if !frontier.wait_at_held(
+            self.room,
+            root,
+            (author, seq),
+            (self.peer, ready.clone()),
+            &mut self.root_also,
+        ) {
+            // Back into the headroom untrimmed: the other continuations' states still live
+            // under it (`checked`); it is trimmed only at the next root, once they are gone.
+            if let (Some(key), Some(kept), Some(headroom)) =
+                (key, ready.take_checked(), self.headroom.as_mut())
+            {
+                if let Some(checked) = headroom.restore(kept, usize::MAX) {
+                    self.checked.insert(key, checked);
+                }
+            }
+            return Ok(false);
+        }
+        *settled = true;
+        Ok(true)
+    }
+
+    /// What an entry's operation checked, kept for its continuation within the admission's
+    /// headroom (JoinDesign S1, C5). When it does not fit beside what is kept already, the
+    /// other continuations' states go (each is derived again when it runs), so the operation
+    /// that runs always keeps its own: a nested dependency then runs to its admission and the
+    /// root starts again at most once per dependency. The headroom holds the whole bound
+    /// (`Checked::headroom`), so a state alone always fits; one that did not would break that
+    /// invariant, and fails the entry's admission, said in the daemon log, rather than be
+    /// dropped and derived again for ever.
+    fn keep_checked(
+        &mut self,
+        key: (RequestId, Digest32, u64),
+        checked: Box<super::admission::Checked>,
+    ) -> Result<()> {
+        let Some(headroom) = self.headroom.as_mut() else {
+            return Ok(());
+        };
+        let bytes = checked.bytes();
+        let kept: usize = self.checked.values().map(|checked| checked.bytes()).sum();
+        if kept + bytes > headroom.bytes() {
+            self.checked.clear();
+        }
+        if bytes > headroom.bytes() {
+            debug_assert!(false, "kept validation state past Checked::headroom");
+            eprintln!(
+                "vox: room {}: entry {} under head {}: its admission's kept validation state \
+                 ({bytes} bytes) exceeds its bound ({} bytes); the entry's admission fails",
+                crate::node::network::short_id(self.room),
+                key.2,
+                crate::node::network::short_id(key.1),
+                headroom.bytes()
+            );
+            return Err(Error::Profile(
+                "an admission's kept validation state exceeds its bound",
+            ));
+        }
+        self.checked.insert(key, checked);
+        Ok(())
     }
 
     /// The frontier's need for a wire dependency of an admission flow's `step`, with what it
@@ -459,6 +631,13 @@ impl Flow {
             self.failed = self.admit_root.take().map(|(ready, _)| ready);
         }
         self.park();
+    }
+
+    /// The position (author, seq) of the root a failed admission holds back (`fail`).
+    pub(crate) fn failed_position(&self) -> Option<(Digest32, u64)> {
+        self.failed
+            .as_ref()
+            .map(|ready| (ready.entry.skeleton.author_id, ready.entry.skeleton.seq))
     }
 
     /// Stop a failed admission before its flow is retired.
@@ -1138,8 +1317,38 @@ impl Flow {
             }
             Operation::Local(step) => {
                 let before = self.record.as_ref().and_then(|cell| cell.current());
-                let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
+                // What this entry's last operation checked goes in; what this one checked when
+                // it stops comes back, for its continuation (JoinDesign S1).
+                let key = match step {
+                    LocalStep::Entry {
+                        request, head, seq, ..
+                    } => Some((request, head, seq)),
+                    LocalStep::Verify(_) => None,
+                };
+                // It lives under the admission's headroom while the operation runs, as it did
+                // while it was kept: nothing is reserved here and nothing waits.
+                let resumed = key.and_then(|key| self.checked.remove(&key));
+                let checked: super::admission::CheckedSlot =
+                    Arc::new(std::sync::Mutex::new(resumed));
+                let mut result = receiver
+                    .local_step(job, step, &checked, crate::time::Ms(now))
+                    .await?;
+                let kept = checked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let (Some(key), Some(kept)) = (key, kept) {
+                    self.keep_checked(key, kept)?;
+                }
                 self.controls_ready |= result.controls_ready;
+                // The root's own stop names what else it lacks; a nested dependency's does not.
+                if let LocalStep::Entry { head, seq, .. } = step {
+                    if self.admit_root.as_ref().is_some_and(|(ready, settled)| {
+                        !settled && ready.head == head && ready.entry.skeleton.seq == seq
+                    }) {
+                        self.root_also = std::mem::take(&mut result.also);
+                    }
+                }
                 if self.frontier.is_some() {
                     // An admission flow fetches nothing: a dependency on evidence or a body this
                     // node does not hold ends it, and its entries wait for that need, held by the
@@ -1267,7 +1476,7 @@ impl Flow {
                         LocalStep::Entry {
                             phase: EntryPhase::Start | EntryPhase::Preflight { .. },
                             ..
-                        } | LocalStep::Control { .. }
+                        }
                     );
                     if result.need.is_some() && rederive {
                         // Keep the oldest exact root in the scalar replay slot. Once that slot is
@@ -1348,6 +1557,15 @@ impl Flow {
                         ));
                     }
                     Some(LocalNeed::Entry { head, seq }) => {
+                        // A control handed here and not admitted yet (ready or waiting) is
+                        // admitted in its own turn: the root waits for that position instead of
+                        // descending into it inline, a descent every root lacking it repeated
+                        // (FixJoinE: about four operations per stop).
+                        if self.wait_root_at_held(head, seq).await? {
+                            self.tasks.clear();
+                            self.replay = None;
+                            return Ok(());
+                        }
                         // A distinct dependency starts a distinct staging activation. Reusing
                         // the parent request after an earlier dependency reached Complete would
                         // correctly trip history_demand's replay guard and strand the remaining
@@ -1364,20 +1582,6 @@ impl Flow {
                                 body: false,
                                 role_header: false,
                                 phase: EntryPhase::Start,
-                            }),
-                        })?;
-                    }
-                    Some(LocalNeed::Control {
-                        head,
-                        through,
-                        effects,
-                    }) => {
-                        self.push(Task {
-                            request: task.request,
-                            operation: Operation::Local(LocalStep::Control {
-                                head,
-                                through,
-                                effects,
                             }),
                         })?;
                     }
@@ -1458,6 +1662,20 @@ fn authorization_changed(error: &Error) -> bool {
                 | "live window authorization changed"
                 | "live retry authorization changed"
         ) | Error::StreamRefused(super::AUTHORIZATION_CHANGED)
+    )
+}
+
+/// Whether a failed admission's cause is a local condition that ends by itself: the room's one
+/// pending write or its unfinished publication held by another save or flow (refused as
+/// `room publication is busy`). Such a failure waits for that release
+/// (`ChannelState::history_publication_wake`) and the room's admission runs again. Every other
+/// failure needs a real change (a store fault cleared by reopen, a changed room, a missing or
+/// changed local fact) and waits for news that can change its outcome
+/// (`pull::Frontier::failed_admission_news`).
+pub(crate) fn failure_clears_by_itself(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Profile("room publication is busy; retry this operation")
     )
 }
 impl Drop for Flow {

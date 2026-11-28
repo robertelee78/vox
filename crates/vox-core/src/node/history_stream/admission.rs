@@ -905,38 +905,262 @@ fn coordinate_deferred(
         .is_some()
 }
 
-pub(super) enum EntryStart {
-    Preflight,
-    BodyNeeded,
-    Cursor(CursorBinding),
+/// Where an entry's admission operation goes on after it had to stop before Begin: at its start,
+/// at the exact scalar position of its preflight, or inside validation. What it checked rides
+/// with the entry in memory ([`Checked`]); without it, it goes on from its start (preflight
+/// from its scalar position).
+#[derive(Clone, Copy)]
+pub(super) enum Resume {
+    Start,
+    Preflight { parent: usize, next: usize },
+    Validate,
+}
+
+/// What an entry's admission operation checked before it stopped (JoinDesign S1), kept in
+/// memory with the entry: by the flow for its continuation, by the frontier's `Ready` across a
+/// wait (charged to the entry's assembly there), and resumed by the next operation instead of
+/// being sealed in a cursor and re-derived from the start. Bound to the activation
+/// (`generation`), the room, the head the entry was handed under and the entry itself; a
+/// validation also to the fingerprint of the author's key its typed body was checked under.
+/// Anything else drops it and the entry starts again. It holds no authority: Begin's token is
+/// still made by validation's last step in the operation that runs Begin, and every step still
+/// rechecks what can change (`SparseValidation::advance`: the entry's and the parent's heads
+/// committed, the parent's whole context; the gates under the owned write).
+pub(super) struct Checked {
+    generation: Digest32,
+    room: Digest32,
+    head: Digest32,
+    entry: Digest32,
+    stage: Stage,
+}
+
+enum Stage {
+    /// Its body is not held: what start established and preflight's position.
+    Preflight {
+        started: Started,
+        at: (usize, usize),
+    },
+    /// Its typed body checked under the author's key `key` (a fingerprint), validation's exact
+    /// cursor and the head its receipt is kept under (`binding`).
+    Validate {
+        validation: governance::SparseValidation,
+        head: Digest32,
+        key: Digest32,
+    },
+}
+
+impl Checked {
+    /// What it takes in memory, as an assembly charge counts it: each header it holds (the
+    /// entry's and each parent's) at its largest, with its descriptors, and the allocation of
+    /// its validation's F3 deferrals.
+    pub(super) fn bytes(&self) -> usize {
+        let (parents, deferred) = match &self.stage {
+            Stage::Preflight { started, .. } => (started.parents.len(), 0),
+            Stage::Validate { validation, .. } => {
+                (validation.parents().len(), validation.deferred_bytes())
+            }
+        };
+        Self::HEADER_BYTES * (1 + parents) + std::mem::size_of::<Self>() + deferred
+    }
+
+    /// One held header at its largest, with its descriptors.
+    const HEADER_BYTES: usize = crate::log::history::MAX_HEADER_BYTES + 256;
+
+    /// An admission's headroom for what it keeps ([`super::pull::CheckedRoom`]), and the
+    /// invariant `bytes() <= headroom()` of every state one entry's whole validation can keep,
+    /// whatever it resumed from: the entry's header and its most parents
+    /// ([`governance::MAX_PARENTS`]), with the most deferrals a whole validation can hold
+    /// ([`governance::deferred_bytes_max`], from `AUTHORS_HARD_LIMIT`). Reserved whole before a
+    /// root is taken, so a kept state never outgrows it (`Flow::keep_checked` fails the entry's
+    /// admission loudly if it ever did).
+    pub(super) fn headroom() -> usize {
+        Self::HEADER_BYTES * (1 + governance::MAX_PARENTS)
+            + std::mem::size_of::<Self>()
+            + governance::deferred_bytes_max()
+    }
+}
+
+/// The one place an operation's [`Checked`] is handed in and given back.
+pub(super) type CheckedSlot = std::sync::Arc<std::sync::Mutex<Option<Box<Checked>>>>;
+
+/// What an entry's admission operation waits for when it stops.
+pub(super) enum EntryNeed {
+    Wire(Query),
+    /// The admission of another position.
+    Entry {
+        head: Digest32,
+        seq: u64,
+    },
+    Fork(ForkWait),
+}
+
+/// How far one entry's bounded admission operation reached before Begin (`ready_entry`).
+#[allow(clippy::large_enum_variant)]
+pub(super) enum EntryReady {
+    /// Validated in this operation: Begin commits with this token, re-derived nowhere else.
+    Validated(governance::ValidatedSparseEntry, CursorBinding),
+    /// The operation stopped: its budget or turn target was spent, or it lacks `need`. What it
+    /// checked is kept in the operation's [`CheckedSlot`], and where it goes on in `resume`.
+    /// `also`: the other
+    /// authors' prerequisite controls (author, position) the same walk found missing after
+    /// `need`; the entry waits for each in turn before it runs again (`Frontier::settled`).
+    Stop {
+        resume: Resume,
+        need: Option<EntryNeed>,
+        also: Vec<(Digest32, u64)>,
+    },
+    /// Another publication owns the room, or its bounded work queue is full.
+    Busy,
+}
+
+/// The bound of one entry's admission operation: ONE default verifier budget, charged by its
+/// preflight, its control-prefix walks (the inline ones and the walk in a control's own effect
+/// transaction), its typed body and its validation, never replenished inside the operation;
+/// and the cooperative turn target (`runtime::LOCAL_TURN_BUDGET`), checked between bounded
+/// primitives (`design/adopt/ruling-join-consolidation.md`, condition 3).
+pub(super) struct Bound {
+    pub(super) work: WorkBudget,
+    started: std::time::Instant,
+}
+
+impl Bound {
+    pub(super) fn new() -> Self {
+        Self {
+            work: WorkBudget::default(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub(super) fn spent(&self) -> bool {
+        self.started.elapsed() >= super::runtime::LOCAL_TURN_BUDGET
+    }
+
+    /// What is left of the turn target.
+    pub(super) fn left(&self) -> std::time::Duration {
+        super::runtime::LOCAL_TURN_BUDGET.saturating_sub(self.started.elapsed())
+    }
+}
+
+/// An entry's exact inclusion under a head committed here, its authenticated prefix and each
+/// parent's receipt, found before preflight follows them.
+struct Started {
+    included: crate::log::history::IncludedHeader,
+    head: Digest32,
+    parents: Vec<Option<governance::SparseParent>>,
+}
+
+/// An entry's parent references in their signed order: its own predecessor first, then its
+/// `seen`. ADR-053 M0: an ordinary Content entry's `seen` are ordering hints; only its own
+/// predecessor needs a receipt here. Controls keep one per reference.
+fn references(entry: &Entry) -> Result<Vec<crate::log::history::EntryReference>> {
+    let v2 = entry
+        .skeleton
+        .v2
+        .as_ref()
+        .ok_or(invalid("entry is not typed"))?;
+    let seen = governance::checked_seen(v2);
+    let mut references = Vec::with_capacity(seen.len() + 1);
+    if entry.skeleton.seq > 1 {
+        references.push(crate::log::history::EntryReference {
+            author: entry.skeleton.author_id,
+            seq: entry.skeleton.seq - 1,
+            hash: entry.skeleton.prev_hash,
+        });
+    }
+    references.extend(seen.iter().cloned());
+    Ok(references)
+}
+
+/// What rules F2 D and E make of one parent reference by what is recorded here now.
+enum Reference {
+    /// F2 D: it names a proved forker at or after its boundary; it requires no entry.
+    Waived,
+    /// F2 E: this node's validated entry at that position is another one.
+    Fork(ForkWait),
+    /// Required as it names, under the author's recorded fork boundary, if any.
+    Required(Option<u64>),
+}
+
+fn reference_rule(
+    input: &entry_store::Read<'_>,
+    splits: &governance::Splits,
+    own_parent: bool,
+    reference: &crate::log::history::EntryReference,
+) -> Result<Reference> {
+    let boundary = if own_parent {
+        None
+    } else {
+        splits.boundary(&reference.author)
+    };
+    if seen_waived(boundary, reference) {
+        return Ok(Reference::Waived);
+    }
+    // A validated parent must still be the entry it names.
+    if let Some((_, held)) = input.history_validated_header(&reference.author, reference.seq)? {
+        if held.entry_hash() != reference.hash {
+            if own_parent {
+                return Err(invalid("signed parent differs from validated position"));
+            }
+            return mismatched_reference(boundary, reference).map(Reference::Fork);
+        }
+    }
+    Ok(Reference::Required(boundary))
+}
+
+/// A carried start ([`Stage::Preflight`]) checked again by [`reference_rule`] against what is
+/// recorded here now, as `start_entry` checks each reference.
+enum Recheck {
+    /// Still good; a reference a fork proved since waives is dropped from it.
+    Kept,
+    Fork(ForkWait),
+    /// It no longer matches what a start would establish: the entry starts again.
+    Again,
+}
+
+fn recheck_references(
+    room: &impl HistoryAdmissionRoom,
+    store: &Store,
+    entry: &Entry,
+    started: &mut Started,
+) -> Result<Recheck> {
+    let references = references(entry)?;
+    if references.len() != started.parents.len() {
+        return Ok(Recheck::Again);
+    }
+    let input = room.history_read(store)?;
+    let splits = room.history_splits(store)?;
+    for (at, reference) in references.iter().enumerate() {
+        let own_parent = at == 0 && entry.skeleton.seq > 1;
+        match reference_rule(&input, &splits, own_parent, reference)? {
+            Reference::Waived => started.parents[at] = None,
+            Reference::Fork(wait) => return Ok(Recheck::Fork(wait)),
+            Reference::Required(_) if started.parents[at].is_none() => return Ok(Recheck::Again),
+            Reference::Required(_) => {}
+        }
+    }
+    Ok(Recheck::Kept)
+}
+
+enum Start {
+    Ready(Box<Started>),
     Need(Query),
     Fork(ForkWait),
     Busy,
 }
 
-/// Start structural/typed-body closure only after exact inclusion. The body may be absent
-/// for ordinary content or a recipient-scoped key package; that never claims its effect.
-// All scalar bindings belong to this exact entry and current validation phase.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn start_entry(
+/// The start of structural/typed-body closure, only after exact inclusion.
+fn start_entry(
     room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
-    request: RequestId,
-    generation: Digest32,
     head: Digest32,
     entry: &Entry,
-    require_body: bool,
-    context_ready: bool,
-) -> Result<EntryStart> {
-    if room.history_publication_busy(store)? {
-        return Ok(EntryStart::Busy);
-    }
+) -> Result<Start> {
     let input = room.history_read(store)?;
     let author = entry.skeleton.author_id;
     let seq = entry.skeleton.seq;
     let Some(included) = entry_inclusion(&input, &head, &author, seq)? else {
-        return Ok(EntryStart::Need(Query::Proof {
+        return Ok(Start::Need(Query::Proof {
             head,
             kind: ProofKind::Inclusion,
             from: seq,
@@ -956,7 +1180,7 @@ pub(super) fn start_entry(
     if !input.history_head_committed(&included.head_id(), included.binding())? {
         drop(input);
         return match promote_head(room, store, committed, head)? {
-            Advanced::Need(query) => Ok(EntryStart::Need(query)),
+            Advanced::Need(query) => Ok(Start::Need(query)),
             // The verifier path that opened the competing entry records the fork; an entry
             // under a head proven to be another history is never started.
             Advanced::Fork(_) => Err(invalid("entry head is a competing signed history")),
@@ -970,7 +1194,7 @@ pub(super) fn start_entry(
             {
                 Err(invalid("entry head is not committed"))
             }
-            _ => Ok(EntryStart::Busy),
+            _ => Ok(Start::Busy),
         };
     }
     let target = input
@@ -981,56 +1205,33 @@ pub(super) fn start_entry(
         // Retain its exact authenticated prefix before effects can mark it settled; inclusion
         // in a newer head alone does not construct that prefix. The actual author retains each
         // historical local root and can serve this ordinary consistency proof.
-        return Ok(EntryStart::Need(Query::Proof {
+        return Ok(Start::Need(Query::Proof {
             head,
             kind: ProofKind::Consistency,
             from: seq,
             to: target.root.leaves,
         }));
     }
-    let key = room
-        .history_author_key(&author)
-        .ok_or(local("entry author is unknown"))?;
-    let v2 = entry
-        .skeleton
-        .v2
-        .as_ref()
-        .ok_or(invalid("entry is not typed"))?;
-    // ADR-053 M0: an ordinary Content entry's `seen` are ordering hints; only its own
-    // predecessor needs a receipt here. Controls keep one per reference.
-    let seen = governance::checked_seen(v2);
-    let mut references = Vec::with_capacity(seen.len() + 1);
-    if seq > 1 {
-        references.push(crate::log::history::EntryReference {
-            author,
-            seq: seq - 1,
-            hash: entry.skeleton.prev_hash,
-        });
-    }
-    references.extend(seen.iter().cloned());
+    let references = references(entry)?;
     let mut parents = Vec::with_capacity(references.len());
     let splits = room.history_splits(store)?;
     for (at, reference) in references.into_iter().enumerate() {
         let own_parent = at == 0 && seq > 1;
-        let boundary = if own_parent {
-            None
-        } else {
-            splits.boundary(&reference.author)
-        };
-        if seen_waived(boundary, &reference) {
-            parents.push(None);
-            continue;
-        }
-        // A validated parent must still be the entry it names.
-        if let Some((_, held)) = input.history_validated_header(&reference.author, reference.seq)? {
-            if held.entry_hash() != reference.hash {
-                if own_parent {
-                    return Err(invalid("signed parent differs from validated position"));
-                }
-                return mismatched_reference(boundary, &reference).map(EntryStart::Fork);
+        let boundary = match reference_rule(&input, &splits, own_parent, &reference)? {
+            Reference::Waived => {
+                parents.push(None);
+                continue;
             }
-        }
+            Reference::Fork(wait) => return Ok(Start::Fork(wait)),
+            Reference::Required(boundary) => boundary,
+        };
         if let Some(parent) = parent_evidence(&input, &reference.author, reference.seq)? {
+            if parent.header().entry_hash() != reference.hash {
+                if own_parent {
+                    return Err(invalid("preflight parent receipt differs"));
+                }
+                return mismatched_reference(boundary, &reference).map(Start::Fork);
+            }
             // Before preflight follows its frontier: a published parent's positional prefix
             // must be its own whole context, else a local fault of this store.
             parent.check_published(&input)?;
@@ -1043,19 +1244,19 @@ pub(super) fn start_entry(
             .sparse_author(&reference.author, LogScope::Public)?
             .and_then(|state| state.committed)
         else {
-            return Ok(EntryStart::Need(Query::Head(reference.author)));
+            return Ok(Start::Need(Query::Head(reference.author)));
         };
         let target = input
             .history_head(&parent_head)?
             .ok_or(local("parent target missing"))?;
         if target.root.leaves < reference.seq {
-            return Ok(EntryStart::Need(Query::Head(reference.author)));
+            return Ok(Start::Need(Query::Head(reference.author)));
         }
         if input
             .history_pending_header(&parent_head, reference.seq)?
             .is_none()
         {
-            return Ok(EntryStart::Need(Query::Header {
+            return Ok(Start::Need(Query::Header {
                 head: parent_head,
                 seq: reference.seq,
             }));
@@ -1064,41 +1265,63 @@ pub(super) fn start_entry(
             .history_inclusion_receipt(&parent_head, &reference.author, reference.seq)?
             .is_none()
         {
-            return Ok(EntryStart::Need(Query::Proof {
+            return Ok(Start::Need(Query::Proof {
                 head: parent_head,
                 kind: ProofKind::Inclusion,
                 from: reference.seq,
                 to: reference.seq,
             }));
         }
-        return Ok(EntryStart::Need(Query::Proof {
+        return Ok(Start::Need(Query::Proof {
             head: parent_head,
             kind: ProofKind::Consistency,
             from: reference.seq,
             to: target.root.leaves,
         }));
     }
-    if !context_ready {
-        return Ok(EntryStart::Preflight);
+    Ok(Start::Ready(Box::new(Started {
+        included,
+        head,
+        parents,
+    })))
+}
+
+/// One entry admitted from its start up to Begin as part of ONE bounded native operation
+/// (`client::Receiver::admit_entry`), which commits nothing for its progress until it must
+/// stop: start, preflight, the control-prefix walks preflight and validation find short, the
+/// typed body and validation run in order under the operation's one `Bound`. A stop keeps what
+/// it checked in `checked` (JoinDesign S1), which the next operation resumes from when it is
+/// still bound to this activation, room, head, entry and author key; preflight's position is
+/// also the scalar continuation. The caller owns the room's pending write and the verifier
+/// envelope, never the room's mutex.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ready_entry(
+    room: &impl HistoryAdmissionRoom,
+    store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
+    request: RequestId,
+    generation: Digest32,
+    head: Digest32,
+    entry: &Entry,
+    from: Resume,
+    checked: &mut Option<Box<Checked>>,
+    bound: &mut Bound,
+    ready: &mut bool,
+) -> Result<EntryReady> {
+    if room.history_publication_busy(store)? {
+        return Ok(EntryReady::Busy);
     }
-    // Public control admission can retain an authenticated key-package header while the
-    // recipient's durable body obligation is serviced independently.
-    if require_body && entry.payload.is_none() {
-        return Ok(EntryStart::BodyNeeded);
-    }
-    let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {
-        governance::PayloadValidation::Complete(body) => body,
-        governance::PayloadValidation::BodyRequired => {
-            return Ok(EntryStart::Need(Query::Entry {
-                head,
-                seq,
-                offset: 0,
-            }))
-        }
-        governance::PayloadValidation::Yielded => return Ok(EntryStart::Busy),
+    let author = entry.skeleton.author_id;
+    let seq = entry.skeleton.seq;
+    let hash = entry.entry_hash();
+    let stop = |resume, need| {
+        Ok(EntryReady::Stop {
+            resume,
+            need,
+            also: Vec::new(),
+        })
     };
-    let cursor = governance::SparseValidation::new(included, body, parents)?;
-    let binding = CursorBinding {
+    let binding = |head| CursorBinding {
         request,
         room: room.channel_id(),
         head,
@@ -1108,108 +1331,384 @@ pub(super) fn start_entry(
         through: seq,
         generation,
     };
+    let keep = |stage| {
+        Some(Box::new(Checked {
+            generation,
+            room: room.channel_id(),
+            head,
+            entry: hash,
+            stage,
+        }))
+    };
+    let carried = checked
+        .take()
+        .filter(|checked| {
+            checked.generation == generation
+                && checked.room == room.channel_id()
+                && checked.head == head
+                && checked.entry == hash
+        })
+        .map(|checked| checked.stage);
+    let (mut cursor, binding, fingerprint) = match carried {
+        Some(Stage::Validate {
+            validation,
+            head,
+            key: fingerprint,
+        }) if room
+            .history_author_key(&author)
+            .is_some_and(|key| key.fingerprint() == fingerprint) =>
+        {
+            (validation, binding(head), fingerprint)
+        }
+        carried => {
+            // A carried start is rechecked by rules F2 D and E against what is recorded here
+            // now, as `start_entry` checks them: a fork proved since waives a reference, a
+            // position validated since as another entry is a fork wait.
+            let carried = match carried {
+                Some(Stage::Preflight { mut started, at }) => {
+                    match recheck_references(room, store, entry, &mut started)? {
+                        Recheck::Kept => Some((started, at)),
+                        Recheck::Fork(wait) => return stop(from, Some(EntryNeed::Fork(wait))),
+                        Recheck::Again => None,
+                    }
+                }
+                _ => None,
+            };
+            let (started, at, fresh) = match carried {
+                Some((started, at)) => (started, at, false),
+                None => {
+                    let started = match start_entry(room, store, committed, head, entry)? {
+                        Start::Ready(started) => *started,
+                        Start::Need(query) => return stop(from, Some(EntryNeed::Wire(query))),
+                        Start::Fork(wait) => return stop(from, Some(EntryNeed::Fork(wait))),
+                        Start::Busy => return Ok(EntryReady::Busy),
+                    };
+                    let at = match from {
+                        Resume::Preflight { parent, next } => (parent, next),
+                        _ => (0, 0),
+                    };
+                    (started, at, true)
+                }
+            };
+            let key = room
+                .history_author_key(&author)
+                .ok_or(local("entry author is unknown"))?;
+            let body = match governance::TypedSparseBody::verify(entry, &key, &mut bound.work)? {
+                governance::PayloadValidation::Complete(body) => body,
+                governance::PayloadValidation::BodyRequired => {
+                    // Before its body is asked for, the entry's prerequisites are made held here
+                    // (`prerequisites`), so a body fetch never waits on a control it names. With
+                    // its body held, validation walks what it lacks itself, below.
+                    let ((parent, next), need, also) = match prerequisites(
+                        room,
+                        store,
+                        committed,
+                        entry,
+                        &started.parents,
+                        at,
+                        bound,
+                        ready,
+                    )? {
+                        Prerequisites::Held(at) => (
+                            at,
+                            Some(EntryNeed::Wire(Query::Entry {
+                                head: started.head,
+                                seq,
+                                offset: 0,
+                            })),
+                            Vec::new(),
+                        ),
+                        Prerequisites::Stopped(at, need, also) => (at, need, also),
+                    };
+                    *checked = keep(Stage::Preflight {
+                        started,
+                        at: (parent, next),
+                    });
+                    return Ok(EntryReady::Stop {
+                        resume: Resume::Preflight { parent, next },
+                        need,
+                        also,
+                    });
+                }
+                governance::PayloadValidation::Yielded => {
+                    *checked = keep(Stage::Preflight { started, at });
+                    return stop(from, None);
+                }
+            };
+            let binding = binding(started.head);
+            let Started {
+                included, parents, ..
+            } = started;
+            let mut validation = governance::SparseValidation::new(included, body, parents)?;
+            // The start of this operation checked every parent's whole context (S2).
+            if fresh {
+                validation.parents_checked();
+            }
+            (validation, binding, key.fingerprint())
+        }
+    };
+    // Validation continues while the operation's bound allows; a parent is not a boundary.
+    let mut input = None;
+    let mut walked = None;
+    let need = loop {
+        if bound.spent() {
+            break None;
+        }
+        if input.is_none() {
+            input = Some(room.history_read(store)?);
+        }
+        let Some(read) = &input else {
+            return Err(local("entry validation read"));
+        };
+        let splits = room.history_splits(store)?;
+        match cursor.advance(read, &mut bound.work, &splits)? {
+            governance::SparseValidationStep::Complete(token) => {
+                return Ok(EntryReady::Validated(token, binding));
+            }
+            governance::SparseValidationStep::Progress => {}
+            governance::SparseValidationStep::Yielded => break None,
+            governance::SparseValidationStep::MissingContext(hash) => {
+                break Some(EntryNeed::Wire(Query::Context(hash)));
+            }
+            governance::SparseValidationStep::Mismatch(reference) => {
+                break Some(EntryNeed::Fork(ForkWait::Fork {
+                    author: reference.author,
+                    at: reference.seq,
+                }));
+            }
+            governance::SparseValidationStep::Unmatched(reference) => {
+                break Some(EntryNeed::Fork(ForkWait::Unmatched(reference)));
+            }
+            governance::SparseValidationStep::MissingControl(reference) => {
+                let Some(head) = read
+                    .sparse_author(&reference.author, LogScope::Public)?
+                    .and_then(|state| state.committed)
+                else {
+                    break Some(EntryNeed::Wire(Query::Head(reference.author)));
+                };
+                let target = read
+                    .history_head(&head)?
+                    .ok_or(local("control head missing"))?;
+                if target.root.leaves < reference.seq {
+                    break Some(EntryNeed::Wire(Query::Head(reference.author)));
+                }
+                // As preflight did: advance the author's authenticated control range from its
+                // durable prefix, once; waiting on the named control itself would descend the
+                // chain one admission at a time. A walk that completes without it held waits
+                // for its admission.
+                if walked == Some((reference.author, reference.seq)) {
+                    break Some(EntryNeed::Entry {
+                        head,
+                        seq: reference.seq,
+                    });
+                }
+                walked = Some((reference.author, reference.seq));
+                input = None;
+                match advance_prefix(
+                    room,
+                    store,
+                    committed,
+                    head,
+                    reference.seq,
+                    false,
+                    &mut bound.work,
+                    ready,
+                )? {
+                    Prefix::Complete => {}
+                    Prefix::Yielded => break None,
+                    Prefix::Need(need) => break Some(need),
+                }
+            }
+            governance::SparseValidationStep::ControlPrefixPending { head, through } => {
+                input = None;
+                match advance_prefix(
+                    room,
+                    store,
+                    committed,
+                    head,
+                    through,
+                    false,
+                    &mut bound.work,
+                    ready,
+                )? {
+                    Prefix::Complete => {}
+                    Prefix::Yielded => break None,
+                    Prefix::Need(need) => break Some(need),
+                }
+            }
+        }
+    };
     drop(input);
-    if !room.history_write_tracked(store, committed, |index| {
-        index.keep_history_verifier_cursor(binding, &HistoryVerifier::Validation(cursor))
-    })? {
-        return Ok(EntryStart::Busy);
+    // A control validation lacks: the same pass as before a body fetch, within what is left of
+    // the bound, names the other authors' controls the entry lacks, so that it waits once
+    // (`prerequisites`). Scheduling only: validation still checks each one when it resumes.
+    let mut also = Vec::new();
+    if let Some(EntryNeed::Entry { head: missing, .. }) = &need {
+        let read = room.history_read(store)?;
+        let missing = read.history_head(missing)?.map(|head| head.binding.author);
+        drop(read);
+        if let Prerequisites::Stopped(_, Some(EntryNeed::Entry { head, seq }), rest) =
+            prerequisites(
+                room,
+                store,
+                committed,
+                entry,
+                cursor.parents(),
+                (0, 0),
+                bound,
+                ready,
+            )?
+        {
+            let first = room
+                .history_read(store)?
+                .history_head(&head)?
+                .map(|head| (head.binding.author, seq));
+            also = first
+                .into_iter()
+                .chain(rest)
+                .filter(|(author, _)| Some(*author) != missing)
+                .collect();
+        }
     }
-    Ok(EntryStart::Cursor(binding))
+    // An operation that stops inside validation keeps its exact cursor with the entry, in
+    // memory; it commits nothing for it (S1).
+    cursor.end_operation();
+    *checked = keep(Stage::Validate {
+        validation: cursor,
+        head: binding.head,
+        key: fingerprint,
+    });
+    Ok(EntryReady::Stop {
+        resume: Resume::Validate,
+        need,
+        also,
+    })
 }
 
-// A bounded transient result covered by the existing verifier working reservation.
-#[allow(clippy::large_enum_variant)]
-pub(super) enum EntryAdvanced {
-    Progress,
-    Need(Query),
-    ControlPending { head: Digest32, through: u64 },
-    ControlSource { head: Digest32, seq: u64 },
-    Validated(governance::ValidatedSparseEntry),
-    Fork(ForkWait),
-    Busy,
+pub(super) enum Prefix {
+    Complete,
+    Yielded,
+    Need(EntryNeed),
 }
 
-pub(super) fn advance_entry(
+/// Advance an author's control-source or control-effect prefix through `through` with the
+/// existing walk (`advance_control_receipt`: it stops at a coverage gap, a missing or
+/// conflicting source and an unfinished effect), each walk step charged to the operation's
+/// budget, the steps in one transaction. `ready`: this walk made the author's controls current
+/// here (permission news, `Flow::controls_ready`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn advance_prefix(
     room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
-    binding: CursorBinding,
-) -> Result<EntryAdvanced> {
-    if room.history_publication_busy(store)? {
-        return Ok(EntryAdvanced::Busy);
-    }
+    head: Digest32,
+    through: u64,
+    effects: bool,
+    work: &mut WorkBudget,
+    ready: &mut bool,
+) -> Result<Prefix> {
+    use entry_store::sparse::SourceProgress;
     let input = room.history_read(store)?;
-    let Some(HistoryVerifier::Validation(mut cursor)) = input.history_verifier_cursor(binding)?
-    else {
-        return Err(local("entry validation cursor missing"));
+    let named = input
+        .history_head(&head)?
+        .ok_or(local("control target head missing"))?;
+    // Control facts are kept per author (`control_prefix_complete`); an older committed head is
+    // replaced by the author's current one only so that a coverage need names the head this
+    // node and its peers hold now.
+    let head = match input
+        .sparse_author(&named.binding.author, named.binding.scope)?
+        .and_then(|state| state.committed)
+    {
+        Some(current)
+            if current != head && input.history_head_committed(&head, named.binding)? =>
+        {
+            current
+        }
+        _ => head,
     };
-    // Rule F3: the proved splitters as this node holds them now, read again at every step, so
-    // the completing step decides against what is held at that moment (sec-5 condition 3).
-    let splits = room.history_splits(store)?;
-    let result = cursor.advance(&input, &mut WorkBudget::default(), &splits)?;
-    let outcome = match result {
-        governance::SparseValidationStep::Complete(token) => {
-            // Keep the prior sealed cursor: publication's next slice can re-create the token
-            // from the same final bounded validation step without serializing an authority token.
-            return Ok(EntryAdvanced::Validated(token));
-        }
-        governance::SparseValidationStep::MissingContext(hash) => {
-            EntryAdvanced::Need(Query::Context(hash))
-        }
-        governance::SparseValidationStep::Mismatch(reference) => {
-            // The validator returns a mismatch only below any boundary recorded for that author
-            // (one at or after it is deferred and decided at completion): park on the fork.
-            EntryAdvanced::Fork(ForkWait::Fork {
-                author: reference.author,
-                at: reference.seq,
-            })
-        }
-        governance::SparseValidationStep::Unmatched(reference) => {
-            EntryAdvanced::Fork(ForkWait::Unmatched(reference))
-        }
-        governance::SparseValidationStep::MissingControl(reference) => {
-            match input
-                .sparse_author(&reference.author, LogScope::Public)?
-                .and_then(|state| state.committed)
-            {
-                Some(head) => {
-                    let target = input
-                        .history_head(&head)?
-                        .ok_or(local("control head missing"))?;
-                    if target.root.leaves < reference.seq {
-                        EntryAdvanced::Need(Query::Head(reference.author))
-                    } else {
-                        EntryAdvanced::ControlSource {
-                            head,
-                            seq: reference.seq,
-                        }
-                    }
-                }
-                None => EntryAdvanced::Need(Query::Head(reference.author)),
-            }
-        }
-        governance::SparseValidationStep::ControlPrefixPending { head, through } => {
-            EntryAdvanced::ControlPending { head, through }
-        }
-        governance::SparseValidationStep::Progress | governance::SparseValidationStep::Yielded => {
-            EntryAdvanced::Progress
-        }
-    };
+    let target = input
+        .history_head(&head)?
+        .ok_or(local("control target head missing"))?;
+    if through == 0 || through > target.root.leaves {
+        return Err(local("control receipt bound exceeds target"));
+    }
+    let leaves = target.root.leaves;
     drop(input);
-    room.history_write_tracked(store, committed, |index| {
-        if !index.keep_history_verifier_cursor(binding, &HistoryVerifier::Validation(cursor))? {
-            return Err(local("existing entry verifier capacity vanished"));
+    if !work.take_control_lookup() {
+        return Ok(Prefix::Yielded);
+    }
+    let progress = room.history_write_tracked(store, committed, |index| loop {
+        let progress = if effects {
+            index.advance_control_effects(&head, through)?
+        } else {
+            index.advance_control_sources(&head, through)?
+        };
+        if !matches!(progress, SourceProgress::Progress { .. }) || !work.take_control_lookup() {
+            return Ok(progress);
         }
-        Ok(())
     })?;
-    Ok(outcome)
+    // The author's effect prefix was below its committed size (not complete when preflight or
+    // validation looked, and `through` reaches that size) and this walk brought it there.
+    *ready |= effects
+        && through >= leaves
+        && matches!(
+            progress,
+            SourceProgress::Complete { through: done } | SourceProgress::Progress { through: done }
+                if done >= leaves
+        );
+    Ok(match progress {
+        SourceProgress::Complete { through: done } | SourceProgress::Progress { through: done }
+            if done >= through =>
+        {
+            Prefix::Complete
+        }
+        SourceProgress::Progress { .. } | SourceProgress::Complete { .. } => Prefix::Yielded,
+        SourceProgress::MissingCoverage { after } => Prefix::Need(EntryNeed::Wire(Query::Proof {
+            head,
+            kind: ProofKind::Control,
+            from: after + 1,
+            to: through,
+        })),
+        SourceProgress::MissingSource { seq } => Prefix::Need(EntryNeed::Entry { head, seq }),
+        SourceProgress::ConflictingSource {
+            author,
+            seq,
+            expected,
+            actual,
+        } => {
+            tracing::warn!(
+                ?author,
+                seq,
+                ?expected,
+                ?actual,
+                "conflicting sparse control source"
+            );
+            return Err(invalid(
+                "held sparse control source conflicts with authenticated head",
+            ));
+        }
+        SourceProgress::PendingEffect { hash } => {
+            let seq = room
+                .history_read(store)?
+                .history_object(entry_store::sparse::ObjectKind::Header, &hash)?
+                .map(|wire| Entry::from_wire(&wire).map(|entry| entry.skeleton.seq))
+                .transpose()?
+                .ok_or(local("pending history effect header missing"))?;
+            Prefix::Need(EntryNeed::Entry { head, seq })
+        }
+    })
 }
 
 /// Scheduling preflight only: never an authority/admission token. Resolve the exact parent's
 /// authenticated frontier as well as the claimed pre-context, so an underclaim cannot occupy
 /// the sole control-body slot before its omitted prerequisite control has been received.
-pub(super) enum Preflight {
+enum Preflight {
     Progress {
+        parent: usize,
+        next: usize,
+    },
+    /// The operation's budget is spent at this exact position.
+    Yielded {
         parent: usize,
         next: usize,
     },
@@ -1218,133 +1717,229 @@ pub(super) enum Preflight {
         head: Digest32,
         through: u64,
         effects: bool,
+        /// The control's author, and the coordinate a walk that goes on past this author
+        /// continues from (`prerequisites`).
+        author: Digest32,
+        next: usize,
     },
     Fork(ForkWait),
     Complete,
-    Busy,
 }
-/// Read-only: it runs on the room under a read and writes nothing.
-pub(super) fn preflight(
-    room: &crate::node::channel::ChannelState,
+
+/// How far the walk before a body fetch reached (`prerequisites`).
+enum Prerequisites {
+    /// Every prerequisite is held here; the body may be asked for.
+    Held((usize, usize)),
+    /// It stopped at this exact position: its bound was spent, or it lacks `need` and then the
+    /// other authors' controls in `also`.
+    Stopped((usize, usize), Option<EntryNeed>, Vec<(Digest32, u64)>),
+}
+
+/// The walk an entry whose body is not held makes before that body is asked for: preflight
+/// from `(parent, next)`, and each control prefix it finds short advanced inline, all under the
+/// operation's bound. `parents` are the receipts `start_entry` took in this operation.
+///
+/// One pass reports every author whose control the entry lacks (one stop per entry, not one
+/// per author): a control the walk finds not admitted here is noted, its author is passed over
+/// for the rest of the pass (its prefix is one number: a later control of it waits on the same
+/// one), and the walk goes on within the same bound. It stops at the first one found, with the
+/// others in `also`, so the next pass walks again from there. Scheduling only: the entry is
+/// never Held while any author was passed over.
+#[allow(clippy::too_many_arguments)]
+fn prerequisites(
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
-    head: Digest32,
+    committed: &std::sync::atomic::AtomicBool,
     entry: &Entry,
-    parent: usize,
-    next: usize,
-) -> Result<Preflight> {
-    if room.history_publication_busy(store)? {
-        return Ok(Preflight::Busy);
-    }
-    let input = room.history_read(store)?;
-    let splits = room.history_splits(store)?;
-    let Some(included) =
-        entry_inclusion(&input, &head, &entry.skeleton.author_id, entry.skeleton.seq)?
-    else {
-        return Ok(Preflight::Need(Query::Proof {
-            head,
-            kind: ProofKind::Inclusion,
-            from: entry.skeleton.seq,
-            to: entry.skeleton.seq,
-        }));
+    parents: &[Option<governance::SparseParent>],
+    (mut parent, mut next): (usize, usize),
+    bound: &mut Bound,
+    ready: &mut bool,
+) -> Result<Prerequisites> {
+    let mut skip = std::collections::BTreeSet::new();
+    let mut first: Option<((usize, usize), EntryNeed)> = None;
+    let mut also = Vec::new();
+    // What the pass found missing ends it; nothing found leaves `otherwise`.
+    let stopped = |first: Option<((usize, usize), EntryNeed)>,
+                   also: Vec<(Digest32, u64)>,
+                   otherwise: Prerequisites| match first {
+        Some((at, need)) => Prerequisites::Stopped(at, Some(need), also),
+        None => otherwise,
     };
-    if included.header().entry().header_wire() != entry.header_wire() {
-        return Err(invalid("preflight differs from exact inclusion"));
-    }
+    // The entry's own context, once: each parent's frontier is compared with it.
     let v2 = entry
         .skeleton
         .v2
         .as_ref()
         .ok_or(invalid("preflight header is legacy"))?;
-    let own = usize::from(entry.skeleton.seq > 1);
-    let seen = governance::checked_seen(v2);
-    let parent_count = own + seen.len();
+    if !bound.work.take_context_load() {
+        return Ok(Prerequisites::Stopped((parent, next), None, Vec::new()));
+    }
+    let Some(pre) = room.history_read(store)?.history_context(&v2.pre_context)? else {
+        return Ok(Prerequisites::Stopped(
+            (parent, next),
+            Some(EntryNeed::Wire(Query::Context(v2.pre_context))),
+            Vec::new(),
+        ));
+    };
+    bound.work.refund_context_load(pre.coordinates.len());
+    if pre.room != room.channel_id() || pre.scope != v2.scope {
+        return Err(invalid("preflight context/cursor differs"));
+    }
+    loop {
+        if bound.spent() {
+            return Ok(stopped(
+                first,
+                also,
+                Prerequisites::Stopped((parent, next), None, Vec::new()),
+            ));
+        }
+        let input = room.history_read(store)?;
+        let splits = room.history_splits(store)?;
+        let (head, through, effects, author, resume) = loop {
+            match preflight(
+                &input,
+                &splits,
+                &pre,
+                parents,
+                parent,
+                next,
+                &skip,
+                &mut bound.work,
+            )? {
+                Preflight::Progress {
+                    parent: at,
+                    next: coordinate,
+                } => (parent, next) = (at, coordinate),
+                Preflight::Complete => {
+                    return Ok(stopped(first, also, Prerequisites::Held((parent, next))));
+                }
+                Preflight::Yielded {
+                    parent: at,
+                    next: coordinate,
+                } => {
+                    return Ok(stopped(
+                        first,
+                        also,
+                        Prerequisites::Stopped((at, coordinate), None, Vec::new()),
+                    ));
+                }
+                Preflight::Need(query) => {
+                    return Ok(stopped(
+                        first,
+                        also,
+                        Prerequisites::Stopped(
+                            (parent, next),
+                            Some(EntryNeed::Wire(query)),
+                            Vec::new(),
+                        ),
+                    ));
+                }
+                Preflight::Fork(wait) => {
+                    return Ok(Prerequisites::Stopped(
+                        (parent, next),
+                        Some(EntryNeed::Fork(wait)),
+                        Vec::new(),
+                    ));
+                }
+                Preflight::Control {
+                    head,
+                    through,
+                    effects,
+                    author,
+                    next: resume,
+                } => break (head, through, effects, author, resume),
+            }
+            if bound.spent() {
+                return Ok(stopped(
+                    first,
+                    also,
+                    Prerequisites::Stopped((parent, next), None, Vec::new()),
+                ));
+            }
+        };
+        drop(input);
+        match advance_prefix(
+            room,
+            store,
+            committed,
+            head,
+            through,
+            effects,
+            &mut bound.work,
+            ready,
+        )? {
+            Prefix::Complete => {}
+            Prefix::Yielded => {
+                return Ok(stopped(
+                    first,
+                    also,
+                    Prerequisites::Stopped((parent, next), None, Vec::new()),
+                ));
+            }
+            // Another position's admission: noted, and the pass goes on past its author.
+            Prefix::Need(EntryNeed::Entry { head, seq }) => {
+                match &first {
+                    None => first = Some(((parent, next), EntryNeed::Entry { head, seq })),
+                    Some(_) => also.push((author, seq)),
+                }
+                skip.insert(author);
+                next = resume;
+            }
+            Prefix::Need(need) => {
+                return Ok(stopped(
+                    first,
+                    also,
+                    Prerequisites::Stopped((parent, next), Some(need), Vec::new()),
+                ));
+            }
+        }
+    }
+}
+
+/// Read-only: one parent's control prefixes and its frontier, or one chunk of the entry's own
+/// context `pre`, each lookup charged to the operation's budget. The parent's receipt is the one
+/// `start_entry` took and checked in this operation. A parent's frontier coordinate that `pre`
+/// reaches (the same control, or a later one of its author) is walked once, in `pre`'s phase:
+/// an author's control prefixes are one number each, complete through the later coordinate
+/// only if complete through the earlier one. Authors in `skip` (a control of theirs is already
+/// noted missing in this pass) are passed over, uncharged.
+#[allow(clippy::too_many_arguments)]
+fn preflight(
+    input: &entry_store::Read<'_>,
+    splits: &governance::Splits,
+    pre: &ControlContext,
+    parents: &[Option<governance::SparseParent>],
+    parent: usize,
+    next: usize,
+    skip: &std::collections::BTreeSet<Digest32>,
+    work: &mut WorkBudget,
+) -> Result<Preflight> {
+    let parent_count = parents.len();
     if parent > parent_count {
         return Err(local("preflight parent cursor"));
     }
-    let context_id = if parent == parent_count {
-        v2.pre_context
-    } else {
-        let reference = if own == 1 && parent == 0 {
-            crate::log::history::EntryReference {
-                author: entry.skeleton.author_id,
-                seq: entry.skeleton.seq - 1,
-                hash: entry.skeleton.prev_hash,
-            }
-        } else {
-            seen[parent - own].clone()
-        };
-        let own_parent = own == 1 && parent == 0;
-        let boundary = if own_parent {
-            None
-        } else {
-            splits.boundary(&reference.author)
-        };
-        if seen_waived(boundary, &reference) {
-            // Rule F2 D: it adds nothing, so nothing of its frontier is followed.
-            return Ok(Preflight::Progress {
-                parent: parent + 1,
-                next: 0,
-            });
+    if matches!(parents.get(parent), Some(None)) {
+        return Ok(Preflight::Progress {
+            parent: parent + 1,
+            next: 0,
+        });
+    }
+    let frontier = if let Some(Some(receipt)) = parents.get(parent) {
+        // The parent's two prefix receipts.
+        if !work.take_control_lookup() {
+            return Ok(Preflight::Yielded { parent, next });
         }
-        if let Some((_, prior)) =
-            input.history_validated_header(&reference.author, reference.seq)?
-        {
-            if prior.entry_hash() != reference.hash {
-                if own_parent {
-                    return Err(invalid("preflight parent position differs"));
-                }
-                return mismatched_reference(boundary, &reference).map(Preflight::Fork);
-            }
-        }
-        // One lookup, by author and position, as `start_entry` does.
-        let Some(receipt) = parent_evidence(&input, &reference.author, reference.seq)? else {
-            // Admission starts by acquiring every exact receipt. A changed current head can
-            // require a fresh proof; it never permits substituting another parent position.
-            let Some(parent_head) = input
-                .sparse_author(&reference.author, LogScope::Public)?
-                .and_then(|state| state.committed)
-            else {
-                return Ok(Preflight::Need(Query::Head(reference.author)));
-            };
-            let target = input
-                .history_head(&parent_head)?
-                .ok_or(local("preflight parent target missing"))?;
-            if target.root.leaves < reference.seq {
-                return Ok(Preflight::Need(Query::Head(reference.author)));
-            }
-            let included = input
-                .history_inclusion_receipt(&parent_head, &reference.author, reference.seq)?
-                .is_some();
-            return Ok(Preflight::Need(Query::Proof {
-                head: parent_head,
-                kind: if included {
-                    ProofKind::Consistency
-                } else {
-                    ProofKind::Inclusion
-                },
-                from: reference.seq,
-                to: if included {
-                    target.root.leaves
-                } else {
-                    reference.seq
-                },
-            }));
-        };
-        if receipt.header().entry_hash() != reference.hash {
-            if own_parent {
-                return Err(invalid("preflight parent receipt differs"));
-            }
-            return mismatched_reference(boundary, &reference).map(Preflight::Fork);
-        }
-        // Before anything follows the frontier (`start_entry` checked it too; a resumed
-        // preflight checks again).
-        receipt.check_published(&input)?;
         let parent_head = receipt.head_id();
+        let parent_author = receipt.header().skeleton.author_id;
         // SparseValidation requires this exact parent prefix, not only the
         // control coordinates named in its frontier. Finish it before taking a body
         // slot; validation then cannot recursively discover an earlier control.
         let through = receipt.prefix().leaves;
         for effects in [false, true] {
+            if skip.contains(&parent_author) {
+                break;
+            }
             let complete = if effects {
                 input.control_effects_complete(&parent_head, through)?
             } else {
@@ -1355,27 +1950,58 @@ pub(super) fn preflight(
                     head: parent_head,
                     through,
                     effects,
+                    author: parent_author,
+                    next,
                 });
             }
         }
-        receipt.prefix().frontier
+        if !work.take_context_load() {
+            return Ok(Preflight::Yielded { parent, next });
+        }
+        let hash = receipt.prefix().frontier;
+        let Some(frontier) = input.history_context(&hash)? else {
+            return Ok(Preflight::Need(Query::Context(hash)));
+        };
+        work.refund_context_load(frontier.coordinates.len());
+        if frontier.room != pre.room || frontier.scope != pre.scope {
+            return Err(invalid("preflight context/cursor differs"));
+        }
+        Some(frontier)
+    } else {
+        None
     };
-    let Some(context) = input.history_context(&context_id)? else {
-        return Ok(Preflight::Need(Query::Context(context_id)));
-    };
-    if context.room != room.channel_id()
-        || context.scope != v2.scope
-        || next > context.coordinates.len()
-    {
+    let context = frontier.as_ref().unwrap_or(pre);
+    if next > context.coordinates.len() {
         return Err(invalid("preflight context/cursor differs"));
     }
     // One context and at most 16 exact coordinate/header/receipt lookups: <=64 objects.
     let end = (next + 16).min(context.coordinates.len());
-    for coordinate in &context.coordinates[next..end] {
+    for (at, coordinate) in context.coordinates[next..end].iter().enumerate() {
+        if frontier.is_some()
+            && pre
+                .coordinates
+                .binary_search_by_key(&coordinate.author, |reached| reached.author)
+                .is_ok_and(|found| {
+                    let reached = &pre.coordinates[found];
+                    reached.seq > coordinate.seq
+                        || (reached.seq == coordinate.seq && reached.hash == coordinate.hash)
+                })
+        {
+            continue;
+        }
+        if skip.contains(&coordinate.author) {
+            continue;
+        }
+        if !work.take_control_lookup() {
+            return Ok(Preflight::Yielded {
+                parent,
+                next: next + at,
+            });
+        }
         let Some((control_head, control)) =
             input.history_validated_header(&coordinate.author, coordinate.seq)?
         else {
-            if coordinate_deferred(&splits, coordinate) {
+            if coordinate_deferred(splits, coordinate) {
                 continue;
             }
             let Some(control_head) = input
@@ -1396,10 +2022,12 @@ pub(super) fn preflight(
                 head: control_head,
                 through: coordinate.seq,
                 effects: false,
+                author: coordinate.author,
+                next: next + at + 1,
             });
         };
         if control.entry_hash() != coordinate.hash {
-            if coordinate_deferred(&splits, coordinate) {
+            if coordinate_deferred(splits, coordinate) {
                 continue;
             }
             return Ok(Preflight::Fork(ForkWait::Fork {
@@ -1418,6 +2046,8 @@ pub(super) fn preflight(
                     head: control_head,
                     through: coordinate.seq,
                     effects,
+                    author: coordinate.author,
+                    next: next + at + 1,
                 });
             }
         }

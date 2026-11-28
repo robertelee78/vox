@@ -54,7 +54,9 @@ use crate::suite::algo;
 #[derive(Clone)]
 pub struct CompositePublicKey {
     ed: EdVerifyingKey,
-    ml_dsa: DsaVerifyingKey<MlDsa65>,
+    /// Shared: a clone of the key (every room's author map, each admission's facts) copies a
+    /// pointer, not the expanded ML-DSA key.
+    ml_dsa: std::sync::Arc<DsaVerifyingKey<MlDsa65>>,
     /// [`Self::fingerprint`], worked out once (V030-09). It re-encoded the 1,952-byte ML-DSA key
     /// and hashed it on every call, and a node asks for every room's creator and every member's
     /// fingerprint each time it rebuilds its view and its peer policy — after every command and
@@ -113,7 +115,7 @@ impl CompositePublicKey {
 
         Ok(Self {
             ed,
-            ml_dsa,
+            ml_dsa: std::sync::Arc::new(ml_dsa),
             fp: std::sync::OnceLock::new(),
         })
     }
@@ -268,7 +270,7 @@ impl CompositeSecret {
     fn public(&self) -> CompositePublicKey {
         CompositePublicKey {
             ed: self.ed.verifying_key(),
-            ml_dsa: self.ml_dsa.verifying_key(),
+            ml_dsa: std::sync::Arc::new(self.ml_dsa.verifying_key()),
             fp: std::sync::OnceLock::new(),
         }
     }

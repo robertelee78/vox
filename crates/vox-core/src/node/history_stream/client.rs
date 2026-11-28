@@ -13,7 +13,7 @@ use crate::node::store::{ReceivedFlow, Store};
 
 use super::admission::{self, Advanced, Staged};
 use super::source::{Lookup, OwnedRoom, Source};
-use super::{ProofKind, Query, RequestId};
+use super::{Query, RequestId};
 
 // Includes the actual maximum descriptor trace capacity, overlapping the verifier,
 // generated contexts and Directory scratch under the existing 12-MiB record job.
@@ -375,62 +375,6 @@ impl Receiver {
         .await
         .map_err(|_| Error::Unreachable("history record assembly stopped"))?
     }
-
-    pub(super) async fn start_entry(
-        &self,
-        request: RequestId,
-        head: Digest32,
-        record: Arc<Record>,
-        require_body: bool,
-        context_ready: bool,
-    ) -> Result<Lookup<(Arc<Record>, admission::EntryStart)>> {
-        let generation = self.generation;
-        let job = record.job.clone();
-        let committed = self.source.commit_ledger();
-        // The record already owns the complete verification/parse envelope.
-        self.source
-            .write_admission(&job, (64 * 1024, 0), move |room, store| {
-                let outcome = admission::start_entry(
-                    room,
-                    store,
-                    &committed,
-                    request,
-                    generation,
-                    head,
-                    &record.entry,
-                    require_body,
-                    context_ready,
-                )?;
-                Ok((record, outcome))
-            })
-            .await
-    }
-
-    pub(super) async fn advance_entry(
-        &self,
-        record: Arc<Record>,
-        binding: CursorBinding,
-    ) -> Result<Lookup<(Arc<Record>, admission::EntryAdvanced)>> {
-        if binding.generation != self.generation {
-            return Err(Error::Profile("history entry activation changed"));
-        }
-        let job = record.job.clone();
-        let committed = self.source.commit_ledger();
-        self.source
-            .write_admission(&job, (ENTRY_VALIDATION_WORK, 0), move |room, store| {
-                if record.entry.skeleton.author_id != binding.author
-                    || record.entry.skeleton.seq != binding.from
-                {
-                    return Err(Error::Profile("history entry record changed"));
-                }
-                if room.channel_id() != binding.room {
-                    return Err(Error::Profile("history entry room changed"));
-                }
-                let outcome = admission::advance_entry(room, store, &committed, binding)?;
-                Ok((record, outcome))
-            })
-            .await
-    }
 }
 
 fn current(
@@ -560,126 +504,142 @@ impl Receiver {
         }))))
     }
 
-    /// One entry's admission as ONE owned write of the room (`design/adopt/
-    /// ruling-admission-order.md`, Amendment 1 §3). From Begin (`begin`), or from its own
-    /// unfinished publication (`Publish`), one transaction publishes the source together with the
-    /// governance facts over it (`PendingHistorySource::publish_in`). Then, the room's
+    /// One entry's admission as ONE bounded native operation, owned from its start to its effect
+    /// (`design/adopt/ruling-join-consolidation.md`, B with C; PL-31 item 1). Under the one pending
+    /// write this step reserves: start, preflight, the control-prefix walks, the typed body and
+    /// validation (`admission::ready_entry`); then Begin, whose validation authority is derived
+    /// in this operation, in one transaction that publishes the source together with the
+    /// governance facts over it (`PendingHistorySource::publish_in`); then, the room's
     /// publication idle, the fold's bounded turn a governance change owes and one effect
-    /// quantum, each prepared and installed under the room lock and saved off it, all under the
-    /// one pending write this step reserved; the room is published once, at the write's end.
+    /// quantum. Each step under the room's mutex is a bounded in-memory one, never across a
+    /// transaction; the room is published once, at the write's end. An operation that must stop
+    /// (a need, or its `admission::Bound` spent) keeps only its exact continuation and what it
+    /// checked (`checked`, JoinDesign S1), and lets go. Also returns whether an author's controls
+    /// became current in this operation (permission news).
     pub(super) async fn admit_entry(
+        &self,
+        record: Arc<Record>,
+        request: RequestId,
+        head: Digest32,
+        from: admission::Resume,
+        checked: &admission::CheckedSlot,
+        now: crate::time::Ms,
+    ) -> Result<Lookup<(Arc<Record>, Admitted, bool)>> {
+        let (scratch, hold_effect) = self.entry_gates(&record).await?;
+        let job = record.job.clone();
+        let grant = self.grant();
+        let effect = self.effect_inputs(now);
+        let authorization = self.source.authorization();
+        let generation = self.generation;
+        let checked = Arc::clone(checked);
+        self.source
+            .begin_owned(
+                &job,
+                (ENTRY_VALIDATION_WORK, scratch),
+                request,
+                move |room, store| {
+                    grant.check(room, store)?;
+                    let facts = room.prepare_history_admission(store, authorization)?;
+                    let instance = room.history_instance(store)?;
+                    let epoch = room.epoch();
+                    Ok((record, facts, instance, epoch))
+                },
+                move |(record, facts, instance, epoch), store, owned| {
+                    let mut bound = admission::Bound::new();
+                    let mut ready = false;
+                    let reached = facts.with(|room| {
+                        admission::ready_entry(
+                            room,
+                            store,
+                            &effect.committed,
+                            request,
+                            generation,
+                            head,
+                            &record.entry,
+                            from,
+                            &mut checked
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            &mut bound,
+                            &mut ready,
+                        )
+                    })?;
+                    let (validated, binding) = match reached {
+                        admission::EntryReady::Validated(validated, binding) => {
+                            (validated, binding)
+                        }
+                        admission::EntryReady::Stop { resume, need, also } => {
+                            return Ok((record, Admitted::Stopped { resume, need, also }, ready));
+                        }
+                        admission::EntryReady::Busy => return Ok((record, Admitted::Busy, ready)),
+                    };
+                    let pending = {
+                        let room = owned.lock_for_write()?;
+                        grant.check(&room, store)?;
+                        room.prepare_history_begin(store, &record.entry, binding.request)?
+                    };
+                    let saved = effect.received.scope(|| {
+                        pending.commit(
+                            store,
+                            &effect.committed,
+                            binding.request,
+                            &record.entry,
+                            &validated,
+                            binding,
+                            now,
+                            &effect.received,
+                            |batch| grant.check_batch(batch, binding.room, instance, epoch),
+                        )
+                    });
+                    let published = {
+                        let mut room = owned.lock()?;
+                        match room.finish_history_begin(saved)? {
+                            crate::node::channel::HistorySourceStart::Busy => {
+                                return Ok((record, Admitted::Busy, ready));
+                            }
+                            crate::node::channel::HistorySourceStart::Duplicate => {
+                                return Ok((record, Admitted::Duplicate, ready));
+                            }
+                            crate::node::channel::HistorySourceStart::Started(published) => {
+                                room.install_history_source(&record.entry, &published)?;
+                                published
+                            }
+                        }
+                    };
+                    let admitted = after_source(
+                        owned,
+                        store,
+                        &record,
+                        &published,
+                        binding,
+                        hold_effect,
+                        (&effect, &facts),
+                        &mut bound,
+                        &mut ready,
+                    )?;
+                    Ok((record, admitted, ready))
+                },
+                |_, _, value| Ok(value),
+            )
+            .await
+    }
+
+    /// The same owned write resuming this request's own publication whose DAG facts are
+    /// unfinished (`Publish`), then as `admit_entry` goes on after Begin.
+    pub(super) async fn publish_entry(
         &self,
         record: Arc<Record>,
         binding: CursorBinding,
         now: crate::time::Ms,
-        begin: bool,
-    ) -> Result<Lookup<(Arc<Record>, Admitted)>> {
+    ) -> Result<Lookup<(Arc<Record>, Admitted, bool)>> {
         if binding.generation != self.generation {
             return Err(Error::Profile("history publication activation changed"));
         }
-        // A proof can keep a remote departure's effect pending while the leaver probes a live
-        // head; nothing else waits here.
-        #[cfg(feature = "test-knobs")]
-        let hold_effect = record.entry.skeleton.v2.as_ref().map(|header| header.kind)
-            == Some(crate::log::history::SignedEntryKind::Governance)
-            && match crate::governance::entry::GovEntry::body_bound_to(&record.entry) {
-                Ok(crate::governance::entry::GovBody::Presence(presence)) => !presence.body.here,
-                Ok(_) => false,
-                Err(_) => true,
-            }
-            && self.departure_held(record.entry.skeleton.author_id).await?;
-        #[cfg(not(feature = "test-knobs"))]
-        let hold_effect = false;
-        let kind = record.entry.skeleton.v2.as_ref().map(|header| header.kind);
-        // The fold's turn runs inside this write: reserve its scratch as `Operation::Governance`.
-        let scratch = if matches!(
-            kind,
-            Some(
-                crate::log::history::SignedEntryKind::Governance
-                    | crate::log::history::SignedEntryKind::StepPolicy
-            )
-        ) {
-            4 * 1024 * 1024
-        } else {
-            0
-        };
+        let (scratch, hold_effect) = self.entry_gates(&record).await?;
         let job = record.job.clone();
         let grant = self.grant();
         let effect = self.effect_inputs(now);
-        if begin {
-            let authorization = self.source.authorization();
-            return self
-                .source
-                .begin_owned(
-                    &job,
-                    (64 * 1024, scratch),
-                    binding.request,
-                    move |room, store| {
-                        grant.check(room, store)?;
-                        if record.entry.skeleton.author_id != binding.author
-                            || record.entry.skeleton.seq != binding.from
-                        {
-                            return Err(Error::Profile("history entry record changed"));
-                        }
-                        if room.channel_id() != binding.room {
-                            return Err(Error::Profile("history entry room changed"));
-                        }
-                        let facts = room.prepare_history_admission(store, authorization)?;
-                        let instance = room.history_instance(store)?;
-                        let epoch = room.epoch();
-                        let pending =
-                            room.prepare_history_begin(store, &record.entry, binding.request)?;
-                        Ok((record, facts, pending, instance, epoch))
-                    },
-                    move |(record, facts, pending, instance, epoch), store, owned| {
-                        // The validation token, re-derived from its sealed cursor in this write.
-                        let validated = match facts.with(|room| {
-                            admission::advance_entry(room, store, &effect.committed, binding)
-                        })? {
-                            admission::EntryAdvanced::Validated(validated) => validated,
-                            admission::EntryAdvanced::Busy => return Ok((record, Admitted::Busy)),
-                            _ => {
-                                return Err(Error::Profile(
-                                    "completed history validation requires renewed evidence",
-                                ))
-                            }
-                        };
-                        let saved = effect.received.scope(|| {
-                            pending.commit(
-                                store,
-                                &effect.committed,
-                                binding.request,
-                                &record.entry,
-                                &validated,
-                                binding,
-                                now,
-                                &effect.received,
-                                |batch| grant.check_batch(batch, binding.room, instance, epoch),
-                            )
-                        });
-                        let published = {
-                            let mut room = owned.lock()?;
-                            match room.finish_history_begin(saved)? {
-                                crate::node::channel::HistorySourceStart::Busy => {
-                                    return Ok((record, Admitted::Busy));
-                                }
-                                crate::node::channel::HistorySourceStart::Duplicate => {
-                                    return Ok((record, Admitted::Duplicate));
-                                }
-                                crate::node::channel::HistorySourceStart::Started(published) => {
-                                    room.install_history_source(&record.entry, &published)?;
-                                    published
-                                }
-                            }
-                        };
-                        let admitted =
-                            after_source(owned, store, &record, &published, hold_effect, &effect)?;
-                        Ok((record, admitted))
-                    },
-                    |_, _, value| Ok(value),
-                )
-                .await;
-        }
+        let authorization = self.source.authorization();
         let retirement_request = self.source.retirement_request()?;
         self.source
             .write_owned(
@@ -697,9 +657,10 @@ impl Receiver {
                     let epoch = room.epoch();
                     let pending =
                         room.prepare_history_source(store, &record.entry, binding.request)?;
-                    Ok((record, pending, instance, epoch))
+                    let facts = room.prepare_history_admission(store, authorization)?;
+                    Ok((record, pending, facts, instance, epoch))
                 },
-                move |(record, pending, instance, epoch), store, owned| {
+                move |(record, pending, facts, instance, epoch), store, owned| {
                     let published = pending.publish(
                         store,
                         &effect.committed,
@@ -720,13 +681,53 @@ impl Receiver {
                             )?;
                         }
                     }
-                    let admitted =
-                        after_source(owned, store, &record, &published, hold_effect, &effect)?;
-                    Ok((record, admitted))
+                    let mut bound = admission::Bound::new();
+                    let mut ready = false;
+                    let admitted = after_source(
+                        owned,
+                        store,
+                        &record,
+                        &published,
+                        binding,
+                        hold_effect,
+                        (&effect, &facts),
+                        &mut bound,
+                        &mut ready,
+                    )?;
+                    Ok((record, admitted, ready))
                 },
                 |_, _, value| Ok(value),
             )
             .await
+    }
+
+    /// What an entry's owned write needs before it starts: the fold's scratch when it may owe a
+    /// fold turn (reserved as `Operation::Governance`), and whether a proof keeps a remote
+    /// departure's effect pending while the leaver probes a live head; nothing else waits here.
+    async fn entry_gates(&self, record: &Record) -> Result<(usize, bool)> {
+        let kind = record.entry.skeleton.v2.as_ref().map(|header| header.kind);
+        #[cfg(feature = "test-knobs")]
+        let hold_effect = kind == Some(crate::log::history::SignedEntryKind::Governance)
+            && match crate::governance::entry::GovEntry::body_bound_to(&record.entry) {
+                Ok(crate::governance::entry::GovBody::Presence(presence)) => !presence.body.here,
+                Ok(_) => false,
+                Err(_) => true,
+            }
+            && self.departure_held(record.entry.skeleton.author_id).await?;
+        #[cfg(not(feature = "test-knobs"))]
+        let hold_effect = false;
+        let scratch = if matches!(
+            kind,
+            Some(
+                crate::log::history::SignedEntryKind::Governance
+                    | crate::log::history::SignedEntryKind::StepPolicy
+            )
+        ) {
+            4 * 1024 * 1024
+        } else {
+            0
+        };
+        Ok((scratch, hold_effect))
     }
 
     /// The proof hold `VOX_TEST_DEPARTURE_HOLD_FILE`: `true` while the file exists and `author`
@@ -830,7 +831,9 @@ impl Receiver {
             (
                 crate::node::channel::HistoryEffectCursor,
                 crate::node::channel::HistoryEffectProgress,
+                Option<admission::EntryNeed>,
             ),
+            bool,
         )>,
     > {
         let job = record.job.clone();
@@ -881,31 +884,26 @@ impl Receiver {
                 Lookup::Missing => return Ok(Lookup::Missing),
             }
         }
-        let staged = record.staged.is_some() || record.memory;
         let effect = self.effect_inputs(now);
+        let authorization = self.source.authorization();
         self.source
             .write_owned(
                 &job,
                 (64 * 1024, 0, false),
-                |_, _| Ok(()),
-                move |(), store, owned| {
-                    let progress = effect_quantum(
+                move |room, store| room.prepare_history_admission(store, authorization),
+                move |facts, store, owned| {
+                    let mut bound = admission::Bound::new();
+                    let mut ready = false;
+                    let progress = effect_quantum_walked(
                         owned,
                         store,
                         &record,
-                        &effect,
-                        |room, store| {
-                            room.prepare_received_effect(
-                                store,
-                                cursor,
-                                effect.now,
-                                staged,
-                                effect.historical,
-                            )
-                        },
-                        None,
+                        (&effect, &facts),
+                        cursor,
+                        &mut bound,
+                        &mut ready,
                     )?;
-                    Ok((record, progress))
+                    Ok((record, progress, ready))
                 },
                 |_, _, value| Ok(value),
             )
@@ -966,6 +964,8 @@ impl Receiver {
                             )
                         },
                         Some(&record.entry),
+                        &mut crate::log::history::WorkBudget::default(),
+                        &mut false,
                     )?;
                     Ok((record, progress))
                 },
@@ -975,22 +975,37 @@ impl Receiver {
     }
 }
 
-/// How far one entry's owned admission write reached (`Receiver::admit_entry`).
+/// How far one entry's owned admission operation reached (`Receiver::admit_entry`).
 pub(super) enum Admitted {
-    /// Another publication owns the room, or validation found it busy.
+    /// It stopped before Begin: its budget or turn target was spent, or it lacks `need` (and
+    /// then the other authors' controls in `also`, `admission::EntryReady::Stop`).
+    Stopped {
+        resume: admission::Resume,
+        need: Option<admission::EntryNeed>,
+        also: Vec<(Digest32, u64)>,
+    },
+    /// Another publication owns the room, or its bounded work queue is full.
     Busy,
     /// The position already holds this entry: its body/effect continue.
     Duplicate,
     /// The publication's DAG facts (`switched == false`: nothing of it is history yet) or its
     /// cleanup continue in the next quantum.
-    Source { switched: bool },
-    /// Published, the room's publication idle, and one effect quantum ran.
+    Source {
+        switched: bool,
+        binding: CursorBinding,
+    },
+    /// Published, the room's publication idle, and one effect quantum ran; with what its walk of
+    /// the prerequisite controls' effect prefix lacks, if it lacks something.
     Effect(
         crate::node::channel::HistoryEffectCursor,
         crate::node::channel::HistoryEffectProgress,
+        Option<admission::EntryNeed>,
     ),
     /// Published; the test departure hold keeps its effect pending.
     EffectHeld,
+    /// Published; the operation's turn target was spent before its effect, which the next
+    /// operation runs.
+    EffectOwed,
 }
 
 /// What an effect quantum needs from its receiver, owned by the native write running it.
@@ -1007,24 +1022,35 @@ struct EffectInputs {
 /// publication is idle, the fold's bounded turn a governance change owes, as an unpublished
 /// room's construction takes it (`actor/construction_save.rs` `fold_unpublished_governance`:
 /// `advance_governance`, which also moves the room's governance display and its news), so the
-/// effect reads the governance it changed; then one effect quantum.
+/// effect reads the governance it changed; then one effect quantum. The fold runs within what
+/// is left of the operation's turn target (at least one step; work it leaves is the
+/// maintenance turn's, as for any fold), never with an allowance of its own on top; the effect
+/// runs only while the target is not spent.
+#[allow(clippy::too_many_arguments)]
 fn after_source(
     owned: &OwnedRoom<'_>,
     store: &Store,
     record: &Record,
     published: &crate::node::channel::PublishedHistorySource,
+    binding: CursorBinding,
     hold_effect: bool,
-    effect: &EffectInputs,
+    (effect, facts): (
+        &EffectInputs,
+        &crate::node::channel::PendingHistoryAdmission,
+    ),
+    bound: &mut admission::Bound,
+    ready: &mut bool,
 ) -> Result<Admitted> {
     if !published.cleaned() {
         return Ok(Admitted::Source {
             switched: published.switched(),
+            binding,
         });
     }
     if published.governance_changed() {
         let mut room = owned.lock_for_write()?;
         effect.grant.check(&room, store)?;
-        match room.advance_governance(store, effect.now) {
+        match room.advance_governance_within(store, effect.now, bound.left()) {
             Err(error) if ChannelState::governance_refreshing(&error) => {}
             folded => {
                 folded?;
@@ -1034,24 +1060,86 @@ fn after_source(
     if hold_effect {
         return Ok(Admitted::EffectHeld);
     }
-    let staged = record.staged.is_some() || record.memory;
+    if bound.spent() {
+        return Ok(Admitted::EffectOwed);
+    }
     let cursor = crate::node::channel::HistoryEffectCursor::new(record.entry.entry_hash());
-    let (cursor, progress) = effect_quantum(
-        owned,
-        store,
-        record,
-        effect,
-        |room, store| {
-            room.prepare_received_effect(store, cursor, effect.now, staged, effect.historical)
-        },
-        None,
-    )?;
-    Ok(Admitted::Effect(cursor, progress))
+    let (cursor, progress, need) =
+        effect_quantum_walked(owned, store, record, (effect, facts), cursor, bound, ready)?;
+    Ok(Admitted::Effect(cursor, progress, need))
+}
+
+/// One effect quantum. An effect that waits for its prerequisite controls' effects walks their
+/// author's effect prefix in the same operation, on its budget (`admission::advance_prefix`),
+/// and, that prefix complete, runs once more; what the walk lacks is the effect's need.
+fn effect_quantum_walked(
+    owned: &OwnedRoom<'_>,
+    store: &Store,
+    record: &Record,
+    (effect, facts): (
+        &EffectInputs,
+        &crate::node::channel::PendingHistoryAdmission,
+    ),
+    cursor: crate::node::channel::HistoryEffectCursor,
+    bound: &mut admission::Bound,
+    ready: &mut bool,
+) -> Result<(
+    crate::node::channel::HistoryEffectCursor,
+    crate::node::channel::HistoryEffectProgress,
+    Option<admission::EntryNeed>,
+)> {
+    let staged = record.staged.is_some() || record.memory;
+    let quantum = |cursor: crate::node::channel::HistoryEffectCursor,
+                   work: &mut crate::log::history::WorkBudget,
+                   ready: &mut bool| {
+        effect_quantum(
+            owned,
+            store,
+            record,
+            effect,
+            |room, store| {
+                room.prepare_received_effect(store, cursor, effect.now, staged, effect.historical)
+            },
+            None,
+            work,
+            ready,
+        )
+    };
+    let (cursor, progress) = quantum(cursor, &mut bound.work, ready)?;
+    let crate::node::channel::HistoryEffectProgress::ControlPending { head, through } = progress
+    else {
+        return Ok((cursor, progress, None));
+    };
+    if bound.spent() {
+        return Ok((cursor, progress, None));
+    }
+    match facts.with(|room| {
+        admission::advance_prefix(
+            room,
+            store,
+            &effect.committed,
+            head,
+            through,
+            true,
+            &mut bound.work,
+            ready,
+        )
+    })? {
+        admission::Prefix::Complete if !bound.spent() => {
+            let (cursor, progress) = quantum(cursor, &mut bound.work, ready)?;
+            Ok((cursor, progress, None))
+        }
+        admission::Prefix::Complete | admission::Prefix::Yielded => Ok((cursor, progress, None)),
+        admission::Prefix::Need(need) => Ok((cursor, progress, Some(need))),
+    }
 }
 
 /// One semantic effect (or refill) quantum and the legacy migration quantum it owes, inside an
 /// owned write: each prepared and installed under the room lock, each saved off it. Every
-/// native transaction rechecks the same flow grant.
+/// native transaction rechecks the same flow grant. A control's effect walks its author's
+/// control prefixes on `work`, its operation's budget; `ready` says that walk made the author's
+/// controls current.
+#[allow(clippy::too_many_arguments)]
 fn effect_quantum(
     owned: &OwnedRoom<'_>,
     store: &Store,
@@ -1062,6 +1150,8 @@ fn effect_quantum(
         &Store,
     ) -> Result<crate::node::channel::pending_received::PendingReceived>,
     refill: Option<&crate::log::entry::Entry>,
+    work: &mut crate::log::history::WorkBudget,
+    ready: &mut bool,
 ) -> Result<(
     crate::node::channel::HistoryEffectCursor,
     crate::node::channel::HistoryEffectProgress,
@@ -1082,10 +1172,12 @@ fn effect_quantum(
         &effect.committed,
         &effect.received,
         refill,
+        work,
         |batch| grant.check_batch(batch, room, instance, epoch),
         |batch, hash| complete_staged(batch, effect.staging.as_ref(), record, hash),
     );
     let migrate = completed.legacy_migration();
+    *ready |= completed.controls_ready();
     let progress = owned.lock()?.finish_received(store, completed)?;
     if let Some(maintenance_now) = migrate {
         let pending = {
@@ -1155,24 +1247,18 @@ pub(crate) enum LocalStep {
         role_header: bool,
         phase: EntryPhase,
     },
-    Control {
-        head: Digest32,
-        through: u64,
-        effects: bool,
-    },
 }
 #[derive(Clone, Copy)]
 pub(crate) enum EntryPhase {
+    /// One bounded operation admits the entry from its start (`Receiver::admit_entry`); the
+    /// next two are where such an operation goes on after it stopped.
     Start,
     Preflight {
         parent: usize,
         next: usize,
     },
-    Body,
-    Validate(CursorBinding),
-    /// Validation done: one owned write begins the publication and, as far as its quantum
-    /// reaches, publishes the source and runs its fold turn and first effect quantum.
-    Begin(CursorBinding),
+    /// Inside validation; its cursor rides with the entry in memory (`admission::Checked`).
+    Validate,
     /// The same write resuming this request's publication whose DAG facts are unfinished.
     Publish(CursorBinding),
     Cleanup(CursorBinding),
@@ -1187,11 +1273,6 @@ pub(crate) enum LocalNeed {
     Entry {
         head: Digest32,
         seq: u64,
-    },
-    Control {
-        head: Digest32,
-        through: u64,
-        effects: bool,
     },
     Governance,
     /// Rule F2 E and rule F3: a wait on an author's fork or on a certified splitter's unmatched
@@ -1208,9 +1289,21 @@ pub(crate) struct LocalResult {
     pub(crate) governance: bool,
     pub(crate) busy: bool,
     pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
-    /// A control-effects step made its author's Session controls current here, which they were
-    /// not: permission news for the room's tellers (`Flow::controls_ready`).
+    /// An entry's operation made its author's controls current here, which they were not:
+    /// permission news for the room's tellers (`Flow::controls_ready`).
     pub(crate) controls_ready: bool,
+    /// With a need: the other authors' controls (author, position) the stopped entry lacks
+    /// too; it waits for each in turn (`pull::Frontier::settled`).
+    pub(crate) also: Vec<(Digest32, u64)>,
+}
+impl From<admission::EntryNeed> for LocalNeed {
+    fn from(need: admission::EntryNeed) -> Self {
+        match need {
+            admission::EntryNeed::Wire(query) => Self::Wire(query),
+            admission::EntryNeed::Entry { head, seq } => Self::Entry { head, seq },
+            admission::EntryNeed::Fork(wait) => Self::Fork(wait),
+        }
+    }
 }
 impl LocalResult {
     fn next(step: LocalStep) -> Self {
@@ -1223,6 +1316,7 @@ impl LocalResult {
             busy: false,
             byte_pressure: None,
             controls_ready: false,
+            also: Vec::new(),
         }
     }
     fn done() -> Self {
@@ -1235,6 +1329,7 @@ impl LocalResult {
             busy: false,
             byte_pressure: None,
             controls_ready: false,
+            also: Vec::new(),
         }
     }
     fn wait(step: LocalStep, need: LocalNeed) -> Self {
@@ -1247,6 +1342,7 @@ impl LocalResult {
             busy: false,
             byte_pressure: None,
             controls_ready: false,
+            also: Vec::new(),
         }
     }
     fn busy(step: LocalStep) -> Self {
@@ -1259,6 +1355,7 @@ impl LocalResult {
             busy: true,
             byte_pressure: None,
             controls_ready: false,
+            also: Vec::new(),
         }
     }
 
@@ -1273,10 +1370,13 @@ impl LocalResult {
 impl Receiver {
     /// One local slice. The actor schedules its returned dependency explicitly; this function
     /// opens no stream, loops no verifier budget, and retains no full record on return.
-    pub(crate) async fn local_step(
+    /// `checked`: what the entry's admission operation checked before it stopped (JoinDesign
+    /// S1), handed in for this step and given back in it when the step stops again.
+    pub(super) async fn local_step(
         &self,
         job: &crate::node::history_budget::Job,
         step: LocalStep,
+        checked: &admission::CheckedSlot,
         now: crate::time::Ms,
     ) -> Result<LocalResult> {
         use crate::node::channel::HistoryEffectProgress as Effect;
@@ -1310,13 +1410,6 @@ impl Receiver {
                     }
                 });
             }
-            LocalStep::Control {
-                head,
-                through,
-                effects,
-            } => {
-                return self.control_step(job, step, head, through, effects).await;
-            }
             LocalStep::Entry { .. } => {}
         }
         let LocalStep::Entry {
@@ -1330,29 +1423,21 @@ impl Receiver {
         else {
             unreachable!()
         };
-        let full = body
-            && matches!(
-                phase,
-                EntryPhase::Body
-                    | EntryPhase::Begin(_)
-                    | EntryPhase::Publish(_)
-                    | EntryPhase::Refill
-                    | EntryPhase::Effect(_)
-            );
-        let completion = matches!(
+        // One record serves an entry's whole operation, from its start through Begin and its
+        // first effect: the full entry when its body is required, else its header.
+        let operation = matches!(
             phase,
-            EntryPhase::Begin(_)
-                | EntryPhase::Publish(_)
-                | EntryPhase::Refill
-                | EntryPhase::Effect(_)
-        ) && (body || role_header);
+            EntryPhase::Start | EntryPhase::Preflight { .. } | EntryPhase::Validate
+        );
+        let full = body && !matches!(phase, EntryPhase::Cleanup(_));
+        let completion = !matches!(phase, EntryPhase::Cleanup(_)) && (body || role_header);
         let assembly = if full {
             match self.held_record(job, head, seq).await? {
                 Some(assembly) => assembly,
                 None => self.assemble(job, completion).await?,
             }
         } else {
-            let local_work = if matches!(phase, EntryPhase::Validate(_)) {
+            let local_work = if operation {
                 ENTRY_VALIDATION_WORK
             } else {
                 RECORD_METADATA_WORK
@@ -1435,14 +1520,9 @@ impl Receiver {
                 Effect::RefillPending { governance: false } => LocalResult::next(step),
                 Effect::BodyUnavailable => LocalResult::wait(step, LocalNeed::StagedBody),
                 Effect::KeyBodyRetired => LocalResult::wait(step, LocalNeed::KeyBodyRetired),
-                Effect::ControlPending { head, through } => LocalResult::wait(
-                    step,
-                    LocalNeed::Control {
-                        head,
-                        through,
-                        effects: true,
-                    },
-                ),
+                // Its operation walked the prerequisite controls' effect prefix as far as its
+                // budget allowed (`effect_quantum_walked`); the next operation walks on.
+                Effect::ControlPending { .. } => LocalResult::next(step),
                 Effect::GovernancePending => LocalResult::wait(step, LocalNeed::Governance),
                 Effect::CheckpointPending { author, seq } => {
                     // Existing Checkpoint payloads contain only seq/hash: their target is
@@ -1461,12 +1541,16 @@ impl Receiver {
                     busy: false,
                     byte_pressure: None,
                     controls_ready: false,
+                    also: Vec::new(),
                 },
             }
         };
         // An effect quantum's outcome, whichever write ran it: a continuation resumes at its
         // exact cursor in the Effect phase.
-        let effect_step = |cursor, progress| -> LocalResult {
+        let effect_step = |cursor, progress, need: Option<admission::EntryNeed>| -> LocalResult {
+            if let Some(need) = need {
+                return LocalResult::wait(next(EntryPhase::Effect(Some(cursor))), need.into());
+            }
             if let Effect::RefillPending { governance } = progress {
                 let refill = next(EntryPhase::Refill);
                 return if governance {
@@ -1491,153 +1575,92 @@ impl Receiver {
             }
             result
         };
+        let admitted = |mut admitted: Admitted, ready| -> LocalResult {
+            let also = match &mut admitted {
+                Admitted::Stopped { also, .. } => std::mem::take(also),
+                _ => Vec::new(),
+            };
+            let mut result = match admitted {
+                Admitted::Stopped { resume, need, .. } => {
+                    let phase = match resume {
+                        admission::Resume::Start => EntryPhase::Start,
+                        admission::Resume::Preflight { parent, next } => {
+                            EntryPhase::Preflight { parent, next }
+                        }
+                        admission::Resume::Validate => EntryPhase::Validate,
+                    };
+                    match need {
+                        None => LocalResult::next(next(phase)),
+                        Some(admission::EntryNeed::Wire(query)) => {
+                            // A mandatory typed-control body is now an explicit staged
+                            // obligation; the caller cannot fetch it and then retry header-only
+                            // admission.
+                            let body = body
+                                || matches!(query, Query::Entry { head: needed, seq: at, .. } if needed == head && at == seq);
+                            LocalResult::wait(
+                                LocalStep::Entry {
+                                    request,
+                                    head,
+                                    seq,
+                                    body,
+                                    role_header,
+                                    phase,
+                                },
+                                LocalNeed::Wire(query),
+                            )
+                        }
+                        Some(
+                            need @ (admission::EntryNeed::Entry { .. }
+                            | admission::EntryNeed::Fork(_)),
+                        ) => LocalResult::wait(next(phase), need.into()),
+                    }
+                }
+                Admitted::Busy => LocalResult::busy(step),
+                Admitted::Duplicate => LocalResult::next(next(if body {
+                    EntryPhase::Refill
+                } else {
+                    EntryPhase::Effect(None)
+                })),
+                Admitted::Source {
+                    switched: false,
+                    binding,
+                } => LocalResult::next(next(EntryPhase::Publish(binding))),
+                Admitted::Source {
+                    switched: true,
+                    binding,
+                } => LocalResult::next(next(EntryPhase::Cleanup(binding))),
+                Admitted::EffectHeld => LocalResult::busy(next(EntryPhase::Effect(None))),
+                Admitted::EffectOwed => LocalResult::next(next(EntryPhase::Effect(None))),
+                Admitted::Effect(cursor, progress, need) => effect_step(cursor, progress, need),
+            };
+            result.controls_ready = ready;
+            result.also = also;
+            result
+        };
         Ok(match phase {
-            EntryPhase::Start | EntryPhase::Body => {
+            EntryPhase::Start | EntryPhase::Preflight { .. } | EntryPhase::Validate => {
+                let from = match phase {
+                    EntryPhase::Preflight { parent, next } => {
+                        admission::Resume::Preflight { parent, next }
+                    }
+                    EntryPhase::Validate => admission::Resume::Validate,
+                    _ => admission::Resume::Start,
+                };
                 let Lookup::Found(value) = self
-                    .start_entry(
-                        request,
-                        head,
-                        record,
-                        body,
-                        matches!(phase, EntryPhase::Body),
-                    )
+                    .admit_entry(record, request, head, from, checked, now)
                     .await?
                 else {
                     return Ok(LocalResult::busy(step));
                 };
-                match value.value.1 {
-                    admission::EntryStart::Preflight => {
-                        LocalResult::next(next(EntryPhase::Preflight { parent: 0, next: 0 }))
-                    }
-                    admission::EntryStart::BodyNeeded => {
-                        // Admission can promote a header-only dependency when its signed
-                        // recipient is this node. Carry that requirement into staging; merely
-                        // changing the phase would otherwise reconstruct the same header again.
-                        LocalResult::next(LocalStep::Entry {
-                            request,
-                            head,
-                            seq,
-                            body: true,
-                            role_header: false,
-                            phase: EntryPhase::Body,
-                        })
-                    }
-                    admission::EntryStart::Cursor(binding) => {
-                        LocalResult::next(next(EntryPhase::Validate(binding)))
-                    }
-                    admission::EntryStart::Need(query) => {
-                        let resume = if matches!(query, Query::Entry { head: needed, seq: at, .. } if needed == head && at == seq)
-                        {
-                            // A mandatory typed-control body is now an explicit staged obligation;
-                            // the caller cannot fetch it and then retry header-only admission.
-                            LocalStep::Entry {
-                                request,
-                                head,
-                                seq,
-                                body: true,
-                                role_header: false,
-                                phase,
-                            }
-                        } else {
-                            step
-                        };
-                        LocalResult::wait(resume, LocalNeed::Wire(query))
-                    }
-                    admission::EntryStart::Fork(wait) => {
-                        LocalResult::wait(step, LocalNeed::Fork(wait))
-                    }
-                    admission::EntryStart::Busy => LocalResult::busy(step),
-                }
+                let (_, reached, ready) = value.value;
+                admitted(reached, ready)
             }
-            EntryPhase::Preflight { parent, next: at } => {
-                let job = record.job.clone();
-                let value = self
-                    .read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-                        admission::preflight(room, store, head, &record.entry, parent, at).map(Some)
-                    })
-                    .await?;
-                let Lookup::Found(value) = value else {
+            EntryPhase::Publish(binding) => {
+                let Lookup::Found(value) = self.publish_entry(record, binding, now).await? else {
                     return Ok(LocalResult::busy(step));
                 };
-                match value.value.1 {
-                    admission::Preflight::Complete => LocalResult::next(next(EntryPhase::Body)),
-                    admission::Preflight::Progress { parent, next: at } => {
-                        LocalResult::next(next(EntryPhase::Preflight { parent, next: at }))
-                    }
-                    admission::Preflight::Need(query) => {
-                        LocalResult::wait(step, LocalNeed::Wire(query))
-                    }
-                    admission::Preflight::Control {
-                        head,
-                        through,
-                        effects,
-                    } => LocalResult::wait(
-                        step,
-                        LocalNeed::Control {
-                            head,
-                            through,
-                            effects,
-                        },
-                    ),
-                    admission::Preflight::Fork(wait) => {
-                        LocalResult::wait(step, LocalNeed::Fork(wait))
-                    }
-                    admission::Preflight::Busy => LocalResult::busy(step),
-                }
-            }
-            EntryPhase::Validate(binding) => {
-                let Lookup::Found(value) = self.advance_entry(record, binding).await? else {
-                    return Ok(LocalResult::busy(step));
-                };
-                match value.value.1 {
-                    admission::EntryAdvanced::Validated(_) => {
-                        LocalResult::next(next(EntryPhase::Begin(binding)))
-                    }
-                    admission::EntryAdvanced::Progress => LocalResult::next(step),
-                    admission::EntryAdvanced::Need(query) => {
-                        LocalResult::wait(step, LocalNeed::Wire(query))
-                    }
-                    admission::EntryAdvanced::ControlPending { head, through } => {
-                        LocalResult::wait(
-                            step,
-                            LocalNeed::Control {
-                                head,
-                                through,
-                                effects: false,
-                            },
-                        )
-                    }
-                    admission::EntryAdvanced::ControlSource { head, seq } => {
-                        LocalResult::wait(step, LocalNeed::Entry { head, seq })
-                    }
-                    admission::EntryAdvanced::Fork(wait) => {
-                        LocalResult::wait(step, LocalNeed::Fork(wait))
-                    }
-                    admission::EntryAdvanced::Busy => LocalResult::busy(step),
-                }
-            }
-            EntryPhase::Begin(binding) | EntryPhase::Publish(binding) => {
-                let begin = matches!(phase, EntryPhase::Begin(_));
-                let Lookup::Found(value) = self.admit_entry(record, binding, now, begin).await?
-                else {
-                    return Ok(LocalResult::busy(step));
-                };
-                match value.value.1 {
-                    Admitted::Busy => LocalResult::busy(step),
-                    Admitted::Duplicate => LocalResult::next(next(if body {
-                        EntryPhase::Refill
-                    } else {
-                        EntryPhase::Effect(None)
-                    })),
-                    Admitted::Source { switched: false } => {
-                        LocalResult::next(next(EntryPhase::Publish(binding)))
-                    }
-                    Admitted::Source { switched: true } => {
-                        LocalResult::next(next(EntryPhase::Cleanup(binding)))
-                    }
-                    Admitted::EffectHeld => LocalResult::busy(next(EntryPhase::Effect(None))),
-                    Admitted::Effect(cursor, progress) => effect_step(cursor, progress),
-                }
+                let (_, reached, ready) = value.value;
+                admitted(reached, ready)
             }
             EntryPhase::Cleanup(binding) => {
                 let Lookup::Found(value) = self.cleanup_source(record, binding).await? else {
@@ -1682,162 +1705,12 @@ impl Receiver {
                 let Lookup::Found(value) = self.advance_effect(record, cursor, now).await? else {
                     return Ok(LocalResult::busy(step));
                 };
-                let (cursor, progress) = value.value.1;
-                effect_step(cursor, progress)
+                let (_, (cursor, progress, need), ready) = value.value;
+                let mut result = effect_step(cursor, progress, need);
+                result.controls_ready = ready;
+                result
             }
         })
-    }
-
-    async fn control_step(
-        &self,
-        job: &crate::node::history_budget::Job,
-        step: LocalStep,
-        head: Digest32,
-        through: u64,
-        effects: bool,
-    ) -> Result<LocalResult> {
-        use crate::node::channel::entry_store::sparse::SourceProgress;
-        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
-            return Ok(LocalResult::busy(step));
-        };
-        let committed = self.source.commit_ledger();
-        let value = self
-            .source
-            .write_admission(
-                &work_job,
-                (VERIFY_ENVELOPE, 4 * 1024 * 1024),
-                move |room, store| {
-                    let input = room.history_read(store)?;
-                    let named = input
-                        .history_head(&head)?
-                        .ok_or(Error::MalformedAtRest("control target head missing"))?;
-                    // Control facts are kept per author (`control_prefix_complete`); an older
-                    // committed head is replaced by the author's current one only so that a
-                    // coverage need names the head this node and its peers hold now.
-                    let head = match input
-                        .sparse_author(&named.binding.author, named.binding.scope)?
-                        .and_then(|state| state.committed)
-                    {
-                        Some(current)
-                            if current != head
-                                && input.history_head_committed(&head, named.binding)? =>
-                        {
-                            current
-                        }
-                        _ => head,
-                    };
-                    let target = input
-                        .history_head(&head)?
-                        .ok_or(Error::MalformedAtRest("control target head missing"))?;
-                    if through == 0 || through > target.root.leaves {
-                        return Err(Error::MalformedAtRest(
-                            "control receipt bound exceeds target",
-                        ));
-                    }
-                    let complete = if effects {
-                        input.control_effects_complete(&head, through)?
-                    } else {
-                        input.control_sources_complete(&head, through)?
-                    };
-                    if complete {
-                        return Ok((SourceProgress::Complete { through }, None, head, false));
-                    }
-                    let leaves = target.root.leaves;
-                    drop(input);
-                    let progress = room.history_write_tracked(store, &committed, |index| {
-                        if effects {
-                            index.advance_control_effects(&head, through)
-                        } else {
-                            index.advance_control_sources(&head, through)
-                        }
-                    })?;
-                    // The author's effect prefix was below its committed size (not complete
-                    // above, and `through` reaches that size) and this step brought it there:
-                    // its Session controls became current (`history_control_ready`) here.
-                    let ready = effects
-                        && through >= leaves
-                        && matches!(
-                            progress,
-                            SourceProgress::Complete { through: done }
-                                | SourceProgress::Progress { through: done }
-                                if done >= leaves
-                        );
-                    let needed = if let SourceProgress::PendingEffect { hash } = &progress {
-                        let input = room.history_read(store)?;
-                        input
-                            .history_object(
-                                crate::node::channel::entry_store::sparse::ObjectKind::Header,
-                                hash,
-                            )?
-                            .map(|wire| {
-                                crate::log::entry::Entry::from_wire(&wire)
-                                    .map(|entry| entry.skeleton.seq)
-                            })
-                            .transpose()?
-                    } else {
-                        None
-                    };
-                    Ok((progress, needed, head, ready))
-                },
-            )
-            .await?;
-        let Lookup::Found(value) = value else {
-            return Ok(LocalResult::busy(step));
-        };
-        let (progress, needed, head, controls_ready) = value.value;
-        let mut result = match (progress, needed) {
-            (
-                SourceProgress::Complete { through: done }
-                | SourceProgress::Progress { through: done },
-                _,
-            ) if done >= through => LocalResult::done(),
-            (SourceProgress::Progress { .. } | SourceProgress::Complete { .. }, _) => {
-                LocalResult::next(step)
-            }
-            (SourceProgress::MissingCoverage { after }, _) => LocalResult::wait(
-                step,
-                LocalNeed::Wire(Query::Proof {
-                    head,
-                    kind: ProofKind::Control,
-                    from: after + 1,
-                    to: through,
-                }),
-            ),
-            (SourceProgress::MissingSource { seq }, _) => {
-                LocalResult::wait(step, LocalNeed::Entry { head, seq })
-            }
-            (
-                SourceProgress::ConflictingSource {
-                    author,
-                    seq,
-                    expected,
-                    actual,
-                },
-                _,
-            ) => {
-                tracing::warn!(
-                    ?author,
-                    seq,
-                    ?expected,
-                    ?actual,
-                    "conflicting sparse control source"
-                );
-                return Err(Error::MalformedBundle(
-                    "held sparse control source conflicts with authenticated head",
-                ));
-            }
-            (SourceProgress::PendingEffect { .. }, Some(seq)) => {
-                LocalResult::wait(step, LocalNeed::Entry { head, seq })
-            }
-            (SourceProgress::PendingEffect { .. }, None) => {
-                return Err(Error::MalformedAtRest(
-                    "pending history effect header missing",
-                ));
-            }
-        };
-        // The author's Session controls became current in this step: permission news, once.
-        result.controls_ready = controls_ready;
-        Ok(result)
     }
 }
 
@@ -1903,6 +1776,8 @@ impl Receiver {
             })
             .await
     }
+    /// Only a proof's departure hold reads a record's stored body before its effect.
+    #[cfg(feature = "test-knobs")]
     async fn read_precharged<T, F>(
         &self,
         job: &crate::node::history_budget::Job,
