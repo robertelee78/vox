@@ -183,6 +183,9 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   bound applies only while the disk is full, a physical limit; it is not a cap on a person's data
   in normal use (FR-8; the lead's call, 2026-10-10).
 - **SR-5.** The fault MUST keep the operating system's error text.
+  *(Amended 2026-11-28, amendment 1: every refusal after the store stopped taking writes names
+  the operating system's failure that stopped it, kept where the storage library sets its failure
+  latch, not only the one writer that met it; see "Amendment 1 (2026-11-28)".)*
 - **SR-6.** Vox MUST refuse a write before the operating system would, when the disk holding the
   store cannot hold the write's reservation above the floor, and MUST say so in SR-2's words;
   reclamation (deletes and cleanups) MUST stay possible on Vox's own ballast when the disk is
@@ -258,6 +261,75 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   his Mac with his OK each time.
 - **PF-2.** A proof that needs a full disk MUST stage it in userspace, with no `sudo`. Where it
   cannot, it MUST print `OPTIONAL PROOF NOT RUN` (ADR-018 §10.2).
+
+## Amendment 1 (2026-11-28): every refusal names what made the store stop taking writes
+
+*(Added 2026-11-28, amendment 1.)* Merged in pull request #1424 (branch `fix/sweep6`, one squashed
+commit `08ec7b2aa` on main `695db44c4`), merge commit `516c08746a16fd9da141672c100a8e31f52e08fa`
+on main, whose tree is that of `scratch/sweep6-land` at `8761dd46f`. Sources, in
+`/opt/vox-evidence/v0431/`: `exec/found-reds.md` entry 156 (first part);
+`release/regress6/DiskFull.md` (rounds 1 and 5 to 8), its review `DiskFull-review-1.md` (every
+round it holds) and `pr-body.md`; `simple-sync/review/STATE.md` (passes 7 and 7c). Code at main
+`516c08746`. Nothing was built or run for this record.
+
+- **What was found** (found-reds 156; `DiskFull.md`, "Verdict", run jnd2). On a filled volume the
+  act `a_full_disk_recovers_without_stranding_sync_or_leave`
+  (`a_sync_failure_names_its_reason_proof.rs`) was red: "full disk was not named: vox: mission
+  cannot save: store save room: store begin write: Previous I/O error occurred. …". The storage
+  library (redb, vendored) latches a database handle after its first I/O failure and refuses every
+  later write with only `PreviousIo` ("Previous I/O error occurred. Please close and re-open the
+  database."); "the disk is full" was decided from the failing error's own text (`fn storage`,
+  `crates/vox-core/src/node/store.rs`), and a room keeps the first error it met as its cause. So
+  only the one writer that met the full disk named it, and which writer that was is a race: in
+  jnd2's second cycle it was a background prekey save, and every room's refusal and `vox status`
+  then named the latch only. SR-2 and SR-5 were not met. Not caused by #1421.
+- **What is built.** The vendored library hands the failure to the store's backend at the moment
+  it sets its latch, and only then: `StorageBackend::latched` (`vendor/redb/src/db.rs`, a default
+  no-op) is called by `CheckedBackend::latch` (`vendor/redb/src/tree_store/page_store/cached_file.rs`)
+  from the five calls that latch on a failure (`len`, `read`, `set_len`, `sync_data`, `write`); not
+  from `close`, whose latch is no failure, not from the best-effort write-back, which does not
+  latch, and not from a read that fails on a handle already latched. The latch itself is set by a
+  guard's drop (`Fence`), so it is set even if the backend's hook panics, and on a normal return
+  the cause is handed over before the latch is set. The store keeps the first failure handed over
+  per writable handle (`IoFault`, `FlushObservedBackend::latched`); a recovered handle gets a
+  fresh one. A refused write begin (`Cached::write_refused`, used by `Store::begin_write`,
+  `received_batch`, the flush, give-back and measure begins) maps `PreviousIo` to that cause
+  through the existing rule, so a full disk reads "the disk is full; free disk space: No space
+  left on device (os error 28) (an earlier I/O failed; no write is taken until the store
+  recovers)". The earlier guessing among the backend's calls in `store.rs` is deleted. No write
+  path, flush or barrier changes; only the text of a refusal. The vendored source differs from
+  upstream only in hunks marked "Vox:", and `Cargo.toml`'s note now says so (`DiskFull.md`,
+  round 7). Two first failures racing on two threads may both be handed over; the one kept
+  latched too.
+- **How it got there, and the reviews** (`DiskFull-review-1.md`, source review only). The first
+  form (`b1ae304ed`) kept the handle's first failed write; the review, at `ccdae31fe`, found (P2)
+  that it also kept a failure of the library's non-latching write-back, so a passing full disk
+  could later name a different fault. Two more forms chose among the backend's calls:
+  `3683d3dd4`, found wrong in the fix-only round 1, and `f9b0e94a4`, found wrong in a second
+  recheck that `DiskFull.md` round 7 reports and the review file does not hold. The form at
+  `7984df6c9` takes the cause where the library sets its latch. Its round 3, by a fresh reviewer
+  (the first had run out of context): "The original cause-selection finding is otherwise closed:
+  all five failure paths notify; best-effort writes, subsequent failed reads and close do not;
+  replacement handles receive fresh fault cells", with one P2, "Preserve the failure fence if the
+  hook panics". Fixed in `c0b2a4481` (`DiskFull.md`, round 8). Its round 4, at `c0b2a4481`:
+  **ACCEPT**, "The guard sets the failure fence on normal return and unwinding; normal execution
+  still records the cause before publishing the fence. P2 closed; no introduced defect found."
+  The pull-request text: "the full-disk naming accepted in its fourth form".
+- **Proof.** The same act, green on each form: jnd3 (the first form: 32 refusals named the full
+  disk after another writer had met it), jndf (the form at `7984df6c9`: 30 refusals read "… the
+  disk is full; free disk space: No space left on device (os error 28) (an earlier I/O failed; no
+  write is taken until the store recovers)", "Previous I/O" 0 times) and jndh (with the guard: 34
+  refusals name the full disk, 0 "Previous I/O"); the crash-inside-a-join act stayed green (jnd4,
+  jndg). On the integrated tree the full-disk file was green in pass 7 (on `e396fd1ee`) and 2 of 2
+  in pass 7c (`43a3ab3cc`) (`simple-sync/review/STATE.md`). What rests on review: a full disk that
+  passes and is followed by a different failure cannot be staged (`DiskFull.md`, round 5;
+  `pr-body.md`, "What rests on review"), nor can a panicking hook. ADR-052 RG-14's "says the disk
+  is full" is proved by the same act.
+- **Built**, in pull request #1424 (merge commit `516c08746`): `b1ae304ed`, `3683d3dd4`,
+  `f9b0e94a4`, `7984df6c9` and `c0b2a4481` (`scratch/disk-full`), merged into the integration
+  branch at `d2c4b3795`. The builder reports both workspace checks with 0 warnings
+  (`DiskFull.md`, round 8); lint is clean on `8761dd46f`, as the pull-request text reports.
+- **Landed**: merge commit `516c08746` of #1424 on main.
 
 ## Superseded and amended lines
 

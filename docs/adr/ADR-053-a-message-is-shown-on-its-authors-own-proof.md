@@ -13,6 +13,10 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies. Amendment 3: the decider's ruling 10 with the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` (MP-9a, MP-6, MP-8), and the moving-head ruling of gpt-6.1-sol, `design/moving-head/ruling.md` (MP-7's prefix serving P, MP-8a's head choice H, W not approved, MP-17), and the Order, each marked where it applies.)*
   *(Amended 2026-11-24, amendment 4: the decider's rulings 11 to 13 (the private-step gap stays in v0.4.31 and is named; v0.4.31 is the busy room, and MP-14 and MP-16 move to v0.4.32; the stack of sync fixes is not the fix); the acknowledgement ruling of gpt-6.1-sol, `design/busy-room/ack-ruling.md` (MP-4); the control-closure ruling of gpt-6.1-sol, `design/busy-room/control-closure-ruling.md` (MP-7); the return ruling of the reviewer of #1393, `mp/cut-disappear/ruling-n.md` (MP-11); what has landed (MP-6 and MP-11 in #1393, MP-10's boundaries in #1392, MP-15 in #1391 with ADR-052 RG-13 closed); and ADR-054, which is to replace the fetching machinery this record's Order assumed (MP-9, MP-12, MP-13, the Order). Each is marked where it applies; the text it amends stays as it was, beside the mark. The coordinator's draft of this amendment is `design/amendment-4-draft.md`.)*
   *(Amended 2026-11-27, amendment 5: the decider's rulings 14 and 15 of 2026-11-27 (KISS: fix the bad design rather than patch it, without eroding security; a splitter that is the creator or ever held an admin certificate ships named open); rule F3, `design/forked-target/rule-f3.md`, with its design reviews `design/forked-target/sec-1.md` to `sec-5.md` and its code reviews `sec-code-1.md` to `sec-code-6.md`, as built, accepted in review and merged in #1414 (merge commit `f6320b55d`): MP-9b, in the section "Amendment 5". It supersedes MP-9a and the forked-target ruling `design/forked-target/ruling.md` as the thing to build, and amends MP-9, MP-6 where it speaks of a split target, MP-8, and the M0 ruling's clause that controls keep their full parent checks, as carried in MP-1, MP-3 and MP-5. Each is marked where it applies; the text it amends stays as it was, beside the mark.)*
+  *(Amended 2026-11-28, amendment 6, merged with the fixes of the sixth proof sweep in pull
+  request #1424, merge commit `516c08746` on main: only the end of the current store handle's
+  oldest open read resumes a waiting give-back pass (MP-15; `exec/found-reds.md` entry 164c); in
+  the section "Amendment 6".)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -841,6 +845,10 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     `a_running_node_gives_expired_space_back_and_keeps_acknowledged_rows_after_a_crash` (running when
     this record was written); the longest write wait during a pass at 200 MB and at 2 GB, warm and
     cold.
+  *(Amended 2026-11-28, amendment 6: a pass that waits for reads is resumed only by the end of
+  the oldest open read of the current handle; before, the end of any older read resumed it, so
+  with one read held open about 100 empty passes ran a second, each with two or three durable
+  commits, while a post waited 5 to 16 s. See "Amendment 6".)*
 
 - **MP-16. Stage 2: after a body expires, only the chain's fingerprint stays (ruling 7; C7 and C8
   are its conditions).** In a room whose retention is not for ever, once a content entry's body
@@ -1352,6 +1360,67 @@ digest-only comparison and deduplication introduce no defect found", and of the 
 to land as a fail-closed, connection-local availability limit—not guaranteed automatic recovery; a
 fresh connection receives fresh asks". The reviews read the code; none built or ran anything. The
 runs on the merged content are in (f).
+
+## Amendment 6 (2026-11-28): only the end of the oldest open read resumes a waiting give-back pass
+
+*(Added 2026-11-28, amendment 6.)* Merged in pull request #1424 (branch `fix/sweep6`, one squashed
+commit `08ec7b2aa` on main `695db44c4`), merge commit `516c08746a16fd9da141672c100a8e31f52e08fa`
+on main, whose tree is that of `scratch/sweep6-land` at `8761dd46f`. Sources, in
+`/opt/vox-evidence/v0431/`: `exec/found-reds.md` entries 164 (c) and 164c;
+`release/regress6/GiveBack.md` (with §5) and its review `GiveBack-review-1.md`; `pr-body.md`;
+`simple-sync/review/STATE.md` (pass 7, pass 7c) and the pass 7c log. Code at main `516c08746`, in
+`crates/vox-core/src/node/store.rs`. Nothing was built or run for this record.
+
+- **What was found.** The act `retention_proof::a_quiet_node_gives_space_back_after_its_last_prune`
+  went red in sweep pass 7, in the file run and alone: "one post waited 8277 ms / 10686 ms; the
+  daemon says it is busy past 5000 ms" (the act's bound is the daemon's own five-second "busy"
+  report, `STALL_BUDGET`). PRODUCT, older than this week and not load: red already on main
+  `8490105c6` (2026-11-24) alone at load 4.39 (5886 ms), red at load 5.22 (gbd2), green at 35.03
+  (gb1) (`GiveBack.md` §2). Cause (`GiveBack.md` §3): a pass that waits for reads was resumed by
+  the end of any read begun before its wait (`GiveBack::read_ended`, from `fc8a807e7`,
+  2026-11-23). The vendored engine frees retired pages only below the oldest open read, so while
+  one read stays open and is the oldest, no other read's end frees anything; yet each resumed pass
+  still made two or three durable commits and gave nothing back, about 100 passes a second, and a
+  post waits for a moment when no room has a save pending: in gbd3 one post waited 16,305 ms
+  behind 1,797 identical passes.
+- **The rule as built.** Reads begin one at a time under a small set of the open reads
+  (`OpenReads`, taken in `Store::begin_read` under the handle's read lock), so the order they
+  began in is the order of the store versions they see. A read's end resumes a waiting pass only
+  when it was the oldest open read of the current handle (`GiveBack::read_ended`,
+  `OpenReads::end`). The places that install a new store handle (`make_writable`, with its
+  read-only fallback, `rewrite_fresh_locked` and `finish_replacement`) mark where the current
+  handle's reads begin (`OpenReads::new_handle`), so a read of a replaced handle neither resumes a
+  pass nor holds back the current handle's reads (the review's P2, `GiveBack.md` §5). Everything
+  else of the pass is as before; no write path changes.
+- **What a person meets.** Before: on a node giving space back while one read stays open, one post
+  could wait 5 to 16 s with no message, and about 100 empty give-back passes ran a second, each
+  making two or three durable commits that gave nothing back. After: the quiet-node act's runs
+  made 77 to 79 passes (gbf1 to gbf3, gb5; 1,042 to 5,451 before), the separate resume act's runs
+  80 each (gbh1, gb6), and the longest post wait was 0.4 to 2.3 s (gbf1 to gbf3, gb5). Named, not
+  fixed: a deferred command
+  still waits for no room to have a save pending, so "A post can still wait about a second for a
+  quiet moment in saving" (`pr-body.md`, "Named, not fixed").
+- **Proof.** Green alone three times in a row on the first form (gbf1, gbf2, gbf3: 1124, 417 and
+  504 ms longest), and once on the final form (gb5, 2318 ms);
+  `a_read_begun_as_a_pass_waits_for_reads_resumes_it` green on both forms (gbh1, gb6); the
+  full-disk act, whose recovery rebuilds the store through `rewrite_fresh_locked`, green (gb7). On
+  the integrated tree, pass 7c (`43a3ab3cc`) reported the retention file's 23 harness successes:
+  twelve tests executed, both give-back acts among them, and eleven notices of optional proofs not
+  run, because the gate's file runs are built without `optional-proofs`
+  (`release/gate-sweep/pass7c/logs/retention_proof.log`). No mutant arm is recorded for the rule.
+  Rests on review: a read of an old handle held across its rebuild while the fresh handle's oldest
+  read ends under a waiting pass, which no act stages (`GiveBack.md` §5; the review: "checked
+  structurally, not by a run").
+- **Reviews** (`GiveBack-review-1.md`, RevStore, source review only). At `abdbaf7b8`: one P2,
+  "Scope oldest-reader gating to the active database handle"; "Within one handle, redb's
+  oldest-transaction reclamation floor supports the optimization; serialized read creation
+  preserves that order. Durability operations are unchanged." Fix-only at `d3335cb6c`:
+  **ACCEPT**, "P2 closed; no introduced defect found. All four installation outcomes are covered,
+  including `make_writable`'s read-only fallback."
+- **Built**, in pull request #1424 (merge commit `516c08746`): `abdbaf7b8` and `d3335cb6c`
+  (`scratch/giveback`), merged into the integration branch at `43a3ab3cc`. The builder reports both
+  workspace checks clean (`GiveBack.md` §§4, 5).
+- **Landed**: merge commit `516c08746` of #1424 on main.
 
 ## Order
 

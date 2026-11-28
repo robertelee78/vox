@@ -578,6 +578,12 @@ lessons. It changes neither this record's decision status nor any requirement or
   the post is neither published nor refused, and once the policy applies it is published under it
   and read once. Its claim, nothing published under stale authority, is kept; the journey is green
   and the stage's arm `VOX_MUTANT_FX28=stale-post-authority` red (ADR-055 (f)).)*
+  *(Amended 2026-11-28 by ADR-055 amendment 2 (f): "a computer whose trust was withdrawn while it
+  was on the older version reads nothing" is narrowed to nothing written after the withdrawal; a
+  post sealed under the generation it was handed while trusted may be shown to it once it updates
+  (ADR-055 FO-5; `exec/found-reds.md` entry 158). The act no longer asserts the wider claim, a
+  removal the owner accepted on 2026-11-28 (`proof_changes_2 = accept`), with that consequence
+  (`withdrawn_reads_earlier = accept`); merged in pull request #1424, merge commit `516c08746`.)*
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

@@ -7,6 +7,10 @@ leaving and ending a room (RL-8, with the lifecycle tags `0x0019`–`0x001B`, AD
 where a requirement says otherwise. Not built: a room created with a retention (RL-2.1), the
 `vox status` line for a room with no always-on member (RL-4.9), and pruning a key-package once its
 recipient acknowledges it (RL-4.7).
+*(Amended 2026-11-28, amendment 1, merged with the fixes of the sixth proof sweep in pull request
+#1424, merge commit `516c08746` on main: two faults of the author's checkpoint walk, present since
+v0.4.6 and v0.4.5, against RL-3.2 and RL-3.3 (`exec/found-reds.md` entry 157); in the section
+"Amendment 1". Each amended place is marked.)*
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, ordering, retention, sender-keys, anchors
@@ -142,9 +146,16 @@ below remain unchanged.
 
   The check MUST run on every tick, not only after a prune, so that a backlog already expired when
   the room opens is checkpointed.
+  *(Amended 2026-11-28, amendment 1: since `e8bf4f9b7` (v0.4.6) the author's walk did not know
+  its own last version-2 checkpoint, so "since its last checkpoint" counted from the start of its
+  feed and a quiet node wrote the same checkpoint again on every turn; the walk now counts its own
+  earlier checkpoints.)*
 - **RL-3.3. The position it names.** The highest one below which every content entry of the author
   has had its body pruned on that node. Governance entries and earlier checkpoints keep their bodies
   and MUST NOT hold it back.
+  *(Amended 2026-11-28, amendment 1: since `1ec8b15b1` (v0.4.5) a retained Session support record,
+  which keeps its body as a governance entry does, held the walk back, so nothing after it was
+  checkpointed; the walk now passes retained records.)*
 - **RL-3.4. Shedding.** A node MUST shed the signature of an entry only when the entry is at or
   below its author's checkpoint, its body is pruned there, and the node's effective retention is not
   forever. It MUST do so when the checkpoint arrives, or when it prunes such an entry afterwards. The
@@ -592,6 +603,9 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    the same entries in the same order; a forged entry below the checkpoint is refused; a closing
    checkpoint follows a quiet room; an expired backlog is checkpointed without another prune.
    `crates/vox-tui/tests/checkpoint_proof.rs`.
+   *(Amended 2026-11-28, amendment 1: the act
+   `a_quiet_room_with_a_one_second_retention_stops_writing_checkpoints` is added for the two faults
+   of Amendment 1, with two arms, `own-uncounted` and `unwritten`.)*
 
 The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 `crates/vox-tui/tests/room_of_three_keys_proof.rs`, `cross_process_join_proof.rs`,
@@ -616,6 +630,8 @@ The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
   commit `18048bf56`).)*
 - **M23.5** Delete the anchor log (decision 6). Built.
 - **M23.6** Checkpoints (decision 3). Built.
+  *(Amended 2026-11-28, amendment 1: built with two faults, the second present since v0.4.5 and
+  the first since v0.4.6; both fixed by Amendment 1.)*
 
 ## Consequences
 
@@ -626,6 +642,138 @@ The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 - Two members who are never online together require an always-on member.
 - The skeleton carries `seen` and `claimed_ms`, and checkpoints add an entry kind.
 - Late arrivals can appear above rows already read.
+
+## Amendment 1 (2026-11-28): the author's checkpoint walk counts its own checkpoints and passes retained records
+
+*(Added 2026-11-28, amendment 1.)* Merged in pull request #1424 (branch `fix/sweep6`, one squashed
+commit `08ec7b2aa` on main `695db44c4`), merge commit `516c08746a16fd9da141672c100a8e31f52e08fa`
+on main, whose tree is that of `scratch/sweep6-land` at `8761dd46f`. This section was checked
+for fidelity against the code and the records (`design/forward-only/adr-sweep6-check-1.md`) and
+is filed as its own documentation pull request. Sources, in `/opt/vox-evidence/v0431/`:
+`exec/found-reds.md` entry 157; `release/regress6/IdleCheckpoint.md` (with "Act repair" and "Act
+repair 2"), its review `IdleCheckpoint-review-1.md` (all three rounds) and the pull-request text
+`pr-body.md`; `release/owed/Trace145d.md` (round 3, where the fault was first seen);
+`simple-sync/review/STATE.md` (passes 7 and 7c). Code is cited by file and function at main
+`516c08746`, under `crates/vox-core/src/` unless another root is given. Run labels are
+directories under `simple-sync/pull/runs/`. Nothing was built or run for this record.
+
+**What RL-3.2 and RL-3.3 require.** The author posts a checkpoint once 32 more of its entries
+have expired on its node since its last checkpoint, or, with fewer, once nothing new has expired
+for 10 minutes (a closing checkpoint); it names the highest position below which every content
+entry of the author has had its body pruned, and "Governance entries and earlier checkpoints keep
+their bodies and MUST NOT hold it back". ADR-036's amendment of decision 3 (at its head) leaves a
+version-2 checkpoint no authority to shed or refuse.
+
+**What the code did.**
+
+1. **Since v0.4.6, a quiet node rewrote its checkpoint for ever** (found-reds 157;
+   `IdleCheckpoint.md`, "Fault 1"). Since `e8bf4f9b7` (2026-10-15, first released in v0.4.6) a
+   version-2 checkpoint is recorded as authority nowhere: `Dag::accept` (`log/dag.rs`) records a
+   checkpoint only for version-1 entries, and so does the sealed restart state, as ADR-036
+   requires. But the author's walk (`PendingCheckpoint::save`, `node/channel/pending_retention.rs`)
+   started after the checkpoint its DAG holds for itself, which for version 2 is always none, so
+   every turn found the same expired positions and, once idle or once 32 had expired, wrote the
+   same checkpoint again. A restart reset only the idle clock. Seen first in run klo/i1
+   (`Trace145d.md`, round 3): ten minutes after its last post, a node with a 1 s retention
+   appended one entry a second to its own feed for the 37 minutes to the run's end (size 9 to
+   2239), and each other member committed every one (2237 lines in alice's log). Each copy is a
+   signed entry that never expires (a 39-byte body plus its header) and that every other member
+   fetches, verifies and keeps. Reproduced in ic3 (the same checkpoint written once a second).
+2. **Since v0.4.5, a Session support record held the walk back** (`IdleCheckpoint.md`, "Fault
+   2"). Since `1ec8b15b1` (2026-10-12, first released in v0.4.5) authors' feeds carry Session
+   support records. `classify_payload` calls such a record content, and the walk ended at the first
+   content entry that still had its body; a retained record never expires (`retained_control`,
+   `node/channel.rs`). So nothing after it was ever checkpointed: for a room's creator always (its
+   record is at position 3, ic1 and ic2), and for a joiner whenever its record landed before its
+   posts (ic4, ic7). This broke RL-3.3, a retained record keeping its body for the same reason as a
+   governance entry. It cost no storage and nothing for a late joiner, since a version-2
+   checkpoint sheds no signature and refuses nothing; and, by the builder's reading, it hid fault
+   1 for members whose walk stopped at their own support record first.
+
+**What it does now** (`PendingCheckpoint::save`). The walk keeps the expired positions it meets;
+an earlier checkpoint of this author that it meets drops those at or below the position it names;
+the count and the named position come from what is left. The walk stops at a content entry with a
+body unless it is a retained record (a Session support, floor or step-policy record). No timer and
+no authority is added; the durable and in-memory DAG are unchanged. Only positions an earlier
+checkpoint of the same author already names are dropped, and any position expired above it is
+counted and named by the same 32-entry and idle rule (`IdleCheckpoint.md`, "Fix"). The reviewer:
+"Earlier own checkpoints remove only covered positions; newly expired positions above their named
+boundary remain eligible under the existing batch/idle rule"; "Skipping retained controls preserves
+the stop at ordinary content still held. Retained bodies stay retained; v2 signatures and
+checkpoint authority remain unchanged" (`IdleCheckpoint-review-1.md`).
+
+**What a person meets.** Checkpoint preparation runs only in a room whose message retention or
+Session-step retention is finite (`prepare_pending_checkpoint`, `node/channel/pending_retention.rs`);
+a node's own shorter retention does not enable it. The default two-day Session-step retention
+(`governance/step_policy.rs`) enables it unless both of the room's lifetimes are set to forever.
+Before the fix, in such a room, a node whose walk was not held back wrote a checkpoint on every
+retention turn once some of its own entries had expired and nothing new had expired for 10
+minutes, or on every turn once 32 had expired: seen at one a second, and at one per idle interval
+when the room reopened after each write (ic5, ic6, ic8, with the test knob's 3 s; the cause of the
+reopening was not traced). Every member kept each copy. After it, a node writes one checkpoint
+per batch of 32 expired entries or per quiet period after new expiries, then stops (ic11, ic12:
+the feed grew by one or two, then stayed still). The builder expects many members to write
+version-2 checkpoints for the first time once they run this release, because their retained
+Session support record stopped the walk before ("In practice fault 2 hid it for most members",
+`IdleCheckpoint.md`, "Fault 1"; `pr-body.md`: "most members write these entries for the first
+time"): new signed entries in their own feeds, which every member fetches and keeps. How many
+members that is was not measured; the runs show particular orders of a creator's and a joiner's
+entries, not how common they are. The pull-request text calls fault 1 present "in every release
+since v0.4.6; about once a second in the worst case; every member kept each copy".
+
+**Proof.** The act `a_quiet_room_with_a_one_second_retention_stops_writing_checkpoints`
+(`crates/vox-tui/tests/checkpoint_proof.rs`, two daemons, about a minute; it needs `--features
+test-knobs` for `VOX_TEST_CHECKPOINT_IDLE_SECS` and for the daemon line below), in its final form
+(`IdleCheckpoint.md`, "Act repair 2"): alice sets the room's retention to 1 s; bob posts once and
+waits until his read no longer shows it; then 20 reads a second apart, each taking his
+`own_feed_through` from `vox status --json` and counting his daemon's own line for this room,
+`test-knobs: checkpoint written in room <room id>: it closes this node's own feed through position
+<seq>`, said in `PendingCheckpoint::save` only after the checkpoint's append succeeded. It is red,
+PRODUCT, when no such line comes ("no closing checkpoint was written"); when the lines are not
+exactly one, or the feed changed within the last 12 reads ("kept growing"); or when the final feed
+is not above the feed at the last read before the line ("the checkpoint is not in his feed").
+Counting from the line, a Session support record or a key re-send landing at any point cannot
+pass for the checkpoint. Its arms, chosen by the run setting `VOX_MUTANT_CHECKPOINT`, which the act
+passes to its daemons as `VOX_TEST_CHECKPOINT_MUTANT` (test-knobs reads in
+`node/channel/pending_retention.rs`, false without the feature): `own-uncounted`
+(`own_checkpoint_uncounted`: the walk does not count its own earlier checkpoint, fault 1 put back)
+and `unwritten` (`checkpoint_unwritten`: a checkpoint the walk owes is not written).
+
+Runs: before the fix, red (ic3, on the first form of the act: "bob's own feed grew by 18 over 20
+reads a second apart"). The final act: green ck4 ("bob's daemon said its checkpoint by read 4
+(feed before: 5)", still to the end); `own-uncounted` red ck5 on its own assertion, "kept growing:
+bob's daemon said 16 checkpoint(s) written …", with its engaged line "test-knobs:
+own-checkpoint-uncounted mutant engaged: this node's own checkpoint naming 4 closes nothing";
+`unwritten` red ck6 on its own assertion, "no closing checkpoint was written: bob's daemon never
+said it wrote one …", with its engaged line "test-knobs: checkpoint-unwritten mutant engaged: the
+checkpoint owed at 4 is not written" (`runs/ck{4,5,6}/q.log`). On the integrated tree the
+checkpoint file was green in pass 7 (on `e396fd1ee`, which carries the final act) and 2 of 2 in pass
+7c (`43a3ab3cc`) (`simple-sync/review/STATE.md`). That fault 2's fix is needed is shown only in
+part: without it, a support record before bob's post meant no checkpoint at all (ic4, ic7); with
+it the closing checkpoint came although bob's post was not the first entry after his join (ic8,
+ic12), and the entry kinds were not printed in ic12 (`IdleCheckpoint.md`, "Fault 2"); no arm
+removes that fix alone. No CI workflow or script names `checkpoint_proof` (`IdleCheckpoint.md`,
+"Proof stage"). The act reads a test-knobs line of the daemon, the kind of proof the owner on
+2026-11-28 asked to be looked at again as the first work after the release (`proof_purge =
+after_release`, `exec/deviations.md`).
+
+**Reviews** (`IdleCheckpoint-review-1.md`, source review only). At `aea4c4c14`: **REJECT**, one
+P2 in the act, "no product defect found in the two checkpoint-walk hunks", quoted above, and of
+the act: "If checkpoint emission regresses to emitting nothing, that support record alone makes
+`grown != 0` … the act passes without any closing checkpoint." Fix-only round 1, at `8b2470b44`
+(the act's first repair, a staged baseline counted by feed size, with the two arms): **REJECT**,
+"The stated gap permits a **false pass with broken checkpoint emission**": two join entries and a
+key re-send could meet the baseline while the support record was still pending. Fix-only round 2,
+at `883d1e5a6` (the daemon's line): **ACCEPT**, "P2 closed. Late support or key re-sends cannot
+substitute for the required checkpoint line; `unwritten` cannot produce it."
+
+**Built**, in pull request #1424 (merge commit `516c08746`, tree of `8761dd46f`): the walk as
+`aea4c4c14`, the act as `8b2470b44` and `883d1e5a6` (`scratch/ledger-145`), merged into the
+integration branch at `eb9654c6d`, `12c7da06a` and `e396fd1ee`. The builder reports both
+workspace checks clean and `rustfmt --check` clean (`IdleCheckpoint.md`, "Act repair 2"); lint is
+clean on `8761dd46f`, as the pull-request text reports.
+
+**Landed**: merge commit `516c08746` of #1424 on main.
 
 ## Related ADRs
 
