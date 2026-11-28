@@ -102,6 +102,12 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
         Ok(())
     }
 
+    /// Vox: the I/O failure that has just set this backend's failure latch, after which every
+    /// write is refused with only [`StorageError::PreviousIo`]. Called by the latch, at its
+    /// transition only: not for a best-effort write's failure (which does not latch), nor for a
+    /// read failing on an already latched backend. A backend may keep it as the latch's cause.
+    fn latched(&self, _error: &io::Error) {}
+
     /// Attempts to acquire an exclusive byte-range lock.
     ///
     /// Returns `Ok(true)` on acquisition, `Ok(false)` on a conflicting lock, or an error.

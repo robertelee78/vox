@@ -35,6 +35,41 @@ fn lengthening_unfenced() -> bool {
     false
 }
 
+/// The `test-knobs` switch of the checkpoint walk's mutants (`checkpoint_proof`'s quiet-room act).
+#[cfg(feature = "test-knobs")]
+const CHECKPOINT_MUTANT: &str = "VOX_TEST_CHECKPOINT_MUTANT";
+
+/// `test-knobs` mutant (`VOX_TEST_CHECKPOINT_MUTANT=own-uncounted`): the walk does not count this
+/// node's own earlier checkpoint, ledger 145's fault, so an idle node writes the same one again on
+/// every turn. Never selectable in a build without the feature.
+#[cfg_attr(not(feature = "test-knobs"), allow(unused_variables))]
+fn own_checkpoint_uncounted(named: u64) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var(CHECKPOINT_MUTANT).as_deref() == Ok("own-uncounted") {
+        eprintln!(
+            "test-knobs: own-checkpoint-uncounted mutant engaged: this node's own checkpoint \
+             naming {named} closes nothing"
+        );
+        return true;
+    }
+    false
+}
+
+/// `test-knobs` mutant (`VOX_TEST_CHECKPOINT_MUTANT=unwritten`): a checkpoint the walk owes is
+/// not written. Never selectable in a build without the feature.
+#[cfg_attr(not(feature = "test-knobs"), allow(unused_variables))]
+fn checkpoint_unwritten(seq: u64) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var(CHECKPOINT_MUTANT).as_deref() == Ok("unwritten") {
+        eprintln!(
+            "test-knobs: checkpoint-unwritten mutant engaged: the checkpoint owed at {seq} is \
+             not written"
+        );
+        return true;
+    }
+    false
+}
+
 /// `test-knobs` hold: while the file `VOX_TEST_HOLD_RETENTION_REMOVAL_FILE` names exists, no
 /// cleanup removes anything, messages or private Session items. Its turns still complete, so the
 /// room opens and answers as usual, and the room's Session work does not wait for a removal
@@ -1163,39 +1198,52 @@ impl PendingCheckpoint {
         let selected = self.sek.with(|sek| {
             let index = entry_store::EntryIndex::default();
             let entries = index.read(store, sek, &self.room)?;
-            let mut below = None;
-            let mut expired = 0usize;
+            // The expired positions since the last checkpoint this node holds as authority. A v2
+            // checkpoint is none (ADR-036; `Dag::accept`, `restart::advance` take only v1), so
+            // the author's own earlier checkpoints, met on the way, close what they name here.
+            let mut expired: Vec<(u64, Digest32)> = Vec::new();
             for seq in self.already.saturating_add(1)..=self.head {
                 let Some(entry) = entries.get(&self.me, seq)? else {
                     break;
                 };
-                match entry.payload.as_deref() {
-                    None => {
-                        below = Some((seq, entry.entry_hash()));
-                        expired += 1;
+                let Some(payload) = entry.payload.as_deref() else {
+                    expired.push((seq, entry.entry_hash()));
+                    continue;
+                };
+                match classify_payload(payload) {
+                    // A message still held ends the expired prefix. A retained record (a Session
+                    // support, floor or step policy) is never expired, like a governance entry,
+                    // and does not hold the checkpoint back (ADR-023 RL-3.3).
+                    Ok(EntryKind::Content) if !retained_control(payload) => break,
+                    Ok(EntryKind::Checkpoint) => {
+                        let named = crate::log::checkpoint::Checkpoint::from_payload(payload);
+                        if let Ok(Some(cp)) = named {
+                            if !own_checkpoint_uncounted(cp.seq) {
+                                expired.retain(|(at, _)| *at > cp.seq);
+                            }
+                        }
                     }
-                    Some(payload)
-                        if matches!(classify_payload(payload), Ok(EntryKind::Content)) =>
-                    {
-                        break
-                    }
-                    Some(_) => {}
+                    _ => {}
                 }
             }
-            let Some((seq, entry_hash)) = below else {
+            let Some(&(seq, entry_hash)) = expired.last() else {
                 return Ok(None);
             };
             let idle = self.now.get().saturating_sub(self.last_pruned_at)
                 >= self.idle_seconds.saturating_mul(1_000);
-            if seq <= self.already || (expired < CHECKPOINT_EVERY && !idle) {
+            if seq <= self.already || (expired.len() < CHECKPOINT_EVERY && !idle) {
                 return Ok(None);
             }
-            Ok(Some(
+            if checkpoint_unwritten(seq) {
+                return Ok(None);
+            }
+            Ok(Some((
+                seq,
                 crate::log::checkpoint::Checkpoint { seq, entry_hash }.to_wire(),
-            ))
+            )))
         });
         let result = match selected {
-            Ok(Some(payload)) => self
+            Ok(Some((seq, payload))) => self
                 .append
                 .append_control_owned(
                     store,
@@ -1205,7 +1253,18 @@ impl PendingCheckpoint {
                     crate::log::history::SignedEntryKind::Checkpoint,
                     self.now,
                 )
-                .map(|hash| pending_text::Saved::Governance(Some(hash))),
+                .map(|hash| {
+                    // Said for a proof (`test-knobs` only): this node wrote a checkpoint.
+                    #[cfg(feature = "test-knobs")]
+                    eprintln!(
+                        "test-knobs: checkpoint written in room {}: it closes this node's own \
+                         feed through position {seq}",
+                        crate::node::link::b32_encode(&self.room)
+                    );
+                    #[cfg(not(feature = "test-knobs"))]
+                    let _ = seq;
+                    pending_text::Saved::Governance(Some(hash))
+                }),
             Ok(None) => Ok(pending_text::Saved::Governance(None)),
             Err(error) => Err(error),
         };

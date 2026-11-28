@@ -1383,10 +1383,20 @@ impl Flow {
                         drop(room);
                         return Ok(());
                     }
+                    // The package body this root refills is owed no more (its debt was met or
+                    // retired, or the package expired here). Its header is admitted already, so
+                    // nothing waits for it and nothing is fetched for it: the root leaves the
+                    // frontier, and the posts its held control position blocked run again.
+                    if matches!(result.need, Some(LocalNeed::KeyBodyRetired)) {
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.settle_root(None, None, None);
+                        return Ok(());
+                    }
                     let wire = match &result.need {
                         Some(LocalNeed::Wire(Query::Proof { .. })) => None,
                         Some(LocalNeed::Wire(query)) => Some(Some(query.clone())),
-                        Some(LocalNeed::StagedBody | LocalNeed::KeyBodyRetired) => Some(None),
+                        Some(LocalNeed::StagedBody) => Some(None),
                         _ => None,
                     };
                     if let Some(query) = wire {

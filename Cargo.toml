@@ -231,5 +231,7 @@ quinn-udp = { path = "vendor/quinn-udp" }
 # live-snapshot recovery onto a fresh inode (ADR-038 S8).
 # Upstream redb-4.3.0.crate SHA-256:
 # fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22
-# Source is byte-identical except CheckedBackend::read's closed-only precheck.
+# Source differs from it only in hunks marked "Vox:", among them CheckedBackend::read's
+# closed-only precheck and the failure latch handing its cause to the backend
+# (StorageBackend::latched), so a refused write names the failure that latched.
 redb = { path = "vendor/redb" }

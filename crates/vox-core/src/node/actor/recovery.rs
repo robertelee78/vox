@@ -201,6 +201,34 @@ impl Node {
         Outcome::Failed(fault)
     }
 
+    /// A room whose store recovered may have left its peers' loops parked: while the store
+    /// failed, this node refused or ended their exchanges for the room, and a refusal parks a
+    /// connection until the peer's news (ADR-054 PL-23), which a recovery is not: this node's Have
+    /// is what it was. A new connection is news. So each live connection to a peer that shares
+    /// the room is closed and dialled again, as a peer a network change stranded is. A closed
+    /// connection is no longer held, so rooms recovering together replace it once.
+    pub(super) async fn replace_connections_after_recovery(&mut self, id: Digest32) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let peers: Vec<Digest32> = self.connected.iter().copied().collect();
+        let mut replaced = Vec::new();
+        for peer in peers {
+            if net.manager().existing(&peer).is_none() || !self.shares_room(&id, &peer).await {
+                continue;
+            }
+            if net
+                .manager()
+                .close_peer(&peer, crate::wire::WireError::Superseded)
+            {
+                replaced.push(peer);
+            }
+        }
+        if !replaced.is_empty() {
+            self.dial_stranded(&replaced).await;
+        }
+    }
+
     pub(super) fn storage_health(&self, report: &mut crate::node::status::StatusReport) {
         report.recovered = self
             .store_recovered

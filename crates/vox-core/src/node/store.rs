@@ -120,8 +120,10 @@ pub struct StoreSpace {
 }
 
 /// A store's give-back passes (RG-13). Every read of the store shares it: a pass that finds
-/// pages it retired still seen by reads records which reads those are, and the end of one of
-/// them resumes it. No timer and no fixed number of commits.
+/// pages it retired still seen by reads records which reads those are, and the end of the
+/// oldest open one of them resumes it. A commit frees retired pages only up to the oldest open
+/// read, so no other read's end frees a page: a pass it resumed would only commit again. No
+/// timer and no fixed number of commits.
 #[derive(Default)]
 struct GiveBack {
     now: Mutex<GiveBackNow>,
@@ -131,6 +133,8 @@ struct GiveBack {
     /// One pass at a time; a pass asked for meanwhile sets `again` and the running one repeats.
     pass: Mutex<()>,
     again: AtomicBool,
+    /// The reads open now, each by the order it began in.
+    open: Mutex<OpenReads>,
     /// Set by the first pass, which always starts from the shared store on the daemon's
     /// runtime: a read may end on any thread, and the pass it resumes runs on that runtime.
     store: std::sync::OnceLock<(std::sync::Weak<Store>, tokio::runtime::Handle)>,
@@ -142,7 +146,7 @@ struct GiveBackNow {
     passes: u32,
     /// The `waits` count of the wait reads may end, while a pass waits for them.
     waiting: Option<u64>,
-    /// A read begun after that count ended while the pass waited.
+    /// The oldest open read, begun after that count, ended while the pass waited.
     missed: bool,
     /// What the store held when it last measured, under its writer.
     held: Option<u64>,
@@ -151,6 +155,10 @@ struct GiveBackNow {
 impl GiveBack {
     fn now(&self) -> MutexGuard<'_, GiveBackNow> {
         self.now.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn open(&self) -> MutexGuard<'_, OpenReads> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wait for the reads begun until now. Set before the pass's last trim, so a read that ends
@@ -192,8 +200,12 @@ impl GiveBack {
         }
     }
 
-    /// A read begun under `began` ended: when a pass waits for it, resume the pass.
-    fn read_ended(&self, began: u64) {
+    /// The read begun under `began`, `order`th, ended: when it was the oldest open read of the
+    /// handle open now and a pass waits for it, resume the pass.
+    fn read_ended(&self, began: u64, order: u64) {
+        if !self.open().end(order) {
+            return;
+        }
         let resume = {
             let mut now = self.now();
             match now.waiting {
@@ -227,15 +239,51 @@ impl GiveBack {
     }
 }
 
+/// The reads of a store open now. They begin one at a time under this, so the order they began
+/// in is the order of the store versions they see. A read of a handle the store has since
+/// replaced (`rewrite_fresh_locked`, `make_writable`, `finish_replacement`) sees another file,
+/// whose pages no pass gives back: it neither resumes a pass nor holds back the reads of the
+/// handle open now, the first of which is the oldest.
+#[derive(Default)]
+struct OpenReads {
+    next: u64,
+    /// The order of the first read of the handle open now.
+    since: u64,
+    open: std::collections::BTreeSet<u64>,
+}
+
+impl OpenReads {
+    fn begin(&mut self) -> u64 {
+        let order = self.next;
+        self.next += 1;
+        self.open.insert(order);
+        order
+    }
+
+    /// Whether the read that ended was the oldest open read of the handle open now.
+    fn end(&mut self, order: u64) -> bool {
+        let oldest = self.open.range(self.since..).next() == Some(&order);
+        self.open.remove(&order);
+        oldest
+    }
+
+    /// The store installed another handle, under its handle lock: reads begun from now on are
+    /// its reads.
+    fn new_handle(&mut self) {
+        self.since = self.next;
+    }
+}
+
 /// The end of one read of a store; see [`GiveBack`].
 struct ReadEnd {
     give_back: Arc<GiveBack>,
     began: u64,
+    order: u64,
 }
 
 impl Drop for ReadEnd {
     fn drop(&mut self) {
-        self.give_back.read_ended(self.began);
+        self.give_back.read_ended(self.began, self.order);
     }
 }
 
@@ -247,9 +295,19 @@ pub(crate) fn full_flushes() -> u64 {
     FULL_FLUSHES.load(Ordering::Relaxed)
 }
 
-/// Preserve redb's native file and locking behavior, observing only successful sync_data calls.
+/// Preserve redb's native file and locking behavior, observing only successful sync_data calls,
+/// and the failure that latched the file (`IoFault`).
 #[derive(Debug)]
-struct FlushObservedBackend(redb::backends::FileBackend);
+struct FlushObservedBackend(redb::backends::FileBackend, IoFault);
+
+/// The I/O failure that latched a database handle, as the OS said it. redb latches a handle on a
+/// failed write, resize, sync, length or read, and refuses every later write on it with only
+/// "Previous I/O error", so whichever writer comes next would otherwise name the latch and not its
+/// cause: a full disk is said as a full disk by every refused write, whichever write met it
+/// (`Cached::write_refused`). redb's latch hands its cause over itself, at its transition
+/// (`StorageBackend::latched`, a Vox hunk in `vendor/redb`): not a best-effort write's failure,
+/// which does not latch, nor a read failing after the latch.
+type IoFault = Arc<std::sync::OnceLock<String>>;
 
 impl StorageBackend for FlushObservedBackend {
     fn len(&self) -> std::io::Result<u64> {
@@ -276,6 +334,10 @@ impl StorageBackend for FlushObservedBackend {
 
     fn close(&self) -> std::io::Result<()> {
         self.0.close()
+    }
+
+    fn latched(&self, error: &std::io::Error) {
+        let _ = self.1.set(error.to_string());
     }
 
     fn try_lock_range(
@@ -400,6 +462,8 @@ struct Cached<T> {
     profile: Option<Arc<ProfileOwner>>,
     /// A read's end, after `inner` has ended it: it may resume a waiting give-back pass.
     read_end: Option<ReadEnd>,
+    /// A writable handle's latching I/O failure (`IoFault`); none for anything else.
+    fault: Option<IoFault>,
 }
 
 impl<T> std::ops::Deref for Cached<T> {
@@ -425,6 +489,7 @@ impl Cached<Arc<Database>> {
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
             read_end: None,
+            fault: None,
         })
     }
 
@@ -437,7 +502,28 @@ impl Cached<Arc<Database>> {
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
             read_end: None,
+            fault: None,
         })
+    }
+
+    /// [`storage`] for a write this handle refused: one refused because an I/O failure latched
+    /// the handle names that failure (a full disk stays a full disk, whichever write met it),
+    /// not only the latch.
+    fn write_refused(&self, op: &'static str) -> impl FnOnce(redb::TransactionError) -> Error + '_ {
+        move |error| {
+            let cause = match &error {
+                redb::TransactionError::Storage(redb::StorageError::PreviousIo) => {
+                    self.fault.as_ref().and_then(|fault| fault.get().cloned())
+                }
+                _ => None,
+            };
+            match cause {
+                Some(cause) => storage(op)(format!(
+                    "{cause} (an earlier I/O failed; no write is taken until the store recovers)"
+                )),
+                None => storage(op)(error),
+            }
+        }
     }
 }
 
@@ -451,6 +537,7 @@ impl Cached<ReadOnlyDatabase> {
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
             read_end: None,
+            fault: None,
         })
     }
 }
@@ -462,7 +549,7 @@ impl Cached<redb::WriteTransaction> {
             database,
             cache,
             profile,
-            read_end: _,
+            ..
         } = self;
         let result = inner.commit();
         drop(database);
@@ -496,13 +583,15 @@ fn open_database(path: &Path) -> std::result::Result<Cached<Arc<Database>>, redb
         .create(true)
         .truncate(false)
         .open(path)?;
-    let backend = FlushObservedBackend(redb::backends::FileBackend::new(file)?);
+    let fault = IoFault::default();
+    let backend = FlushObservedBackend(redb::backends::FileBackend::new(file)?, Arc::clone(&fault));
     Ok(Cached {
         inner: Arc::new(builder.create_with_backend(backend)?),
         database: None,
         cache,
         profile: None,
         read_end: None,
+        fault: Some(fault),
     })
 }
 
@@ -516,6 +605,7 @@ fn open_read_only_database(
         cache,
         profile: None,
         read_end: None,
+        fault: None,
     })
 }
 
@@ -1001,6 +1091,7 @@ impl Store {
         // The read-only handle is released first: redb refuses a writable open of a file this
         // process still holds open.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
+        self.give_back.open().new_handle();
         match open_database(&self.path) {
             Ok(db) => {
                 super::paths::set_private_file_mode(&self.path)?;
@@ -1133,6 +1224,7 @@ impl Store {
         epochs.replacement_generation = replacement_generation;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         *backing = Backing::Writable(self.keep_profile(fresh));
+        self.give_back.open().new_handle();
         drop(backing);
         self.finish_replacement(epochs)?;
         Ok(())
@@ -1152,6 +1244,7 @@ impl Store {
                 *backing = Backing::Writable(self.keep_profile(
                     open_database(&self.path).map_err(|error| open_error(&self.path, error))?,
                 ));
+                self.give_back.open().new_handle();
                 super::paths::set_private_file_mode(&self.path)?;
             }
             if !matches!(*backing, Backing::Writable(_)) {
@@ -1199,17 +1292,20 @@ impl Store {
     }
 
     /// Begin a read transaction on whichever handle is open. Its end may resume a give-back
-    /// pass that waits for it: the count is taken before the read begins.
+    /// pass that waits for it: the count is taken before the read begins, and the read begins
+    /// in its order among the open reads ([`OpenReads`]).
     fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
         let began = self.give_back.waits.load(Ordering::SeqCst);
-        let mut txn = self
-            .db
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .begin_read()?;
+        let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        let mut open = self.give_back.open();
+        let mut txn = db.begin_read()?;
+        let order = open.begin();
+        drop(open);
+        drop(db);
         txn.read_end = Some(ReadEnd {
             give_back: Arc::clone(&self.give_back),
             began,
+            order,
         });
         Ok(txn)
     }
@@ -1233,9 +1329,10 @@ impl Store {
     fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
         let epochs = self.writer()?;
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => {
-                Ok((epochs, db.begin_write().map_err(storage("begin write"))?))
-            }
+            Backing::Writable(db) => Ok((
+                epochs,
+                db.begin_write().map_err(db.write_refused("begin write"))?,
+            )),
             Backing::ReadOnly(_) | Backing::Closed => Err(Error::Storage {
                 op: "begin write",
                 detail: "the store is read-only until the identity is unlocked".into(),
@@ -1645,7 +1742,9 @@ impl Store {
     pub(crate) fn received_batch(&self, flow: &ReceivedFlow) -> Result<Batch<'_>> {
         let epochs = self.writer()?;
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.begin_write().map_err(storage("begin received write"))?,
+            Backing::Writable(db) => db
+                .begin_write()
+                .map_err(db.write_refused("begin received write"))?,
             Backing::ReadOnly(_) | Backing::Closed => {
                 return Err(Error::Storage {
                     op: "begin received write",
@@ -1682,7 +1781,7 @@ impl Store {
             return Ok(());
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
+            Backing::Writable(db) => db.begin_write().map_err(db.write_refused("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => return Ok(()),
         };
         self.commit_flushed(txn, &mut epochs, "flush")
@@ -1809,7 +1908,7 @@ impl Store {
             return Ok(false);
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
+            Backing::Writable(db) => db.begin_write().map_err(db.write_refused("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => {
                 return Err(Error::Storage {
                     op: "begin received flush",
@@ -1852,12 +1951,12 @@ impl Store {
     }
 
     /// Give space back while the store is shared (RG-13): after a prune (retention, or a private
-    /// drive's expiry), once after Ready, and when a read ends that a pass waits for. While the
-    /// file exceeds 1.25 times what it holds by 64 MiB, a pass trims the end of the file, moves
-    /// the highest pages into the lowest free ones, and trims again. Each step is one durable
-    /// commit under the writer: writers wait for one step at a time, reads never wait. The pass
-    /// is counted at once, so `vox status` says so before it starts. Best effort: a failure is
-    /// logged and the node goes on.
+    /// drive's expiry), once after Ready, and when the oldest open read a pass waits for ends.
+    /// While the file exceeds 1.25 times what it holds by 64 MiB, a pass trims the end of the
+    /// file, moves the highest pages into the lowest free ones, and trims again. Each step is one
+    /// durable commit under the writer: writers wait for one step at a time, reads never wait.
+    /// The pass is counted at once, so `vox status` says so before it starts. Best effort: a
+    /// failure is logged and the node goes on.
     pub(crate) fn give_back_space(self: &Arc<Self>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -1945,8 +2044,8 @@ impl Store {
     /// invariant: after the last event that frees space, once no read still sees a page a
     /// commit retired, the file is within 1.25 times what it holds plus 64 MiB without any
     /// further trigger. A pass ends within that bound; or waiting for the reads that still see
-    /// pages it retired, the end of each of which resumes it ([`GiveBack`]); or when a move found
-    /// nothing lower free for the highest pages.
+    /// pages it retired, the end of the oldest of which resumes it ([`GiveBack`]); or when a
+    /// move found nothing lower free for the highest pages.
     fn give_back_rounds(&self, notice: impl FnOnce(u64, u64)) -> Result<Option<GaveBack>> {
         let began = std::time::Instant::now();
         let mut steps = 0_u32;
@@ -1964,9 +2063,9 @@ impl Store {
             let started = std::time::Instant::now();
             if let Some(relocate) = work {
                 let mut txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-                    Backing::Writable(db) => {
-                        db.begin_write().map_err(storage("begin give back"))?
-                    }
+                    Backing::Writable(db) => db
+                        .begin_write()
+                        .map_err(db.write_refused("begin give back"))?,
                     Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
                 };
                 if relocate {
@@ -1981,7 +2080,9 @@ impl Store {
                 steps += 1;
             }
             let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-                Backing::Writable(db) => db.begin_write().map_err(storage("measure store"))?,
+                Backing::Writable(db) => db
+                    .begin_write()
+                    .map_err(db.write_refused("measure store"))?,
                 Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
             };
             let space = txn.space().map_err(storage("measure store"))?;

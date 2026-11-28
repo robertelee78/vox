@@ -5578,6 +5578,45 @@ fn revoked_admin_stale_board_does_not_block_live_rejoin() {
         joined.ok,
         "PRODUCT: revoked admin's stale board blocked a live rejoin: {joined:?}"
     );
+    // Staging (ADR-055, #1418): the creator reads the returner forward from the point its own
+    // node learns her return, so it posts only once its node holds her feed through her
+    // statement that she is back; a post before that is, for the creator, written before the
+    // return, and is not hers to read.
+    let back = {
+        let status = room.workers[2].vox(None, &["status", "--json"]);
+        serde_json::from_str::<serde_json::Value>(&status.stdout)
+            .ok()
+            .and_then(|s| {
+                s["rooms"]
+                    .as_array()?
+                    .iter()
+                    .find(|r| r["id"] == id.as_str())?["own_feed_through"]
+                    .as_u64()
+            })
+            .unwrap_or_else(|| {
+                panic!("APPARATUS: the returner's own feed after her return: {status:?}")
+            })
+    };
+    let returner = room.workers[2].b32();
+    let (learnt, seen) = poll(&room.workers[0], &["status", "--json"], WITHIN, |o| {
+        o.ok && serde_json::from_str::<serde_json::Value>(&o.stdout)
+            .ok()
+            .and_then(|s| {
+                s["rooms"]
+                    .as_array()?
+                    .iter()
+                    .find(|r| r["id"] == id.as_str())?["members"]
+                    .as_array()?
+                    .iter()
+                    .find(|m| m["id"] == returner.as_str())?["verified_through"]
+                    .as_u64()
+            })
+            .is_some_and(|held| held >= back)
+    });
+    assert!(
+        learnt,
+        "APPARATUS: the live creator's node did not hold the returner's return (her feed through {back}): {seen:?}"
+    );
     let text = "live creator after stale revoked board";
     setup(&room.workers[0], &["room", "post", &id, text]);
     support::until(

@@ -576,6 +576,8 @@ pub(super) fn settled_in(batch: &Batch<'_>, sek: &Sek, room: &Digest32) -> Resul
         && header.head_generation == header.authority_generation)
 }
 
+// Held on the stack for one read; boxing the owned snapshot would add an allocation to every read.
+#[allow(clippy::large_enum_variant)]
 enum ReadSnapshot<'a> {
     Owned(Snapshot),
     Borrowed(&'a Snapshot),

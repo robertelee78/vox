@@ -458,9 +458,6 @@ impl ChannelState {
             }
             _ => None,
         };
-        #[cfg(feature = "test-knobs")]
-        let refill_outcome = matches!(&work, Work::Refill { settled: true, .. })
-            && effect.is_some_and(|(_, _, _, kind, _)| kind == SignedEntryKind::Content);
         if committed {
             self.entries.committed();
             let projection_result =
@@ -544,18 +541,6 @@ impl ChannelState {
             if committed || poisoned {
                 self.record_fx29_content_outcome(&hash, result.is_ok())?;
             }
-        }
-        #[cfg(feature = "test-knobs")]
-        if refill_outcome
-            && result.as_ref().is_ok_and(|progress| {
-                matches!(
-                    progress,
-                    HistoryEffectProgress::Complete { .. }
-                        | HistoryEffectProgress::AdmittedProgress { .. }
-                )
-            })
-        {
-            self.record_fx29_refill_outcome(&cursor.hash)?;
         }
         result.map(|progress| (cursor, progress))
     }
@@ -704,10 +689,30 @@ impl PendingReceived {
                 }
                 if is_refill && kind == SignedEntryKind::KeyPackage {
                     projection.track_known_with(&mut batch, sek, entry, log)?;
-                    if key_body.is_some()
-                        && projection.expired(&batch, sek, entry, entry.skeleton.claimed_ms)?
-                    {
-                        return Ok(HistoryEffectProgress::KeyBodyRetired);
+                    if let Some(need) = key_body {
+                        if projection.expired(&batch, sek, entry, entry.skeleton.claimed_ms)? {
+                            // The package expired here before its body was held: its debt is
+                            // retired now, as the retention sweep's KeyDebt step would, and
+                            // committed alone, so the same body is not owed and asked again.
+                            drop(batch);
+                            let mut batch = store.batch()?;
+                            batch.derived();
+                            let mut index = self.index.write(&mut batch, sek, &self.room)?;
+                            index.finish_history_obligation(&entry_store::sparse::Obligation {
+                                head: need.head,
+                                kind: entry_store::sparse::ObligationKind::KeyBody,
+                                object: need.hash,
+                                author: need.author,
+                                from: need.seq,
+                                through: need.seq,
+                            })?;
+                            index.seal()?;
+                            batch.commit()?;
+                            self.index.committed();
+                            committed = true;
+                            committed_ledger.store(true, Ordering::Release);
+                            return Ok(HistoryEffectProgress::KeyBodyRetired);
+                        }
                     }
                 }
                 poisoned = true;
@@ -835,12 +840,6 @@ impl PendingReceived {
                                 .get_sparse_published(&hash)?
                                 .ok_or(Error::MalformedAtRest("tracked entry missing"))?;
                             projection.track_current_with(&mut batch, sek, &tracked, log)?;
-                        } else if is_refill
-                            && mutant.as_deref() == Ok("refill-content-with-current-time")
-                            && std::env::var("VOX_TEST_FX29_CONTENT_REFILL_HASH").as_deref()
-                                == Ok(crate::node::link::b32_encode(&hash).as_str())
-                        {
-                            projection.track_current_with(&mut batch, sek, entry, log)?;
                         } else {
                             projection.track_known_with(&mut batch, sek, entry, log)?;
                         }

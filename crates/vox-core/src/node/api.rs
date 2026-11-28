@@ -741,6 +741,9 @@ pub struct ChannelDetail {
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
+    /// The other members whose latest consent to this identity here is a signed withdrawal, in
+    /// fingerprint order ([`ChannelState::withdrawn_from_me`](crate::node::channel::ChannelState::withdrawn_from_me)).
+    pub withdrawn: Vec<Digest32>,
     /// The other members a post of which is held here and not shown because the render gate
     /// holds it back, each with the current fact that does (`status::NOT_SHOWN_NO_GRANT`,
     /// `status::NOT_SHOWN_NO_KEY`), in fingerprint order.

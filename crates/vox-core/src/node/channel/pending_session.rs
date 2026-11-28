@@ -228,6 +228,12 @@ impl ChannelState {
             if self.is_member_removed(store, &package.recipient)? {
                 return Err(Error::StreamRefused("key recipient is removed"));
             }
+            // A recipient that has left is refused here too, before the room's write is
+            // reserved, as [`Self::package_return`] refuses it below (R2): a refusal after the
+            // reservation would fail the room's save and close the room for its recovery.
+            if self.key_departed(&package.recipient) {
+                return Err(Error::StreamRefused("key recipient has left the room"));
+            }
         }
         let refresh_wait = if delivered || package {
             None

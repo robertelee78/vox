@@ -1894,12 +1894,15 @@ async fn reply_entry(
     } else {
         None
     };
-    let found: Vec<String> = match client
-        .request(&Request::EntryPrefix {
+    let found: Vec<String> = match history_waiting(
+        client,
+        cid,
+        &Request::EntryPrefix {
             channel_id: cid,
             prefix,
-        })
-        .await?
+        },
+    )
+    .await?
     {
         Frame::Order { entries, .. } => entries.iter().map(|(hash, _)| b32_encode(hash)).collect(),
         Frame::Error { reason } => return Err(AppError::Usage(reason)),
@@ -2095,25 +2098,18 @@ pub struct Tagged {
     pub from: Option<String>,
 }
 
-/// One `RoomPage`, waiting while the room refreshes its saved history (just after a retention
-/// change, one projection turn). A "not yet" is asked again by whoever was told it (ADR-052
-/// RG-4): at the client's cadence, saying once what it waits for, and giving the refusal
-/// unchanged at the client's start patience, as a command does for a preparing room.
-async fn room_page_waiting(
+/// One request of a room's saved history, waiting while the room refreshes it (just after a
+/// retention change or a join, one projection turn). A "not yet" is asked again by whoever was
+/// told it (ADR-052 RG-4): at the client's cadence, saying once what it waits for, and giving
+/// the refusal unchanged at the client's start patience, as a command does for a preparing room.
+async fn history_waiting(
     client: &mut IpcClient,
     channel_id: Digest32,
-    before: Option<Digest32>,
-    limit: u64,
-) -> Result<Frame, AppError> {
+    request: &Request,
+) -> Result<Frame, vox_core::error::Error> {
     let mut waiting_since: Option<std::time::Instant> = None;
     loop {
-        let frame = client
-            .request(&Request::RoomPage {
-                channel_id,
-                before,
-                limit,
-            })
-            .await?;
+        let frame = client.request(request).await?;
         let refreshing = matches!(&frame, Frame::Error { reason }
             if reason.contains(vox_core::node::api::HISTORY_REFRESHING));
         if !refreshing
@@ -2157,7 +2153,12 @@ async fn rows_of(
 ) -> Result<Option<Vec<vox_core::node::api::MessageRow>>, AppError> {
     if tagged.tags.is_empty() {
         let Some(since) = since else {
-            return match room_page_waiting(client, channel_id, before, limit as u64).await? {
+            let page = Request::RoomPage {
+                channel_id,
+                before,
+                limit: limit as u64,
+            };
+            return match history_waiting(client, channel_id, &page).await? {
                 vox_core::node::ipc::Frame::RoomPage {
                     rows,
                     older,
@@ -2785,13 +2786,16 @@ pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut after = None;
     let mut revision = None;
     loop {
-        match client
-            .request(&Request::Order {
+        match history_waiting(
+            &mut client,
+            channel_id,
+            &Request::Order {
                 channel_id,
                 after,
                 revision,
-            })
-            .await
+            },
+        )
+        .await
         {
             Ok(Frame::Order {
                 entries,
@@ -3292,17 +3296,20 @@ impl TailOperation {
         let mut found = false;
         let mut comma = false;
         loop {
-            let (rows, next, current, conflict) = match lookup
-                .request(&Request::OperationPage {
+            let (rows, next, current, conflict) = match history_waiting(
+                lookup,
+                room,
+                &Request::OperationPage {
                     channel_id: room,
                     author: row.author,
                     op: result.op.clone(),
                     through,
                     after,
                     revision,
-                })
-                .await
-                .map_err(|e| AppError::Usage(e.to_string()))?
+                },
+            )
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
             {
                 Frame::OperationPage {
                     rows,

@@ -67,6 +67,8 @@
 mod hostile;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "../../vox-core/tests/support/raw_sync.rs"]
+mod raw_sync;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -1014,8 +1016,28 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
     // ---- 5. a key that cannot go says why, once --------------------------------------------
     // Staged as spy itself may: its own withdraw, stamped now, on carol's board takes its bundle
     // off, and spy stays a member of the room. spy is connected to carol (the attacker's
-    // connection), so carol's key to it fails for want of a bundle to open a session from.
+    // connection) and makes on it the room's version-3 history exchange, as a member's node does
+    // on every connection and without which carol writes no room key on it (ADR-055 FO-10 item
+    // 2); so carol's key to it fails for want of a bundle to open a session from.
     let (_s3, spy_carol) = rt.block_on(connect(&spy, carol_addr, carol_id));
+    let open_by = Instant::now() + Duration::from_secs(60);
+    let epoch = loop {
+        let status = vox_in(&carol_dir, &["status", "--json"], "").1;
+        if let Some((_, epoch)) = raw_sync::room_and_epoch(&status, &b32_encode(&room)) {
+            break epoch;
+        }
+        assert!(
+            Instant::now() < open_by,
+            "PRODUCT (staging): carol did not hold the room open within 60 s: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(
+        rt.block_on(raw_sync::exchange_history(&spy_carol, &room, epoch)),
+        Ok(0),
+        "APPARATUS (staging not achieved): carol did not complete spy's version-3 history \
+         exchange (DONE status 0 = complete)"
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("APPARATUS (harness error): the clock")

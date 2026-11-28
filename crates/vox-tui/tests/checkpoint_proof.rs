@@ -30,6 +30,8 @@ mod watchdog;
 
 #[path = "support/attach.rs"]
 mod attach;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "support/typed.rs"]
 mod typed;
 
@@ -131,9 +133,26 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
 /// The **test-only** override of how long a room must be quiet before a backlog under a
 /// checkpoint batch is closed anyway (production: ten minutes).
 const IDLE_ENV: &str = "VOX_TEST_CHECKPOINT_IDLE_SECS";
+/// The **test-only** switch of the checkpoint walk's mutant arms (`own-uncounted`, `unwritten`),
+/// set on every daemon here from the run's [`CHECKPOINT_MUTANT_RUN`].
+const CHECKPOINT_MUTANT: &str = "VOX_TEST_CHECKPOINT_MUTANT";
+/// The run setting that selects a checkpoint mutant arm: `VOX_MUTANT_CHECKPOINT=own-uncounted`.
+const CHECKPOINT_MUTANT_RUN: &str = "VOX_MUTANT_CHECKPOINT";
 
-/// Start `vox daemon` on `dir` at `listen`.
+/// Start `vox daemon` on `dir` at `listen`; `idle` sets the test-only [`IDLE_ENV`], else it is
+/// removed and the node waits the production ten minutes. A run's [`CHECKPOINT_MUTANT_RUN`] is
+/// passed on as [`CHECKPOINT_MUTANT`].
 fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str) -> Daemon {
+    daemon_idle(dir, tag, listen, stdin_lines, None)
+}
+
+fn daemon_idle(
+    dir: &Path,
+    tag: &str,
+    listen: &str,
+    stdin_lines: &str,
+    idle: Option<u64>,
+) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
     let mut cmd = Command::new(VOX);
@@ -146,6 +165,12 @@ fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str) -> Daemon {
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
+    if let Some(arm) = std::env::var_os(CHECKPOINT_MUTANT_RUN) {
+        cmd.env(CHECKPOINT_MUTANT, arm);
+    }
+    if let Some(idle) = idle {
+        cmd.env(IDLE_ENV, idle.to_string());
+    }
     let mut child = cmd.spawn().expect("spawn vox daemon");
     let mut pipe = child.stdin.take().expect("daemon stdin");
     pipe.write_all(stdin_lines.as_bytes()).unwrap();
@@ -392,5 +417,188 @@ fn a_disappearing_room_reopens_and_a_newcomer_syncs_it() {
         std::thread::sleep(Duration::from_millis(500));
     }
     println!("bob reads alice's next message: {next:?}");
+    stop_all(vec![alice_d, bob_d]);
+}
+
+/// How long, in the test-only knob's seconds, a quiet room waits before closing its expired
+/// backlog with a checkpoint (production: ten minutes).
+const QUIET_IDLE_SECS: u64 = 3;
+/// Answered `vox status --json` reads, a second apart, over which a quiet room is watched once its
+/// last message has expired: several idle intervals.
+const QUIET_READS: usize = 20;
+/// The last reads over which the quiet room's feed must not change: three idle intervals and
+/// their retention turns.
+const QUIET_STILL: usize = 12;
+/// What a `test-knobs` daemon says each time it writes a checkpoint, followed by the room's id
+/// (`pending_retention.rs`, `PendingCheckpoint::save`).
+const CHECKPOINT_SAID: &str = "test-knobs: checkpoint written in room ";
+
+/// This node's own feed position in `room` as `vox status --json` shows it (`own_feed_through`).
+fn own_feed_through(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["own_feed_through"]
+        .as_u64()
+}
+
+/// **A quiet room with the shortest retention a person can set stops writing.** Alice keeps a
+/// room for one second (`vox room retention <room> 1`); Bob joins, posts once and the room goes
+/// quiet. Once his message has expired, his node closes that backlog with one idle checkpoint
+/// (ADR-023 decision 3), and then writes nothing more. Over [`QUIET_READS`] reads a second apart
+/// after the expiry: his daemon says exactly once that it wrote a checkpoint for this room
+/// ([`CHECKPOINT_SAID`]), the feed `vox status --json` shows for him is past where it stood at
+/// the last read before that line, and it stays still for the last [`QUIET_STILL`] reads, several
+/// idle intervals.
+///
+/// Nothing a person can run names an entry's kind (`vox room read --hashes` prints hash and
+/// clock; `vox status --json` counts the feed), and a joiner's own writes besides his post (his
+/// Session support record, a key package re-sent to a member whose prekey was used) land at no
+/// fixed point, so a count from a baseline cannot tell them from a checkpoint. The checkpoint is
+/// identified by the node's own words instead: a `test-knobs`-only line said where the checkpoint
+/// is written, after it is appended, naming the room and the position it closes through. The
+/// feed count is taken relative to that line, so whatever else lands before it does not matter.
+///
+/// Before the fix his node never counted its own earlier checkpoint and wrote the same one again
+/// on every idle turn, without end (ledger 145 klo/i1: one a second for 37 minutes). The idle
+/// interval is shortened by the test-only knob `VOX_TEST_CHECKPOINT_IDLE_SECS` (production: ten
+/// minutes).
+///
+/// Mutant arms (run setting `VOX_MUTANT_CHECKPOINT`, passed to the daemons as
+/// `VOX_TEST_CHECKPOINT_MUTANT`; test-knobs builds only), each red on its own assertion:
+/// `own-uncounted` puts that fault back (the walk does not count the node's own earlier
+/// checkpoint) — "kept growing"; `unwritten` skips the checkpoint write — "no closing checkpoint
+/// was written".
+#[test]
+#[ignore = "two real vox daemons and real seconds (about a minute); run it in release"]
+fn a_quiet_room_with_a_one_second_retention_stops_writing_checkpoints() {
+    watchdog::arm();
+    test_knobs::require(&[IDLE_ENV]);
+    if std::env::var_os(CHECKPOINT_MUTANT_RUN).is_some() {
+        test_knobs::require(&[CHECKPOINT_MUTANT]);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = members(tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&dirs[0], &dirs[1]);
+    let alice_d = daemon(alice, "alice", "127.0.0.1:0", &format!("{IDENTITY}\n"));
+    attached(alice, "alice");
+    let (ok, _, err) = vox(
+        alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "quiet",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "vox room create: {err}");
+    let room = attached(alice, "alice")
+        .split_whitespace()
+        .next()
+        .expect("a room id")
+        .to_owned();
+    let (ok, out, err) = vox(alice, &["room", "retention", &room, "1"], None);
+    assert!(
+        ok,
+        "PRODUCT: `vox room retention {room} 1` was refused: {out}{err}"
+    );
+    let bob_d = daemon_idle(
+        bob,
+        "bob",
+        "127.0.0.1:0",
+        &format!("{IDENTITY}\n"),
+        Some(QUIET_IDLE_SECS),
+    );
+    attached(bob, "bob");
+    let (ok, link, err) = vox(alice, &["room", "link", &room], None);
+    assert!(ok, "vox room link: {err}");
+    let (ok, _, err) = vox(
+        bob,
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "vox room join: {err}");
+    let said = || {
+        std::fs::read_to_string(bob.join("daemon-bob.err"))
+            .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
+    };
+    let checkpoint_line = format!("{CHECKPOINT_SAID}{room}");
+    let checkpoints_said = || {
+        said()
+            .lines()
+            .filter(|l| l.contains(&checkpoint_line))
+            .count()
+    };
+    post(bob, &room, "quiet 1");
+    let after_post = own_feed_through(bob, &room)
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` named no own feed for {room}"));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while texts(&read(bob, &room)).contains(&"quiet 1") {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a message kept for one second still shows after two minutes"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Each answered read, a second apart: the feed size, the read it last changed at, and the
+    // feed as it stood at the last read after which the daemon had not yet said a checkpoint.
+    let mut shown = Vec::new();
+    let mut changed_at = 0;
+    let mut unsaid_feed = after_post;
+    let mut said_at = None;
+    for read_no in 1..=QUIET_READS {
+        std::thread::sleep(Duration::from_secs(1));
+        let now = own_feed_through(bob, &room)
+            .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` named no own feed for {room}"));
+        if shown.last().copied().unwrap_or(after_post) != now {
+            println!("bob's own feed in the quiet room: {now} (after his post: {after_post})");
+            shown.push(now);
+            changed_at = read_no;
+        }
+        let lines = checkpoints_said();
+        if lines == 0 {
+            unsaid_feed = now;
+        } else if said_at.is_none() {
+            println!(
+                "bob's daemon said its checkpoint by read {read_no} (feed before: {unsaid_feed})"
+            );
+            said_at = Some(read_no);
+        }
+    }
+    let end = shown.last().copied().unwrap_or(after_post);
+    let still = QUIET_READS - changed_at;
+    let lines = checkpoints_said();
+    assert!(
+        lines != 0,
+        "PRODUCT: no closing checkpoint was written: bob's daemon never said it wrote one for \
+         {room} over {QUIET_READS} reads a second apart after his only message expired (his own \
+         feed: {after_post} after his post, then {shown:?}); a quiet room closes its expired \
+         backlog with one checkpoint once idle for {QUIET_IDLE_SECS} s\nbob's daemon said: {}",
+        said()
+    );
+    assert!(
+        lines == 1 && still >= QUIET_STILL,
+        "PRODUCT: a quiet room kept for one second kept growing: bob's daemon said {lines} \
+         checkpoint(s) written for {room}, and his own feed went from {after_post} through \
+         {shown:?} over {QUIET_READS} reads a second apart after his only message expired, the \
+         last change {still} read(s) before the end; the one closing checkpoint is all that is \
+         due, so it must be said once and the feed then stay still for {QUIET_STILL} reads, \
+         several idle intervals\nbob's daemon said: {}",
+        said()
+    );
+    assert!(
+        end > unsaid_feed,
+        "PRODUCT: bob's daemon said it wrote a checkpoint for {room} (by read {said_at:?}), but \
+         his own feed is at {end}, where it stood before that line ({unsaid_feed}): the \
+         checkpoint is not in his feed\nbob's daemon said: {}",
+        said()
+    );
     stop_all(vec![alice_d, bob_d]);
 }

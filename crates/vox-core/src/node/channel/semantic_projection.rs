@@ -247,6 +247,9 @@ pub(crate) struct SemanticProjection {
     normal_advances: u64,
     drive_advances: u64,
     receivers_dirty: bool,
+    /// This pass's batch carries the whole receiver map (`queue_receivers_with`): once it
+    /// commits, no advanced ratchet is ahead of its durable copy.
+    receivers_queued: bool,
     normal_bytes: Zeroizing<Vec<u8>>,
     drive_bytes: Zeroizing<Vec<u8>>,
     normal_stamp: receiver_overlay::Stamp,
@@ -288,6 +291,7 @@ impl SemanticProjection {
             normal_advances: 0,
             drive_advances: 0,
             receivers_dirty: channel.chains_advanced,
+            receivers_queued: false,
             normal_bytes: Zeroizing::new(Vec::new()),
             drive_bytes: Zeroizing::new(Vec::new()),
             normal_stamp: channel.receiver_persistence.normal(),
@@ -825,7 +829,8 @@ impl SemanticProjection {
         index.seal()
     }
 
-    pub(crate) fn queue_receivers_with(&self, batch: &mut Batch<'_>, sek: &Sek) -> Result<()> {
+    pub(crate) fn queue_receivers_with(&mut self, batch: &mut Batch<'_>, sek: &Sek) -> Result<()> {
+        self.receivers_queued = true;
         let normal = seal_segment(
             sek,
             SegmentKind::KeyMaterial,
@@ -965,7 +970,11 @@ impl SemanticProjection {
         }
         channel.next_log_id = self.next_log_id;
         channel.install_legacy_projection_context(&self.legacy);
-        channel.chains_advanced |= self.normal_advances != 0 || self.drive_advances != 0;
+        // Only ratchets this pass did not write are ahead of disk. The live receive path writes
+        // them with its entry; marking that pass held the key prune until an unrelated backfill
+        // committed, and with none to come, for good.
+        channel.chains_advanced |=
+            !self.receivers_queued && (self.normal_advances != 0 || self.drive_advances != 0);
         for author in self.unheld {
             if channel.drive.told_unheld.insert(author) {
                 channel

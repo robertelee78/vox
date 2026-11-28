@@ -11,8 +11,10 @@
 //! **Staging.** Every node is the real `vox` binary, set up as a person sets it up: an anchor, a
 //! victim `vox daemon` that creates a room, and mallory, who joins it with `vox room join`.
 //! Mallory's daemon is then stopped, and **her identity**, from the profile the binary wrote,
-//! connects to the victim through a test-side wire client, which answers every key the victim
-//! sends her by taking it (`KEY_TAKEN`) — what her own node does with a key it opens. No `vox`
+//! connects to the victim through a test-side wire client, which makes on each connection the
+//! version-3 history exchange a member's node makes, without which the victim writes no room key
+//! on it (ADR-055 FO-10 item 2), and answers every key the victim sends her by taking it
+//! (`KEY_TAKEN`) — what her own node does with a key it opens. No `vox`
 //! command can count the keys a node is sent, which is why a wire client plays the member. The
 //! victim trusts mallory (`vox trust add`); its consent writes her the room's first key, and she
 //! takes it. The victim's daemon is then stopped and started again, as after a reboot (it reopens
@@ -87,7 +89,9 @@ fn lock(seen: &Mutex<Seen>) -> std::sync::MutexGuard<'_, Seen> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Take each pairwise key (`KEY_TAKEN`). Records what arrived, timed from `t0`.
+/// Take each pairwise key (`KEY_TAKEN`): a key in a session of its own (`RotationHello`, the one
+/// way a node sends a key directly, ADR-030 W-1, ADR-055 FO-7 item 4), and a bare `Skdm`, which
+/// no node sends any more, counted too. Records what arrived, timed from `t0`.
 fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mutex<Seen>> {
     let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::default()));
     let record = Arc::clone(&seen);
@@ -107,7 +111,7 @@ fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mute
                     read_frame_within(&mut recv, MAX_PAIRWISE_FRAME, Duration::from_secs(5)).await
                 {
                     match PairwiseFrame::from_frame(&f) {
-                        Ok(PairwiseFrame::Skdm { .. }) => {
+                        Ok(PairwiseFrame::Skdm { .. } | PairwiseFrame::RotationHello { .. }) => {
                             key = true;
                             break;
                         }
@@ -360,16 +364,31 @@ fn taken_first_key_after(halt: Halt) {
     let victim_addr: std::net::SocketAddr = victim_listen
         .parse()
         .expect("APPARATUS: the victim's listen address");
+    // Each connection makes the room's version-3 history exchange, at the epoch the victim
+    // reports once it holds the room open, as mallory's node does on every connection it makes.
     let connect = |rt: &Rt| {
+        let open_by = Instant::now() + SETUP;
+        let (room_id, epoch) = loop {
+            let status = vox_once(&victim_dir, &args(&["status", "--json"])).1;
+            if let Some(room) = raw_sync::room_and_epoch(&status, &prefix) {
+                break room;
+            }
+            assert!(
+                Instant::now() < open_by,
+                "PRODUCT (staging): the victim did not hold room {prefix} open within {SETUP:?}: \
+                 {status}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
         rt.block_on(async {
             let endpoint = raw_sync::endpoint_as_member(&mallory_paths, IDENTITY.as_bytes()).await;
             let deadline = Instant::now() + SETUP;
-            loop {
+            let conn = loop {
                 match endpoint
                     .connect(victim_addr, victim_id, raw_sync::now())
                     .await
                 {
-                    Ok(conn) => break (endpoint, Arc::new(conn)),
+                    Ok(conn) => break Arc::new(conn),
                     Err(e) if Instant::now() < deadline => {
                         let _ = e;
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -378,7 +397,14 @@ fn taken_first_key_after(halt: Halt) {
                         panic!("PRODUCT (staging): mallory's identity did not connect: {e:?}")
                     }
                 }
-            }
+            };
+            assert_eq!(
+                raw_sync::exchange_history(&conn, &room_id, epoch).await,
+                Ok(0),
+                "APPARATUS: the victim did not complete mallory's version-3 history exchange \
+                 (DONE status 0 = complete)"
+            );
+            (endpoint, conn)
         })
     };
 

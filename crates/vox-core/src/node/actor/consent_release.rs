@@ -719,14 +719,23 @@ impl Node {
                 .map_err(|error| fault_of(&error));
         }
         // A creator readmission or a return is a new forward boundary regardless of an old
-        // pending SKDM or trust mark.
+        // pending SKDM or trust mark: the live position, unless the live generation was minted
+        // after the return and the trust, and so is released whole (ADR-055; the invariant is
+        // at `live_generation_after_return`).
         let once_removed = !channel
             .validated_member_removals(profile.store(), &target, self.now_ms())
             .map_err(|error| fault_of(&error))?
             .is_empty();
         if once_removed || channel.key_returned(&target) {
-            return channel
-                .skdm_for_consent(profile, &target)
+            let whole = channel
+                .live_generation_after_return(profile.store(), &target, decision)
+                .map_err(|error| fault_of(&error))?;
+            let key = if whole {
+                channel.release_generation(profile, &target, channel.sender_generation(), 0)
+            } else {
+                channel.skdm_for_consent(profile, &target)
+            };
+            return key
                 .map(|key| (key, None, true))
                 .map_err(|error| fault_of(&error));
         }

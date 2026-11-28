@@ -601,16 +601,34 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // `vox service list` says it (a copied command reaching the service across members' own
     // names is a_service_is_reached_only_by_its_address_proof's).
     let (ssh_port, _ssh_heard) = ssh_banner_service();
-    let (ok, out, err) = vox_once(
-        &host_dir,
-        &[
-            "service".into(),
-            "add".into(),
-            room.clone(),
-            "nas-ssh".into(),
-            format!("127.0.0.1:{ssh_port}"),
-        ],
-    );
+    // Just after the guest's join and first reach the host may still be applying that change to
+    // the room; `vox service add` then refuses at once and says to try again once it is done
+    // (found-reds 17 and 25: that refusal ships in v0.4.31). A person tries again, so does this.
+    let asked = Instant::now();
+    let (ok, out, err) = loop {
+        let (ok, out, err) = vox_once(
+            &host_dir,
+            &[
+                "service".into(),
+                "add".into(),
+                room.clone(),
+                "nas-ssh".into(),
+                format!("127.0.0.1:{ssh_port}"),
+            ],
+        );
+        if ok
+            || !format!("{out}{err}")
+                .contains("a previous change to this room is still being applied")
+            || asked.elapsed() >= Duration::from_secs(90)
+        {
+            break (ok, out, err);
+        }
+        eprintln!(
+            "[test] the host's share of nas-ssh was refused as a change still being applied, {:?} after it was first asked; asked again",
+            asked.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
     assert!(ok, "PRODUCT (staging): the host shares nas-ssh: {out}{err}");
     let listing = |dir: &std::path::Path, what: &str, want: &dyn Fn(&str) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(90);

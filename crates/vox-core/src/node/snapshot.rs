@@ -55,6 +55,9 @@ pub struct OpenRoomSnap {
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, so a client can show who trusts this node (ADR-028 L-4).
     pub consenting: Vec<Digest32>,
+    /// The other members whose latest consent to this identity here is a signed withdrawal, in
+    /// fingerprint order: unlike a grant set aside at a member's key turn, its trust was taken back.
+    pub withdrawn: Vec<Digest32>,
     /// The members held back for equivocating: `(author, seq)`.
     pub equivocations: Vec<(Digest32, u64)>,
     /// Who has read this node's own recent messages here: `(entry, readers)`, oldest first
@@ -198,6 +201,7 @@ impl NodeSnapshot {
                     member_consent: d.member_consent.clone(),
                     governance_revision: d.governance_revision,
                     consenting: d.consenting.clone(),
+                    withdrawn: d.withdrawn.clone(),
                     equivocations: d.equivocations.clone(),
                     read_by: d.read_by.clone(),
                     held: d.held.clone(),
@@ -268,13 +272,14 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(17)
+            e.array(18)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
             digests(&mut e, &o.member_consent);
             e.uint(o.governance_revision);
             digests(&mut e, &o.consenting);
+            digests(&mut e, &o.withdrawn);
             e.array(o.equivocations.len());
             for (author, seq) in &o.equivocations {
                 e.array(2).bytes(author).uint(*seq);
@@ -392,7 +397,7 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 17 {
+            if fields != 18 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
@@ -402,6 +407,7 @@ impl NodeSnapshot {
             let member_consent = read_digests(&mut d)?;
             let governance_revision = d.uint().map_err(bad("ipc snapshot governance revision"))?;
             let consenting = read_digests(&mut d)?;
+            let withdrawn = read_digests(&mut d)?;
             let mut equivocations = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot equivocations"))? {
                 want(&mut d, 2, "ipc snapshot equivocation")?;
@@ -453,6 +459,7 @@ impl NodeSnapshot {
                 member_consent,
                 governance_revision,
                 consenting,
+                withdrawn,
                 equivocations,
                 read_by,
                 held,

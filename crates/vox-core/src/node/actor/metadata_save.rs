@@ -3864,6 +3864,7 @@ impl Node {
                         .unwrap_or("unknown"),
                     crate::node::link::b32_encode(&room)
                 );
+                self.replace_connections_after_recovery(room).await;
             } else {
                 let cause = match &outcome {
                     Outcome::Failed(fault) => fault.to_string(),

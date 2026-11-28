@@ -7295,9 +7295,15 @@ fn superseded_governance_resumes() {
 ///   "AFTER-UNTRUST"; carol reads it.
 /// - Bob and dave update: their daemons restart without the knob.
 /// - **PRODUCT:** bob reads "MIXED 1" and "AFTER-UNTRUST" and alice reads "OLD 1": what was owed
-///   while the room was mixed stayed owed and went once both spoke version 3. Dave, updated at the
-///   same moment, reads neither "MIXED 1" nor "AFTER-UNTRUST" once bob has read both: the key
-///   owed to him under alice's trust is not delivered after she withdrew it.
+///   while the room was mixed stayed owed and went once both spoke version 3.
+/// - **PRODUCT, dave:** while his computer runs the older Vox nothing is exchanged with it (he
+///   reads no "MIXED 1" in the mixed window above). Once he has updated and holds alice's feed
+///   through "AFTER-UNTRUST" (his `vox status --json` gives her `verified_through` at least her own
+///   feed position just after that post, and says a post of hers is held and not shown, or he shows
+///   it), he does not show "AFTER-UNTRUST": nothing she writes after withdrawing his trust is
+///   readable by him. What he shows of her earlier posts is printed, not asserted: "MIXED 1" is
+///   sealed under the generation he was given while trusted, before "READY", and ADR-055 FO-5 lets
+///   him read "earlier posts it can open with a key it kept".
 ///
 /// - **PRODUCT, what each person is told** (R10, R11): while the room is mixed, alice's
 ///   `vox status` says on bob's sync row, and bob's says on alice's, that the other computer runs
@@ -7503,6 +7509,25 @@ fn a_computer_on_an_older_vox_exchanges_nothing_until_it_updates() {
         "PRODUCT (staging): alice's `vox trust remove dave` failed: {out}{err}"
     );
     post(0, &room, "AFTER-UNTRUST");
+    // This room's row of `i`'s `vox status --json`.
+    let room_status = |i: usize| -> Option<serde_json::Value> {
+        let (_, out, _) = run(i, &["status", "--json"], "");
+        let status: serde_json::Value = serde_json::from_str(&out).ok()?;
+        status["rooms"]
+            .as_array()?
+            .iter()
+            .find(|r| {
+                r["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(room.as_str()) || room.starts_with(id))
+            })
+            .cloned()
+    };
+    // Alice's own feed position with AFTER-UNTRUST in it: dave holds that post once his record
+    // of her feed reaches it.
+    let after_untrust_at = room_status(0)
+        .and_then(|r| r["own_feed_through"].as_u64())
+        .expect("APPARATUS: alice's `vox status --json` names no own_feed_through for the room");
     assert!(
         wait_until(RETURN_WITHIN, || reads(2, &room, "AFTER-UNTRUST")),
         "PRODUCT: carol never read alice's AFTER-UNTRUST"
@@ -7517,10 +7542,38 @@ fn a_computer_on_an_older_vox_exchanges_nothing_until_it_updates() {
         reads(1, &room, "MIXED 1") && reads(1, &room, "AFTER-UNTRUST")
     });
     let alice_read = wait_until(RETURN_WITHIN, || reads(0, &room, "OLD 1"));
+    // Dave holds alice's feed through AFTER-UNTRUST, and either says a post of hers is held and
+    // not shown or shows AFTER-UNTRUST: his "unread" below is not a race with its arrival.
+    let mut dave_of_alice = None;
+    let dave_holds = wait_until(RETURN_WITHIN, || {
+        dave_of_alice = room_status(3).and_then(|r| {
+            r["members"]
+                .as_array()?
+                .iter()
+                .find(|m| {
+                    m["id"]
+                        .as_str()
+                        .is_some_and(|id| fps[0].starts_with(id) || id.starts_with(fps[0].as_str()))
+                })
+                .cloned()
+        });
+        dave_of_alice.as_ref().is_some_and(|m| {
+            m["verified_through"]
+                .as_u64()
+                .is_some_and(|through| through >= after_untrust_at)
+                && (!m["not_shown"].is_null() || reads(3, &room, "AFTER-UNTRUST"))
+        })
+    });
     let dave_shows = run(3, &["room", "read", &room], "").1;
     println!(
         "[proof] updated: bob read MIXED 1 and AFTER-UNTRUST: {bob_read}; alice read OLD 1: \
-         {alice_read}; dave shows {dave_shows:?}"
+         {alice_read}; dave holds alice's feed through AFTER-UNTRUST (position \
+         {after_untrust_at}): {dave_holds}; his status of her: {dave_of_alice:?}"
+    );
+    println!(
+        "[proof] updated: dave shows {dave_shows:?} (her earlier posts he may read with the key he \
+         kept, FO-5: MIXED 1 shown: {})",
+        dave_shows.contains("MIXED 1")
     );
     assert!(
         bob_read,
@@ -7533,10 +7586,16 @@ fn a_computer_on_an_older_vox_exchanges_nothing_until_it_updates() {
         "PRODUCT: alice never read bob's OLD 1 in {RETURN_WITHIN:?} after he updated"
     );
     assert!(
-        !dave_shows.contains("MIXED 1") && !dave_shows.contains("AFTER-UNTRUST"),
-        "PRODUCT: dave, whose trust alice withdrew while he ran an older Vox, read a post of hers \
-         from that time once he updated (a key owed under withdrawn trust was delivered): \
-         {dave_shows:?}"
+        dave_holds,
+        "CANNOT MEASURE: dave, updated, never held alice's feed through AFTER-UNTRUST (her \
+         position {after_untrust_at}) with a post of hers said held and not shown, in \
+         {RETURN_WITHIN:?}; his status of her: {dave_of_alice:?}"
+    );
+    assert!(
+        !dave_shows.contains("AFTER-UNTRUST"),
+        "PRODUCT: dave, whose trust alice withdrew while he ran an older Vox, read her \
+         AFTER-UNTRUST, written after the withdrawal, once he updated (a key minted after the \
+         withdrawal reached him): {dave_shows:?}"
     );
     let after = sync_row(0, 1);
     println!("[proof] updated: alice's `vox status` says of bob: {after:?}");

@@ -511,7 +511,8 @@ fn render(v: &Value) -> Result<String, AppError> {
             if flag("key_delivery_pending") {
                 let _ = writeln!(
                     o,
-                    "      is still owed one or more of your sender keys here"
+                    "      has not yet confirmed one or more of your sender keys here; a key it \
+                     takes from the room counts once it confirms over a direct connection"
                 );
             }
         }

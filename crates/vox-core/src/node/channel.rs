@@ -5062,6 +5062,20 @@ impl ChannelState {
         self.with_consent_facts(|facts| facts.can_read(target, &me))
     }
 
+    /// The other authors whose latest consent to this identity is a signed withdrawal. A grant
+    /// set aside by its author's reset (a key turn's statement that it is back) is not one: it
+    /// stays a grant on the log until the author issues it again.
+    pub fn withdrawn_from_me(&self) -> Result<Vec<Digest32>> {
+        let me = self.me();
+        self.with_consent_facts(|facts| {
+            self.authors
+                .keys()
+                .filter(|author| **author != me && facts.withdrew(author, &me))
+                .copied()
+                .collect()
+        })
+    }
+
     /// Page through admitted members this identity currently consents to, from the same
     /// in-memory projection as [`Self::has_consented`]. Sender-key delivery uses this bounded
     /// page on its periodic retry; it must not reopen and decrypt the sealed governance index
@@ -5747,6 +5761,54 @@ impl ChannelState {
             return Ok(None);
         }
         Ok((!plan.is_empty()).then_some(plan))
+    }
+
+    /// Whether this identity's live generation is wholly after `target`'s current return
+    /// (ADR-055), so a release to it may start at the generation's origin. Invariant: a member
+    /// that came back is never given a position of a generation minted before its return cut
+    /// or its trust point; a generation minted after both is given whole.
+    ///
+    /// It is after the return when its chain id is above every cut this node took for
+    /// `target`: the sender position this node's own fold recorded on applying `target`'s
+    /// signed return Presence (`reconcile_return`) and each validated removal of it. These are
+    /// this node's durable facts; the target only states that it is back, and the cut is where
+    /// this node's sender stood when it learned that. A sender chain id here only grows within
+    /// a membership, and a fresh sender is a fresh key. It is after the trust point when its
+    /// mint stamp is after `decision` in the decision's own counter, as [`Self::history_plan`]
+    /// reads it. `false` whenever this node cannot tell: `target` shows no return here, no
+    /// cut is held for the return or a removal, there is no decision, or the live
+    /// generation's stamp is missing or another counter's. Then the release stays at the live
+    /// position.
+    pub(crate) fn live_generation_after_return(
+        &self,
+        store: &Store,
+        target: &Digest32,
+        decision: Option<Stamp>,
+    ) -> Result<bool> {
+        let Some(decision) = decision else {
+            return Ok(false);
+        };
+        if !self.key_returned(target) {
+            return Ok(false);
+        }
+        let me = self.me();
+        let view = self.checked_governance(store, self.now_hint)?;
+        let Some(back) = view.return_cut(target, &me)? else {
+            return Ok(false);
+        };
+        let mut cut = back.chain;
+        for hash in view.validated_member_removals(target)? {
+            let Some((chain, _)) = view.sender_cut(&hash, target, &me)? else {
+                return Ok(false);
+            };
+            cut = cut.max(chain);
+        }
+        let live = self.sender.chain_id();
+        Ok(live > cut
+            && self
+                .my_generations()
+                .into_iter()
+                .any(|(chain, mint)| chain == live && mint.is_some_and(|m| m.after(&decision))))
     }
 
     /// Release this identity's generation `chain_id` at `iteration` (V210-45). The live
@@ -6726,7 +6788,10 @@ impl ChannelState {
     }
 
     /// The members a drive key may be owed to: every member admitted here that has not left,
-    /// this node excepted. Empty until this node holds its own feed (V210-164).
+    /// this node excepted. A member admitted again whose return this node has not folded yet is
+    /// not one (its latest Presence is still its departure, R2): it is owed nothing until the
+    /// fold, whose drive rotation then releases it the new generation whole and seals the
+    /// Session records again in it. Empty until this node holds its own feed (V210-164).
     #[must_use]
     pub fn drive_members(&self) -> BTreeSet<Digest32> {
         if self.poisoned.get() || !self.settled {
@@ -6736,7 +6801,7 @@ impl ChannelState {
         self.authors
             .keys()
             .copied()
-            .filter(|a| *a != me && !self.has_left(a))
+            .filter(|a| *a != me && !self.has_left(a) && !self.key_departed(a))
             .collect()
     }
 

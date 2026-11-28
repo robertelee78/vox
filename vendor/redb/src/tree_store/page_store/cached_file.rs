@@ -207,6 +207,24 @@ impl CheckedBackend {
         }
     }
 
+    // Vox: set the failure latch for `error`. At the transition only (the latch not yet set),
+    // the error goes first to the backend (`StorageBackend::latched`), so every later
+    // `PreviousIo` can be named by its cause; a read failing on a backend already latched is not
+    // passed on. Two first failures racing may both be passed on; the backend keeps one. The
+    // latch is set by a guard's drop, so it is set even if the backend's hook panics.
+    fn latch(&self, error: &crate::io::Error) {
+        struct Fence<'a>(&'a AtomicBool);
+        impl Drop for Fence<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _fence = Fence(&self.io_failed);
+        if !self.io_failed.load(Ordering::Acquire) {
+            self.file.latched(error);
+        }
+    }
+
     fn close(&self) -> Result {
         self.closed.store(true, Ordering::Release);
         self.io_failed.store(true, Ordering::Release);
@@ -218,8 +236,8 @@ impl CheckedBackend {
     fn len(&self) -> Result<u64> {
         self.check_failure()?;
         let result = self.file.len();
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.latch(error);
         }
         result.map_err(StorageError::from)
     }
@@ -233,8 +251,8 @@ impl CheckedBackend {
             return Err(StorageError::DatabaseClosed);
         }
         let result = self.file.read(offset, out);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.latch(error);
         }
         result.map_err(StorageError::from)
     }
@@ -242,8 +260,8 @@ impl CheckedBackend {
     fn set_len(&self, len: u64) -> Result<()> {
         self.check_failure()?;
         let result = self.file.set_len(len);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.latch(error);
         }
         result.map_err(StorageError::from)
     }
@@ -251,8 +269,8 @@ impl CheckedBackend {
     fn sync_data(&self) -> Result<()> {
         self.check_failure()?;
         let result = self.file.sync_data();
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.latch(error);
         }
         result.map_err(StorageError::from)
     }
@@ -260,8 +278,8 @@ impl CheckedBackend {
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
         let result = self.file.write(offset, data);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.latch(error);
         }
         result.map_err(StorageError::from)
     }
