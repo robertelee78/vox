@@ -3073,9 +3073,19 @@ pub(crate) fn standing(
         return Ok(None);
     }
     if standing == Standing::Departed {
-        let served = lock(&holdings.peers)
-            .get(&(snapshot.room(), peer, serial))
-            .map_or(0, |p| p.receipt_served);
+        // A departed author holds nothing of the room: its leave removed the room there. What it
+        // told on this connection that it held is no longer so, and a Have of its next instance
+        // (a return) lists only what that one holds, so a row it no longer lists would stay
+        // "held" and never be told to it again (a returner whose own entries cite a member that
+        // stays offline then never admits them, and its own-history recovery never completes).
+        let served = match lock(&holdings.peers).get_mut(&(snapshot.room(), peer, serial)) {
+            Some(held) => {
+                held.authors.clear();
+                held.kept = RECORD_KEPT_BYTES;
+                held.receipt_served
+            }
+            None => 0,
+        };
         if snapshot.left_at(&peer).is_some_and(|at| served >= at) {
             return Ok(None);
         }
@@ -3199,6 +3209,16 @@ async fn tell(c: &Connection) -> Result<()> {
         frontier.borrow_and_update();
         let version = *peer_have.borrow_and_update();
         let snapshot = current(c, &cell)?;
+        // A peer that is not a member is told only its own row. What it was told of other
+        // authors while it was one went with its leave; it is told them afresh when it is a
+        // member again.
+        if !snapshot.is_member(&c.peer) {
+            let was = told.len();
+            told.retain(|(author, _), _| *author == c.peer);
+            if told.len() != was {
+                compared = None;
+            }
+        }
         // The private section goes only to a peer the room's last publication counts eligible
         // for its private Sessions, and only once a native discovery quantum found a retained,
         // unexpired record the serve's own per-record check would give it: the newest such

@@ -101,6 +101,9 @@ pub(crate) struct Attempt {
     floor_resolved: bool,
     /// R1: an ordinary room key this node deleted; it installs nothing.
     tombstoned: bool,
+    /// The acknowledgement probe of a node that came back: answered taken only for a release
+    /// already tombstoned or covered, installing nothing.
+    probe: bool,
 }
 
 pub(crate) enum Saved {
@@ -204,10 +207,7 @@ enum Native {
         queue: Option<key_package_queue::Queue>,
     },
     LedgerReset {
-        target: Digest32,
-        floor: Option<u64>,
-        delivered: bool,
-        write_history: bool,
+        ledger: Ledger,
     },
 }
 
@@ -233,71 +233,65 @@ enum Delta {
     Ledger(Ledger),
 }
 
-/// One member's rows of this node's key ledgers: `history` is the retired generation it is owed
-/// from (`SEG_HISTORY`), `delivered` that its "has the live generation" row (`SEG_DELIVERED`) is
-/// removed, so the periodic rekeys owe it the live one.
+/// One member's key debt owed anew (V210-118, the reset rule): `add` joins its set of
+/// unacknowledged generations (`SEG_HISTORY`), and its debt revision is renewed when this is
+/// installed, even when the set does not change, so no delivery selected before settles it.
+/// `snapshot` is the ledger in memory when this was prepared: what is written when the stored
+/// one is absent or in the floor format, which is not read. An empty `add` (a member with no
+/// entitlement: no debt without one) writes and creates no row.
 struct Ledger {
     target: Digest32,
-    history: Option<u64>,
-    delivered: bool,
+    add: BTreeSet<u64>,
+    snapshot: BTreeMap<Digest32, BTreeSet<u64>>,
 }
 
 impl Ledger {
+    /// Merge `add` into `target`'s stored row, in `batch`; every other stored row is kept.
     fn queue(
         &self,
         batch: &mut crate::node::store::Batch<'_>,
         sek: &Sek,
         room: &Digest32,
     ) -> Result<()> {
-        if let Some(floor) = self.history {
-            queue_ledger_row(batch, sek, room, SEG_HISTORY, self.target, Some(floor))?;
+        if self.add.is_empty() {
+            return Ok(());
         }
-        if self.delivered {
-            queue_ledger_row(batch, sek, room, SEG_DELIVERED, self.target, None)?;
-        }
-        Ok(())
+        let stored = match batch.get_segment(room, SegmentKind::KeyMaterial, SEG_HISTORY)? {
+            Some(sealed) => parse_outstanding(&open_segment(
+                sek,
+                SegmentKind::KeyMaterial,
+                SEG_HISTORY,
+                &sealed,
+            )?)?,
+            None => None,
+        };
+        let (mut ledger, posted) =
+            stored.unwrap_or_else(|| (self.snapshot.clone(), super::Posted::new()));
+        ledger
+            .entry(self.target)
+            .or_insert_with(|| self.snapshot.get(&self.target).cloned().unwrap_or_default())
+            .extend(self.add.iter().copied());
+        let sealed = seal_segment(
+            sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &outstanding_bytes(&ledger, &posted),
+        )?;
+        batch.put_segment(room, SegmentKind::KeyMaterial, SEG_HISTORY, &sealed)
     }
 
     fn apply(self, channel: &mut ChannelState) {
-        if self.delivered {
-            channel.delivered.remove(&self.target);
+        channel.renew_history_debt(self.target);
+        if self.add.is_empty() {
+            return;
         }
-        if let Some(floor) = self.history {
-            channel.history.insert(self.target, floor);
-        }
+        let row = self.snapshot.get(&self.target).cloned().unwrap_or_default();
+        channel
+            .outstanding
+            .entry(self.target)
+            .or_insert(row)
+            .extend(self.add);
     }
-}
-
-/// Set (`Some`) or remove (`None`) `target`'s row of one key ledger segment, in `batch`.
-fn queue_ledger_row(
-    batch: &mut crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    segment: u64,
-    target: Digest32,
-    value: Option<u64>,
-) -> Result<()> {
-    let mut values = match batch.get_segment(room, SegmentKind::KeyMaterial, segment)? {
-        Some(sealed) => parse_delivered(&open_segment(
-            sek,
-            SegmentKind::KeyMaterial,
-            segment,
-            &sealed,
-        )?)?,
-        None => BTreeMap::new(),
-    };
-    if let Some(value) = value {
-        values.insert(target, value);
-    } else {
-        values.remove(&target);
-    }
-    let sealed = seal_segment(
-        sek,
-        SegmentKind::KeyMaterial,
-        segment,
-        &delivered_bytes(&values),
-    )?;
-    batch.put_segment(room, SegmentKind::KeyMaterial, segment, &sealed)
 }
 
 pub(crate) struct Prepared {
@@ -525,20 +519,11 @@ impl ChannelState {
                 Native::Acknowledge { receipt, queue }
             }
             Work::ResetDelivery { target, history } => {
-                let floor = if history {
-                    self.entitled_from(&target)
-                        .map(|(from, _)| from)
-                        .filter(|from| *from < self.sender.chain_id())
-                } else {
-                    None
-                };
-                let write_history = floor
-                    .is_some_and(|floor| self.history.get(&target).is_none_or(|old| *old >= floor));
+                // A reset owes the member anew (it lost what it held), whatever its set comes
+                // to: no delivery selected before settles any of it.
+                self.renew_history_debt(target);
                 Native::LedgerReset {
-                    target,
-                    floor,
-                    delivered: self.delivered.contains_key(&target),
-                    write_history,
+                    ledger: self.owed_anew(target, history),
                 }
             }
         };
@@ -593,6 +578,19 @@ impl ChannelState {
         } else {
             None
         };
+        // **The acknowledgement probe** (ruling-returner, condition 3): a node that came back
+        // answers a direct offer as taken only for a release it holds a tombstone for or its
+        // existing receiver already covers, installing nothing (`run` decides coverage). The
+        // own-history-behind and departure checks stay ahead of it; any other offer is refused.
+        let probe = locator.is_none()
+            && !drive
+            && !fresh
+            && skdm.is_some()
+            && !self.own_history_behind()
+            && self.key_returned(&self.me());
+        #[cfg(feature = "test-knobs")]
+        let probe =
+            probe && std::env::var("VOX_TEST_FWD_MUTANT").as_deref() != Ok("direct-accepted");
         let selected = (|| {
             let Some(skdm) = skdm else { return Ok(None) };
             if !key_boundary_off("package-open")
@@ -631,7 +629,8 @@ impl ChannelState {
                         ),
                     });
                 }
-                if locator.is_none() && (self.key_departed(&me) || self.key_returned(&me)) {
+                if locator.is_none() && (self.key_departed(&me) || self.key_returned(&me)) && !probe
+                {
                     return Err(Error::StreamRefused(
                         "a node that came back takes room keys only from its return-bound packages",
                     ));
@@ -710,9 +709,7 @@ impl ChannelState {
         // that installs the key, before the key is acknowledged, so the periodic rekeys owe it
         // from then on, whatever becomes of the stream or of any attempt to deliver at once.
         let debt = match (&selected, author) {
-            (Ok(Some(_)), Some(target)) if fresh && locator.is_none() => {
-                self.owed_again(store, target)?
-            }
+            (Ok(Some(_)), Some(target)) if fresh && locator.is_none() => self.owed_again(target),
             _ => None,
         };
         Ok(Native::Install {
@@ -728,33 +725,43 @@ impl ChannelState {
                 floor_baseline: floor_wait,
                 floor_resolved: false,
                 tombstoned,
+                probe,
             },
             selected,
             debt,
         })
     }
 
-    /// What `target` is owed again once it may take this node's keys (V210-118), if it is
-    /// consented to here: every generation it is entitled to, the live one (its "delivered"
-    /// row goes) and each retired one from where its entitlement began, as history. It may
+    /// What `target` is owed again once it may take this node's keys (V210-118), if it holds
+    /// an entitlement here (no debt without one; its grant at this moment does not decide):
+    /// every generation it is entitled to that is still retained, the live one included. It may
     /// have refused them while its owner did not trust this identity, or dropped them when its
     /// owner stopped trusting it. Sending a generation it already holds is harmless: it keeps
-    /// the one it has.
-    fn owed_again(&self, store: &Store, target: Digest32) -> Result<Option<Ledger>> {
-        if !self.has_consented(store, &target)? {
-            return Ok(None);
+    /// the one it has, and its answer settles it.
+    fn owed_again(&self, target: Digest32) -> Option<Ledger> {
+        if !self.entitled.contains_key(&target) {
+            return None;
         }
-        let history = self
-            .entitled_from(&target)
-            .map(|(from, _)| from)
-            .filter(|from| *from < self.sender.chain_id())
-            .filter(|from| self.history.get(&target).is_none_or(|old| *old >= *from));
-        let delivered = self.delivered.contains_key(&target);
-        Ok((history.is_some() || delivered).then_some(Ledger {
+        // Always a ledger, even one that adds nothing: its install owes the member anew
+        // (`Ledger::apply`), so a delivery selected before it settles none of this debt.
+        Some(self.owed_anew(target, true))
+    }
+
+    /// `target` owed anew: every generation its entitlement allows (`history`), or the live
+    /// one only; nothing for a target with no entitlement.
+    fn owed_anew(&self, target: Digest32, history: bool) -> Ledger {
+        let add = if !self.entitled.contains_key(&target) {
+            BTreeSet::new()
+        } else if history {
+            self.entitled_generations_of(&target)
+        } else {
+            BTreeSet::from([self.sender.chain_id()])
+        };
+        Ledger {
             target,
-            history,
-            delivered,
-        }))
+            add,
+            snapshot: self.outstanding.clone(),
+        }
     }
 
     pub(crate) fn finish_pending_package(&mut self, mut completed: Completed) -> Result<Saved> {
@@ -1152,6 +1159,16 @@ impl Prepared {
                         // R1: authenticated above, then answered as accepted and unchanged, with
                         // its floor resolved. No receiver, index, backfill or debt is written.
                         if receipt.tombstoned {
+                            // Said for a proof (`test-knobs` only): a key package from the log
+                            // re-offered a generation this node deleted.
+                            #[cfg(feature = "test-knobs")]
+                            if receipt.locator.is_some() {
+                                eprintln!(
+                                    "test-knobs: a key package of deleted generation {} was \
+                                     answered as taken; nothing installed",
+                                    selected.skdm.body.chain_id
+                                );
+                            }
                             receipt.floor_resolved = true;
                             receipt.accepted = Some(AcceptedSkdm {
                                 rendered: 0,
@@ -1170,6 +1187,36 @@ impl Prepared {
                                 .is_some_and(|chain| chain.epoch() != pending.epoch)
                         {
                             receipt.refusal = Some(Error::OwnHistoryBehind);
+                            return Ok(Saved::Installed(receipt));
+                        }
+                        // The acknowledgement probe (ruling-returner, condition 3): the coverage
+                        // test alone, never the merge below. Covered: accepted and unchanged, as a
+                        // tombstone is; anything else is refused as before the probe.
+                        if receipt.probe {
+                            let covered = existing.as_ref().is_some_and(|existing| {
+                                use subtle::ConstantTimeEq;
+                                let (iteration, held) = existing.history_release_binding();
+                                if iteration < selected.skdm.body.iteration {
+                                    incoming.retain_history_release(existing).is_ok()
+                                } else {
+                                    iteration == selected.skdm.body.iteration
+                                        && bool::from(held.ct_eq(&crate::hash::sha256(
+                                            &selected.skdm.body.canonical_body(),
+                                        )))
+                                }
+                            });
+                            if covered {
+                                receipt.floor_resolved = true;
+                                receipt.accepted = Some(AcceptedSkdm {
+                                    rendered: 0,
+                                    changed: false,
+                                });
+                            } else {
+                                receipt.refusal = Some(Error::StreamRefused(
+                                    "a node that came back takes room keys only from its \
+                                     return-bound packages",
+                                ));
+                            }
                             return Ok(Saved::Installed(receipt));
                         }
                         let (mut candidate, changed, covered) = if let Some(mut existing) = existing
@@ -1342,61 +1389,29 @@ impl Prepared {
                         });
                         Ok(Saved::Installed(receipt))
                     }
-                    Native::LedgerReset {
-                        target,
-                        floor,
-                        delivered,
-                        write_history,
-                    } => {
+                    Native::LedgerReset { ledger } => {
                         poison = true;
-                        let live = (SEG_DELIVERED, None, delivered);
-                        let history = (SEG_HISTORY, floor, write_history);
-                        let mut last_error = None;
-                        let mut saved_history = None;
-                        let mut saved_delivered = false;
-                        for (segment, value, write) in [live, history] {
-                            if !write {
-                                continue;
-                            }
-                            let saved = (|| -> Result<()> {
-                                let mut batch = store.batch()?;
-                                if let Some(generation) = pending.removal_generation {
-                                    governance::check_removal_generation_in(
-                                        &batch,
-                                        sek,
-                                        &pending.room,
-                                        generation,
-                                    )?;
-                                }
-                                queue_ledger_row(
-                                    &mut batch,
+                        let saved = (|| -> Result<()> {
+                            let mut batch = store.batch()?;
+                            if let Some(generation) = pending.removal_generation {
+                                governance::check_removal_generation_in(
+                                    &batch,
                                     sek,
                                     &pending.room,
-                                    segment,
-                                    target,
-                                    value,
+                                    generation,
                                 )?;
-                                batch.commit()
-                            })();
-                            match saved {
-                                Ok(()) => {
-                                    if segment == SEG_HISTORY {
-                                        saved_history = value;
-                                    } else {
-                                        saved_delivered = true;
-                                    }
-                                    delta = Delta::Ledger(Ledger {
-                                        target,
-                                        history: saved_history,
-                                        delivered: saved_delivered,
-                                    });
-                                }
-                                Err(error) => {
-                                    last_error = Some(error);
-                                }
                             }
-                        }
-                        Ok(Saved::DeliveryReset { error: last_error })
+                            ledger.queue(&mut batch, sek, &pending.room)?;
+                            batch.commit()
+                        })();
+                        let error = match saved {
+                            Ok(()) => {
+                                delta = Delta::Ledger(ledger);
+                                None
+                            }
+                            Err(error) => Some(error),
+                        };
+                        Ok(Saved::DeliveryReset { error })
                     }
                 }
             })

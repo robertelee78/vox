@@ -370,8 +370,9 @@ fn wait_room_open(dir: &Path, room: &str, who: &str) {
 }
 
 /// What one profile holds of a room, walked in the **room's order** as a person pages back:
-/// the newest page first (`--json --limit`), then `--before` the oldest row of each page until a
-/// page comes back short.
+/// the newest page first (`--json --limit`), then `--before` the oldest row of each page for as
+/// long as the product says older messages are not shown. A page may come back shorter than
+/// asked (the node caps a page at `SESSION_PAGE_ROWS`), so a short page is not the end.
 struct Held {
     /// Every `post <i>` number, **oldest first**, in the order the rows came. A duplicate shows as
     /// a number twice, a reordering as a number out of turn.
@@ -418,7 +419,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         if rows.is_empty() {
             break;
         }
-        let short = rows.len() < page;
+        let more = err.lines().any(|l| l.contains("older messages not shown"));
         before = Some(
             rows[0]["entry_hash"]
                 .as_str()
@@ -431,7 +432,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
                 .to_owned(),
         );
         pages_newest_first.push(rows);
-        if short {
+        if !more {
             break;
         }
     }
@@ -2719,7 +2720,11 @@ fn interrupted_history_and_private_packages_recover() {
         "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
     ]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let mut tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        println!("[proof] daemon dirs kept under {}", tmp.path().display());
+    }
     let root = tmp.path();
     let alice = root.join("alice");
     let bob = root.join("bob");
@@ -2839,6 +2844,12 @@ fn interrupted_history_and_private_packages_recover() {
     // Bob is now a real returning member, but is offline while two authors build suffixes.  That
     // makes his next Page settle newer positions before the older private-package header closes
     // Alice's gap, and gives the durable continuation scheduler two authors to rotate.
+    // Alice's keys for him must have reached him first: one still owed (his history key waits for
+    // a fresh one-time prekey of his) goes into the log as a package when a reach of him fails, at
+    // a time of its own, and would be counted as Carol's below.
+    while member_key_delivery_pending(&alice, &room, &fps[1]) != Some(false) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     bob_daemon.stop();
 
     // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
@@ -2902,6 +2913,16 @@ fn interrupted_history_and_private_packages_recover() {
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
+    // `vox trust add` returns once the trust is saved: Carol is offline, so the reach it starts
+    // runs in the background (`reach_member`), and only its failure writes the package and the
+    // consent she is owed into the room's log (`deliver_through_log`), about 10 s later. That
+    // failed-direct event is what this waits for, in Alice's shipped status; the watchdog owns a
+    // fallback that never comes.
+    while status_log_entries(&alice, &room) == Some(before_package_log)
+        || room_own_feed_through(&alice, &room) == Some(before_package_through)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let after_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
@@ -3017,12 +3038,16 @@ fn interrupted_history_and_private_packages_recover() {
         "alice settled successor {}",
         alice_successors - vox_core::log::history::MAX_PAGE_ENTRIES
     );
-    let oldest = read_hash(&bob, &room, &oldest_alice_live).unwrap_or_else(|| {
-        panic!(
-            "PRODUCT: Bob's shipped JSON read omitted Alice's expected oldest live-window row \
-             {oldest_alice_live:?} before archive paging"
-        )
-    });
+    // Since one pull loop fetches everything (ADR-054 PL-3, #1411) a returning member fetches
+    // newest first and the rest unasked: the newest marker shows before the older rows of the
+    // suffix have come. The row the archive request pages back from is waited for, as a person
+    // who sees it in the room would; the watchdog owns one that never comes.
+    let oldest = loop {
+        if let Some(hash) = read_hash(&bob, &room, &oldest_alice_live) {
+            break hash;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let (ok, out, err) = vox(
         &bob,
         &[
@@ -3053,10 +3078,29 @@ fn interrupted_history_and_private_packages_recover() {
     // independently. Alice must instead report Bob's authenticated receipt through the exact
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
     // package header, even though Bob must never receive its private body.
+    // Since one pull loop fetches everything (ADR-054 PL-3, #1411) Bob's archive request can be
+    // terminal while his restarted node still verifies Alice's suffix (his `verified_through` of
+    // her feed rises after the restart); Alice asks his receipt when his Have names it. So a
+    // terminal request is a wedge only while nothing moves: neither Bob's verified head of
+    // Alice's feed nor Alice's report of his receipt changed over `RECEIPT_STILL_READS` answered
+    // reads a second apart.
+    const RECEIPT_STILL_READS: usize = 10;
+    let mut seen = None;
+    let mut still = 0;
     while member_held_through(&alice, &room, &fps[1]) != Some(marker_through) {
         let current = history_observation(&bob, &room);
+        let progress = (
+            member_holds_through(&bob, &room, &fps[0]),
+            member_held_through(&alice, &room, &fps[1]),
+        );
+        if seen == Some(progress) {
+            still += 1;
+        } else {
+            seen = Some(progress);
+            still = 0;
+        }
         assert!(
-            current.phase != "complete" && current.remaining != 0,
+            (current.phase != "complete" && current.remaining != 0) || still < RECEIPT_STILL_READS,
             "PRODUCT: Bob's exact archive request reached terminal status {}/{}, but Alice did \
              not report his authenticated receipt through {marker_through}; Carol's header-only \
              package did not settle contiguously for Bob's role\n\
@@ -3065,7 +3109,7 @@ fn interrupted_history_and_private_packages_recover() {
             current.remaining,
             said(&bob, "bob-after-interruption")
         );
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_secs(1));
     }
     assert!(
         read_hash(&bob, &room, before_package_text).as_deref()
@@ -5087,6 +5131,24 @@ fn member_held_through_state(dir: &Path, room: &str, member: &str) -> Option<Opt
         serde_json::Value::Number(value) => value.as_u64().map(Some),
         _ => None,
     }
+}
+
+/// Whether this node's shipped status says `member` is still owed one of its keys in `room`
+/// (`members[].key_delivery_pending`): its current generation or a history generation.
+fn member_key_delivery_pending(dir: &Path, room: &str, member: &str) -> Option<bool> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["key_delivery_pending"]
+        .as_bool()
 }
 
 /// The local role-complete cursor for `member` as the shipped status command reports it.

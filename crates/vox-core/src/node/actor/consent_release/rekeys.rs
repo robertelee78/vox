@@ -27,7 +27,6 @@ struct Pass {
     attachment: u64,
     lifetime: Option<Arc<Lifetime>>,
     targets: VecDeque<Digest32>,
-    history: BTreeMap<Digest32, u64>,
     asked: bool,
     now: u64,
     delivered: u64,
@@ -49,6 +48,9 @@ pub(in crate::node::actor) struct Target {
     peer: Digest32,
     conn: Arc<VoxConnection>,
     history: bool,
+    /// The revision of the member's key debt these keys were selected under: each answer
+    /// settles its own generation under it, and nothing under another (V210-45).
+    revision: u64,
     keys: VecDeque<Skdm>,
     admitted: VecDeque<PairwiseAdmission>,
     jobs: Vec<(mpsc::OwnedPermit<PairwiseJob>, PairwiseJob)>,
@@ -186,7 +188,6 @@ impl Node {
             attachment: self.delivery_epoch,
             lifetime,
             targets: targets.into_iter().collect(),
-            history,
             asked,
             now: self.now_ms().get(),
             delivered: 0,
@@ -300,22 +301,23 @@ impl Node {
             if !self.trust.is_trusted(&peer) {
                 continue;
             }
-            if let std::collections::btree_map::Entry::Vacant(slot) = pass.history.entry(peer) {
-                let selected = {
-                    let channel = pass.instance.lock().await;
-                    match self.profile.as_ref() {
-                        Some(profile) => channel.owed_history_for(profile.store(), &peer),
-                        None => Err(Error::AtRestLocked),
-                    }
-                };
-                match selected {
-                    Ok(Some(floor)) => {
-                        slot.insert(floor);
-                    }
-                    Ok(None) => {}
-                    Err(_) => continue,
+            // **The direct route carries every generation still in the member's set** (V210-45),
+            // whether it was owed at a rotation, a reset or a boundary; each answer settles its
+            // own. The send stays gated as ever (`owed_keys_for`: a valid grant at this moment).
+            let owed = {
+                let channel = pass.instance.lock().await;
+                let live = channel.sender_generation();
+                match self.profile.as_ref() {
+                    Some(profile) => channel
+                        .owed_keys_for(profile.store(), &peer)
+                        .map(|owed| owed.map(|owed| owed.iter().any(|g| *g < live))),
+                    None => Err(Error::AtRestLocked),
                 }
-            }
+            };
+            let history = match owed {
+                Ok(Some(history)) => history,
+                Ok(None) | Err(_) => continue,
+            };
             if !pass.asked
                 && self
                     .key_backoff
@@ -324,18 +326,36 @@ impl Node {
             {
                 continue;
             }
-            let history = pass.history.contains_key(&peer);
             let pair = (pass.room, peer);
             if self.history_in_flight.contains_key(&pair)
                 || (!history && self.keys_in_flight.contains_key(&pair))
             {
                 continue;
             }
-            // A member that came back takes room keys only by return-bound log package (R4). It
-            // is skipped only while a delivery to it is this room's save in flight: the settling
-            // mark is not that, as it outlives a delivery that deferred or failed.
-            let returned = pass.instance.lock().await.key_returned(&peer);
-            if returned {
+            // A member that came back takes room keys only by return-bound log package (R4),
+            // and the log route posts each it is owed once. **The acknowledgement probe**
+            // (ruling-returner): once every key it is owed is posted to it, that exact release in
+            // a package bound to its current return (the posted mark), those same releases go to
+            // it directly, where it installs none of them (`package_install`) and its answers
+            // settle them. The log route is skipped only while a delivery to it is this room's
+            // save in flight: the settling mark is not that, as it outlives a delivery that
+            // deferred or failed.
+            let returned = {
+                let channel = pass.instance.lock().await;
+                channel.key_returned(&peer).then(|| {
+                    self.profile.as_ref().is_some_and(|profile| {
+                        channel
+                            .owed_keys_for(profile.store(), &peer)
+                            .ok()
+                            .flatten()
+                            .and_then(|owed| channel.owed_skdms(profile, &peer, &owed).ok())
+                            .is_some_and(|keys| {
+                                channel.releases_posted(profile.store(), &peer, &keys)
+                            })
+                    })
+                })
+            };
+            if returned == Some(false) {
                 let delivering = match self.pending_posts.get(&pass.room) {
                     Some(post_save::Pending::Maintenance(pending)) => {
                         pending.consent().is_some_and(|next| next.target == peer)
@@ -359,15 +379,23 @@ impl Node {
             }
             let selected = {
                 let channel = pass.instance.lock().await;
+                let revision = channel.history_revision(&peer);
                 match self.profile.as_ref() {
-                    Some(profile) => match pass.history.get(&peer) {
-                        Some(floor) => channel.history_skdms(profile, &peer, *floor),
-                        None => channel.rekey_skdm_for(profile, &peer).map(|key| vec![key]),
+                    Some(profile) => match channel.owed_keys_for(profile.store(), &peer) {
+                        Ok(Some(owed)) => channel.owed_skdms(profile, &peer, &owed),
+                        Ok(None) => Ok(Vec::new()),
+                        Err(error) => Err(error),
                     },
                     None => Err(Error::AtRestLocked),
                 }
+                .map(|keys| (keys, revision))
             };
-            let Ok(mut keys) = selected else { continue };
+            let Ok((mut keys, revision)) = selected else {
+                continue;
+            };
+            if keys.is_empty() {
+                continue;
+            }
             if history {
                 keys.reverse();
             }
@@ -382,8 +410,11 @@ impl Node {
             let Some(conn) = self.reach_member(&pass.room, peer, pass.asked).await else {
                 continue;
             };
-            let Some(admitted) =
-                self.reserve_key_deliveries(&pass.room, peer, &conn, &keys, history)
+            // The room's lock is waited for, as this pass waited for it just above to select
+            // the keys; nothing of the room's is held here (ledger 148).
+            let Some(admitted) = self
+                .reserve_key_deliveries_waiting(&pass.room, peer, &conn, &keys, history)
+                .await
             else {
                 continue;
             };
@@ -394,6 +425,7 @@ impl Node {
                 peer,
                 conn,
                 history,
+                revision,
                 keys: keys.into(),
                 admitted: admitted.into(),
                 jobs: Vec::with_capacity(capacity),
@@ -441,6 +473,7 @@ impl Node {
                             hello: false,
                             session: None,
                             history: target.history,
+                            revision: target.revision,
                             epoch: target.pass.attachment,
                         },
                         credit: admission.job,
@@ -574,6 +607,7 @@ impl Node {
                         key: key_ref,
                         reservation,
                         opening: frame.opening,
+                        revision: target.revision,
                         prekey: prekey.clone(),
                     },
                 );
@@ -590,6 +624,7 @@ impl Node {
                             hello: false,
                             session: None,
                             history: target.history,
+                            revision: target.revision,
                             epoch: target.pass.attachment,
                         },
                         credit,

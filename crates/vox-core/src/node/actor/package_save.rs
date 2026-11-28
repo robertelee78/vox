@@ -168,6 +168,19 @@ impl Continuation {
     pub(super) fn is_preparation(&self) -> bool {
         matches!(&self.after, After::Preparation(_))
     }
+    /// The sender and connection of the inbound key this continuation will answer, if any.
+    pub(super) fn inbound_key(&self) -> Option<(Digest32, u64)> {
+        match &self.after {
+            After::Inbound(inbound) => Some((inbound.peer, inbound.conn.serial())),
+            _ => None,
+        }
+    }
+    /// A key that waited for its room's save is judged under the trust standing when it resumes.
+    pub(super) fn retrust(&mut self, trusted: BTreeSet<Digest32>) {
+        if let After::Inbound(inbound) = &mut self.after {
+            inbound.trusted = trusted;
+        }
+    }
     fn attached(&self, node: &Node, room: &Digest32) -> bool {
         self.attachment == node.delivery_epoch
             && if self.is_preparation() {

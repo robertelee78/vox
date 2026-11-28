@@ -99,6 +99,9 @@ struct Delivery {
     /// Held until these exact retry bytes are no longer needed.
     reservation: DeliveryReservation,
     opening: Digest32,
+    /// The revision of the member's key debt the key was selected under: a delivery from
+    /// before the debt was owed anew is not resent (`ChannelState::history_revision`).
+    revision: u64,
     /// Shared with every queued copy until the opening is first written or retired.
     prekey: Option<prekeys::OneTimeReservation>,
 }
@@ -1570,8 +1573,8 @@ enum NetEvent {
         node: Digest32,
         instance: std::sync::Weak<crate::node::channel::RoomLock>,
     },
-    /// A sender key written to `peer` was taken: it is recorded as delivered (V210-88), and any
-    /// backoff on re-sending to it ends.
+    /// A sender key written to `peer` was taken: that generation leaves its key debt (V210-45,
+    /// V210-88), and any backoff on re-sending to it ends.
     SkdmTaken {
         /// The room.
         channel_id: Digest32,
@@ -1585,6 +1588,9 @@ enum NetEvent {
         /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
         removal_generation: Option<u64>,
+        /// The revision of the member's key debt the key was selected under: its answer
+        /// settles nothing under another.
+        revision: u64,
         /// The [`Node::delivery_epoch`] its watcher started in.
         epoch: u64,
     },
@@ -2699,6 +2705,8 @@ enum AfterWrite {
         session: Option<u64>,
         /// Whether the key belongs to a history batch (V210-88).
         history: bool,
+        /// The revision of the member's key debt the key was selected under.
+        revision: u64,
         /// The `Node::delivery_epoch` it was counted in flight in (V210-88).
         epoch: u64,
     },
@@ -2744,6 +2752,7 @@ async fn write_pairwise_jobs(
                     opening,
                     session,
                     history,
+                    revision,
                     epoch,
                     ..
                 },
@@ -2758,6 +2767,7 @@ async fn write_pairwise_jobs(
                         opening,
                         session,
                         history,
+                        revision,
                         epoch,
                         removal_generation: credit
                             .as_ref()
@@ -2779,6 +2789,7 @@ async fn write_pairwise_jobs(
                     session,
                     history,
                     epoch,
+                    ..
                 },
             ) => {
                 let mut v = Vec::with_capacity(2);
@@ -2830,6 +2841,7 @@ struct Watched {
     opening: Option<Digest32>,
     session: Option<u64>,
     history: bool,
+    revision: u64,
     epoch: u64,
     removal_generation: Option<u64>,
     _credit: Option<PairwiseCredit>,
@@ -2853,6 +2865,7 @@ fn watch_delivery(
         opening,
         session,
         history,
+        revision,
         epoch,
         removal_generation,
         _credit: credit,
@@ -2885,6 +2898,7 @@ fn watch_delivery(
                 session,
                 history,
                 removal_generation,
+                revision,
                 epoch,
             },
         };
@@ -7150,9 +7164,18 @@ pub struct Node {
     /// only after a key has gone to one of its one-time prekeys since (ADR-030 S-5).
     signed_said: BTreeSet<(Digest32, Digest32)>,
     /// `(room, member, skdm_ref)` of every key this node has posted to a room's log as a
-    /// key-package since it unlocked: a batch retried whole posts each such key once, never again
-    /// (a posted package cannot be taken back, and each new one names a fresh one-time prekey).
+    /// key-package since it unlocked: each is posted once, never again on a fresh bundle. A
+    /// package settles nothing (V210-45), so the key stays owed, but the author cannot tell a
+    /// member that opened it (and so published a fresh bundle) from one that could not: a repost
+    /// per fresh bundle posts the same key for ever to every member that takes keys from the log.
+    /// The durable posted mark in the member's ledger row (`ChannelState::posted`) keeps it so
+    /// across a restart.
     packages_posted: BTreeSet<(Digest32, Digest32, Digest32)>,
+    /// `(room, member, skdm_ref)` of every release posted again since this node unlocked, after
+    /// the member that came back answered its acknowledgement probe that it does not hold it
+    /// (ruling-returner): one new package per release, so a member that keeps answering so
+    /// cannot make this node fill its own feed with packages.
+    packages_reposted: BTreeSet<(Digest32, Digest32, Digest32)>,
     /// Rooms whose records are to be renewed because the prekeys this node offers changed: their
     /// renewal pushes them to the members connected now, not only to its own board and the anchors.
     prekeys_changed: BTreeSet<Digest32>,
@@ -7163,9 +7186,10 @@ pub struct Node {
     /// Per room: the `timestamp_ms` of the last records this node signed there, on any board, and
     /// the prekeys their bundle named. See [`spaced_stamp`].
     records_stamped: BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
-    /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
-    /// whether the batch fell short (a key refused, or not all of it written). The history is
-    /// recorded as delivered only once every key of a whole batch was taken (V210-88).
+    /// Per `(room, member)`: the history batch in flight, as the keys not yet answered, and
+    /// whether the batch fell short (a key refused, or not all of it written). Each key's own
+    /// answer settles its generation (V210-45); the batch's frames are kept for resending until
+    /// every key of it was taken (V210-88).
     history_in_flight: BTreeMap<(Digest32, Digest32), (u32, bool)>,
     /// Which delivery watchers are current (V210-88): bumped when the node locks, which forgets
     /// what is in flight. A watcher started before carries the old value, and its answer arriving
@@ -7225,6 +7249,10 @@ pub struct Node {
     pending_posts: BTreeMap<Digest32, post_save::Pending>,
     parked_private_drives: BTreeMap<Digest32, private_save::ParkedPrivateDrive>,
     parked_consents: consent_release::ParkedConsents,
+    /// Keys members sent while their room's own save was in flight, one per room and sender,
+    /// taken when that save ends (`maintenance_save::resume_parked_keys`).
+    parked_keys:
+        BTreeMap<(Digest32, Digest32), (maintenance_save::Work, maintenance_save::Continuation)>,
     pending_policy: Option<policy_save::Pending>,
     parked_construction: Option<construction_save::Parked>,
     failed_construction_policy: Option<computer::ComputerPolicyGuard>,
@@ -7692,6 +7720,7 @@ impl Node {
             one_time_waits: BTreeMap::new(),
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
+            packages_reposted: BTreeSet::new(),
             prekeys_changed: BTreeSet::new(),
             prekey_publish_owed: BTreeSet::new(),
             records_stamped: BTreeMap::new(),
@@ -7712,6 +7741,7 @@ impl Node {
             pending_posts: BTreeMap::new(),
             parked_private_drives: BTreeMap::new(),
             parked_consents: consent_release::ParkedConsents::default(),
+            parked_keys: BTreeMap::new(),
             pending_policy: None,
             parked_construction: None,
             failed_construction_policy: None,
@@ -11941,6 +11971,10 @@ impl Node {
                 // an anchor receiving a mirror does not mirror it onward and this cannot ring
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
+                    // A key that waits in this room for a member's bundle (ADR-030 D-5, P-3) goes
+                    // when a record lands, which is how its fresh bundle arrives: the same pass
+                    // the tick runs, now rather than on the next periodic retry.
+                    let key_waits = self.key_waiting.keys().any(|(room, _)| *room == channel_id);
                     crate::node::status::SyncBook::note_board_news(&self.sync_book);
                     self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews, None)
                         .await;
@@ -11962,6 +11996,10 @@ impl Node {
                     self.resume_parked_private_drive(channel_id).await;
                     for peer in self.session_release_recipients(channel_id) {
                         self.wake_session_release(channel_id, peer, None).await;
+                    }
+                    if key_waits {
+                        self.deliver_owed_rekeys().await;
+                        self.deliver_owed_consents(None).await;
                     }
                 }
             }
@@ -12462,6 +12500,7 @@ impl Node {
                 }
             }
             NetEvent::ConnectionClosed { peer, serial } => {
+                self.retire_parked_keys(Some((peer, serial)));
                 let current = self
                     .net
                     .as_ref()
@@ -12551,25 +12590,24 @@ impl Node {
                         }
                     }
                 }
+                // The exact release this answer is for: the key the delivery carried.
+                let offered = self
+                    .deliveries
+                    .get(&(channel_id, peer, chain_id))
+                    .filter(|d| Some(d.opening) == opening)
+                    .map(|d| (channel_id, peer, d.key));
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
                 ) else {
                     return;
                 };
-                {
+                let repost = {
                     let mut channel = shared.lock().await;
-                    let _ = channel.note_undelivered(profile.store(), peer, chain_id);
-                    // A refused generation older than the live one is owed again as history
-                    // (V210-45), from the member's recorded entitlement and never before it, so
-                    // a key taken at a position is never re-owed from its origin. A refused
-                    // live generation is owed by the ledger above, and its re-key respects the
-                    // same entitlement (`rekey_skdm_for`).
-                    if channel.entitled_from(&peer).is_some_and(|(c, _)| {
-                        c <= chain_id && chain_id < channel.sender_generation()
-                    }) {
-                        let _ = channel.owe_history(profile.store(), peer, chain_id);
-                    }
+                    // A refusal, a timeout or a lost write settles nothing (V210-45): the
+                    // generation was never acknowledged, so it is still in the member's set,
+                    // unless an authorization boundary rewrote that set since, and then it is
+                    // not owed back.
                     // **Refused because its owner does not trust us** (V210-118): the member holds
                     // none of what it refused, and by the time it trusts us the generation refused
                     // may be retired. Everything it is entitled to is owed again, so the re-key
@@ -12578,6 +12616,29 @@ impl Node {
                     if why == KeyRefusal::describe(KeyRefusal::NotTrusted.code().into_inner()) {
                         let _ = channel.owe_entitled_history(profile.store(), &peer);
                     }
+                    // **A member that came back answered its acknowledgement probe that it does
+                    // not hold the release** (ruling-returner, condition 5), authenticated: the
+                    // package that carried exactly that release, bound to its current return,
+                    // may never open. Its posted mark is cleared so one new package is posted;
+                    // nothing else changes, the debt stays. Once per release while this node
+                    // runs.
+                    offered.filter(|posted_as| {
+                        answered
+                            && why
+                                == KeyRefusal::describe(KeyRefusal::NotAccepted.code().into_inner())
+                            && channel.key_returned(&peer)
+                            && !self.packages_reposted.contains(posted_as)
+                            && channel.clear_package_posted(
+                                profile.store(),
+                                &peer,
+                                chain_id,
+                                &posted_as.2,
+                            )
+                    })
+                };
+                if let Some(posted_as) = repost {
+                    self.packages_posted.remove(&posted_as);
+                    self.packages_reposted.insert(posted_as);
                 }
                 // **The member holds no session with us** (V210-78): it restarted or locked, and
                 // sessions live only in memory. Ours is dead at its end, and resending under it is
@@ -12917,6 +12978,7 @@ impl Node {
                 history,
                 epoch,
                 removal_generation,
+                revision,
             } => {
                 if epoch != self.delivery_epoch {
                     return;
@@ -12973,12 +13035,14 @@ impl Node {
                     self.delivery_reserved
                         .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                 }
+                // **This answer settles exactly its generation**, under the debt revision its key
+                // was selected under (V210-45).
                 self.begin_owned_pairwise_receipt(
                     channel_id,
                     peer,
                     chain_id,
                     removal_generation,
-                    whole_history,
+                    revision,
                 )
                 .await;
             }
@@ -15684,8 +15748,8 @@ impl Node {
         }
     }
 
-    /// A key of the history batch in flight to `peer` was answered. Returns whether that was the
-    /// last one and every key of the whole batch was taken, so the history is delivered.
+    /// A key of the history batch in flight to `peer` was answered. Whether that was the last
+    /// one and every key of the whole batch was taken.
     fn history_landed(&mut self, channel_id: Digest32, peer: Digest32, taken: bool) -> bool {
         let key = (channel_id, peer);
         let Some((left, short)) = self.history_in_flight.get_mut(&key) else {
@@ -17518,7 +17582,10 @@ impl Node {
             .then_some(epoch)
     }
 
-    fn reserve_key_deliveries(
+    /// Reserve the deliveries of `keys` to `peer` over `conn`. The room's lock is waited for, as
+    /// the pass's own preparation waits for it, instead of tried once: tried once, a room busy
+    /// with fetched history refused it on every tick, silently, for many seconds (ledger 148).
+    async fn reserve_key_deliveries_waiting(
         &mut self,
         room: &Digest32,
         peer: Digest32,
@@ -17526,17 +17593,21 @@ impl Node {
         keys: &[crate::group::skdm::Skdm],
         history: bool,
     ) -> Option<Vec<PairwiseAdmission>> {
+        let instance = Arc::clone(self.channels.get(room)?);
+        let channel = instance.lock().await;
         let epoch = self.key_connection(room, conn)?;
         let profile = self.profile.as_ref()?;
-        let channel = self.channels.get(room)?.try_lock().ok()?;
         if channel
             .is_member_removed(profile.store(), &channel.me())
             .ok()?
             || channel.is_member_removed(profile.store(), &peer).ok()?
             || channel.room_removal_rotation_needed(profile.store()).ok()?
             || channel.key_departed(&peer)
-            // A member that came back takes room keys only by return-bound package (R4).
-            || channel.key_returned(&peer)
+            // A member that came back takes room keys only by return-bound package (R4); the
+            // one exception is the acknowledgement probe (ruling-returner): each key offered is
+            // exactly the release already posted to it in a package bound to its current return.
+            || (channel.key_returned(&peer)
+                && !channel.releases_posted(profile.store(), &peer, keys))
         {
             return None;
         }
@@ -17554,6 +17625,7 @@ impl Node {
             holdings: Arc::clone(&self.history_holdings),
             target: (peer, departure),
         });
+        let revision = channel.history_revision(&peer);
         drop(channel);
         let fresh: Vec<bool> = keys
             .iter()
@@ -17577,7 +17649,14 @@ impl Node {
                     self.delivery_reserved.remove(&id);
                 }
                 // A changed consent names another key; its old opening cannot carry this one.
-                if self.deliveries.get(&id).is_some_and(|d| d.key != key_ref) {
+                // Nor is a delivery from before the member's debt was owed anew resent: it
+                // may be answered taken without opening anything (W-3), and the member may
+                // no longer hold what it took then.
+                if self
+                    .deliveries
+                    .get(&id)
+                    .is_some_and(|d| d.key != key_ref || d.revision != revision)
+                {
                     if let Some(old) = self.deliveries.remove(&id) {
                         self.delivery_reserved.insert(id, old.reservation);
                     }
@@ -18186,6 +18265,7 @@ impl Node {
         self.retire_parked_construction(Fault::Locked);
         self.retire_parked_private_drives(Fault::Locked);
         self.retire_parked_consents();
+        self.retire_parked_keys(None);
         self.retire_identity_startup();
         self.retire_pending_posts();
         if let Some(pending) = self.pending_policy.take() {
@@ -18293,6 +18373,7 @@ impl Node {
         self.one_time_waits.clear();
         self.signed_said.clear();
         self.packages_posted.clear();
+        self.packages_reposted.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.pairwise_epoch.send_replace(self.delivery_epoch);
@@ -23042,6 +23123,25 @@ async fn exchange_boards_live(
         ),
         anchor_path,
     );
+    // `VOX_TEST_FWD_MUTANT=notice-not-exchanged`: the admission notices a board holds are left
+    // out of what this node takes from it, as they are of what it offers one
+    // ([`offer_board_records`]), so a node learns a member's readmission only from the member
+    // that admitted it.
+    #[cfg(feature = "test-knobs")]
+    let read = {
+        let mut read = read;
+        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("notice-not-exchanged") {
+            if let Some(records) = read.records.as_mut().filter(|r| !r.notices.is_empty()) {
+                eprintln!(
+                    "test-knobs: notice-not-exchanged mutant engaged: {} admission notice(s) \
+                     from board {board:?} are left out",
+                    records.notices.len()
+                );
+                records.notices.clear();
+            }
+        }
+        read
+    };
     let fetched = read.records.map(Arc::new);
     let Some(records) = fetched
         .as_ref()
@@ -23321,12 +23421,17 @@ async fn offer_board_records(
     let mut complete = true;
     let mut rejected = false;
     for wire in records {
-        // `VOX_TEST_FWD_MUTANT=notice-not-offered`: admission notices are left out of the offer,
-        // so a board learns a member's readmission only from the member that admitted it.
+        // `VOX_TEST_FWD_MUTANT=notice-not-exchanged`: admission notices are left out of the
+        // offer, as they are of what is taken from a board (`exchange_boards_live`), so a board
+        // learns a member's readmission only from the member that admitted it.
         #[cfg(feature = "test-knobs")]
-        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("notice-not-offered")
+        if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("notice-not-exchanged")
             && crate::nat::notice::AdmissionNotice::from_wire(wire).is_ok()
         {
+            eprintln!(
+                "test-knobs: notice-not-exchanged mutant engaged: an admission notice is left \
+                 out of the offer to board {board:?}"
+            );
             continue;
         }
         if !scope.is_live() {

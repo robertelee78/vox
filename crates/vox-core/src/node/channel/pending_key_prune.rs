@@ -244,9 +244,11 @@ impl DeletedReceivers {
     }
 }
 
-/// The exact origin safety decision contains only a floor and nonsecret generation IDs.
+/// The exact origin safety decision: which retired generations are still needed (live
+/// included), and the nonsecret generation IDs it was taken over.
 struct Origins {
-    floor: u64,
+    needed: super::OriginsNeeded,
+    live: u64,
     generations: Generations,
 }
 
@@ -318,10 +320,10 @@ impl Completed {
             }
             if self.saved.origins != 0 {
                 if let Some(origins) = &self.pending.origins {
-                    channel.origins.retain_from(
+                    channel.origins.retain_needed(
                         &self.pending.room,
                         self.pending.epoch,
-                        origins.floor,
+                        |generation| origins.needed.keeps(generation, origins.live),
                     );
                 }
             }
@@ -341,12 +343,13 @@ impl ChannelState {
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
-        trusted: &BTreeSet<Digest32>,
+        trusted: &Arc<BTreeSet<Digest32>>,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
         if self.poisoned.get() {
             return Err(self.save_failure());
         }
+        self.keyring = Arc::clone(trusted);
         // Uncommitted ratchets cannot be reconstructed from disk. Their ordinary bounded
         // render/drive completion persists them; keep this tick's source untouched until then.
         if self.chains_advanced {
@@ -367,18 +370,43 @@ impl ChannelState {
                 Err(error) if governance::refreshing(&error) => return Ok(None),
                 Err(error) => return Err(error),
             }
-            let floor = self
-                .oldest_generation_needed(store, trusted, now)?
-                .unwrap_or(u64::MAX)
-                .min(self.sender.chain_id());
+            let needed = self.origins_needed(store, trusted, now)?;
+            let live = self.sender.chain_id();
             let generations = self
                 .origins
                 .generations(&self.channel_id, self.epoch, &self.me());
+            // `test-knobs`: each new origin decision is said once, so a proof can stage after it.
+            #[cfg(feature = "test-knobs")]
+            {
+                static SAID: std::sync::Mutex<BTreeMap<Digest32, String>> =
+                    std::sync::Mutex::new(BTreeMap::new());
+                let held: Vec<u64> = generations.iter().map(|(chain, _)| *chain).collect();
+                let kept: Vec<u64> = held
+                    .iter()
+                    .copied()
+                    .filter(|chain| needed.keeps(*chain, live))
+                    .collect();
+                let said = format!("keeps generations {kept:?} of {held:?}");
+                let mut last = SAID
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.get(&self.channel_id) != Some(&said) {
+                    eprintln!(
+                        "test-knobs: origin prune of room {} {said}",
+                        crate::node::network::short_id(self.channel_id)
+                    );
+                    last.insert(self.channel_id, said);
+                }
+            }
             // No origin-key cloning or serialization on a quiet tick, even with many held keys.
             Ok(generations
                 .iter()
-                .any(|(chain, _)| *chain < floor)
-                .then_some(Origins { floor, generations }))
+                .any(|(chain, _)| !needed.keeps(*chain, live))
+                .then_some(Origins {
+                    needed,
+                    live,
+                    generations,
+                }))
         })();
         let (origins, origin_error) = match origins {
             Ok(origins) => (origins, None),
@@ -573,7 +601,9 @@ impl Prepared {
                     {
                         return Err(Error::MalformedAtRest("key prune origin basis changed"));
                     }
-                    let gone = candidate.retain_from(&self.room, self.epoch, origins.floor);
+                    let gone = candidate.retain_needed(&self.room, self.epoch, |generation| {
+                        origins.needed.keeps(generation, origins.live)
+                    });
                     if gone == 0 {
                         return Ok(());
                     }

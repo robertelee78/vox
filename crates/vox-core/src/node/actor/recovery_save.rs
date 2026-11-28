@@ -239,15 +239,18 @@ impl Node {
                 self.governance_work.wake_room(room);
             }
         }
+        let closed = self.closed_under(&continuation);
         match continuation.after {
             After::Governance(next) => self.reject_owned_governance(room, error, next, reply),
             After::Producer => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                } else if !matches!(
-                    error,
-                    Error::Profile("room publication is busy; retry this operation")
-                ) {
+                } else if !closed
+                    && !matches!(
+                        error,
+                        Error::Profile("room publication is busy; retry this operation")
+                    )
+                {
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
                         note: format!(
                             "room {} recovery did not complete its retained save: {error}; check vox status and the daemon log before reopening this room",
@@ -257,6 +260,17 @@ impl Node {
                 }
             }
         }
+    }
+    /// Whether this node closed `continuation`'s room instance while the stage ran (a leave
+    /// wiped its key, `leave_save.rs`): the stage's failure is then the room's departure, not a
+    /// fault to report. A locked store (no unlocked identity, or a lock under way) never is.
+    fn closed_under(&self, continuation: &Continuation) -> bool {
+        self.locking == 0
+            && self.profile.as_ref().is_some_and(Profile::is_unlocked)
+            && continuation
+                .instance
+                .try_lock()
+                .is_ok_and(|channel| channel.key_wiped())
     }
     pub(super) async fn finish_owned_recovery(
         &mut self,
@@ -333,8 +347,10 @@ impl Node {
                     continuation.stage,
                     Stage::Settle | Stage::CatchUp | Stage::Presence | Stage::Shares
                 ) {
-                    let _ = self.event_tx.send(NodeEvent::NodeNote { note: format!(
-                        "room {} settlement did not start a new sender key: {error}; check vox status and the daemon log before reopening this room", crate::node::network::short_id(room)) });
+                    if !self.closed_under(&continuation) {
+                        let _ = self.event_tx.send(NodeEvent::NodeNote { note: format!(
+                            "room {} settlement did not start a new sender key: {error}; check vox status and the daemon log before reopening this room", crate::node::network::short_id(room)) });
+                    }
                     self.finish_settlement_offer(room, &mut continuation);
                     if continuation.recover {
                         continuation.stage = Stage::Fence;
