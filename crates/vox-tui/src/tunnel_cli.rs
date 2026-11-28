@@ -1814,9 +1814,9 @@ pub(crate) async fn open_named_room(
         _ => resolve_prefix(prefix, &rooms.iter().map(|r| r.0).collect::<Vec<_>>())?,
     };
     if rooms.iter().any(|r| r.0 == channel_id && r.4) {
-        return Err(AppError::Usage(
-            vox_core::node::api::Fault::RoomPreparing.explain().into(),
-        ));
+        // A room still preparing is waited for, as every room verb waits for it.
+        return crate::room_cli::room_of(client, &vox_core::node::link::b32_encode(&channel_id))
+            .await;
     }
     let open = rooms.iter().any(|r| r.0 == channel_id && r.2);
     if open {

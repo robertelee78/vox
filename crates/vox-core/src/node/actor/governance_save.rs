@@ -1472,13 +1472,6 @@ impl Node {
     /// Start each room in the original BTreeMap order. Scheduling is not a prune/checkpoint;
     /// only the matching final callback publishes a changed retention view.
     pub(super) async fn sweep_retention(&mut self) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if std::env::var_os("VOX_TEST_HOLD_RETENTION_SWEEP_FILE")
-            .filter(|path| !path.is_empty())
-            .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
-            return false;
-        }
         let now = self.now_ms();
         self.refresh_node_retention(now);
         if self.profile.is_none() {

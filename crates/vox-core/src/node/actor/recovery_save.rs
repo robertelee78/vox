@@ -347,7 +347,30 @@ impl Node {
                     continuation.stage,
                     Stage::Settle | Stage::CatchUp | Stage::Presence | Stage::Shares
                 ) {
-                    if !self.closed_under(&continuation) {
+                    // **A stage refused only for a busy turn is not a failure to tell** (as a room
+                    // this node closed under it is not): the room's one publication slot, or its
+                    // governance turn, was taken. While the room still owes this work the tick
+                    // takes it up again (`settle_room`); a room with sparse history owes no other
+                    // (its chain is Settle and Shares, both what `settlement_work_pending` asks),
+                    // so there it was done meanwhile or is no longer due. Said, it put "check vox
+                    // status and the daemon log" over whatever the person was being told, a join
+                    // among them.
+                    let busy = matches!(
+                        error,
+                        Error::Profile("room publication is busy; retry this operation")
+                    ) || ChannelState::governance_refreshing(&error);
+                    let retried = busy && {
+                        let channel = continuation.instance.lock().await;
+                        self.profile.as_ref().is_some_and(|profile| {
+                            channel
+                                .uses_sparse_history(profile.store())
+                                .unwrap_or(false)
+                                || channel
+                                    .settlement_work_pending(profile.store(), self.now_ms())
+                                    .unwrap_or(false)
+                        })
+                    };
+                    if !retried && !self.closed_under(&continuation) {
                         let _ = self.event_tx.send(NodeEvent::NodeNote { note: format!(
                             "room {} settlement did not start a new sender key: {error}; check vox status and the daemon log before reopening this room", crate::node::network::short_id(room)) });
                     }

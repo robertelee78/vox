@@ -1542,10 +1542,6 @@ impl FinishedHistoryEffect {
 
 #[cfg(feature = "test-knobs")]
 const TEST_FX29_CONTENT_OUTCOME_ENV: &str = "VOX_TEST_FX29_CONTENT_OUTCOME_FILE";
-#[cfg(feature = "test-knobs")]
-const TEST_FX29_REFILL_OUTCOME_ENV: &str = "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE";
-#[cfg(feature = "test-knobs")]
-const TEST_FX29_REFILL_HASH_ENV: &str = "VOX_TEST_FX29_CONTENT_REFILL_HASH";
 
 #[derive(Clone, Copy)]
 pub(crate) struct HistoryEffectCursor {
@@ -1645,56 +1641,6 @@ impl ChannelState {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(_) => Err(Error::Profile(
                 "test sparse-Content outcome marker could not be published",
-            )),
-        };
-        let _ = std::fs::remove_file(&temporary);
-        published
-    }
-
-    #[cfg(feature = "test-knobs")]
-    pub(super) fn record_fx29_refill_outcome(&self, hash: &Digest32) -> Result<()> {
-        use std::io::Write as _;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
-
-        let encoded = crate::node::link::b32_encode(hash);
-        if std::env::var(TEST_FX29_REFILL_HASH_ENV).as_deref() != Ok(encoded.as_str()) {
-            return Ok(());
-        }
-        let Some(path) = std::env::var_os(TEST_FX29_REFILL_OUTCOME_ENV)
-            .filter(|path| !path.is_empty())
-            .map(std::path::PathBuf::from)
-        else {
-            return Ok(());
-        };
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(format!(
-            ".writing.{}.{}",
-            std::process::id(),
-            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
-        ));
-        let temporary: std::path::PathBuf = temporary.into();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|_| {
-                Error::Profile("test sparse-Content refill marker could not be created")
-            })?;
-        if write!(file, "accepted:{encoded}").is_err() {
-            drop(file);
-            let _ = std::fs::remove_file(&temporary);
-            return Err(Error::Profile(
-                "test sparse-Content refill marker could not be written",
-            ));
-        }
-        drop(file);
-        let published = match std::fs::hard_link(&temporary, &path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(_) => Err(Error::Profile(
-                "test sparse-Content refill marker could not be published",
             )),
         };
         let _ = std::fs::remove_file(&temporary);

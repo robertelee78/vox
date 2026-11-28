@@ -461,8 +461,18 @@ impl ChannelState {
                 "an identity cannot withdraw trust in itself",
             ));
         }
+        // A key may have gone out to the target when a grant committed, when it holds an
+        // entitlement (a first grant's package writes the entitlement in its own batch, before
+        // the grant commits, `PendingConsent::save`), or whenever it is an admitted author here:
+        // a store written before this release may hold a package to it with neither a grant nor
+        // a row. So the withdrawal rotates in each of those cases, and nothing written after it
+        // is sealed under a key the target may hold. `authors` is this room's own durable
+        // admission state; an identity that never was an author here was never given a key and
+        // costs no rotation.
         let revoke = match self.has_consented(store, &target) {
-            Ok(consented) => consented,
+            Ok(consented) => {
+                consented || self.entitled.contains_key(&target) || self.is_author(&target)
+            }
             Err(error) if governance::refreshing(&error) => true,
             Err(error) => return Err(error),
         };

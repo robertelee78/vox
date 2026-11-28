@@ -146,10 +146,12 @@ A newly created room builds its first saved-history projection before it is show
 Later projection work, such as right after a retention change, or an expiry backlog larger than
 one sweep can make the node answer `the room is refreshing saved history; retry`; that answer does
 not mean the node is downloading the room's whole history. `vox room read` waits for that work
-instead: it prints `vox: waiting for room <id> to finish refreshing its saved history` once, then
-the messages when the work is done, and gives the node's answer only if it has not finished within
-15 seconds. The terminal app, the Mac app, an agent's hook and `vox room read --since` or `--tag`
-still get the answer at once. Within one sweep, reads exclude expired messages and report exact
+instead, with or without `--hashes`, and so do a `--re` given as a printed hash prefix and the
+operations `vox room tail --json` looks up: it prints `vox: waiting for room <id> to
+finish refreshing its saved history` once, then the messages when the work is done, and gives the
+node's answer only if it has not finished within 15 seconds. The terminal app, the Mac app, an
+agent's hook and `vox room read --since` or `--tag` still get the answer at once. Within one
+sweep, reads exclude expired messages and report exact
 pages and totals without waiting for physical deletion.
 A message your node showed and that then expired stays gone: a longer retention set afterwards,
 by the room or by your node's own setting, does not bring it back, even if its deletion had not

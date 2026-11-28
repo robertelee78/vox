@@ -420,9 +420,26 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
 }
 
 /// Twelve observed ten-second reach bounds leave room for sealing and carrying.
+///
+/// "Carried" is: A's log route to B has posted every key B is owed now (A's daemon says so, the
+/// `test-knobs` line `every key owed to <B> is in the log of room <r>`, said again after the
+/// moment this is called), and C holds A's feed through what A has appended, those packages
+/// included. A's own status keeps B's `key_delivery_pending` true: a package settles nothing
+/// (V210-45, #1422), only B's answer over a direct connection does, and A and B are never up
+/// together here.
 fn wait_for_log_delivery(k: &Cast, a: &Daemon, c: &Daemon, verdict: &str) {
+    test_knobs::require(&["is in the log of room"]);
+    let room_short: String = k.room.chars().take(12).collect();
+    let in_log = format!(
+        "every key owed to {} is in the log of room {room_short}",
+        k.fps[1]
+    );
+    let said = || a.stderr().lines().filter(|l| l.contains(&in_log)).count();
+    let said_before = said();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
+        // Read before A's status: what A appended before saying it is inside `through` below.
+        let posted = said() > said_before;
         // Repeating this operation posts once. Its fresh reach report says whether A's
         // room log currently grants B consent, rather than merely naming B in its ring.
         let (probe_ok, probe) = vox(
@@ -463,10 +480,6 @@ fn wait_for_log_delivery(k: &Cast, a: &Daemon, c: &Daemon, verdict: &str) {
             };
             let a_room = room(&a_status)?;
             let c_room = room(&c_status)?;
-            let b = a_room["members"]
-                .as_array()?
-                .iter()
-                .find(|member| member["id"].as_str() == Some(k.fps[1].as_str()))?;
             let a_at_c = c_room["members"]
                 .as_array()?
                 .iter()
@@ -475,14 +488,16 @@ fn wait_for_log_delivery(k: &Cast, a: &Daemon, c: &Daemon, verdict: &str) {
             let through = a_room["own_feed_through"].as_u64()?;
             // C's authenticated position in A's feed: `verified_through` since 1edf35498, which
             // gave `holds_through` the latest message C can show.
-            Some(
-                renewed
-                    && b["key_delivery_pending"] == false
-                    && a_at_c["verified_through"].as_u64()? >= through,
-            )
+            Some(renewed && posted && a_at_c["verified_through"].as_u64()? >= through)
         })() == Some(true);
         if probe_ok && a_ok && c_ok && ready {
             eprintln!("[keys-by-log] B's grant and all owed keys carried before A stops:\npost: {probe}\nA status: {a_status}\nC status: {c_status}");
+            // What A's operator reads about B now: its keys went through the room, and B has
+            // not confirmed them (printed, not asserted).
+            eprintln!(
+                "[keys-by-log] A's `vox status`:\n{}",
+                vox(&k.a, &["status"], "").1
+            );
             break;
         }
         assert!(

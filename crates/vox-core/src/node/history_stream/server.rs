@@ -17,29 +17,6 @@ const MIB: usize = 1024 * 1024;
 // cannot consume the terminal DONE credit. Duplicate ACKs are charged too, not free input.
 const ACK_RESERVE: usize = 128;
 
-/// **For proofs only.** While this marker exists, the first private key-package requested by a
-/// non-recipient is deliberately served once, then the marker is renamed with `.engaged`
-/// appended.  This makes a real peer hostile at the wire boundary so another shipped daemon can
-/// prove it refuses the unexpected ciphertext before persistence.  It is absent from installable
-/// builds (V210-105).
-#[cfg(feature = "test-knobs")]
-pub const TEST_SERVE_PRIVATE_BODY_ENV: &str = "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE";
-
-fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    #[cfg(feature = "test-knobs")]
-    {
-        let trigger = std::path::PathBuf::from(std::env::var(TEST_SERVE_PRIVATE_BODY_ENV).ok()?);
-        if !trigger.is_file() {
-            return None;
-        }
-        let mut engaged = trigger.as_os_str().to_os_string();
-        engaged.push(".engaged");
-        Some((trigger, engaged.into()))
-    }
-    #[cfg(not(feature = "test-knobs"))]
-    None
-}
-
 enum Sent {
     Yes,
     Full,
@@ -1699,7 +1676,6 @@ async fn entry(
         v2.kind == crate::log::history::SignedEntryKind::KeyPackage
             && v2.recipient != Some(source.peer)
     });
-    let mut hostile_private_body = private_for_another.then(test_private_body_marker).flatten();
     let withhold_private_body = private_for_another && !explicit_body;
     // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
     // A small control uses the small pool; a large record must have the foreground/archive job.
@@ -1820,18 +1796,7 @@ async fn entry(
         )
         .await?
         {
-            Sent::Yes => {
-                if let Some((trigger, engaged)) = hostile_private_body.take() {
-                    // The apparatus records the exact authenticated entry whose chunk crossed the
-                    // sender boundary. The receiver's independent durable marker must match it.
-                    std::fs::write(&trigger, hash).map_err(|_| {
-                        Error::Profile("test hostile-body marker could not record the entry")
-                    })?;
-                    std::fs::rename(trigger, engaged).map_err(|_| {
-                        Error::Profile("test hostile-body marker could not record engagement")
-                    })?;
-                }
-            }
+            Sent::Yes => {}
             Sent::Full => {
                 result.status = Status::More;
                 return Ok(result);

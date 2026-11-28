@@ -122,7 +122,9 @@ Host *.vox
     #   ProxyCommand socat - SOCKS5:127.0.0.1:1080:%h:%p
 ```
 
-Copy the block your `vox up` printed: it names the port the proxy really uses. `nc -X` is the
+`vox up <room>` opens that room if it is closed; a room still preparing its saved history, as one
+does when the node has just started again, is waited for, up to 15 seconds, as every room command
+waits for it. Copy the block your `vox up` printed: it names the port the proxy really uses. `nc -X` is the
 OpenBSD netcat that macOS and most Linux systems ship. With another netcat, use the `socat` line. Then
 connect with your account on the sharer's machine, here `robert`:
 

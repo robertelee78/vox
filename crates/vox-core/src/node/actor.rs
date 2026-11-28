@@ -495,11 +495,12 @@ fn detail_of(
     let same_trust = prev.filter(|p| {
         p.governance_revision == governance_revision && p.members == members && p.epoch == epoch
     });
-    let (trusted_by, member_consent, consenting, offer_bases) = match same_trust {
+    let (trusted_by, member_consent, consenting, withdrawn, offer_bases) = match same_trust {
         Some(p) => (
             p.trusted_by.clone(),
             p.member_consent.clone(),
             p.consenting.clone(),
+            p.withdrawn.clone(),
             p.offer_bases.clone(),
         ),
         None => {
@@ -526,6 +527,7 @@ fn detail_of(
                 trusted_by,
                 member_consent,
                 consenting,
+                ch.withdrawn_from_me()?,
                 ch.offer_bases(store)?,
             )
         }
@@ -599,6 +601,7 @@ fn detail_of(
         render_backfill_pending: ch.governance_backfill_pending(store)?,
         key_delivery_pending,
         consenting,
+        withdrawn,
         not_shown,
         offer_bases,
         trusted_by,

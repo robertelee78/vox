@@ -18,10 +18,10 @@
 //!    newest `MAX_PAGE_ENTRIES` (128) rows of an author and leaves the backlog below it where it
 //!    is. Bob pages back through the room in its order (`--json --limit --before`, as a person
 //!    pages back) and, each time he reaches the oldest row he holds, asks for the page before it
-//!    with `vox room read --history older --before <that row>`; each such page arrives within
-//!    [`PAGE_WITHIN`], and in the end he reads every `post <i>` **once each and in order**, within
-//!    [`BOUND`] of his join. Two sizes: [`BACKLOG`] (257: 129 below the window) **blocks**; 1,500
-//!    (across the sender-key rotation at 1,000, ADR-006 `N`) is **optional** for its staging time.
+//!    with `vox room read --history older --before <that row>`, and in the end he reads every
+//!    `post <i>` **once each and in order**, within [`BOUND`] of his join. Two sizes: [`BACKLOG`]
+//!    (257: 129 below the window) **blocks**; 1,500 (across the sender-key rotation at 1,000,
+//!    ADR-006 `N`) is **optional** for its staging time.
 //!
 //! **The defect this began with.** Bob's paged read stopped at 500 posts, 1,001–1,500: a sender
 //! key rotates every 1,000 messages, and a newcomer was handed only the generation current at its
@@ -78,6 +78,23 @@
 //!    other "busy": alice's Computer publication lease held from bob's admission request
 //!    (`<file>.lease`, as a policy transition holds it): one attempt while it stands, and bob gets
 //!    in once it is released: [`a_join_whose_admission_meets_the_computer_lease_gets_in_once_it_is_released`].
+//! 4. **A returning member crosses a private package and keeps its cursors** (optional): Bob
+//!    returns behind two authors; Alice reports his receipt through Carol's header-only private
+//!    package; he holds the row before it; one page back brings Carol's feed below his first
+//!    window; a restart restores his exact durable feed heads; Carol comes back and all three
+//!    exchange posts; a late member sees a pruned body as unavailable:
+//!    [`a_returning_member_crosses_a_private_package_and_keeps_its_cursors`]. Its privacy section
+//!    (Carol must not read Alice's tail through Bob while Alice is offline) was removed: it
+//!    asserted the opposite of required behaviour since #1075 (`cab86a7e0`; ADR-036 as amended
+//!    by ADR-046; PRD-001 R11), proven by
+//!    `key_package_proof.rs::keys_reach_an_offline_member_through_an_always_on_member`. Its
+//!    interrupted-request resume (`--history resume`) was removed: since `7257301f9` (#1411,
+//!    ADR-054) a returning member's pull loop fetches an author's whole feed unasked, so a request
+//!    was outstanding at the interruption only by chance; that command has no proof in this release.
+//!    Its late member's delayed-body refill (a younger local witness aging out, then Carol bringing
+//!    Bob's expired body, which must stay unshown) was removed: since `7257301f9` (#1411) a node
+//!    never owes or fetches a body whose lifetime is over (`held_history.rs`, `completed`), so the
+//!    bytes it waited for never come.
 //!
 //! **Mutations, one per claim:**
 //! - a first-use refusal or wait on the room's convergence put back (a text post refused as
@@ -114,7 +131,7 @@ optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
     hosted_nodes_read_each_other,
-    interrupted_history_and_private_packages_recover,
+    a_returning_member_crosses_a_private_package_and_keeps_its_cursors,
     retained_rows_render_once_their_key_and_consent_arrive,
     a_busy_room_newcomer_reads_every_member_with_a_paused_member,
     a_busy_room_newcomer_reads_every_member_with_a_delayed_path,
@@ -153,9 +170,6 @@ const BOUND: Duration = Duration::from_secs(300);
 /// its room already meets both ways (`a_member_that_restarts_finds_its_room_proof`, 10 s); a
 /// fresh room measured well under it, and the backlog room must meet the same figure.
 const READY_WITHIN: Duration = Duration::from_secs(10);
-/// Existing optional private-history responsiveness claim; the blocking connected catch-up arm
-/// uses structural owner/progress observations instead of this elapsed bound.
-const PAGE_WITHIN: Duration = Duration::from_secs(60);
 /// The reproduced connected catch-up backlog: past `MAX_PAGE_ENTRIES` (128), so 129 rows sit
 /// below the live window and are read only on demand. The former 160-row arm did not cover the
 /// 257-row daemon wedge observed on the release base.
@@ -802,8 +816,11 @@ fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
         {
             continue;
         }
+        // The command itself now waits for a refresh and says so on a line of its own before the
+        // refusal, so the refusal is recognised as the last line it says.
         if !result.0
-            && result.2.trim() == "vox: node: the room is refreshing saved history; retry"
+            && result.2.trim().lines().last()
+                == Some("vox: node: the room is refreshing saved history; retry")
             && refreshing_since.elapsed() < Duration::from_secs(120)
         {
             std::thread::sleep(Duration::from_millis(250));
@@ -1040,6 +1057,30 @@ fn room_changed_while_reading(err: &str) -> bool {
     refused
 }
 
+/// Whether a refused command named the room's permissions being read from local storage: the
+/// named wait that tells a person to try again once the room is ready
+/// (`Fault::GovernanceRefreshing`; the text `support/room.rs` retries a trust on).
+fn permissions_still_being_read(said: &str) -> bool {
+    said.contains("this room's permissions are still being read from local storage")
+        && said.contains("try again once the room is ready")
+}
+
+/// `vox room retention <room> --steps 7d`, run again while it is refused only with
+/// [`permissions_still_being_read`], as a person told to try again once the room is ready would;
+/// any other answer goes to the caller's verdict. The watchdog owns a wait that never ends.
+fn retention_reload(dir: &Path, room: &str) -> (bool, String, String) {
+    loop {
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        if ok || !permissions_still_being_read(&format!("{out}\n{err}")) {
+            return (ok, out, err);
+        }
+        eprintln!(
+            "[proof] `vox room retention` waits: the room's permissions are still being read"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Whether `vox room read` on `dir` shows `text` now. A read that fails is a red, never silence;
 /// a read the room asks to refresh is read again, as a person would.
 fn reads(dir: &Path, room: &str, text: &str) -> bool {
@@ -1111,7 +1152,6 @@ fn read_hash(dir: &Path, room: &str, text: &str) -> Option<String> {
 struct HistoryObservation {
     phase: String,
     remaining: u64,
-    request: Option<String>,
 }
 
 fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
@@ -1135,23 +1175,7 @@ fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
     let remaining = status["remaining"]
         .as_u64()
         .unwrap_or_else(|| panic!("PRODUCT: history status named no remaining count: {value}"));
-    // The CLI renders the binary request id as a copyable hexadecimal string at the envelope;
-    // the nested status keeps its wire-shaped byte array.
-    let request = match &value["request"] {
-        serde_json::Value::String(request) => Some(request.to_owned()),
-        serde_json::Value::Null => None,
-        _ => panic!("PRODUCT: history status printed a non-string request id: {value}"),
-    };
-    HistoryObservation {
-        phase,
-        remaining,
-        request,
-    }
-}
-
-fn history_status(dir: &Path, room: &str) -> (String, u64) {
-    let observed = history_observation(dir, room);
-    (observed.phase, observed.remaining)
+    HistoryObservation { phase, remaining }
 }
 
 /// How long after `since` each side first read the other: alice `to_alice`, bob `to_bob`
@@ -2704,20 +2728,23 @@ fn hosted_nodes_read_each_other() {
     converged(&staged);
 }
 
-/// Members recover readable history and exchange posts after an interrupted history request.
-/// Status also names the last room sync, and a late member sees a pruned body as unavailable.
+/// A returning member crosses a private package and keeps its exact cursors: Bob returns behind
+/// two authors, Alice reports his receipt through Carol's header-only private package, he holds
+/// the row before it, status names the last room sync, one page back brings Carol's feed below
+/// his first window, and a restart restores his exact durable feed heads; Carol comes back and
+/// all three exchange posts; and a late member sees a pruned body as unavailable. Three sections
+/// were removed: the privacy section (it asserted the opposite of required behaviour since
+/// #1075), the interrupted-request resume (it passed by a race since #1411), and the late
+/// member's delayed-body refill (since `7257301f9`, #1411, a node never owes or fetches a body
+/// whose lifetime is over, `held_history.rs` `completed`, so the bytes it waited for never come).
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real vox daemons and private-package staging; optional, run it in release"]
-fn interrupted_history_and_private_packages_recover() {
+fn a_returning_member_crosses_a_private_package_and_keeps_its_cursors() {
     test_knobs::require(&[
         "VOX_TEST_HOLD_PACKAGES_FILE",
-        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
         "VOX_TEST_FX29_MUTANT",
         "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
-        "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
-        "VOX_TEST_FX29_CONTENT_REFILL_HASH",
-        "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
     ]);
     watchdog::arm();
     let mut tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -2755,21 +2782,12 @@ fn interrupted_history_and_private_packages_recover() {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
-    let hostile = root.join("serve-private-body-once");
-    let hostile_path = hostile
-        .to_str()
-        .expect("APPARATUS: a UTF-8 hostile-body marker path")
-        .to_owned();
-    let alice_knob = [(
-        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
-        hostile_path.as_str(),
-    )];
     let sparse_content_outcome = root.join("fx29-sparse-content-outcome");
     let sparse_content_outcome_path = sparse_content_outcome
         .to_str()
         .expect("APPARATUS: a UTF-8 sparse-Content outcome marker path")
         .to_owned();
-    let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
+    let _alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
@@ -3019,8 +3037,6 @@ fn interrupted_history_and_private_packages_recover() {
         vox_core::log::history::MAX_PAGE_ENTRIES
     );
 
-    std::fs::write(&hostile, b"")
-        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hostile.display()));
     let bob_after_gap = daemon(&bob, "bob-after-gap");
     attached(&bob, "bob-after-gap");
     wait_room_open(&bob, &room, "bob-after-gap");
@@ -3034,46 +3050,11 @@ fn interrupted_history_and_private_packages_recover() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let oldest_alice_live = format!(
-        "alice settled successor {}",
-        alice_successors - vox_core::log::history::MAX_PAGE_ENTRIES
-    );
-    // Since one pull loop fetches everything (ADR-054 PL-3, #1411) a returning member fetches
-    // newest first and the rest unasked: the newest marker shows before the older rows of the
-    // suffix have come. The row the archive request pages back from is waited for, as a person
-    // who sees it in the room would; the watchdog owns one that never comes.
-    let oldest = loop {
-        if let Some(hash) = read_hash(&bob, &room, &oldest_alice_live) {
-            break hash;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    let (ok, out, err) = vox(
-        &bob,
-        &[
-            "room",
-            "read",
-            &room,
-            "--history",
-            "older",
-            "--before",
-            &oldest,
-        ],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: Bob's `vox room read --history older --before {oldest}` was refused: {out}{err}"
-    );
-    bob_after_gap.stop();
-    let bob_after_interruption = daemon(&bob, "bob-after-interruption");
-    attached(&bob, "bob-after-interruption");
-    let (ok, out, err) = vox(&bob, &["room", "read", &room, "--history", "resume"], None);
-    assert!(
-        ok,
-        "PRODUCT: Bob's shipped `vox room read --history resume` was refused after interruption: \
-         {out}{err}"
-    );
+    // The step that paged Bob back (`--history older`), interrupted him and resumed the request
+    // (`--history resume`) was removed: since `7257301f9` (#1411, ADR-054) a returning member's
+    // pull loop fetches the whole of an author's feed unasked, so a request was outstanding at
+    // the interruption only by chance; `--history resume` after an interruption has no proof in
+    // this release.
     // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
     // independently. Alice must instead report Bob's authenticated receipt through the exact
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
@@ -3107,7 +3088,7 @@ fn interrupted_history_and_private_packages_recover() {
              bob's daemon said: {}",
             current.phase,
             current.remaining,
-            said(&bob, "bob-after-interruption")
+            said(&bob, "bob-after-gap")
         );
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -3117,14 +3098,7 @@ fn interrupted_history_and_private_packages_recover() {
         "PRODUCT: Bob's shipped archive read settled Alice's exact cursor through \
          {marker_through}, but did not continue past Carol's header to the exact older row \
          {before_package_hash}\nbob's daemon said: {}",
-        said(&bob, "bob-after-interruption")
-    );
-    let archive_status = history_status(&bob, &room);
-    assert_eq!(
-        archive_status,
-        ("complete".to_owned(), 0),
-        "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
-         returned the exact older row, its status was not exactly complete with zero remaining"
+        said(&bob, "bob-after-gap")
     );
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["status", "--json"], None);
@@ -3140,10 +3114,64 @@ fn interrupted_history_and_private_packages_recover() {
         );
     }
 
+    // Bob first met Carol's feed after the gap, so his walk floor for it is the lowest of her
+    // newest 128 positions (ADR-052 RG-6, `newcomer_floor`): her first post lies below it and his
+    // pull loop never fetches it unasked, so his role-complete cursor of her feed stops just
+    // under it. The removed page back (`--history older`, which owes every author's held run down
+    // to position 1) used to bring it. Page back once with the shipped command, then wait until
+    // his own status holds both feeds exactly, so the restart below restores durable heads that
+    // were complete before it. A wedge only while nothing moves: neither cursor changed over
+    // `RECEIPT_STILL_READS` answered reads a second apart.
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &before_package_hash,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Bob's `vox room read --history older --before {before_package_hash}` was \
+         refused: {out}{err}"
+    );
+    println!("[proof] Bob paged back before the restart: {}", err.trim());
+    let mut seen = None;
+    let mut still = 0;
+    loop {
+        let heads = (
+            member_holds_through(&bob, &room, &fps[0]),
+            member_holds_through(&bob, &room, &fps[2]),
+        );
+        if heads == (Some(marker_through), Some(carol_tail_through)) {
+            break;
+        }
+        if seen == Some(heads) {
+            still += 1;
+        } else {
+            println!("[proof] Bob's `vox status --json` holds Alice and Carol through {heads:?}");
+            seen = Some(heads);
+            still = 0;
+        }
+        assert!(
+            still < RECEIPT_STILL_READS,
+            "PRODUCT: after Bob paged back with Alice online, his role-complete cursors of \
+             Alice and Carol stayed at {heads:?} over {RECEIPT_STILL_READS} answered reads a \
+             second apart, short of {marker_through} and {carol_tail_through}\n\
+             bob's daemon said: {}",
+            said(&bob, "bob-after-gap")
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
     // Restart Bob before the next receipt probe. Alice observing a newer completed sync and the
     // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
     // in-memory acknowledgement left over from the first daemon.
-    bob_after_interruption.stop();
+    bob_after_gap.stop();
     let bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     wait_room_open(&bob, &room, "bob-after-restart");
@@ -3156,139 +3184,16 @@ fn interrupted_history_and_private_packages_recover() {
         said(&bob, "bob-after-restart")
     );
 
-    // Alice now goes offline. Release Carol's package hold only after Carol and Bob are running,
-    // then wait for a completed Carol↔Bob sync (not elapsed silence). If Bob persisted the hostile
-    // ciphertext, he can serve it and Carol will show Alice's tail. The correct product completed
-    // that sync but has only the authenticated package header, so her shipped read remains absent.
-    alice_daemon.stop();
-    let carol_from_bob_daemon = daemon_env(&carol, "carol-from-bob", &knob);
-    attached(&carol, "carol-from-bob");
-    wait_room_open(&carol, &room, "carol-from-bob");
-    assert!(
-        !reads(&carol, &room, &package_marker),
-        "PRODUCT: Carol read Alice's marker while the confirmed package-installer hold remained \
-         armed; the product installed or served the held key-package past its causal hold"
-    );
-    std::fs::remove_file(&hold)
-        .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
-    // A successful trust update causally releases retained key-package replay and advances its
-    // first bounded turn before the shipped command returns. Keep Alice offline, then wait on the
-    // shipped pending bit until every continuation is done: the privacy verdict is not a race
-    // with the separately scheduled package-maintenance turn.
-    let (ok, out, err) = vox(&carol, &["trust", "add", &fps[0], "--name", "alice"], None);
-    assert!(
-        ok,
-        "PRODUCT: Carol's idempotent shipped trust update could not start retained-package \
-         processing while Alice was offline: {out}{err}"
-    );
-    let packages_deadline = Instant::now() + READY_WITHIN;
-    while key_packages_pending(&carol, &room) != Some(false) {
-        assert!(
-            Instant::now() < packages_deadline,
-            "PRODUCT: Carol's shipped status did not report retained key-package processing \
-             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
-            said(&carol, "carol-from-bob")
-        );
-        std::thread::yield_now();
-    }
-
-    // A completed inventory round is not evidence that Bob had to answer for Alice's history.
-    // Re-arm Carol's package hold before the shipped reader asks for the exact page below Alice's
-    // oldest live-window row. The hold keeps the shipped pending bit observable until the proof
-    // releases it. The product has only the role-complete header: persisting the hostile private
-    // body already turns the earlier exact refusal assertion red.
-    std::fs::write(&hold, b"").unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not re-arm Carol's package hold at {} before the explicit history \
-             request: {e}",
-            hold.display()
-        )
-    });
-
-    // The bounded interval contains the package. Alice is offline and Bob is the only source, so
-    // the retained request bound to that exact authenticated Alice cursor and ending its quantum
-    // has given Bob the exact opportunity to serve every byte he holds in that interval.
-    let (ok, out, err) = vox(
-        &carol,
-        &[
-            "room",
-            "read",
-            &room,
-            "--history",
-            "older",
-            "--before",
-            &oldest,
-        ],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: while Alice was offline, Carol's shipped history read through Bob was refused: \
-         {out}{err}"
-    );
-    let history_deadline = Instant::now() + PAGE_WITHIN;
-    let bob_only_history = loop {
-        let observed = history_observation(&carol, &room);
-        if observed.request.is_some() && matches!(observed.phase.as_str(), "more" | "complete") {
-            break observed;
-        }
-        assert!(
-            Instant::now() < history_deadline,
-            "PRODUCT: Carol's shipped history status did not finish the exact Alice page through \
-             reachable Bob within {PAGE_WITHIN:?} while Alice was offline; phase={}, request={:?}, \
-             remaining={}\ncarol said: {}\nbob said: {}",
-            observed.phase,
-            observed.request,
-            observed.remaining,
-            said(&carol, "carol-from-bob"),
-            said(&bob, "bob-after-restart")
-        );
-        std::thread::yield_now();
-    };
-
-    std::fs::remove_file(&hold).unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not release Carol's post-history package hold at {}: {e}",
-            hold.display()
-        )
-    });
-    let post_history_packages_deadline = Instant::now() + READY_WITHIN;
-    while key_packages_pending(&carol, &room) != Some(false) {
-        assert!(
-            Instant::now() < post_history_packages_deadline,
-            "PRODUCT: Carol's shipped status did not report post-history key-package processing \
-             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
-            said(&carol, "carol-from-bob")
-        );
-        std::thread::yield_now();
-    }
-    assert!(
-        !reads(&carol, &room, &package_marker),
-        "PRODUCT: after Bob exhausted Carol's explicit Alice-history quantum (phase={}, \
-         remaining={}) and retained-package replay completed while Alice was offline, Carol read \
-         Alice's private-package tail {package_marker:?}; Bob persisted and re-served ciphertext \
-         addressed only to Carol\ncarol said: {}\nbob said: {}",
-        bob_only_history.phase,
-        bob_only_history.remaining,
-        said(&carol, "carol-from-bob"),
-        said(&bob, "bob-after-restart")
-    );
-
-    // Bringing the actual source back is the one causal change that makes Carol's package
-    // available. Her exact tail appears, then all three shipped daemons still exchange content.
-    let _alice_after_privacy = daemon_env(&alice, "alice-after-privacy", &alice_knob);
-    attached(&alice, "alice-after-privacy");
-    let released_deadline = Instant::now() + READY_WITHIN;
-    while !reads(&carol, &room, &package_marker) {
-        assert!(
-            Instant::now() < released_deadline,
-            "PRODUCT: Carol did not read Alice's exact tail within {READY_WITHIN:?} after the \
-             actual package source returned\ncarol said: {}\nalice said: {}",
-            said(&carol, "carol-from-bob"),
-            said(&alice, "alice-after-privacy")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // The privacy section that stood here was removed: its assertion ("Bob persisted and
+    // re-served ciphertext addressed only to Carol") asserted the opposite of required behaviour
+    // since #1075 (`cab86a7e0`; ADR-036 as amended by ADR-046; PRD-001 R11): every member keeps
+    // the sealed package so an always-on member carries it to an offline recipient, as
+    // `key_package_proof.rs::keys_reach_an_offline_member_through_an_always_on_member` proves.
+    //
+    // Carol comes back plainly; then all three shipped daemons still exchange content.
+    let carol_returned = daemon(&carol, "carol-returns");
+    attached(&carol, "carol-returns");
+    wait_room_open(&carol, &room, "carol-returns");
     let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
@@ -3304,31 +3209,22 @@ fn interrupted_history_and_private_packages_recover() {
             Instant::now() < converged_deadline,
             "PRODUCT: alice and bob did not both read carol's post within {READY_WITHIN:?} after \
              her package landed\nalice's daemon said: {}\nbob's daemon said: {}",
-            said(&alice, "alice-after-privacy"),
+            said(&alice, "alice"),
             said(&bob, "bob-after-restart")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    prove_a_pruned_body_stays_unshown(
-        &alice,
-        &bob,
-        &carol,
-        &late,
-        &room,
-        &link,
-        carol_from_bob_daemon,
-    );
+    prove_a_pruned_body_stays_unshown(&alice, &bob, &carol, &late, &room, &link, carol_returned);
     drop(bob_after_restart);
 }
 
 /// Continue the quiet-room journey with a member trusted before the posts. `late` was mutually
 /// trusted with every author before any room post. Alice and Bob visibly prune one Bob body while
 /// its only retaining source (Carol) is offline, so late settles its authenticated header and
-/// shows the post as not received yet. A later local post visibly aging out proves that header's
-/// sealed retention origin is already expired. Carol then returns with the body while a
-/// proof-only sweep hold preserves the exact post-refill observation: the old body must not become
-/// visible merely because its bytes arrived later. No forged frame or database inspection stands
-/// in for the shipped product.
+/// shows the post as not received yet. Late keeps the room's retention: a message that arrives
+/// already expired is never shown, not even in its place (`docs/manual/rooms.md`, retention;
+/// `owed_window`), and since #1380 a joined room keeps the node's own retention from its join.
+/// No forged frame or database inspection stands in for the shipped product.
 #[cfg(feature = "optional-proofs")]
 fn prove_a_pruned_body_stays_unshown(
     alice: &Path,
@@ -3347,7 +3243,13 @@ fn prove_a_pruned_body_stays_unshown(
                 "APPARATUS: could not stage {name}'s local retention file for the refusal: {error}"
             )
         });
-        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        // Alice created the room: her `--steps` sets the room's own. Bob is not an admin: his is
+        // his own, never longer than the room's, so he first waits until his node holds Alice's
+        // week (he restarted just before).
+        if name == "bob" {
+            wait_room_step_week(dir, "Bob", room);
+        }
+        let (ok, out, err) = retention_reload(dir, room);
         assert!(
             ok,
             "PRODUCT: {name}'s shipped retention reload was refused while staging the late-member \
@@ -3357,15 +3259,14 @@ fn prove_a_pruned_body_stays_unshown(
     std::fs::write(carol.join("cfg/retention"), "default forever\n").unwrap_or_else(|error| {
         panic!("APPARATUS: could not preserve Carol as the delayed body source: {error}")
     });
+    // Carol is not an admin either, and came back just before: the same wait.
+    wait_room_step_week(carol, "Carol", room);
     let (ok, out, err) = vox(carol, &["room", "retention", room, "--steps", "7d"], None);
     assert!(
         ok,
         "PRODUCT: Carol's shipped retention reload was refused while staging the delayed body: \
          {out}{err}"
     );
-    std::fs::write(late.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not stage late's local retention file: {error}")
-    });
     let (ok, out, err) = vox(bob, &["room", "post", room, "--json", pruned], None);
     assert!(
         ok,
@@ -3378,33 +3279,60 @@ fn prove_a_pruned_body_stays_unshown(
         .as_str()
         .unwrap_or_else(|| panic!("PRODUCT: Bob's delayed-refill post named no entry hash: {out}"))
         .to_owned();
-    while !reads(carol, room, pruned) || !reads(alice, room, pruned) {
-        std::thread::yield_now();
+    // Carol (the delayed body source) must show the post, and Alice must have received it,
+    // before Carol stops. Alice keeps messages one second here (`LOCAL_RETENTION`): her read can
+    // show the post only inside that second, and what expired stays gone (#1420, `9afdcd189`).
+    // Demanding both reads true in the same pass races Alice's second against Carol's read, so
+    // Alice's receipt is her read having shown it once, or her role-complete cursor of Bob's feed
+    // reaching the post. A wedge only while nothing moves: none of the three changed over
+    // `STILL_READS` answered reads a second apart.
+    const STILL_READS: usize = 10;
+    let (ok, bob_id, err) = vox(bob, &["id"], None);
+    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    let bob_id = bob_id.trim().to_owned();
+    let bob_through = room_own_feed_through(bob, room).unwrap_or_else(|| {
+        panic!("PRODUCT: Bob's `vox status --json` did not name his feed after his post")
+    });
+    let mut alice_shown = false;
+    let mut seen = None;
+    let mut still = 0;
+    loop {
+        alice_shown |= reads(alice, room, pruned);
+        let carol_shows = reads(carol, room, pruned);
+        let alice_cursor = member_holds_through(alice, room, &bob_id);
+        let alice_has = alice_shown || alice_cursor.is_some_and(|through| through >= bob_through);
+        if carol_shows && alice_has {
+            eprintln!(
+                "[proof] Carol shows Bob's post; Alice received it (her read showed it: \
+                 {alice_shown}; her cursor of Bob: {alice_cursor:?}, post at {bob_through})"
+            );
+            break;
+        }
+        let now = (carol_shows, alice_shown, alice_cursor);
+        if seen == Some(now) {
+            still += 1;
+        } else {
+            eprintln!(
+                "[proof] Bob's post at {bob_through}: Carol shows it {carol_shows}, Alice's read \
+                 showed it {alice_shown}, Alice's cursor of Bob {alice_cursor:?}"
+            );
+            seen = Some(now);
+            still = 0;
+        }
+        assert!(
+            still < STILL_READS,
+            "PRODUCT: Bob's post at {bob_through} did not reach Carol's read and Alice: Carol \
+             shows it {carol_shows}, Alice's read showed it {alice_shown}, Alice's cursor of Bob \
+             {alice_cursor:?}, unchanged over {STILL_READS} answered reads a second apart"
+        );
+        std::thread::sleep(Duration::from_secs(1));
     }
     carol_daemon.stop();
     while reads(alice, room, pruned) || reads(bob, room, pruned) {
         std::thread::yield_now();
     }
 
-    let refill_outcome = late.join("fx29-content-refill-outcome");
-    let refill_hold = late.join("hold-retention-after-content-refill");
-    let refill_outcome_text = refill_outcome.to_string_lossy().into_owned();
-    let refill_hold_text = refill_hold.to_string_lossy().into_owned();
-    let late_daemon = daemon_env(
-        late,
-        "late-refusal",
-        &[
-            (
-                "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
-                refill_outcome_text.as_str(),
-            ),
-            ("VOX_TEST_FX29_CONTENT_REFILL_HASH", pruned_hash.as_str()),
-            (
-                "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
-                refill_hold_text.as_str(),
-            ),
-        ],
-    );
+    let late_daemon = daemon(late, "late-refusal");
     attached(late, "late-refusal");
     let (ok, out, err) = vox(
         late,
@@ -3417,82 +3345,35 @@ fn prove_a_pruned_body_stays_unshown(
          command: {out}{err}"
     );
     wait_room_open(late, room, "late-refusal");
-    let (ok, out, err) = vox(late, &["room", "retention", room, "--steps", "7d"], None);
-    assert!(
-        ok,
-        "PRODUCT: late's shipped retention reload was refused after join: {out}{err}"
-    );
     // Staging fence, read as a person reads: late's room shows Bob's post in its place as not
-    // received yet (#1396). Until then its missing-body decision is not made.
+    // received yet (#1396). Until then its missing-body decision is not made. A wedge only while
+    // nothing moves: neither the row nor late's role-complete cursor of Bob's feed changed over
+    // `STILL_READS` answered reads a second apart.
+    let mut seen = None;
+    let mut still = 0;
     while !shows_not_received_yet(late, room, &pruned_hash) {
-        std::thread::sleep(Duration::from_millis(200));
+        let cursor = member_holds_through(late, room, &bob_id);
+        if seen == Some(cursor) {
+            still += 1;
+        } else {
+            eprintln!("[proof] late's cursor of Bob {cursor:?}; Bob's post at {bob_through}");
+            seen = Some(cursor);
+            still = 0;
+        }
+        assert!(
+            still < STILL_READS,
+            "PRODUCT: late did not show Bob's pruned post {pruned_hash} as not received yet: its \
+             cursor of Bob {cursor:?} (post at {bob_through}) unchanged over {STILL_READS} \
+             answered reads a second apart\nlate's daemon said: {}",
+            said(late, "late-refusal")
+        );
+        std::thread::sleep(Duration::from_secs(1));
     }
     eprintln!("[proof] late shows Bob's pruned post {pruned_hash} as not received yet");
     assert!(
         !reads(late, room, pruned),
         "PRODUCT: the late member read Bob's body after every shipped holder had pruned it"
     );
-
-    // The witness is younger than the already-settled Bob header. Its disappearance from the
-    // shipped read is therefore a causal proof that the header's original retention age has
-    // expired; no elapsed threshold decides this verdict. Freeze only later retention sweeps,
-    // return the sole body source, and wait for the exact committed refill marker. One shipped
-    // read while the sweep is held distinguishes preserved age from the mutant's reset age.
-    let witness = "late retention witness after Bob header settlement";
-    let (ok, out, err) = vox(late, &["room", "post", room, witness], None);
-    assert!(
-        ok,
-        "PRODUCT: late's retention witness post was refused: {out}{err}"
-    );
-    assert!(
-        reads(late, room, witness),
-        "PRODUCT: late's accepted retention witness was never visible in its shipped room read"
-    );
-    while reads(late, room, witness) {
-        std::thread::yield_now();
-    }
-    std::fs::write(&refill_hold, b"").unwrap_or_else(|error| {
-        panic!("APPARATUS: could not hold retention after the exact refill: {error}")
-    });
-    let _carol_after_refill = daemon(carol, "carol-delayed-refill-source");
-    attached(carol, "carol-delayed-refill-source");
-    wait_room_open(carol, room, "carol-delayed-refill-source");
-    while !refill_outcome.is_file() {
-        std::thread::yield_now();
-    }
-    let refill = std::fs::read_to_string(&refill_outcome).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not read the exact sparse-Content refill marker: {error}")
-    });
-    assert_eq!(
-        refill,
-        format!("accepted:{pruned_hash}"),
-        "APPARATUS: sparse-Content refill marker named a different entry"
-    );
-    eprintln!(
-        "[proof] FX-29 settled Content delayed-refill apparatus staged: hash={pruned_hash} older witness visibly expired"
-    );
-    assert!(
-        !reads(late, room, pruned),
-        "PRODUCT [FX29 settled-content-refill-age]: delayed bytes made expired Bob body \
-         {pruned_hash} visible after its younger shipped retention witness had already disappeared"
-    );
-    std::fs::remove_file(&refill_hold).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not release post-refill retention maintenance: {error}")
-    });
-    std::fs::write(carol.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not shorten Carol's retention after the refill claim: {error}")
-    });
-    let (ok, out, err) = vox(carol, &["room", "retention", room, "--steps", "7d"], None);
-    assert!(
-        ok,
-        "PRODUCT: Carol's post-refill retention reload was refused: {out}{err}"
-    );
-    while [alice, bob, carol]
-        .iter()
-        .any(|holder| reads(holder, room, pruned))
-    {
-        std::thread::yield_now();
-    }
     drop(late_daemon);
 }
 
@@ -5104,6 +4985,42 @@ fn room_own_feed_through(dir: &Path, room: &str) -> Option<u64> {
         .iter()
         .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["own_feed_through"]
         .as_u64()
+}
+
+/// The room's effective Session-step retention in seconds (`step_retention`) as this node's shipped
+/// `vox status --json` shows it; zero means forever.
+fn room_step_retention(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["step_retention"]
+        .as_u64()
+}
+
+/// Wait, as a member would, until `dir`'s shipped status shows the room's Session-step retention
+/// at one week (the creator just set it), printing each value it shows once. A member who is not
+/// an admin may keep the room's data no longer than the room does (V030-32, `4b9bb142f`;
+/// `post_save.rs` `AboveRoomRetention`), so its own `--steps 7d` waits for this. The watchdog
+/// owns a record that never comes.
+fn wait_room_step_week(dir: &Path, name: &str, room: &str) {
+    let mut shown = None;
+    loop {
+        let now = room_step_retention(dir, room);
+        if shown != Some(now) {
+            eprintln!(
+                "[proof] {name}'s `vox status --json` shows the room's step_retention {now:?}"
+            );
+            shown = Some(now);
+        }
+        if now == Some(7 * 24 * 60 * 60) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {

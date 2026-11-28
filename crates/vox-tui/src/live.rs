@@ -251,6 +251,9 @@ pub struct DaemonCore {
     joined: Option<(Digest32, Digest32, String)>,
     /// The names two rooms here share, each already said once (ADR-028 R-3).
     clashes_said: std::collections::BTreeSet<String>,
+    /// Each `(room, member)` a room's log has shown trusting this node, while this TUI runs: its
+    /// trust is said once, when first shown ([`Self::note_trust`]).
+    trusting: BTreeSet<(Digest32, Digest32)>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
     member_platforms: Option<MemberPlatforms>,
@@ -658,6 +661,7 @@ impl DaemonCore {
             notice: None,
             joined: None,
             clashes_said: std::collections::BTreeSet::new(),
+            trusting: BTreeSet::new(),
             timeline: None,
             member_platforms: None,
             thread_summaries: BTreeMap::new(),
@@ -1271,9 +1275,11 @@ impl DaemonCore {
                 self.notice = Some(format!("joined via {}", self.member_name(&responder)));
             }
             NodeEvent::PeerJoined { channel_id, peer } => self.say_joined(channel_id, peer),
-            NodeEvent::Consented { target, .. } => {
-                self.notice = Some(format!("you now trust {}", self.member_name(&target)));
-            }
+            // A consent this node issued, and a key a member sent, are not said as trust: each
+            // comes again over a trust that already stands (a member's next key generation after
+            // another member left, a grant issued again). Said each time, they told as news what
+            // was not, and took a join's line, and the trust it offers, away. Trust is said once,
+            // where it starts ([`Self::note_trust`]).
             NodeEvent::SenderKeyReceived {
                 channel_id,
                 peer,
@@ -1285,14 +1291,12 @@ impl DaemonCore {
                 // a disjoint set: a backfilled row was stored by an earlier sync that could not
                 // render it, so it is counted once, here.
                 rows_in(self, channel_id, backfilled as usize);
-                self.notice = Some(if backfilled > 0 {
-                    format!(
-                        "{} trusts you — {backfilled} earlier message(s) now readable",
+                if backfilled > 0 {
+                    self.notice = Some(format!(
+                        "{backfilled} earlier message(s) from {} now readable",
                         self.member_name(&peer)
-                    )
-                } else {
-                    format!("{} trusts you", self.member_name(&peer))
-                });
+                    ));
+                }
             }
             NodeEvent::Synced {
                 channel_id,
@@ -1300,6 +1304,43 @@ impl DaemonCore {
                 ..
             } => rows_in(self, channel_id, rendered as usize),
             _ => {}
+        }
+    }
+
+    /// **Trust is said once, where it starts** (ADR-028 K-7, as a join is). That this node now
+    /// trusts a member is its keyring's to say: the keyring is what its person changes, while a
+    /// room's grants can be issued again over a trust that stands. That a member trusts this node
+    /// is said the first time a room's log shows it while this TUI runs, in a room the snapshot
+    /// before held open with that member in it; shown again after a grant issued again, it is not
+    /// said again. A member just listed is its join's to say ([`Self::note_joins`]).
+    fn note_trust(&mut self, before: &NodeSnapshot) {
+        let mut trusts_you = None;
+        for room in &self.snapshot.open {
+            let was = before.open.iter().find(|o| o.channel_id == room.channel_id);
+            // A trust taken back, as the log signs it, is forgotten: given again, it is news.
+            for m in &room.withdrawn {
+                self.trusting.remove(&(room.channel_id, *m));
+            }
+            for m in &room.consenting {
+                if self.trusting.insert((room.channel_id, *m))
+                    && was.is_some_and(|was| was.members.contains(m))
+                {
+                    trusts_you = Some(*m);
+                }
+            }
+        }
+        let mut said = trusts_you.map(|m| format!("{} trusts you", self.member_name(&m)));
+        if let (Some(was), Some(now)) = (before.keyring.known(), self.snapshot.keyring.known()) {
+            if let Some((fp, _)) = now
+                .trusted
+                .iter()
+                .find(|(fp, _)| !was.trusted.iter().any(|(held, _)| held == fp))
+            {
+                said = Some(format!("you now trust {}", self.member_name(fp)));
+            }
+        }
+        if said.is_some() {
+            self.notice = said;
         }
     }
 
@@ -1493,6 +1534,7 @@ impl DaemonCore {
                             }
                         }
                     }
+                    self.note_trust(&before);
                     self.note_joins(&before);
                     self.check_pulls();
                     self.refresh_footers();

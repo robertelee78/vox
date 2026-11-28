@@ -231,6 +231,28 @@ fn a_full_disk_recovers_without_stranding_sync_or_leave() {
     struct Disk(std::path::PathBuf);
     impl Drop for Disk {
         fn drop(&mut self) {
+            // Apparatus only (`VOX_PROOF_KEEP_DIRS`): every node's daemon log survives the image,
+            // copied next to the scratch directory before the image is detached.
+            if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+                let kept = std::env::temp_dir().join(format!("rg14-logs-{}", std::process::id()));
+                let scratch = self.0.parent().map(std::path::Path::to_path_buf);
+                for (name, root) in [
+                    ("bob", Some(self.0.join("bob"))),
+                    ("alice", scratch.map(|s| s.join("alice"))),
+                ] {
+                    let Some(daemon) = root.map(|root| root.join("data").join(".daemon")) else {
+                        continue;
+                    };
+                    for entry in std::fs::read_dir(&daemon).into_iter().flatten().flatten() {
+                        let file = entry.file_name().to_string_lossy().into_owned();
+                        if file.starts_with("log") {
+                            let _ = std::fs::create_dir_all(&kept);
+                            let _ =
+                                std::fs::copy(entry.path(), kept.join(format!("{name}-{file}")));
+                        }
+                    }
+                }
+            }
             let detached = Command::new("/usr/bin/hdiutil")
                 .arg("detach")
                 .arg(&self.0)
@@ -391,6 +413,9 @@ fn a_full_disk_recovers_without_stranding_sync_or_leave() {
                 .expect_ok("post counted recovery progress");
         }
         if !received {
+            // Apparatus only: what bob and alice say of the room when it is not received.
+            let _ = bob.vox(None, &["status"]);
+            let _ = alice.vox(None, &["status"]);
             problems.push(format!(
                 "cycle {cycle}: Bob reported recovery but received none of 100 further posts"
             ));

@@ -1378,6 +1378,8 @@ impl std::fmt::Debug for EntryIndex {
     }
 }
 
+// Held on the stack for one read; boxing the owned snapshot would add an allocation to every read.
+#[allow(clippy::large_enum_variant)]
 enum ReadSnapshot {
     Query(Snapshot),
     Pending(std::sync::Arc<Snapshot>),

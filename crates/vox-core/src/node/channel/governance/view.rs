@@ -216,6 +216,17 @@ impl ConsentFacts {
         self.grant_sequence(author, reader).is_some()
     }
 
+    /// Whether the author's latest consent to `target` on the log is a signed withdrawal, not a
+    /// grant set aside by the author's own reset (its statement that it is back).
+    pub(in crate::node::channel) fn withdrew(&self, author: &Digest32, target: &Digest32) -> bool {
+        matches!(
+            self.consent
+                .get(author)
+                .and_then(|readers| readers.get(target)),
+            Some(Consent::Revoked(_))
+        )
+    }
+
     /// The current granted sequence, after applying the author's reset.
     pub(in crate::node::channel) fn grant_sequence(
         &self,
