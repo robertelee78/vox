@@ -19,6 +19,10 @@ deleted; `vox trust add --history full` is removed.*
   what result, and what has not, is in (f); what was open and how it ended, and what still rests on
   review, is under "Open items". Implementation, acceptance and delivery are recorded on the
   source-bound issues, separately from decision status.
+  *(Amended 2026-11-27, amendment 1, merged in #1422 (`eda5ab5e4`): on main since #1418 an author
+  could delete a key generation an offline member never received (`exec/found-reds.md` entry 147).
+  FO-12, in the section "Amendment 1", replaces the key-debt ledger of FO-5, FO-6 and FO-9 step 3
+  with the set of generations each member has not acknowledged; each amended place is marked.)*
 - **Date**: 2026-11-27
 - **Deciders**: Robert E. Lee
 - **Tags**: sender keys, leaving, rejoining, key deletion, history, migration, version cutover,
@@ -241,6 +245,9 @@ code as built. Where the code differs from the design, the code wins and the ite
      are removed. Stale prepared work, receipts and queued frames are refused by the existing counter
      checks; the Drive rotation checkpoint is marked dirty by the same counter and completes through
      the path a removal uses; Sessions wait on it as after a removal.
+     *(Amendment 1, merged in #1422: the history and delivered rows are one set per member, which
+     the boundary removes, the rotation then adding what the new entitlement allows; FO-12 items 1
+     and 3.)*
   6. Removal wins: `is_member_removed` is checked first everywhere; only the creator's readmission
      lifts a removal, and then the readmission cut and any return cut both apply.
   7. Deleted: `departed_seen`, `begin_owned_rejoin_reset` and `After::Rejoin` (the old reset that
@@ -261,6 +268,11 @@ code as built. Where the code differs from the design, the code wins and the ite
      skips a member only while the room's in-flight maintenance save carries a consent continuation
      for it (`maintenance_save::Pending::consent`), so a delivery deferred for a fresh one-time prekey
      is taken up again by the next pass (`sec-code-1.md` finding 3, `FwdFix1.md`).
+     *(Amendment 1, merged in #1422: one exception, the returner's acknowledgement probe: a sender
+     that knows of the return offers a returner directly only releases it already published to it,
+     each in a package bound to its current return; a sender that has not applied the return still
+     offers directly as before. Either way the returner answers only for a release it already
+     covers or holds a tombstone for, installing nothing; FO-12 item 9.)*
   2. The package names the returner's return Presence as a required ancestor
      (`ChannelState::package_return`, applied to consent packages and to Session key packages): an
      excluded recipient gets no package; a never-left one needs none; a return whose cut this node
@@ -292,6 +304,9 @@ code as built. Where the code differs from the design, the code wins and the ite
   A withdrawal or revocation removes the entitlement, so a later trust decision starts from its own
   boundary. *As built* (`FwdBuild2.md`, "differed" 4): R5's clause on `delivered` is met through key
   selection; the consent-delivery ledger is unchanged.
+  *(Amendment 1, merged in #1422: the consent-delivery ledger is replaced by FO-12: per member,
+  the set of generations not acknowledged over a direct delivery; a package settles nothing, and a
+  direct answer settles exactly one generation.)*
   **A member trusted again after a revocation** (`FwdFix2.md`; `history_plan`, `channel.rs`): the
   plan for an identity this author has revoked in the room is computed as for one never revoked,
   from this room's trust mark of the author's **current** decision, and is accepted only when that
@@ -313,6 +328,14 @@ code as built. Where the code differs from the design, the code wins and the ite
   that is still trusted and holds no entitlement here counts under it, so "pins nothing" holds for
   history floors only (`sec-code-1.md` area 4, `FwdFix1.md`). The full-history prune gate is deleted
   with full grants.
+  *(Amendment 1, merged in #1422: history floors are replaced by the sets of FO-12. A
+  continuously entitled member that is offline keeps each generation pinned until it acknowledges
+  that generation over a direct delivery, not merely until it "takes them" or is reachable, except
+  that at the 256-origin cap a message-bound or mandatory rotation evicts the oldest origin with a
+  named loss line (FO-12 item 8); the prune keeps what any
+  non-excluded set holds, the live origin and the never-joined hold (FO-12 item 7). As built on main
+  by #1418, this sentence did not hold: an author could delete a generation such a member never
+  received ((a) of amendment 1).)*
 - **FO-7. Older history is removed; local recovery and the feed-integrity fence are kept.** (R7;
   `ruling-1.md` conditions 6, 7 and 9.)
   1. Removed: the `--history` choice in the CLI, the terminal app, the FFI the Mac app uses and the
@@ -366,6 +389,8 @@ code as built. Where the code differs from the design, the code wins and the ite
      and runs again at the next open. On completion the daemon says "room <id>: its keys are released
      from each member's trust point on (forward only); this room is updated once" and starts the
      room's re-keys. New rooms are written with the marker.
+     *(Amendment 1, merged in #1422: the history and delivered ledgers are one ledger of sets
+     (FO-12 item 1); step 1 raises or clears a member's set as it raises or clears its entitlement.)*
   2. Step 1, a member a build before v0.4.31 trusted with full history (keyring column 1): when it has
      a validated removal in this room, its forward-only entitlement and debt are kept unchanged;
      otherwise, when `history_plan` gives a plan, its entitlement is raised to the plan's first
@@ -389,6 +414,10 @@ code as built. Where the code differs from the design, the code wins and the ite
      generation again, directly or as a version-2 package. The receiver ignores what it holds and
      tombstones what it deleted. What cannot be re-delivered is a generation whose only surviving
      release was an unopened version-1 package and whose origin is gone (accepted loss O3).
+     *(Amendment 1, merged in #1422: a member re-owed here has in its set every retained
+     generation its entitlement allows and keeps each until it acknowledges it over a direct
+     delivery or the 256-origin cap evicts it (FO-12 item 8); a version-1 history row is decoded
+     strictly and then read the same way (FO-12 item 1).)*
   5. The keyring's column 1 is written 0 only when every stored room, closed rooms included, holds
      segment 33. *As built* (`FwdBuild1.md`): it is cleared at unlock (`clear_legacy_full`,
      `actor/trust_save.rs`), not right after the last migration; the headless startup path does not
@@ -550,6 +579,11 @@ it because its proofs exposed them.
    O2 (exactly one post); O3 needs a sender that already deleted the generation and was not produced
    in its small stores; the "no decision value" form of O1 cannot be produced with v0.4.30, which
    records a decision at every `trust add` (`FwdProveUpdate.md`).
+   *(Amendment 1: "a member that was only offline loses nothing" was not true of the code merged
+   in #1418: a member offline across rotations could lose a generation for good ((a) of amendment
+   1). FO-12, merged in #1422, makes it true again except for a member offline through more than
+   256 of an author's key changes, which the cap names as it evicts (FO-12 item 8). The returning
+   reader 8,000 behind read every post in five runs (amendment 1 (f)); no run reaches the cap.)*
 4. **Computers on different versions exchange no history or keys with each other** until both run
    v0.4.31; between those two computers the room is silent, while each side keeps exchanging
    within itself. A computer still on v0.4.30 is told nothing about why.
@@ -557,6 +591,9 @@ it because its proofs exposed them.
    a member that has applied its return; a sender that has not received the return Presence defers
    (design-4 §3, "most likely to go wrong" 3). The rejoin acts show a returner's keys arriving by
    package ((f)); the deferral resolving under load is not staged.
+   *(Amendment 1, merged in #1422: the returner's acknowledgement probe lets a sender that knows of
+   the return offer the returner directly a release it already published to it in a bound
+   package; the returner installs nothing from it; FO-12 item 9.)*
 6. **A returner reads nothing written while its own recovery was pending** ((c); the rejoin prover's
    reading, `FwdProveRejoin.md` act 4, "changed by ruling").
 7. **While a node's own history is behind, version-2 key packages wait unopened**, Drive packages
@@ -738,6 +775,13 @@ below ran on earlier trees, as named.
   bite (fj7) and is deleted. The case where no holder of the prefix is reachable (status
   fenced, post refused) is part of design-4 §3's row; the record shows the refusal sentence in the
   mutant run, not a separate base staging.
+  *(Amended 2026-11-27, amendment 1:)* `notice-not-offered` no longer exists. It ran green with its
+  engaged line (km8 nn, found-reds 152): the returner fetched the notice from the readmitted
+  member's own board, the other half of the board exchange. Its replacement,
+  `notice-not-exchanged`, removes admission notices from both halves (what is fetched from a board,
+  `exchange_boards_live`, and what is offered to one, `offer_board_records`, `actor.rs`): green
+  without it (kn1), red at the act's W3 assertion with its engaged line (kn2). Why the old arm bit
+  in fj7 and not in km8 is not established (`release/keyloss/KeyDebt6.md`, last section).
 - `an_admin_removes_one_member_and_the_creator_readmits_it_forward_only` and
   `a_queued_key_and_history_debt_cannot_cross_room_removal`, restaged: the never-removed full-history
   arm deleted by ruling 1's consequence, the debt staged as catch-up. Green fj5 (and fz4). The old arm
@@ -938,6 +982,11 @@ Proof gaps that stay open:
    on their intended assertions, but neither switch prints an engaged line
    (`require_own_recovery_complete`, `channel/own_history.rs`; `offer_board_records`, `actor.rs`), so
    no red of either counts under (f)'s rule; a red with a kept engaged line is not shown.
+   *(Amendment 1:)* `audit-back` now prints its engaged line and is red on its own assertion with
+   it (km1 ab: "once-only first post immediately after rejoining was refused"; the line 16 times in
+   alice's daemon log). `notice-not-offered` printed its engaged line but ran green (km8 nn,
+   found-reds 152); it is replaced by `notice-not-exchanged`, red at the act's W3 assertion with
+   158 engaged lines (kn2; see the mark under (f)). Both arms now count.
 2. **The consent-first order of the retained-rows act.** The four runs with the corrected hold were
    green, but none had the consent arrive in Bob's first head, the order that hung before; that the
    corrected hold handles it rests on reading the code, not on a run (`FwdProve5.md`, "Not run";
@@ -954,6 +1003,357 @@ stall (a room left at once after a restart, then joined again) was reproduced in
 FO-3 item 8 is the fix, and its stall was not seen again. The momentary one-way trust reading is
 main's and is named, not fixed. Release notes: the sentences in (c); the release must not claim a
 loss beyond O1 to O3.
+*(Amendment 1:)* `vox room read --history resume` after an interruption has no proof in this
+release: #1422 re-stages only the first stale step of the act that carries it,
+`interrupted_history_and_private_packages_recover`; its further repairs (found-reds 145) follow as
+their own pull request. This is to be named in the release notes.
+
+## Amendment 1 (2026-11-27): the key ledger is the set of generations each member has not acknowledged
+
+*(Added 2026-11-27, amendment 1. The change was accepted in security review and is merged in pull
+request #1422 (branch `fix/key-ledger`, one squashed commit `70bd29186` on main `73d373235`),
+merge commit `eda5ab5e4`.)* This section states
+FO-12, the rule that replaces the author's key-debt ledger of FO-5, FO-6 and FO-9 step 3, and what
+it changes in this record. Each amended place is marked where it stands, and the text it amends
+stays beside the mark. Sources, in the release's evidence archive `/opt/vox-evidence/v0431/`:
+`exec/found-reds.md` entries 147 to 153; the decider's words in `exec/deviations.md`, "Words of the
+owner on 2026-11-27 (in conversation)"; under `release/keyloss/`: `audit-1.md` (the audit of the
+ledger), `ruling-ledger.md` (the ruling, with the coordinating session's decision and its correction
+at the end), `ruling-returner.md` (the returner's acknowledgement, with the coordinating session's
+adoption), `sec-1.md` (the security review, all its rounds), the builders' records `KeyDebt1.md` to
+`KeyDebt6.md`, `ConsentPass.md`, `CAwayRead.md` and the pull request draft `key-pr-body.md`; and the
+acceptance queue in `simple-sync/review/STATE.md`. Code is cited by file and function at main
+`eda5ab5e4`, under `crates/vox-core/src/node/` unless another root is given.
+
+### (a) What was found
+
+1. **An author could delete an old key generation an offline member never received**
+   (`exec/found-reds.md` entry 147). On main since #1418, not in any published version: the first
+   run of the returning-reader act (`a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back`)
+   on a main with #1418, a reader 8,000 entries behind whose daemon was stopped (it never left),
+   with the author rotating its key every 1,000 posts. Run mr1 (main `18048bf56` with another fault's
+   fix): "stopped at 7000 of the 8000 … missing: [(5000, 5999)]"; run mr3: posts 2000 to 2999
+   missing. Each time exactly one of the author's chains, 1,000 of 8,000 posts, unreadable for good:
+   the reader holds every entry, neither side reports pending key work, the author holds only its
+   live key, and restarting both changes nothing. A member that was only offline lost data, against
+   (e) item 3's "a member that was only offline loses nothing" and the design's R6.
+2. **Cause 1, a settlement that cleared more than it carried** (`audit-1.md`, P1; found-reds 147,
+   "cause 1 confirmed"). A history delivery selected a finite batch of generations; generations
+   retired while it was on its way stayed owed through the same history row; the older delivery's
+   completion then removed the member's whole row (`channel/pending_text/consent_delivery.rs`),
+   and with no row the prune kept only the live origin. In mr1, generation 5 was never delivered.
+   A first fix (settle only the interval carried, under a debt revision) did not end the loss: mr3
+   reproduced it on that fix.
+3. **Cause 2, a rotation that owed the retiring generation to nobody** (`KeyDebt1.md` §1; found-reds
+   147, "cause 2 confirmed"; traced in run kd1, `rotation-prepare retired=1 owed=[] … readers=[]`).
+   Every rotation appends the author's own Presence, which resets its consent facts until it
+   re-grants; a second rotation before the re-grant skipped every member as "not a reader"
+   (`channel/pending_text.rs`, the scheduled rotation; the same filter in `rotate_sender`,
+   `pending_text/consent.rs` and `pending_recovery.rs`). The retired generation was owed to nobody,
+   the prune deleted its origin, and the later re-grant re-owed from the entitlement floor, but the
+   selection skipped the missing origin and the settlement closed the debt. In mr3, generation 2.
+4. **The audit's conclusion** (`audit-1.md`, "Required prune invariant"): "every non-excluded,
+   entitled member's undelivered retired generation must remain covered by durable history debt
+   until a matching, non-invalidated delivery proves it was carried. `delivered = max generation` is
+   not proof of intervening coverage." Neither store in the runs retains the lost generations; no
+   fix reconstructs them.
+5. **The decider** (`exec/deviations.md`, "Words of the owner on 2026-11-27 (in conversation): the
+   lost key generation is fixed in v0.4.31"), told of the loss, its two causes and the redesign:
+   "lol", then "**get it fixed please**". The release waits for this fix.
+
+### (b) The rule as built
+
+- **FO-12. An author keeps a key generation until every entitled member has acknowledged it over a
+  direct delivery.** *(Added 2026-11-27, amendment 1; `ruling-ledger.md` as decided and corrected by
+  the coordinating session, `ruling-returner.md` as adopted; for the decider's words in (a) item 5.)*
+  It replaces the ledger of FO-5 ("the consent-delivery ledger is unchanged"), FO-6's history
+  floors and FO-9 step 3's history and delivered rows.
+  1. **The ledger is a set per member.** For each entitled member the author holds the set of its
+     generations, the live one included, that the member has not acknowledged. In ordinary
+     selection a member with no row owes the live generation only; when a room is opened, an
+     entitled member with no stored row is read like a version-1 row below, owing every retained
+     generation its entitlement allows through the live one (`open_with_sek_owned`, `channel.rs`).
+     It is stored in `SEG_HISTORY` as version 2, one row per member,
+     generations ascending, with the posted marks of item 6 (`outstanding_bytes`,
+     `parse_outstanding`, `OUTSTANDING_VERSION`, `channel.rs`). The `delivered` segment is neither
+     read nor written; a stored one is left in place. A version-1 row, as main writes it, is decoded
+     strictly (its whole structure, bounds and lengths, then `finish()`; anything malformed refuses
+     the room unchanged) and then read conservatively at open: every retained generation the
+     member's entitlement allows, from the entitlement to the live one, is outstanding.
+  2. **Every event that creates debt adds to the set.** Every rotation, of all five kinds (posting,
+     scheduled or bound to the message count; explicit; trust withdrawal; removal or return; own
+     recovery, with its settlement and catch-up), adds the generation it actually mints to the set of
+     every entitled member that is not excluded, whatever that member's grant reads at that moment,
+     and the retiring generation stays in each set (`rotation_debt`, which takes the minted
+     generation as an argument, `channel.rs`; every native commit mints that generation). That ends
+     cause 2, and own recovery that jumps its generation owes the generation it mints (`sec-1.md`
+     finding 1). Consent issuance adds what the entitlement allows. A `NotTrusted` refusal, a fresh
+     reciprocal key and a session reset add the entitled generations and the live one, and renew the
+     member's debt revision even when the set does not change (`owe_keys`,
+     `entitled_generations_of`, `channel.rs`; `owed_again`, `owed_anew`, `Ledger`,
+     `channel/pending_package.rs`). No debt is created for a member without a durable entitlement
+     (`sec-1.md` finding 2).
+  3. **Boundaries are not receipts.** A removal, a return and a trust withdrawal rewrite the set
+     (remove it; a return's or readmission's rotation adds what the new entitlement allows), never
+     counting as received (`channel/pending_text/consent.rs`).
+  4. **Only a direct answer settles, and exactly one generation.** An authenticated direct answer
+     that the member took generation `g` (`KEY_TAKEN`; an authenticated tombstoned or covered answer
+     counts the same), selected under the member's debt revision `r`, removes exactly `g` from that
+     set, and only while `r` is still current; a revision renewed while the save ran keeps `g`
+     (`begin_owned_pairwise_receipt`, `actor/consent_release.rs`;
+     `prepare_pending_consent_delivery`, `channel/pending_text/consent_delivery.rs`). The revision
+     is kept in memory only: no delivery outlives the process, so nothing that survives a restart
+     settles a debt. A refusal, a timeout, a cancelled or lost write and a publication settle
+     nothing. That ends cause 1.
+  5. **A package in the log settles nothing.** It only makes a key available to a member that is
+     not reachable; the generation stays in the member's set, and the next direct delivery carries
+     it and settles it (`advance_owned_log_keys`, `actor/consent_release.rs`).
+  6. **A package is posted once per member and release while its generation is outstanding.** Its
+     mark is a hash of the member's current
+     return and the exact release's `skdm_ref` (`posted_release`, `channel.rs`; `skdm_ref` is the
+     hash of the whole signed SKDM, so the mark names generation, release iteration and return),
+     kept in the member's ledger row and written in the same batch as the package's append
+     (`package_posted`, `note_package_posted`, `channel.rs`; Session packages,
+     `channel/pending_session.rs`; consent packages, `PendingConsent::save`,
+     `channel/pending_text/consent.rs`, which writes the entitlement, the debt and the mark in the
+     package's own batch). Both routes check the durable mark before a bundle is picked
+     (`advance_owned_log_keys`; `frame_owned_consent`, `actor/consent_release/outbound.rs`), so a
+     restart posts nothing again (`sec-1.md`, round on `31deeee88`, both gaps closed). The mark
+     lives only as long as its generation is in the member's set: a mark is stored only beside a
+     generation still in its row (`outstanding_bytes`), and opening a room drops any other
+     (`open_with_sek_owned`). A settlement, a boundary or an eviction that removes the generation
+     removes its stored mark with it (`channel/pending_text/consent_delivery.rs`). If that debt is
+     later renewed and the node has restarted in between, a package for it can be posted again
+     without any negative answer. A fresh
+     prekey bundle does not cause a repost: a member that opens a package spends a one-time prekey
+     and publishes a fresh bundle, which the author cannot tell from a package that could not be
+     opened (run kg2/lv1: the same key posted 16 times in a minute to a returner; found-reds 149;
+     `ruling-ledger.md`, the coordinating session's correction). Besides that renewed debt, the
+     one repost is item 9.6.
+  7. **The prune keeps what any set holds.** The author deletes a retired origin only when no
+     entitled, non-excluded member's set holds it, it is not the live one, and the hold for a trusted
+     identity that has not joined (FO-6) does not keep it (`origins_needed`, `OriginsNeeded::keeps`,
+     `channel.rs`; `retain_needed`, `crates/vox-core/src/group/history.rs`). A departed or removed
+     member's set pins nothing.
+  8. **The cap.** At 256 origins in a room and epoch, a rotation made only because of time waits
+     (whoever needs the oldest origin). A rotation bound to the message count (1,000 posts) or any
+     other rotation (explicit, withdrawal, removal or return, own recovery) evicts the oldest origin;
+     the evicted generation leaves every set, and a daemon line names the members whose sets held
+     it (`origin_cap_holds`, `RotationDebt::say_lost`, `channel.rs`; `eviction_victim`,
+     `group/history.rs`; `sec-1.md` finding 4). The line also names trusted identities that have
+     not joined, from the keyring as of the last prune tick; that copy is empty before the first
+     tick after a room opens and can be a tick old, so the line can miss such an identity then
+     (`KeyDebt3.md` §8; `sec-1.md`, fix-only round, finding 4: it affects only who is named).
+  9. **A returner acknowledges through a probe** (`ruling-returner.md`, adopted with its six
+     conditions as an explicit exception to FO-4 item 1; `KeyDebt5.md` §2). Condition 6's "not
+     eviction of owed keys" does not hold as written: the review found it met under the cap
+     ruling, by which a message-bound or mandatory rotation can evict the oldest origin with a
+     named loss line (item 8; `sec-1.md`, round on `31deeee88`, B6).
+     1. A sender that knows of the return (`key_returned`) offers the returner directly only
+        releases it already committed, each in a package
+        bound to the returner's current return: the rekey pass goes down the direct path only when
+        every owed release is marked for the current return (`releases_posted`, `channel.rs`;
+        `advance_owned_rekey_pass`, `actor/consent_release/rekeys.rs`), and
+        `reserve_key_deliveries_waiting` (`actor.rs`) refuses a returner otherwise. The direct
+        offer carries the key, so an altered returner can read it whatever its installer does;
+        that is safe only because the same release was already published to it, and FO-4's
+        "packages are the only route" no longer holds literally. A sender that has not yet
+        applied the return still offers directly as before (`ruling-returner.md` condition 4); the
+        returner accepts such an offer only as in item 9.3, installing nothing.
+     2. The mark (item 6) binds room, epoch, recipient, generation, the release and the current
+        return; the removal, removal-rotation and departure checks run ahead of it. After a restart
+        the durable mark is the evidence; with none, the log route publishes first.
+     3. The returner authenticates the offer, then answers it as taken, unchanged, only when it holds
+        the exact tombstone or its existing receiver already covers the offered release (the coverage
+        test, not the merge that extends coverage), installing nothing, queueing no backfill and
+        owing nothing back (`package_install`, `Native::Install`, `channel/pending_package.rs`).
+     4. The checks for own history behind and for departure or removal stay ahead of it; it is no new
+        route for a node that does not know whether it left.
+     5. Only that authenticated answer settles, through item 4; `NotAccepted`, a timeout and a
+        publication settle nothing.
+     6. A negative answer clears the mark: any authenticated `NotAccepted` from a returner for the
+        exact release its current mark names, including the refusal it gives while its own history is
+        behind and an answer that comes before it opened its package, clears the mark in memory, and
+        the next pass posts one new package (`NetEvent::SkdmRefused`, `actor.rs`;
+        `clear_package_posted`, `channel.rs`). At most once per release per unlock
+        (`Node.packages_reposted`, cleared at lock), so a returner that keeps answering "not held"
+        cannot fill the author's feed. The debt stays. A cleared mark stays on disk until the next
+        package's append rewrites the row, so after a restart in between the mark is back and the
+        probe is offered again.
+     A returner that falsely answers "taken" gives up its own catch-up; one that falsely answers
+     "not held" pins origins, as staying offline does, until it is withdrawn or removed or the cap
+     evicts the oldest origin (item 8).
+  - *Why*: (a). "Explicit sets fix the coverage model; they do not fix an unsound receipt"
+    (`ruling-ledger.md`); the coordinating session took the simplest sound receipt, the existing
+    direct answer, with no new message and no new stored record type.
+
+**Also fixed in the same change** (not part of FO-12): three findings of this work (found-reds 148,
+150, 151) and one found before it (found-reds 127).
+
+- **A member that never left waited seconds for an author's rotated chain** (found-reds 148;
+  `CAwayRead.md`, `ConsentPass.md`; commit `f538a54e6`). After an author rotated, the consent pass
+  that hands the new key to a member tried the room's lock once and, when it was busy, ended with
+  nothing on the wire until a later tick won the race: gaps of 0.1 s to over 60 s, and no node said
+  why. The consent route and the rekey pass now wait for the room's lock
+  (`reserve_key_deliveries_waiting`, `actor.rs`; its callers `frame_owned_consent` and
+  `advance_owned_rekey_pass`); after it the member read the post 272, 272 and 266 ms after the
+  author's post command returned (runs kl6). On main too.
+- **A member that left and joined again on the same connection was not told about an author that
+  stayed offline** (found-reds 150; `KeyDebt6.md`; commit `31deeee88`). A node keeps, per
+  connection, what a peer's Have said it holds; nothing cleared that when the peer left, so the
+  returner was never told that author's head, its own entries that cite that author stayed
+  unadmitted, its own-history recovery never completed, and it never signed its return (red in 6 of
+  10 runs of the variants act). A departed peer's rows are now forgotten, and rows told to its
+  earlier instance are told again when it is a member again (`standing` and `tell`,
+  `history_stream/pull.rs`). Nothing new is served. On main too, by reading.
+- **Leaving a room right after opening it printed two notes about a locked store** (found-reds 151;
+  `KeyDebt6.md`; commit `31deeee88`). The leave locks the room's key while its settlement or
+  recovery is still running, and that stage's failure was reported with advice to re-authenticate.
+  The two notes are now skipped when this node itself closed the room under the stage
+  (`closed_under`, `actor/recovery_save.rs`; `key_wiped`, `channel.rs`); a locked identity or a
+  lock under way still gives them. On main too.
+- **The returning reader's newest post waited seconds for its key** (found-reds 127, "fix built";
+  `release/owed/KeyLatency.md`). Two changes, reviewed with the fix (`sec-1.md`): a board record
+  landing in a room where a key waits starts the delivery passes at once (`NetEvent::BoardGrew`,
+  `actor.rs`); an inbound key that meets its room mid-save waits for the save, one per room and
+  sender, instead of being refused with a back-off. The newest key was installed 4.8 s after the
+  reader's return before (run kl1) and 0.43 s and 0.44 s after (kl3). The second change was not
+  seen engaged in any run and rests on review.
+
+### (c) What a person sees
+
+- A member that was only offline reads everything it is owed once it is reached directly and has
+  acknowledged each generation, unless it stayed away through more than 256 of an author's key
+  changes (the cap, FO-12 item 8; the five returning-reader runs covered 8,000 missed posts, not
+  the cap). Being reachable alone releases nothing.
+- An author keeps more old keys: `vox status --json`'s `key_generations` stays above one until each
+  entitled member has acknowledged each retired generation over a direct delivery.
+- At the cap, the daemon says which member loses which generation (with the limit on trusted
+  identities that have not joined in FO-12 item 8).
+- A member that never left reads an author's posts after a rotation at once (found-reds 148).
+- Leaving a room right after opening it prints no notes about a locked store (found-reds 151).
+
+### (d) What is deliberately not built
+
+- **No new receipt message and no new stored record type.** Ruling-ledger's conditions 5 and 6 (a
+  durable, authenticated receipt for a key taken from a package) are met by leaving a published
+  key outstanding and settling only direct answers; condition 7 (persisted provenance) falls away,
+  since nothing that outlives the process settles a debt (`ruling-ledger.md`, the coordinating
+  session's decision; `sec-1.md`: "Not applicable").
+- **No repost on a fresh bundle**, for anyone ((b) item 6). The freshest-bundle memory built for
+  `sec-1.md` finding 3 (`fa78f9d2a`) is removed with it.
+- **No backpressure on message-bound or mandatory rotations at the cap**: the reviewer's text
+  preferred backpressure; the coordinating session chose eviction with a named loss line.
+
+### (e) What it costs
+
+1. **Old keys stay until each entitled member acknowledged them.** An author keeps a retired origin
+   until each entitled, non-excluded member has acknowledged that generation over a direct
+   delivery; being reachable is not enough. A member that never acknowledges pins it until it
+   leaves, is removed, or the cap evicts it.
+2. **A member that already took a key from a package is sent it again** directly, and answers that
+   it holds it: one duplicate send per generation and member after a reconnect.
+3. **Named limit: a member reached only through others whose one package could not be opened**
+   waits for a direct connection for that key; the author keeps the origin meanwhile.
+4. **A member offline through more than 256 of an author's key changes** loses the oldest
+   generations to message-bound or mandatory rotations, and is named in the daemon's line.
+5. **A returner's negative answer costs one package per release per unlock**, and after a restart
+   one more is possible ((b) item 9.6); a debt renewed after a restart can cost one more package
+   to any member ((b) item 6).
+6. **Storage**: one set per member instead of one floor; at most about `2048 × 256` generation ids
+   per room (`ruling-ledger.md` condition 11).
+
+### (f) Proof
+
+Runs are under `simple-sync/pull/runs/`. The runs on the final tree (`6b7b8e489`, the tree of
+#1422's squash `70bd29186`), as the coordinating session reports them (`simple-sync/review/STATE.md`;
+`key-pr-body.md`): the busy-room journey jrnK2 green, 16 of 16 directions; the returning reader
+8,000 behind (kp1 rr), leave and return (kp2 lb, lv), the author-origin act (kp3 ak),
+`a_returner_reads_while_own_history_is_unavailable` (kp4 ro) green. An earlier journey run on this
+change, jrnK1, gave no product verdict: its own check that posts were offered once a second failed
+while other runs loaded the machine (`release/keyloss/jrnK1/paused/receipt.log`: "APPARATUS:
+offered cadence was not one second"); jrnK2 was the run after it. The returner act's arm
+`notice-not-exchanged` ran before the rebase, on `31deeee88` with the arm's changes
+(`/opt/vox-worktrees/keydebt-fix`; `KeyDebt6.md`, last section): green without it (kn1), red at
+the act's W3 assertion with 158 engaged lines (kn2). The acceptance queue (km1 to km9) ran earlier
+on `/opt/vox-worktrees/keydebt-fix`, branch `scratch/key-land`, at `31deeee88`, the tree before the
+review fixes of `18dd7e40a` and before its rebase onto #1421; the k5 runs on the builders' trees
+named in `KeyDebt5.md`.
+
+- **The returning reader 8,000 entries behind** (the act that found the loss): green five times
+  (km2 r1 to r5, 330 to 389 s each).
+- **The author-origin act** (`an_author_keeps_a_key_only_while_a_member_still_needs_it`), four
+  stages: two rotations back to back while bob's grant reads false (cause 2); bob's keys held on
+  their way across two rotations (cause 1); bob away with his keys posted as packages, which settle
+  nothing; alice's own recovery jumping her generation with bob offline (`sec-1.md` finding 1).
+  Green (km3, k5h, k5n). Arms red on their own assertions with their engaged lines (k5h):
+  `rotation-readers` ("never read post p1 1, p1 2, p2 1 or p2 2"), `settle-whole` ("never read post
+  p3 1, p3 2 or p4 1"), `departed-pins` ("alice still holds Some(3) generations … carol, who left,
+  must pin nothing"). Stage 3 has no arm: its mutant would be "a package settles", which the
+  redesign deletes. Stage 4 has no switch; a throwaway revert of the fix turned it red (kf4) and was
+  reverted. In stage 3 alice held 2 generations in k5n and 3 in k5h: timing of whether bob answered
+  the live key before he stopped, read from the kept logs; no key lost (`KeyDebt5.md` §8.1).
+- **Leave and return**: `a_member_that_left_joins_again_and_is_a_member_again` green (km1 lb), arm
+  `direct-accepted` red with its engaged line (k5g); the variants act green three times in a row
+  (km1 lv1 to lv3; red in 6 of 10 runs before found-reds 150's fix), with a new stage: bob's
+  `key_generations` returns to 1 once alice, back and online, has acknowledged through the probe; a
+  throwaway that switched the probe off turned that stage red ("bob still keeps Some(2)
+  generations", k5f); arm `package-unbound` red with its engaged line (k5i);
+  `a_node_that_left_rejoins_and_posts_at_once` green (km1 l2), arm `audit-back` red on its own
+  assertion with its engaged line (km1 ab).
+- **Key deletion**: the act's package re-offer section re-staged for acknowledged sets (found-reds
+  153; `KeyDebt5.md` §9: the author now owes only the generation bob never took, and bob's node is
+  shown meeting that package again after deleting the generation); green (k5p), arm
+  `floor-not-exact` red with its engaged line (k5q).
+- Green on the queue tree, without arms run: the thirty-day act (km5), `revocation_rotates_the_key_proof`
+  (km6), the restored-backup act (km7), `a_returner_reads_while_own_history_is_unavailable` (km8 ro),
+  the update journey from the published v0.4.30 (km9). The returner act's arm is replaced: see the
+  mark under ADR-055 (f).
+- **Proofs changed** (`key-pr-body.md`): the author-origin act is new; the variants act has one new
+  stage; the key-deletion section is re-staged; `interrupted_history_and_private_packages_recover`
+  has its first stale step (a wait rule older than #1411) re-staged. Its further repairs
+  (found-reds 145), with the deletion of its privacy section and of the test knob
+  `VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE`, are not in #1422: they follow as their own pull
+  request, and on main at `eda5ab5e4` the section and the knob are still there. No run here shows
+  `vox room read --history resume` after an interruption (Open items).
+- **What rests on review, not on a run** (`key-pr-body.md`): the two crash-window fixes of "posted
+  once" (a crash between a package's commit and its grant's commit; an author restart after a
+  brand-new member's first package); the 256-generation cap and the strict reading of a version-1
+  row (no act reaches them); the rekey pass waiting for the room's lock as the consent route does
+  (read, shown only through the acts above); an inbound key waiting through its room's save
+  (found-reds 127; not seen engaged, `sec-1.md`); a renewed debt posted again after a restart
+  ((b) item 6).
+
+### (g) Reviews
+
+All by the same reviewer (SecKeyDebt, `sec-1.md`), source review only.
+
+1. At `f0ad8bed9` with the timing change `2a51bc4f8`: **REJECT**, "one P1 data-loss defect and four
+   P2 defects": recovery's debt owed `old + 1` instead of the generation minted; debt created
+   without a durable entitlement; only the latest bundle remembered; the cap gate missed the
+   never-joined hold; a version-1 ledger accepted without decoding. Fixed in `fa78f9d2a`
+   (`KeyDebt3.md`). Fix-only round: **ACCEPT** "for `f0ad8bed9` + `fa78f9d2a`, subject to the
+   separate leave-and-return fix-only round": the five findings closed; the verdict did not clear
+   the two leave-and-return failures reported apart from it. Finding 3's fix (the freshest-bundle
+   memory) was then replaced by the post-once rule.
+2. On `scratch/key-land` `3ed162c4b..31deeee88` (post once, the probe, the lock wait, the sync fix):
+   **REJECT**, "two P2 contract gaps; no P0/P1 found": a consent package's durable mark was not
+   checked after a restart, and a first grant's package wrote no mark. Its returner conditions: B1
+   to B4 met, B5 met "with the coordinator's republication correction", B6 "met under the accepted
+   cap ruling, not the original literal no-eviction wording"
+   (FO-12 item 9). Fixed in `18dd7e40a` (`KeyDebt5.md` §8). Fix-only round: **ACCEPT** "for
+   `31deeee88` + `18dd7e40a`. Both P2s are closed".
+
+### (h) Built
+
+Built on branch `scratch/key-land2` in `/opt/vox-worktrees/fjh-main`, head `6b7b8e489` on main
+`73d373235`: `a7422ec9d` (the fix as accepted at `18dd7e40a`, with the key-latency change of
+found-reds 127, reviewed with it), `db04c1d25` (a lint alias), `15f9eb967` (the key-deletion act
+re-staged, with one `test-knobs` line in `channel/pending_package.rs`), `6b7b8e489` (the returner
+act's arm `notice-not-exchanged`, `test-knobs` only, and the act's header). Lint on `db04c1d25` is
+clean (`release/keyloss/lint1`, as `simple-sync/review/STATE.md` records). Landed as pull request
+#1422 (`fix/key-ledger`): one squashed commit `70bd29186` on main `73d373235` with the tree of
+`6b7b8e489`, merged as `eda5ab5e4`.
 
 ## Links
 
@@ -964,3 +1364,5 @@ loss beyond O1 to O3.
 - `/opt/vox-evidence/v0431/simple-sync/pull/journey-36/`
 - `/opt/vox-evidence/v0431/release/legacy-room/report.md`
 - Branch `scratch/forward-only` (`/opt/vox-worktrees/forward-only`)
+- `/opt/vox-evidence/v0431/release/keyloss/` (amendment 1), `/opt/vox-evidence/v0431/exec/found-reds.md`
+  entries 147 to 153
