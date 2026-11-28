@@ -223,6 +223,11 @@ Each requirement gives the rule, why, the change, and its proof. "Carries" names
     Green: a daemon restart during a held turn, then a post: it is shown, once. Nine sessions
     restarted together print no `session registration is busy`. Mutants: one per place.
   - *Carries*: B08, B09, B10, B23, B37, B67, B68, B76, B85.
+  *(Amended 2026-11-28, amendment 1, merged in pull request #1424 (merge commit `516c08746`): the
+  plain `vox room read` already waited through saved-history refreshing; `--hashes`, reply
+  resolution by hash prefix (`--re`) and operation-context lookups in `vox room tail --json` now
+  wait the same way, and `vox up` and `vox lan up` use the existing preparation wait. See
+  "Amendment 1 (2026-11-28)".)*
 
 - **RG-5. The sync method is chosen by measurement.** After RG-2, RG-3 and RG-4 land, the
   busy-room journey MUST be run on two builds: today's method with two rules changed (a fetch
@@ -443,6 +448,61 @@ to be meetable without it (RG-0):
 - The release is judged on three journeys. What the fleet and the soak would have caught under
   faults nobody staged is not caught; the UNKNOWN list says what is open.
 - Removal with eviction (RG-8) is the one new behaviour in a stabilization release.
+
+## Amendment 1 (2026-11-28): the commands that failed at once on a preparing or refreshing room wait as the plain read does
+
+*(Added 2026-11-28, amendment 1.)* Merged in pull request #1424 (branch `fix/sweep6`, one squashed
+commit `08ec7b2aa` on main `695db44c4`), merge commit `516c08746a16fd9da141672c100a8e31f52e08fa`
+on main, whose tree is that of `scratch/sweep6-land` at `8761dd46f`. Sources, in
+`/opt/vox-evidence/v0431/`: `exec/found-reds.md` entry 163 (both rows), ledger 43 and its closure
+note; `release/regress6/Transients.md` and its review `Transients-review-1.md` (round 1; rounds 2
+and 3 concern the terminal app, ADR-028); `pr-body.md`; `simple-sync/review/STATE.md` (pass 7b).
+Code at main `516c08746`, under `crates/vox-tui/src/`. Nothing was built or run for this record.
+
+- **What was found** (sweep pass 6; `Transients.md`). (1) Right after a join, `vox room read
+  <room> --hashes` failed at once with "the room is refreshing saved history; retry", while the
+  plain read waits for that same answer: PRODUCT, older than this week. The red log does not tell
+  whether the room was finishing the retention work its join left pending or a change of its
+  classification revision. Ledger 43 recorded the same refusal on a created room, before its
+  closure on 2026-11-22 (`exec/found-reds.md`, closure note). (2) `vox up <room>` gave up at once
+  on a room still preparing ("that room is preparing its saved history"), as the node reattached
+  after `vox forward` exited, where `room_of`, the room verbs' resolver, waits: PRODUCT, old. (3)
+  `vox service add` refused "a previous change to this room is still being applied": the refusal
+  ruled to stay in v0.4.31 (ledgers 17 and 25), met more often now: APPARATUS. In tsr3 the first
+  request was refused about 30 ms after it was asked, and the next, after a 500 ms sleep,
+  succeeded; how long the refusal lasts was not measured.
+- **What is built.** RG-4's rule, that a "not yet" is retried by whoever was told it, applied to
+  the command line: the plain read's wait (`room_page_waiting`) becomes `history_waiting`
+  (`room_cli.rs`; the same poll, the same 15 s bound `START_WITHIN`, the same message) and is used
+  by the plain read, `--hashes` (`order`), `--re` by printed hash prefix and the `vox room tail
+  --json` operation-context lookup. In `tunnel_cli.rs` `open_named_room`, a preparing room is
+  handed to the existing waiting resolver, `room_cli::room_of`, so `vox up <room>` and `vox lan up`
+  wait for it; state-only commands (`room_of_now`) keep their non-waiting behaviour. The manual
+  changes with it (`docs/manual/rooms.md`, `docs/manual/services.md`).
+- **Named, not fixed**: "The terminal app, the Mac app, the agent hook's count, and `vox room
+  read --since`/`--tag` still answer at once while a room is refreshing" (`pr-body.md`).
+- **Proofs changed** (`pr-body.md`): `a_room_bound_service_carries_real_bytes_through_the_real_binaries`
+  (`service_rehearsal_proof.rs`) asks `vox service add` again every 500 ms while it answers "a
+  previous change to this room is still being applied", at most 90 s, its assertion and message
+  unchanged; and the hash-reading helper in `a_newcomer_reads_the_whole_history_proof.rs`
+  recognises the refusal as the command's last line, because the new wait adds a line before it
+  (the review's P2: otherwise "a refresh lasting beyond 15 seconds now fails that proof
+  immediately despite its remaining 120-second retry budget").
+- **Proof.** After the change, alone: the service act green (tsr3, as above), the relayed-UDP act
+  green (tud3) and the Swift-app act green (tsw3); in neither
+  of the last two did the window occur, so neither new wait was met in a run. On the integrated
+  tree, pass 7b (`149a3bd0e`): green `a_cli_failure_tells_the_truth_proof` 5 of 5, `ffi_swift`,
+  `udp_tunnel` 8 of 8, `service_rehearsal` and `room_verbs` (`simple-sync/review/STATE.md`).
+  Rests on review: the two new waits, "the busy moment did not recur in the green runs"
+  (`pr-body.md`).
+- **Review** (`Transients-review-1.md`, RevCli, source review only). At `bc21a0761`: one P2 in the
+  newcomer file's helper, quoted above; "Otherwise, source review found the shared
+  polling/bound, timeout refusal, cancellation, daemon-stop handling, JSON shape and manual
+  descriptions consistent." Round 2: "Earlier CLI-wait P2: **closed by `dcc2b58cd`**".
+- **Built**, in pull request #1424 (merge commit `516c08746`): `bc21a0761` (`scratch/transients`),
+  merged into the integration branch at `dfa2516f9`, and `dcc2b58cd`. The builder reports both
+  workspace checks with 0 warnings (`Transients.md`).
+- **Landed**: merge commit `516c08746` of #1424 on main.
 
 ## Links
 

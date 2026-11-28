@@ -31,6 +31,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   and accepted by each area's reviewer; a full sweep of the release proofs on that build then
   found two faults, fixed and accepted as PL-39 and PL-40 (scratch `8f28b38b8`, measured again
   there); none of it is merged.)*
+  *(Amended 2026-11-28, amendment 4, merged with the fixes of the sixth proof sweep in pull
+  request #1424, merge commit `516c08746` on main: PL-41, after a room's store recovery succeeds
+  the node closes and redials its connections to that room's peers; PL-42, a refill that finds
+  its key body already retired settles its root, and the body's debt is retired where its expiry
+  is established (`exec/found-reds.md` entries 156 and 160); in the section "Amendment 4". Each
+  amended place is marked.)*
 - **Date**: 2026-11-24
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, fetching, serving, admission, KISS, release
@@ -930,6 +936,9 @@ app is a waste".
     (`keys-6.md:9`; `keys-8.md:7`); and identical corrections, a correction that only split runs,
     and a row the bound kept rejecting each let a peer keep one ask running or end a park
     (`loop-13.md:7`; `loop-14.md:8`, :11).
+  *(Amended 2026-11-28, amendment 4: a node whose room store has recovered closes and redials its
+  connections to that room's peers, because a peer parked on a refusal given while the store had
+  failed waits for news, and the recovered node's unchanged Have is none (PL-41).)*
 - **PL-24. Everything that fetches history adopts the loop.**
   1. Every kind of fetching has one asking owner, the connection's loop: public history, own-history
      recovery, key bodies, own sender-key releases, exact receipts, private Sessions and saved
@@ -1166,6 +1175,8 @@ app is a waste".
     the eight-author act about 8 more ordinary takes per run went straight to a short wait (12 of
     156 against 4 of 109) (`loop-20.md:5-13`; `fix-FixBack.md:55`, :58). Accepted at scratch
     `12abc309b` (`loop-20.md:3`), from source.
+  *(Amended 2026-11-28, amendment 4: a held key-package control whose body refill finds the body
+  retired leaves the frontier, so the posts it held run again (PL-42).)*
 - **PL-31. One admitted entry is one owned write and one publication.**
   1. A completed entry MUST be admitted as one bounded native operation: in the ruling's words,
      "one entry-local room-lock hold and one final changed-room/read publication for a completed
@@ -1864,6 +1875,222 @@ is claimed here.)*
 - how often a reply lands above its question during a catch-up, now that an author's newest posts
   are admitted first (PL-30 item 6), is not measured (`loop-20.md:9`).
 
+## Amendment 4 (2026-11-28): a recovered store reconnects, and a retired key body releases its root
+
+*(Added 2026-11-28, amendment 4; amendment 2 is the unlanded draft named under Status.)* Merged in
+pull request #1424 (branch `fix/sweep6`, one squashed commit `08ec7b2aa` on main `695db44c4`),
+merge commit `516c08746a16fd9da141672c100a8e31f52e08fa` on main, whose tree is that of
+`scratch/sweep6-land` at `8761dd46f`. This section was checked for fidelity against the code and
+the records (`design/forward-only/adr-sweep6-check-1.md`). Sources, in `/opt/vox-evidence/v0431/`:
+`exec/found-reds.md` entries 156 and 160 (every row of each); under `release/regress6/`:
+`DiskFull.md` (rounds 2 to 4, and its last section, "Coordinator's ruling on how the peer's park
+ends"), `DiskFull-review-1.md`, `LateJoin.md` (with "Review fix"), `LateJoin-review-1.md` (both
+rounds) and `pr-body.md`; `simple-sync/review/STATE.md` (passes 7 to 7d, jrnS2) and the pass logs
+in `release/gate-sweep/pass7*/logs/`. Code is cited by file and function at main `516c08746`,
+under `crates/vox-core/src/node/`. Run labels are directories under `simple-sync/pull/runs/`.
+Nothing was built or run for this record.
+
+### (a) What was found
+
+1. **After a full disk was freed, a room could stay unsynced between two members for good**
+   (found-reds 156, second part; `DiskFull.md`, rounds 2 and 4). With the naming fix of ADR-034
+   amendment 1 in, the act `a_full_disk_recovers_without_stranding_sync_or_leave`
+   (`a_sync_failure_names_its_reason_proof.rs`) went on and was red 3 of 3 (jnd5, jnd6, jnd7):
+   "Bob reported recovery but received none of 100 further posts". The mechanism, from the
+   diagnostic runs r4d1 (green) and r4d2 (red): while bob's disk was full, bob answered alice's
+   sync stream for the room with `SyncModeUnsupported`, because the room check returned the
+   poisoned room's save failure (`actor.rs`, the inbound sync admission: `uses_sparse_history`
+   not `Ok(true)` gives `refuse_stream_because(…, SyncModeUnsupported)`). Alice's loop counted
+   that as a refusal and parked (PL-23). Once bob recovered, his node dropped the room's old
+   ports, made new ones and started a fresh loop, which told its Have 2 ms later (r4d2); but that
+   page was the one alice already held (`news=false`), and by PL-23 item 6 a page told again
+   unchanged is not news. So alice stayed parked and told bob none of her posts, and bob, holding
+   what he took alice to hold, had nothing to ask. Whether it happened depended on whether bob's
+   holdings changed after the refusal (r4d1 green, r4d2 red): timing. The inference of round 3,
+   that recovery left bob's ports stranded, was wrong (round 4 §1).
+2. **When it came in**: with `7257301f9` (#1411, the one loop), which added the park until news;
+   before it the old asking machinery asked again on later events, so a refusal cost one round.
+   The last green, sweep pass 4 on `9520dc0a9`, ran without that commit (`DiskFull.md`, round 4
+   §4). `7257301f9` is in no published release (`git tag --contains`).
+3. **A newcomer with a short retention could wait behind one expired key package until a
+   restart** (found-reds 160; `LateJoin.md` §1). In run klq the late member of ADR-055's renamed
+   interrupted-history act took nothing for nine minutes from the two members it was connected to
+   (verified 5 of 141 and 3 of 9), and its daemon said "not receiving from connected member …
+   (125 missing now)". The mechanism, from the diagnostic runs lj0 and lje: late asked for a key
+   package addressed to another member and got its header, then asked for its body, to carry it on
+   to its recipient (ADR-046). The body's refill found the package already expired under late's
+   1 s retention (`channel/pending_received.rs`, `HistoryEffectProgress::KeyBodyRetired`). The
+   loop mapped that need like a staged body (`history_stream/runtime.rs`), so the root was settled
+   with a need for its own position and kept; the kept control stayed held unadmitted in the
+   frontier, and every later post of that author waited on its position (PL-30 item 3); nothing
+   was asked. Only a restart, which empties the in-memory frontier, ended it: copies of the klq
+   stores, restarted, took all 125 entries at once. On main since `7257301f9`.
+
+### (b) The rules
+
+- **PL-41. After a room's store recovery succeeds, the node closes and redials its connections
+  to that room's peers.** *(Added 2026-11-28, amendment 4; the coordinating session's ruling,
+  option B, found-reds 156.)*
+  1. A peer parked on a refusal this node gave while its store had failed waits for news
+     (PL-23), and an unchanged Have is not news (item 6); a new connection is (items 1 and 6). So
+     `finish_metadata_open_reply` (`actor/metadata_save.rs`), when a room's store recovery is
+     done, calls `Node::replace_connections_after_recovery` (`actor/recovery.rs`): for each
+     connected peer that has a live connection and shares the room (`shares_room`), it closes that
+     connection with the existing code `WireError::Superseded`, then dials the closed peers again
+     through `dial_stranded`, the path a network change's stranded peers take (the ordinary
+     ladder; for a member, `reach_member`). No rule of PL-23 changes.
+  2. Bounds (`DiskFull.md`, round 4 §2): only after a successful recovery (a failed one, or an
+     ordinary open, never reaches it); only peers that share that room; a closed connection is no
+     longer held, so rooms recovering together replace it once (r4d3: the second and third rooms
+     found no peer to replace), except that a room recovering after the redial has landed replaces
+     the new connection once more (jnd8: two reaches 215 ms apart). No new dial logic, timer or
+     poll. No loop: a recovery starts only for a room poisoned by a failed write, and a reconnect
+     poisons nothing. Loops start only behind the same standing rule as before. No wire change.
+  3. Why not the other two options. The coordinating session's ruling of 2026-11-27, written at
+     the end of `DiskFull.md` ("Coordinator's ruling on how the peer's park ends"), lists the
+     options the builder put: "(A) the recovering node stops refusing a loop's exchange while its
+     room is poisoned and serves from committed state (narrows the window, does not close it:
+     in-flight answers retired by the recovery still park the peer on "transport failed"); (B)
+     after its room recovers the node replaces its connection to each peer of that room (a new
+     connection is news under ADR-054 PL-23; closes the window; every room on that connection
+     restarts); (C) a rule change so any Have arriving while parked on a refusal counts as news
+     (breaks PL-23 item 6)". Ruling: "**B**: it closes the window under the rules as they stand,
+     needs no ADR rule change and no new wire value, and a store recovery is rare; A does not
+     close it and serves from a store whose handle has just failed; C changes the park rule and
+     would need its own security review". This amendment records the behaviour; it changes no
+     earlier rule.
+  4. The cost. Every room's loop with that peer starts again on the new connection, each with a
+     fresh Have, and the peer is without a connection for one reach: about 60 ms from the close to
+     the new loops in r4d3, and reaches that answered in 87 and 67 ms in jnd8; over a relay, as
+     long as an ordinary circuit reach. Meanwhile `vox status` does not list the peer (the
+     builder's [INFERENCE]: the list is of live connections). Neither daemon names the close, and
+     `Superseded`'s documentation says "a duplicate connection … the peer is still connected over
+     the other", while here the other is dialled after the close (`DiskFull.md`, round 4, "Not
+     changed, for the notes").
+  5. Named, not fixed: a false "sync mode unsupported". While a room's store has failed, the node
+     still answers a peer's sync for that room with `SyncModeUnsupported` (item (a) 1), so the
+     peer's `vox status` shows, on each room they share, "last failure: the peer refused: sync mode
+     unsupported". It was captured in r4d2, without the fix, after the freeing ("room … peer
+     <bob>: completed 15 empty 11 partial 0 failed 1; …; last failure: the peer refused: sync mode
+     unsupported"); the act never reads alice's status inside the full-disk window, so the line
+     there is inferred from the same counters. The sentence is false: the peer supports the mode,
+     its store had failed. By the code it clears at the first exchange on the new connection that
+     ends without error (`PortCounters::last_failure_stands`, `status.rs`), and `failed 1` stays
+     counted; no status was captured after the fix to show it gone (the builder's [INFERENCE]).
+     The release notes are to say so (`pr-body.md`, "Named, not fixed").
+- **PL-42. A refill that finds its key body already retired settles its root, and the body's debt
+  is retired where its expiry is established.** *(Added 2026-11-28, amendment 4; found-reds 160.)*
+  1. The root: when a key-package body's refill comes back retired (its debt met or retired, or
+     the package expired here: `LocalNeed::KeyBodyRetired`), the flow clears its tasks and
+     settles the root with no need (`Flow`, `history_stream/runtime.rs`): the root leaves the
+     frontier, and through `refresh` and `unblock` (`history_stream/pull.rs`) the posts its held
+     control position blocked run again, as PL-30 item 3 provides for a control that "leaves the
+     frontier unpublished". Its header was already admitted, so nothing more is owed for it
+     (`LateJoin.md` §2). The reviewer: "The root-release operation itself is sound: the refill
+     requires the already-published exact header and validates the body first; it grants no new
+     admission authority" (`LateJoin-review-1.md`).
+  2. The debt. With item 1 alone, the review found (P2): "The expiry producer returns
+     `KeyBodyRetired` before committing …, so the durable KeyBody obligation remains. This new
+     branch removes its frontier exclusion, making the same body immediately selectable again.
+     Planner class 2b prioritizes that debt over ordinary history; successful body answers impose
+     no retry delay. The observed 458 asks are therefore a real retry storm, not a bounded attempt
+     count." (The builder had called those 458 asks in lje "bounded, but … extra work",
+     `LateJoin.md` §2.) So the refill's expiry branch (`channel/pending_received.rs`, the refill of
+     a key package whose body is owed) now drops its received batch and, in a fresh derived batch
+     committed alone, retires the exact KeyBody obligation built from the refill's checked need
+     (head, author, position, hash) with `finish_history_obligation`, the operation the retention
+     sweep's KeyDebt step uses, before it returns `KeyBodyRetired` (`LateJoin.md`, "Review fix").
+     A body that has not expired is never retired there; a crash leaves what the sweep would
+     have left, and the retire does nothing if the debt is already gone. The expiry it acts on is
+     this node's own retention, as PL-3 requires of a discharge of expired debt. The reviewer:
+     "The expiry-only branch commits retirement of the exact checked KeyBody obligation using the
+     sweep's operation before returning `KeyBodyRetired`. It touches the position, releases the
+     root, and leaves no route that recreates that admitted entry's debt" (`LateJoin-review-1.md`,
+     fix-only).
+  3. Removed with the act's re-staging (ADR-055 amendment 2 (f), part 3), by the coordinating
+     session's ruling, accepted by the owner on 2026-11-28 (`proof_changes_2 = accept`, ADR-055
+     amendment 2 (e bis)): the act's expired-body refill sub-claim and its knobs, which waited for
+     an expired Content body to be fetched. Since `7257301f9` an expired Content position completes
+     without its body being fetched (`completed`, `channel/held_history.rs`: "the body is not
+     needed, or its lifetime is over", applied to Content entries; `LateJoin.md` §3). A
+     key-package body still owed can still be fetched and found expired at its checked refill,
+     which is the case of items 1 and 2.
+
+### (c) What a person sees
+
+- After disk space is freed, a member's rooms sync again with every member; "recovered" is no
+  longer followed by silence from one member in one room.
+- While a member's disk is full, the others' `vox status` says "the peer refused: sync mode
+  unsupported" on the rooms they share, which is false (PL-41 item 5).
+- A newcomer with a short retention no longer stays "not receiving from connected member …"
+  behind an expired key package until a restart.
+
+### (d) What it costs
+
+1. A store recovery restarts every room's loop with each peer that shares the recovered room,
+   and the peer is unconnected for one reach (PL-41 item 4).
+2. One extra small commit when a refill meets an expired key body (PL-42 item 2).
+
+### (e) Proof
+
+- **PL-41**, `a_full_disk_recovers_without_stranding_sync_or_leave`: red 3 of 3 without it (jnd5
+  to jnd7); with it, green three times in a row (jnd8, jnd9, jnda: 23.59 s, 24.85 s, 25.32 s),
+  and green with the diagnostics in r4d3. Also green on that tree: the crash-inside-a-join act
+  (jndb) and the restored-backup act (jndc, which did not reach the new path: "can save again"
+  0 times). With the later forms of the naming fix the act stayed green (jndd, jnde, jndf, jndh)
+  and so did the crash-inside-a-join act (jndg). The test file only gains log keeping (listed in
+  `pr-body.md` as a re-staging). No mutant arm for PL-41 is recorded; the reds without the fix
+  are the runs without it.
+- **PL-42**: in lje (diagnostics, item 1 only) the path was hit ("key body refill retired; root
+  settled"), alice's live window was admitted and no "not receiving" was said; the builder reports
+  that the same body was asked 458 times there before the sweep retired its debt (`LateJoin.md`
+  §2), and the source reviewer calls that a retry storm. With item 2, lt2 (a diagnostic run with
+  lje's staging put back for it): one ask of `Body { seq: 9 }`, then "expired key body debt
+  retired … 9" once and "key body refill retired; root settled" once, and no "not receiving"; lt2
+  then went red at the act's `shows_not_received_yet` step, which that staging cannot pass
+  (`LateJoin.md` §3). lt1, the act as shipped: ok (208.88 s), the path not hit. Before item 2 the
+  renamed act went green to its end twice (lj3, lj4). No mutant arm is recorded.
+- **On the integrated tree** (`simple-sync/review/STATE.md`; the pass logs): the full-disk file,
+  2 tests, both executed, green in pass 7 (on `e396fd1ee`) and in pass 7c (`43a3ab3cc`). The
+  gate's file runs are built without `optional-proofs`, so an optional act prints `OPTIONAL PROOF
+  NOT RUN` and counts as passed: the newcomer file's 15 harness successes in passes 7 and 7d
+  (`b10f075e8`) are six executed tests and nine such notices, and the renamed act that carries the
+  late member is one of the nine; it did not run in these file runs. It was last run alone in lt1
+  (on `scratch/late-join` with item 2) and in fh1 and fw2 to fw8 (on `149a3bd0e` with the unlanded
+  first-read fix of ADR-055 amendment 2), not on the merged tree; further runs on the release
+  commit are to be recorded in `/opt/vox-evidence/v0431/rg-6/close/closing-runs.md`. The busy-room
+  journey jrnS2 on `b10f075e8`: "GREEN: … every post each member is owed (of 3668 acknowledged)
+  shown on it after authors stop" (`release/regress6/jrnS2/paused/receipt.log`). `8761dd46f`
+  differs from `b10f075e8` by a lint-only change.
+- **What rests on review**: PL-41's bounds (one replacement per connection, no loop); PL-42 item
+  2's crash behaviour.
+
+### (f) Reviews
+
+Source review only. `DiskFull-review-1.md` (RevJoinLand) at `ccdae31fe`: "No additional reconnect
+defect established: replacement is success-only, filtered by recovered-room membership, and uses
+the existing close/reach paths"; its finding P2 and its later rounds concern the naming (ADR-034
+amendment 1), and its third and fourth rounds did not re-review the reconnect.
+`LateJoin-review-1.md` (RevJoinLand) at `33e3f9533`: the P2 of PL-42 item 2; "The removed hooks
+are test-knob-only; the server helper's production branch was always `None`. No other live
+behavior removal found." Its fix-only round (RevStore) at `661b38c4f`: **ACCEPT**, quoted in PL-42
+item 2; "Crash consistency matches the existing derived sweep transaction: recovery may retain or
+roll back retirement, allowing a safe retry rather than stranding the root. No introduced defect
+found."
+
+### (g) Built
+
+In pull request #1424 (merge commit `516c08746`, tree of `8761dd46f`): PL-41 as `ccdae31fe`
+(`scratch/disk-full`: `actor/recovery.rs`, +28 lines; one call in `actor/metadata_save.rs`; the
+act's log keeping), merged into the integration branch at `d2c4b3795`; PL-42 as `33e3f9533` and
+`661b38c4f` (`scratch/late-join`), merged at `483dfaf4b` and `3418305f7`. The builders report both
+workspace checks clean (`DiskFull.md`, round 4 §5; `LateJoin.md`, "Review fix"); lint is clean on
+`8761dd46f`, as the pull-request text reports.
+
+### Landed
+
+- Merge commit `516c08746` of #1424 on main.
+
 ## Counts, by reading (the diff decides)
 
 The first design's five-state and 20,000-line claims are withdrawn (C8; design.md:70; ruling.md:72).
@@ -2054,3 +2281,7 @@ otherwise, or named as open; the ledger puts it to the owner (`exec/found-reds.m
 - *(Added 2026-11-26, amendment 3.)* In `/opt/vox-evidence/v0431/`: `simple-sync/review/`
   `fix-FixBack.md`, `fix-FixBack2.md`, `loop-20.md`, `delete-17.md`, `keys-17.md`;
   `exec/found-reds.md` (ledger 127).
+- *(Added 2026-11-28, amendment 4.)* In `/opt/vox-evidence/v0431/`: `release/regress6/`
+  `DiskFull.md`, `DiskFull-review-1.md`, `LateJoin.md`, `LateJoin-review-1.md`, `pr-body.md`;
+  `exec/found-reds.md` (ledger 156, 160). Branches `scratch/disk-full`
+  (`/opt/vox-worktrees/slow-join-land`) and `scratch/sweep6-land` (`/opt/vox-worktrees/sweep6-land`).

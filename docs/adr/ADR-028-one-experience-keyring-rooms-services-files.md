@@ -157,6 +157,13 @@ by any of them (ADR-001: there is no typed agent or human).
   it MUST be offered the newcomer: an item under **needs you** (W-2) showing its fingerprint grouped
   with its art (K-1) and what K-7 says about it. The offer MUST be derived from the join on the log;
   it MUST NOT add an entry type.
+  *(Amended 2026-11-28, amendment of that date, merged in pull request #1424 (merge commit
+  `516c08746`): in the terminal app the join's line with its `:trust` offer was pushed off the
+  help line within a second or two by "you now trust X" and "X trusts you", said on every consent
+  re-issue and key turn, and by a settlement note the tick retries. Now eligible trust changes give
+  at most one trust notice per snapshot refresh, a join in the same refresh taking precedence;
+  the repeated announcements are not made, and qualifying busy-settlement notes are suppressed as
+  described below. See "Amendment (2026-11-28)" below.)*
 - **K-16. Accepting.** Accepting an offer is ADR-020 3.7's second entry point, `vox trust add` with
   the offered fingerprint. It MUST ask for an editable local alias with its known presented name as the default (K-3) and for **read** or **read + drive**, with
   read the default, and MUST pass ADR-020 3.1's passphrase gate as amended by K-12. It MUST NOT
@@ -555,6 +562,71 @@ structure for both clients; the TUI renders the same regions in text.
 ### 12. Out of scope
 
 Calls and the iOS app (both v0.5.0).
+
+## Amendment (2026-11-28): the terminal app says each trust once, so a join's offer stays on screen
+
+*(Added 2026-11-28.)* Merged in pull request #1424 (branch `fix/sweep6`, one squashed commit
+`08ec7b2aa` on main `695db44c4`), merge commit `516c08746a16fd9da141672c100a8e31f52e08fa` on main,
+whose tree is that of `scratch/sweep6-land` at `8761dd46f`. Sources, in
+`/opt/vox-evidence/v0431/`: `exec/found-reds.md` entry 130 (its last row);
+`release/regress6/TuiTrust.md` (rounds 1 and 2), the review `Transients-review-1.md` (rounds 2
+and 3, RevCli) and `pr-body.md`; `simple-sync/review/STATE.md` (passes 7, 7b, 7d). Code at main
+`516c08746`. Nothing was built or run for this record.
+
+- **What was found** (`TuiTrust.md`). The act
+  `the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen` was red alone in sweep
+  pass 6 and in 5 of 5 runs before the change, only at "truth CLAIM trust RED: the join offered
+  ':trust <prefix>': False". PRODUCT (display): the join line with K-15's one trust action was
+  replaced within a second or two by later notices untrue as news: "you now trust X" for every
+  consent this node issued and "X trusts you" for every newly accepted key generation
+  (`crates/vox-tui/src/live.rs`), and "room … settlement did not start a new sender key: node: room
+  publication is busy; retry this operation; check vox status and the daemon log before reopening
+  this room" for a busy settlement step the tick retries
+  (`crates/vox-core/src/node/actor/recovery_save.rs`). The "passphrase does not match" line in the
+  red was the act's deliberately wrong passphrase, rightly refused. Why trusts recur: in rooms with
+  sparse history every sender-key turn publishes a Presence `here`, which the consent fold reads
+  as a return and starts that author's consents over; the node then grants them again (by
+  reading; named, not changed: whether a reader misses anything in that gap is not known).
+- **What is built.** `live.rs`: a consent issued says nothing; a received key says only "N
+  earlier message(s) from X now readable" when N > 0. At each snapshot refresh `note_trust`
+  makes at most one trust notice: "X trusts you" when a room's log first shows X consenting to
+  this node while the app runs (`trusting`), only in a room held open with X in it on the
+  snapshot before; a remembered pair is forgotten when X's latest consent to this node is a
+  signed revocation, so a new grant after it is said again; and "you now trust X" when X entered
+  this node's keyring since the snapshot before, which takes the place of a "trusts you" in the
+  same refresh. The trust notice is noted before the join's, so a join in the same refresh is the
+  line shown. For that, the open-room snapshot gains one field,
+  `withdrawn`: the members whose latest consent to this identity in the room is a signed
+  withdrawal (`ChannelState::withdrawn_from_me`, from `withdrew` in
+  `channel/governance/view.rs`; `ChannelDetail.withdrawn`, `node/api.rs`; `OpenRoomSnap.withdrawn`,
+  `node/snapshot.rs`, also in the IPC snapshot), so each open-room record has 18 fields, and its
+  encoder and decoder both say 18 (the review's round 3 found them still at 17; fixed in
+  `02f5ac770`). `recovery_save.rs`: the note is not sent for a stage refused only because the
+  room's publication slot or governance turn was busy, when the room has sparse history or still
+  owes settlement work; other errors keep the existing reporting, including its silence when this
+  node closed the room under the stage (`closed_under`). Nothing about who may edit the keyring,
+  or what is granted, published or read, changes.
+- **Limits, named.** "X trusts you" said again after a withdrawal and a new grant is shown by no
+  act and rests on review (`pr-body.md`); if a withdrawal and a new grant both land between two
+  snapshot refreshes (about 1 s), the app never sees the revocation and says nothing
+  (`TuiTrust.md`, round 2). The busy note is still sent for a legacy room that no longer owes
+  settlement.
+- **Proof.** The act, unchanged: green 51 of 51 twice on the patch as first recorded (tt6 a and b;
+  no settlement note in any log of either kept directory, where the earlier kept runs tt4 and tt5
+  had them in every directory, publication-busy ones and one governance-refreshing one; the builder
+  counts 9 to 14 per run, and the count depends on which logs are read, since one note is written
+  both to a daemon's log and to its stderr) and once after round 2 (tt7); on the integrated tree
+  green in pass 7b (`149a3bd0e`) and pass 7d (`b10f075e8`) (`simple-sync/review/STATE.md`). No
+  mutant arm is recorded.
+- **Reviews** (`Transients-review-1.md`, RevCli, read-only). Round 2, at `1f2836b7c`: one P2,
+  "Reset trust-notice suppression on a genuine withdrawal"; "The settlement-note change preserves
+  genuine failure notices". Round 3, at `4cabeeb80`: one P2, "Update the snapshot array length",
+  "The original withdrawal-notice P2 is otherwise closed"; the coordinating session records both
+  counts changed to 18.
+- **Built**, in pull request #1424 (merge commit `516c08746`): `1f2836b7c` and `4cabeeb80`
+  (`scratch/transients`), merged into the integration branch at `c2e3c7069` and `92497be62`, and
+  `02f5ac770`.
+- **Landed**: merge commit `516c08746` of #1424 on main.
 
 ## Superseded and amended lines
 
