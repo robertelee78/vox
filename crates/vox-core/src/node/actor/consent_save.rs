@@ -16,11 +16,13 @@ pub(super) enum Work {
         target: Digest32,
         skdm: Box<crate::group::skdm::Skdm>,
     },
+    /// A member's authenticated answer that it took `generation` of a direct delivery selected
+    /// under debt `revision`: that generation leaves its set (`prepare_pending_consent_delivery`).
     Delivered {
         target: Digest32,
         generation: u64,
+        revision: u64,
         removal_generation: Option<u64>,
-        history: bool,
     },
     Issue {
         target: Digest32,
@@ -103,15 +105,15 @@ impl Work {
             Self::Delivered {
                 target,
                 generation,
+                revision,
                 removal_generation,
-                history,
             } => channel
                 .prepare_pending_consent_delivery(
                     store,
                     owner,
                     target,
                     generation,
-                    history,
+                    revision,
                     removal_generation,
                 )
                 .map(|pending| Some(Prepared::Delivered(pending))),

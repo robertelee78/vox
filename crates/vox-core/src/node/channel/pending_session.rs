@@ -28,6 +28,10 @@ pub(crate) enum SessionWrite {
     Package {
         package: crate::node::keypackage::KeyPackage,
         removal_generation: u64,
+        /// The room-key generation it carries and that release's `skdm_ref`: its posted mark
+        /// ([`crate::node::channel::posted_release`]) is written in this append's own batch
+        /// (`ChannelState::posted`). `None` for a Drive key.
+        mark: Option<(u64, Digest32)>,
     },
 }
 
@@ -95,6 +99,9 @@ pub(crate) struct PendingSession {
     news: Vec<String>,
     encrypted: bool,
     package_hash: Option<Digest32>,
+    /// The posted mark `(member, generation, mark)` and the ledger carrying it, written with
+    /// the package's append.
+    ledger_mark: Option<((Digest32, u64, Digest32), SealedSegment)>,
     refresh_changed: bool,
 }
 
@@ -116,6 +123,8 @@ pub(crate) struct CompletedSession {
     failure: Option<String>,
     package_attempted: bool,
     package_committed: bool,
+    /// The posted mark a committed package's append wrote.
+    posted_mark: Option<(Digest32, u64, Digest32)>,
     pub(crate) result: Result<SessionSaved>,
 }
 
@@ -210,6 +219,7 @@ impl ChannelState {
         if let SessionWrite::Package {
             package,
             removal_generation: expected,
+            ..
         } = &write
         {
             if *expected != removal_generation {
@@ -395,11 +405,23 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         };
+        let mut ledger_mark = None;
         if let Some(controls) = &mut controls {
             controls.fence_removal(removal_generation);
-            if let SessionWrite::Package { package, .. } = &write {
-                if let Some(back) = self.package_return(store, &package.recipient)? {
+            if let SessionWrite::Package { package, mark, .. } = &write {
+                let back = self.package_return(store, &package.recipient)?;
+                if let Some(back) = back {
                     controls.require_ancestor(back);
+                }
+                // A package is posted once (V210-45): its mark goes in this append's batch.
+                if let Some((generation, key)) = *mark {
+                    let mark = crate::node::channel::posted_release(
+                        &back.unwrap_or(crate::node::channel::NEVER_LEFT),
+                        &key,
+                    );
+                    ledger_mark = self
+                        .package_mark(package.recipient, generation, mark)?
+                        .map(|seg| ((package.recipient, generation, mark), seg));
                 }
             }
         }
@@ -442,6 +464,7 @@ impl ChannelState {
             news: Vec::new(),
             encrypted: false,
             package_hash: None,
+            ledger_mark,
             refresh_changed: false,
         })
     }
@@ -470,6 +493,7 @@ impl ChannelState {
             change_unsaid,
             mut failure,
             result,
+            posted_mark,
             ..
         } = completed;
         if self.receiver_persistence.drive() != receiver_version {
@@ -482,6 +506,9 @@ impl ChannelState {
             }
         } else {
             self.release_pending_text(&owner, false);
+        }
+        if let Some((target, generation, back)) = posted_mark {
+            self.note_package_posted(target, generation, back);
         }
         if let Some(mut saved) = drive {
             // Undrained notifications and nonpersistent read/render buffers are not the save's.
@@ -593,6 +620,11 @@ impl PendingSession {
             },
             package_attempted: self.package_hash.is_some(),
             package_committed,
+            posted_mark: self
+                .ledger_mark
+                .take()
+                .filter(|_| package_committed)
+                .map(|(mark, _)| mark),
             committed_rows: self.committed_rows,
             news: self.news,
             failure,
@@ -625,13 +657,20 @@ impl PendingSession {
                 .ok_or(Error::Profile("Session package owner missing"))?;
             let wire = package.to_wire();
             self.package_hash = Some(crate::hash::sha256(&wire));
-            controls.append_control_owned(
+            let extra: Vec<(u64, Option<SealedSegment>)> = self
+                .ledger_mark
+                .as_ref()
+                .map(|(_, seg)| (super::SEG_HISTORY, Some(seg.clone())))
+                .into_iter()
+                .collect();
+            controls.append_control_owned_with(
                 store,
                 signer,
                 wire,
                 EntryKind::Content,
                 SignedEntryKind::KeyPackage,
                 crate::time::Ms(self.now),
+                &extra,
             )?;
             return Ok(SessionSaved::Package { package });
         }

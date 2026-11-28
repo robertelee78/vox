@@ -29,13 +29,15 @@
 //!   s once 1 is read and 2 proved (generation 1 deleted while 0 is still to come, and her
 //!   retries offer the deleted 1 again).
 //! - **A key-package re-offer** (design-4 §3): bob's node goes down while alice still owes him
-//!   generation 0, so what she owes him goes into room s's log as key packages, one per
-//!   generation from his floor (0) to her live one (2): the deleted generation 1 is offered again
-//!   by package (staging: alice's daemon says three keys for him went into room s's log). He
-//!   comes back with generation 0 still held back when handed over directly, so it can come only
-//!   by package. **PRODUCT:** he reads generation 0's posts late; every row he read in both rooms
-//!   is still shown; his status shows one received generation of hers in room s, and he ends
-//!   holding one key of hers in each room.
+//!   generation 0 (he acknowledged 1 and 2), so it goes into room s's log as a key package
+//!   (staging: alice's daemon says a key for him went into room s's log). He comes back with
+//!   generation 0 still held back when handed over directly, so it can come only by package.
+//!   He reads it to its end and deletes it; then he trusts carol, and the change of trust makes
+//!   his node replay every retained key package for him, so generation 0's package re-offers a
+//!   generation he deleted (staging: his daemon's `test-knobs` line says it was answered as
+//!   taken, installing nothing). **PRODUCT:** he reads generation 0's posts late; every row he
+//!   read in both rooms is still shown; his status shows one received generation of hers in room
+//!   s, and he ends holding one key of hers in each room.
 //! - **A Drive key is another namespace** (design-4 R1): alice then trusts bob with drive and
 //!   opens a Session in room s. Her first drive key there is generation 0 (`begin_drive`,
 //!   `channel/pending_session.rs`), the number of a room key of hers bob deleted. **PRODUCT:** bob
@@ -600,11 +602,13 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
     );
 
     // ---- A key-package re-offer of the deleted generation is ignored too ----------------
-    // Bob's node goes down while alice still owes him generation 0: her next try to reach him
-    // fails, and what she owes him goes into room s's log as key packages, one per generation
-    // from his floor (0) to her live one (2), the deleted 1 among them. His node comes back
-    // still holding a directly handed generation 0 back, so generation 0 can come only by
-    // package; generation 1's package must change nothing.
+    // Bob's node goes down while alice still owes him generation 0 (he acknowledged 1 and 2):
+    // her next try to reach him fails, and generation 0 goes into room s's log as a key
+    // package. His node comes back still holding a directly handed generation 0 back, so
+    // generation 0 can come only by package, after his deletion of 1. He reads it to its end
+    // with 2 proved and deletes it in turn; then a change of whom he trusts makes his node read
+    // every key package in the log for him again (the retained-package replay), and generation
+    // 0's package, a re-offer of a generation he deleted, must change nothing.
     let packaged = || -> usize {
         let log = std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default();
         log.lines()
@@ -617,7 +621,7 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
     let packaged_before = packaged();
     drop(b);
     let deadline = Instant::now() + Duration::from_secs(120);
-    while packaged() < packaged_before + 3 && Instant::now() < deadline {
+    while packaged() < packaged_before + 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
     }
     let packages = packaged() - packaged_before;
@@ -625,10 +629,10 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
         "[proof] room s: with bob down, alice's daemon put {packages} key(s) for him in the log"
     );
     assert!(
-        packages >= 3,
-        "CANNOT MEASURE: with bob's node down, alice's daemon said only {packages} key(s) of room \
-         s went into the room's log in 120 s, not the three of generations 0, 1 and 2, so no \
-         package re-offered the generation bob deleted"
+        packages >= 1,
+        "CANNOT MEASURE: with bob's node down, alice's daemon said no key of room s went into the \
+         room's log in 120 s, so generation 0 has no package to come by and none to re-offer \
+         once he deletes it"
     );
     b = daemon_with(
         &bob,
@@ -649,7 +653,32 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
     );
     std::fs::remove_file(&hold)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot remove bob's hold file: {e}"));
-    let held = received_until(&bob, &s, 1, 60);
+    let mut held = received_until(&bob, &s, 1, 60);
+    if held == Some(1) {
+        // Generation 0 is deleted (he holds only 2). Trusting carol changes his node's trust,
+        // which replays every retained key package for him: generation 0's among them.
+        let reoffered = || {
+            std::fs::read_to_string(bob.join("daemon-bob-packages.err"))
+                .unwrap_or_default()
+                .lines()
+                .any(|l| {
+                    l.contains("test-knobs: a key package of deleted generation 0 was answered")
+                })
+        };
+        trust(&bob, &carol_fp, "carol");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !reoffered() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            reoffered(),
+            "CANNOT MEASURE: bob's node, trusting carol, never met the key package of alice's \
+             generation 0 again in 120 s after deleting that generation, so no package re-offered \
+             a generation he deleted"
+        );
+        println!("[proof] room s: bob's node met generation 0's package again after deleting it");
+        held = received_until(&bob, &s, 1, 60);
+    }
     // Alice's removals of carol rotated her key in room r too, with nothing posted under the new
     // generation, so bob's generation of "again" is not yet superseded by anything proved: a
     // post in r under her live generation proves it.

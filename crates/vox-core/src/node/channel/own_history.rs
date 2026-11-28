@@ -1023,6 +1023,10 @@ impl ChannelState {
                 )?
                 .is_none()
         {
+            eprintln!(
+                "test-knobs: audit-back mutant engaged: own recovery waits for a readability \
+                 audit cursor nothing writes"
+            );
             return Err(Error::OwnHistoryBehind);
         }
         self.require_legacy_current(store)?;

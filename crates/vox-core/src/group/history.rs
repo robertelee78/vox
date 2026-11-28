@@ -152,16 +152,23 @@ impl OriginKeyStore {
         );
     }
 
-    /// Drop the generation with the smallest `created_at`, breaking ties on the key
-    /// so eviction is deterministic (two generations minted in the same second must
-    /// not evict differently on two nodes reading the same state).
-    fn evict_oldest(&mut self) {
-        let victim = self
-            .records
+    /// The generation a new one would evict at the cap: the one with the smallest
+    /// `created_at`, breaking ties on the key so eviction is deterministic (two generations
+    /// minted in the same second must not evict differently on two nodes reading the same
+    /// state). `None` below the cap.
+    #[must_use]
+    pub fn eviction_victim(&self) -> Option<(Digest32, u64, u64)> {
+        if self.records.len() < MAX_RETAINED_ORIGINS {
+            return None;
+        }
+        self.records
             .iter()
             .min_by_key(|(k, r)| (r.created_at, **k))
-            .map(|(k, _)| *k);
-        if let Some(k) = victim {
+            .map(|(k, _)| *k)
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(k) = self.eviction_victim() {
             self.records.remove(&k);
         }
     }
@@ -449,13 +456,18 @@ impl OriginKeyStore {
         self.records.retain(|_, r| r.created_at >= cutoff);
     }
 
-    /// Drop every retained origin of `(channel_id, epoch)` older than generation `from`
-    /// (ADR-023 decision 4, PRD-001 R14): a superseded generation's key is deleted —
-    /// zeroized on drop — once nothing still has to release it. Returns how many went.
-    pub fn retain_from(&mut self, channel_id: &Digest32, epoch: u64, from: u64) -> usize {
+    /// Drop every retained origin of `(channel_id, epoch)` that `keep` does not keep (ADR-023
+    /// decision 4, PRD-001 R14): a superseded generation's key is deleted — zeroized on drop —
+    /// once nothing still has to release it. Returns how many went.
+    pub fn retain_needed(
+        &mut self,
+        channel_id: &Digest32,
+        epoch: u64,
+        keep: impl Fn(u64) -> bool,
+    ) -> usize {
         let before = self.records.len();
         self.records
-            .retain(|(c, e, id), _| c != channel_id || *e != epoch || *id >= from);
+            .retain(|(c, e, id), _| c != channel_id || *e != epoch || keep(*id));
         before - self.records.len()
     }
 

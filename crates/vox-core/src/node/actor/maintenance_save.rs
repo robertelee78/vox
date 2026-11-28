@@ -694,6 +694,21 @@ impl Node {
         reply: Option<oneshot::Sender<Outcome>>,
     ) -> bool {
         if self.pending_posts.contains_key(&room) {
+            // **A key a member sent waits for its room's save to end** and is then taken
+            // (`resume_parked_keys`), as a consent a person waits for does: refused, its sender
+            // backed it off for seconds. One per room and sender; a second is refused as before.
+            let sender = match &continuation {
+                Continuation::Packages(next) if reply.is_none() => next.inbound_key(),
+                _ => None,
+            };
+            if let Some((peer, _)) = sender {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.parked_keys.entry((room, peer))
+                {
+                    slot.insert((work, continuation));
+                    return false;
+                }
+            }
             self.reject_pending_maintenance(
                 room,
                 Error::Profile("room publication is busy; retry this operation"),
@@ -1349,6 +1364,52 @@ impl Node {
         }
         if pending.governance_owed {
             self.continue_deferred_governance(room, &instance, pending.epoch);
+        }
+    }
+
+    /// `room`'s save ended: each key that waited for it is taken up again, under the trust
+    /// standing now. One that finds the room held again (by a save it or another started)
+    /// waits again for that save's end.
+    pub(super) async fn resume_parked_keys(&mut self, room: Digest32) {
+        let peers: Vec<Digest32> = self
+            .parked_keys
+            .keys()
+            .filter(|(r, _)| *r == room)
+            .map(|(_, p)| *p)
+            .collect();
+        for peer in peers {
+            if self.pending_posts.contains_key(&room) {
+                return;
+            }
+            if let Some((work, mut continuation)) = self.parked_keys.remove(&(room, peer)) {
+                if let Continuation::Packages(next) = &mut continuation {
+                    next.retrust(self.trust.trusted());
+                }
+                Box::pin(self.begin_pending_maintenance(room, work, continuation, None)).await;
+            }
+        }
+    }
+
+    /// A waiting key ends with its connection (`closed`: its peer and serial) or, for `None`,
+    /// with the node's lock: refused as it was before it waited.
+    pub(super) fn retire_parked_keys(&mut self, closed: Option<(Digest32, u64)>) {
+        let ending: Vec<_> = self
+            .parked_keys
+            .iter()
+            .filter(|(_, (_, next))| {
+                closed.is_none()
+                    || matches!(next, Continuation::Packages(next) if next.inbound_key() == closed)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for (room, peer) in ending {
+            if let Some((_, continuation)) = self.parked_keys.remove(&(room, peer)) {
+                let error = match closed {
+                    Some(_) => Error::Profile("the key's connection closed while its room saved"),
+                    None => Error::AtRestLocked,
+                };
+                self.reject_pending_maintenance(room, error, continuation, None);
+            }
         }
     }
 

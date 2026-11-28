@@ -1,27 +1,56 @@
 //! ADR-023 R14 / PRD-001 R14, design-4 R6 — **an author keeps a superseded generation of its
-//! sender key only while a member still entitled to it has not taken it**, driven through the
-//! **shipped `vox` binary**. (Formerly `history_grant_proof`; its `--history full` arm is gone
+//! sender key only while a member still entitled to it has not acknowledged it**, driven through
+//! the **shipped `vox` binary**. (Formerly `history_grant_proof`; its `--history full` arm is gone
 //! with the option, by the owner's ruling of 2026-11-27: nobody is given older history.)
 //!
 //! What runs: alice's room, with bob, carol and dave. Bob and dave trust alice and she trusts
 //! all three. Carol does not trust alice, so she never takes alice's key and is owed it.
 //!
 //! - Alice posts under generation 0 and bob reads it; then bob's node stops.
-//! - Alice stops trusting dave, which rotates her key (generation 1), and posts.
-//! - Carol leaves the room (`vox room leave`).
-//! - Alice trusts dave again, posts, stops trusting him again (generation 2) and posts.
-//! - Bob's node starts again.
+//! - **Stage 1, two rotations back to back.** Alice's re-grant to bob is held
+//!   (`VOX_TEST_HOLD_REGRANT_FILE` names bob on alice's node): every rotation's own Presence
+//!   resets her grants until they are issued again, and none is issued to bob between these
+//!   two. Alice stops trusting dave, which rotates her key (generation 1), and posts; carol
+//!   leaves the room (`vox room leave`); once a re-grant to bob was held, alice trusts dave again,
+//!   posts, stops trusting him again (generation 2) and posts. Then the re-grant goes.
+//! - **Stage 2, a rotation while a delivery is on its way.** Bob's node starts again. The keys he
+//!   is owed go to him directly, and are held on their way (`VOX_TEST_HOLD_PAIRWISE_KEY_FILE`
+//!   names bob on alice's node) while alice trusts and stops trusting dave twice more
+//!   (generations 3 and 4), posting under each; then the keys go.
+//! - **Stage 3, a package settles nothing.** Bob's node stops; alice rotates twice more
+//!   (generations 5 and 6) and her keys for bob go into the room's log as packages; dave relays
+//!   the log. Alice's node stops and bob's starts: he reads those posts from the packages. Bob's
+//!   node stops, alice's starts, then bob's.
+//! - **Stage 4, an own-history recovery that jumps the generation.** Alice's data directory is
+//!   copied with her daemon stopped; she starts and rotates twice more (bob, online, reads it);
+//!   both stop and the copy is put back. Alice starts from it with her re-grant to bob held: she
+//!   is behind her own history, recovers it from dave, and her recovery mints a generation
+//!   above every one her feed shows (not one above the live one of the copy). She posts under
+//!   it and rotates once more (she stops trusting dave), and posts. The re-grant goes once her
+//!   origin prune has decided with that last generation minted. Bob's node starts.
 //!
-//! **PRODUCT:** bob, trusted before all of it and offline across both rotations, reads every
-//! post written after his trust; and once he has taken those keys alice's `vox status --json`
-//! reports **one** generation held (`key_generations`). Carol, who left, pins nothing: her
-//! untaken debt keeps no generation at alice.
+//! **PRODUCT:** bob, trusted before all of it, reads every post written after his trust: those
+//! of the generations minted while his grant read false (stage 1), those of the generations
+//! minted while his keys were on their way (stage 2), those whose keys reached him only as
+//! packages while alice was stopped (stage 3), and those of the generation her recovery minted
+//! while he was offline (stage 4). Alice's `vox status --json` reports **one** generation held
+//! (`key_generations`) once bob has acknowledged his keys, and more while he has not: after
+//! stage 3 she still holds the retired generation until they are online together. Carol, who
+//! left, pins nothing.
 //!
-//! Mutation (red): `VOX_TEST_FWD_MUTANT=departed-pins` (a departed member's history floor pins
-//! origins, `oldest_generation_needed`) → "alice still holds 3 generations".
+//! Mutations (red), each on its own assertion: `VOX_TEST_FWD_MUTANT=rotation-readers` (a
+//! rotation owes nothing to a member whose grant reads false, `rotation_debt`) → bob never reads
+//! p1; `VOX_TEST_FWD_MUTANT=settle-whole` (an answer settles the member's whole set,
+//! `prepare_pending_consent_delivery`) → bob never reads p3; `VOX_TEST_FWD_MUTANT=departed-pins`
+//! (a departed member's set pins origins, `origins_needed`) → "alice still holds 3 generations".
+//! Stage 4 has no switch: with the defect it guards (a recovery's debt owing one above the
+//! copy's live generation instead of the one it mints), alice's prune deletes the recovered
+//! generation and bob never reads p9 1.
 
 #![cfg(unix)]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "support/typed.rs"]
 mod typed;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -97,6 +126,12 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 }
 
 fn daemon(dir: &Path, tag: &str) -> Daemon {
+    daemon_with(dir, tag, None)
+}
+
+/// [`daemon`], holding its direct room-key writes to the peer named in `holds.0`, and its
+/// consents to the peer named in `holds.1`, while those files exist.
+fn daemon_with(dir: &Path, tag: &str, holds: Option<(&Path, &Path)>) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
         .expect("APPARATUS: daemon stdout file");
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
@@ -106,6 +141,10 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
     // `VOX_TEST_*` of the shell that runs it (`temp_home.rs`).
     if let Some(mutant) = std::env::var_os("VOX_MUTANT_FWD") {
         cmd.env("VOX_TEST_FWD_MUTANT", mutant);
+    }
+    if let Some((keys, regrant)) = holds {
+        cmd.env("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", keys);
+        cmd.env("VOX_TEST_HOLD_REGRANT_FILE", regrant);
     }
     let mut child = cmd
         .args(["daemon", "--listen", "127.0.0.1:0"])
@@ -224,9 +263,72 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
     assert!(ok, "PRODUCT (staging): vox room join: {err}");
 }
 
+/// Whether `vox room read` answers for `room` on `dir` within `secs`: a reopened room is
+/// prepared before it is published.
+fn room_answers(dir: &Path, room: &str, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if vox(dir, &["room", "read", room], None).0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The highest generation alice's origin prune has decided with so far (the `test-knobs` line
+/// `origin prune of room … keeps generations […] of […]`, said once per new decision).
+fn decided_up_to(text: &str) -> Option<u64> {
+    text.lines()
+        .filter(|line| line.contains("test-knobs: origin prune of room"))
+        .filter_map(|line| line.rsplit(" of [").next())
+        .flat_map(|held| {
+            held.trim_end_matches(']')
+                .split(", ")
+                .filter_map(|g| g.parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .max()
+}
+
+/// A stopped member's whole data directory, copied, each directory with its own permissions (a
+/// node refuses a management directory that is not private): the backup stage 4 restores from.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", to.display()));
+    let mode = std::fs::metadata(from)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot stat {}: {e}", from.display()))
+        .permissions();
+    std::fs::set_permissions(to, mode)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot set the mode of {}: {e}", to.display()));
+    for e in std::fs::read_dir(from)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot list {}: {e}", from.display()))
+    {
+        let e = e.expect("APPARATUS: cannot read a stopped profile's entry");
+        let target = to.join(e.file_name());
+        let kind = e
+            .file_type()
+            .expect("APPARATUS: cannot read a stopped profile entry's type");
+        if kind.is_dir() {
+            copy_dir(&e.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(e.path(), &target).unwrap_or_else(|err| {
+                panic!("APPARATUS: cannot copy {}: {err}", e.path().display())
+            });
+        }
+        // A socket of the stopped process is not part of the profile.
+    }
+}
+
 #[test]
 #[ignore = "four real vox daemons and production Argon2id; CI runs it in release"]
 fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
+    test_knobs::require(&[
+        "VOX_TEST_HOLD_PAIRWISE_KEY_FILE",
+        "VOX_TEST_HOLD_REGRANT_FILE",
+    ]);
     watchdog::arm();
     let mut tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
@@ -238,7 +340,9 @@ fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
     let (bob, bob_fp) = identity(tmp, "bob");
     let (carol, carol_fp) = identity(tmp, "carol");
     let (dave, dave_fp) = identity(tmp, "dave");
-    let _a = daemon(&alice, "alice");
+    let hold = tmp.join("hold-keys-to-bob");
+    let regrant = tmp.join("hold-regrant-to-bob");
+    let a = daemon_with(&alice, "alice", Some((&hold, &regrant)));
     let b = daemon(&bob, "bob");
     let _c = daemon(&carol, "carol");
     let _d = daemon(&dave, "dave");
@@ -277,6 +381,8 @@ fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
     // Bob's node stops: he stays a member, entitled, and is owed every later generation.
     drop(b);
 
+    // Stage 1: no consent goes to bob from here until both rotations are done.
+    std::fs::write(&regrant, &bob_fp).expect("APPARATUS: write the re-grant hold file");
     // Rotation 1: dave held alice's generation 0.
     untrust(&alice, &dave_fp);
     post(&alice, &room, "p1 1");
@@ -307,21 +413,71 @@ fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
         ok,
         "PRODUCT (staging): dave, trusted again, never read alice's next post in 90 s: {t:?}"
     );
+    // The watchdog owns a re-grant that is never wanted.
+    while !regrant.with_extension("engaged").is_file() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("[proof] alice's re-grant to bob is held after rotation 1");
     untrust(&alice, &dave_fp);
     post(&alice, &room, "p2 1");
+    // The re-grant goes only once alice's origin prune has decided with generation 2 minted
+    // (said once per new decision): what the two rotations left owed is what it keeps. The
+    // watchdog owns a decision that is never made.
+    let decided = |text: &str| {
+        text.lines().any(|line| {
+            line.contains("test-knobs: origin prune of room")
+                && line
+                    .rsplit(" of [")
+                    .next()
+                    .is_some_and(|held| held.trim_end_matches(']').split(", ").any(|g| g == "2"))
+        })
+    };
+    while !decided(&std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default()) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_file(&regrant).expect("APPARATUS: release the re-grant hold");
     let offline = generations(&alice);
     println!("[proof] with bob offline and carol gone, alice holds {offline:?} generation(s)");
 
-    // Bob comes back: he reads everything written after his trust.
-    let _b = daemon(&bob, "bob-back");
+    // Stage 2: bob comes back. Alice's keys for him are held on their way while she rotates
+    // twice more.
+    std::fs::write(&hold, &bob_fp).expect("APPARATUS: write the key hold file");
+    let b = daemon(&bob, "bob-back");
+    // The watchdog owns a delivery that never starts.
+    while !hold.with_extension("engaged").is_file() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("[proof] alice's history keys for bob are held on their way");
+    for generation in [3, 4] {
+        trust(&alice, &dave_fp, "dave");
+        let seen = format!("p{} 2", generation - 1);
+        post(&alice, &room, &seen);
+        let (ok, t) = read_until(&dave, &room, 90, |t| count(t, &seen) == 1);
+        assert!(
+            ok,
+            "PRODUCT (staging): dave, trusted again, never read alice's {seen:?} in 90 s: {t:?}"
+        );
+        untrust(&alice, &dave_fp);
+        post(&alice, &room, &format!("p{generation} 1"));
+    }
+    std::fs::remove_file(&hold).expect("APPARATUS: release the key hold");
     let (ok, t) = read_until(&bob, &room, 120, |t| {
-        count(t, "p0 1") == 1 && count(t, "p1 ") == 2 && count(t, "p2 1") == 1
+        count(t, "p0 1") == 1 && count(t, "p1 ") == 2 && count(t, "p2 ") == 2
     });
     println!("[proof] bob, back, shows {t:?}");
     assert!(
         ok,
-        "PRODUCT: bob, trusted before and offline across two rotations, never read every post \
-         alice wrote after his trust (p0 1, p1 1, p1 2, p2 1) in 120 s: {t:?}"
+        "PRODUCT: bob, trusted before and offline across two rotations made back to back while \
+         his grant read false, never read post p1 1, p1 2, p2 1 or p2 2 in 120 s: {t:?}"
+    );
+    let (ok, t) = read_until(&bob, &room, 120, |t| {
+        count(t, "p3 ") == 2 && count(t, "p4 1") == 1
+    });
+    println!("[proof] bob, back, shows {t:?}");
+    assert!(
+        ok,
+        "PRODUCT: bob, his keys held on their way across two rotations, never read post p3 1, \
+         p3 2 or p4 1 in 120 s: {t:?}"
     );
     let held = until_generations(&alice, 1, 60);
     println!("[proof] once bob took his keys, alice holds {held:?} generation(s)");
@@ -331,4 +487,165 @@ fn an_author_keeps_a_key_only_while_a_member_still_needs_it() {
         "PRODUCT: alice still holds {held:?} generations 60 s after bob took every key he was \
          owed: carol, who left, must pin nothing (alice still holds 3 generations when she does)"
     );
+
+    // Stage 3: a package settles nothing. Bob is away while alice rotates twice more; her keys
+    // for him go into the room's log, and dave, trusted at the end, holds that log.
+    drop(b);
+    for generation in [5, 6] {
+        trust(&alice, &dave_fp, "dave");
+        let seen = format!("p{} 2", generation - 1);
+        post(&alice, &room, &seen);
+        let (ok, t) = read_until(&dave, &room, 90, |t| count(t, &seen) == 1);
+        assert!(
+            ok,
+            "PRODUCT (staging): dave, trusted again, never read alice's {seen:?} in 90 s: {t:?}"
+        );
+        untrust(&alice, &dave_fp);
+        post(&alice, &room, &format!("p{generation} 1"));
+    }
+    // The watchdog owns a log route that never ends.
+    let in_log = format!("every key owed to {bob_fp} is in the log");
+    let posted = |text: &str| {
+        text.lines().any(|line| {
+            line.contains(&in_log)
+                && line.rsplit('{').next().is_some_and(|set| {
+                    let set: Vec<&str> = set.trim_end_matches('}').split(", ").collect();
+                    set.contains(&"5") && set.contains(&"6")
+                })
+        })
+    };
+    while !posted(&std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default()) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    trust(&alice, &dave_fp, "dave");
+    post(&alice, &room, "p6 2");
+    let (ok, t) = read_until(&dave, &room, 90, |t| count(t, "p6 2") == 1);
+    assert!(
+        ok,
+        "PRODUCT (staging): dave, trusted again, never read alice's \"p6 2\" in 90 s: {t:?}"
+    );
+    println!(
+        "[proof] bob away, his keys in the log as packages: alice holds {:?}",
+        generations(&alice)
+    );
+    drop(a);
+    let b = daemon(&bob, "bob-packages");
+    let (ok, t) = read_until(&bob, &room, 120, |t| {
+        count(t, "p5 ") == 2 && count(t, "p6 ") == 2
+    });
+    println!("[proof] bob, back while alice is stopped, shows {t:?}");
+    assert!(
+        ok,
+        "PRODUCT: bob, back while alice is stopped, never read post p5 1, p5 2, p6 1 or p6 2 \
+         from the key packages in the room's log in 120 s: {t:?}"
+    );
+    drop(b);
+    let a = daemon(&alice, "alice-again");
+    // Its room is read from the store after the daemon first answers: a reading, not a number.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut unsettled = generations(&alice);
+    while unsettled.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        unsettled = generations(&alice);
+    }
+    println!("[proof] alice, started again before bob is back, holds {unsettled:?}");
+    assert!(
+        unsettled.is_some_and(|held| held > 1),
+        "PRODUCT: alice, started again, holds {unsettled:?} generation(s) before bob, who took \
+         his keys only from the log, has been online with her: a package settled his debt"
+    );
+    let b = daemon(&bob, "bob-again");
+    let held = until_generations(&alice, 1, 120);
+    println!("[proof] once bob and alice were online together, alice holds {held:?}");
+    assert_eq!(
+        held,
+        Some(1),
+        "PRODUCT: alice still holds {held:?} generations 120 s after bob, who took his keys from \
+         the log, came online with her: his direct answers never settled them"
+    );
+
+    // Stage 4: a copy of alice's data directory, taken with her daemon stopped.
+    drop(a);
+    let backup = tmp.join("alice-backup");
+    copy_dir(&alice, &backup);
+    println!("[proof] alice's data directory copied with her daemon stopped");
+    // She goes on from the original: two more rotations, read by bob and dave.
+    let a = daemon(&alice, "alice-gap");
+    assert!(
+        room_answers(&alice, &room, 120),
+        "PRODUCT (staging): alice's reopened room did not answer `vox room read` in 120 s"
+    );
+    for generation in [7, 8] {
+        untrust(&alice, &dave_fp);
+        post(&alice, &room, &format!("p{generation} 1"));
+        trust(&alice, &dave_fp, "dave");
+        let seen = format!("p{generation} 2");
+        post(&alice, &room, &seen);
+        let (ok, t) = read_until(&dave, &room, 90, |t| count(t, &seen) == 1);
+        assert!(
+            ok,
+            "PRODUCT (staging): dave, trusted again, never read alice's {seen:?} in 90 s: {t:?}"
+        );
+    }
+    let (ok, t) = read_until(&bob, &room, 120, |t| {
+        count(t, "p7 ") == 2 && count(t, "p8 ") == 2
+    });
+    assert!(
+        ok,
+        "PRODUCT (staging): bob, online, never read alice's p7 1, p7 2, p8 1 and p8 2 in 120 s: \
+         {t:?}"
+    );
+    // Bob stops; alice is put back to the copy and started from it, her re-grant to bob held.
+    drop(b);
+    drop(a);
+    std::fs::remove_dir_all(&alice)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot remove {}: {e}", alice.display()));
+    copy_dir(&backup, &alice);
+    std::fs::write(&regrant, &bob_fp).expect("APPARATUS: write the re-grant hold file");
+    let tag = "alice-restored";
+    let a = daemon_with(&alice, tag, Some((&hold, &regrant)));
+    let said =
+        || std::fs::read_to_string(alice.join(format!("daemon-{tag}.err"))).unwrap_or_default();
+    // The watchdog owns a recovery that never completes: dave holds her whole feed.
+    while !said().contains("this node recovered its own history") {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // The restore took: she reads what the copy held, and not her posts after it, whose
+    // generations only the directory put aside held the keys of.
+    let hers = read(&alice, &room);
+    assert!(
+        count(&hers, "p6 2") == 1 && count(&hers, "p7 ") == 0 && count(&hers, "p8 ") == 0,
+        "APPARATUS: the restore did not take: alice, recovered from the copy, reads {hers:?}"
+    );
+    println!("[proof] alice, started from the copy, recovered her own history");
+    post(&alice, &room, "p9 1");
+    // The watchdog owns a prune that never decides with the recovered generation.
+    let recovered = loop {
+        if let Some(generation) = decided_up_to(&said()) {
+            break generation;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // One more rotation retires the generation her recovery minted.
+    untrust(&alice, &dave_fp);
+    post(&alice, &room, "p10 1");
+    while decided_up_to(&said()).is_none_or(|generation| generation <= recovered) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_file(&regrant).expect("APPARATUS: release the re-grant hold");
+    println!(
+        "[proof] alice's recovery minted generation {recovered} with bob offline; she rotated past it"
+    );
+    let _b = daemon(&bob, "bob-restored");
+    let (ok, t) = read_until(&bob, &room, 120, |t| {
+        count(t, "p9 1") == 1 && count(t, "p10 1") == 1
+    });
+    println!("[proof] bob, back after alice's recovery, shows {t:?}");
+    assert!(
+        ok,
+        "PRODUCT: bob, trusted before and offline across alice's own-history recovery, which \
+         jumped her generation, and a rotation after it, never read post p9 1 or p10 1 in 120 s: \
+         {t:?}"
+    );
+    drop(a);
 }

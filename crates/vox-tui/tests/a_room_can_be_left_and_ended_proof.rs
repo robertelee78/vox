@@ -4616,6 +4616,18 @@ fn fwd_quiet(w: &Worker, id: &str, why: &str) -> u64 {
     );
 }
 
+/// `key_generations` for the room on `w`, from `vox status --json`: how many generations of its
+/// own sender key it still keeps (the live one and every retired origin some member still needs).
+#[cfg(feature = "test-knobs")]
+fn fwd_key_generations(w: &Worker, id: &str) -> Option<u64> {
+    let status = w.vox(None, &["status", "--json"]);
+    if !status.ok {
+        return None;
+    }
+    let status: serde_json::Value = serde_json::from_str(&status.stdout).ok()?;
+    status["rooms"].as_array()?.iter().find(|r| r["id"] == id)?["key_generations"].as_u64()
+}
+
 /// Design-4 §3, the variants of [`a_member_that_left_joins_again_and_is_a_member_again`]: alice
 /// leaves and comes back, bob made the room. In turn: bob's package for alice sealed before she
 /// left does not open after her return, and she left at once after a restart, while her room was
@@ -4623,7 +4635,9 @@ fn fwd_quiet(w: &Worker, id: &str, why: &str) -> u64 {
 /// replays the return (a restart) and does not rotate again; bob's key for alice is taken late,
 /// after he posted on his new chain, and a second key that waited for a fresh one-time prekey is
 /// delivered; a removal racing a return leaves alice removed. Alice reads nothing written before
-/// each return. Mutant: `VOX_MUTANT_FWD=package-unbound` (alice reads B-PKG).
+/// each return. Once alice, back, has taken bob's keys from her return-bound packages and both are
+/// online (carol too), bob's acknowledgement probe settles what she owes him, and he keeps only
+/// his live generation. Mutant: `VOX_MUTANT_FWD=package-unbound` (alice reads B-PKG).
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; run in release"]
@@ -4873,6 +4887,26 @@ fn a_member_that_comes_back_reads_forward_from_each_return() {
         "APPARATUS: carol's own feed did not move from {carol_feed}: {settled}"
     );
     eprintln!("[proof] variants: carol, offline for both absences, rotated and stopped; alice and carol read each other");
+
+    // 5b. The acknowledgement probe: alice, back, took bob's keys from the packages bound to her
+    //     second return, and she, bob and carol are online. Bob offers her those same releases
+    //     directly, she answers that she holds them, and her set empties; carol took hers
+    //     directly. Nobody needs a retired generation of his any more: he keeps his live one only.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut kept = fwd_key_generations(&room.workers[b], id);
+    while kept != Some(1) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        kept = fwd_key_generations(&room.workers[b], id);
+    }
+    eprintln!("[proof] variants: with alice back and online, bob keeps {kept:?} generation(s)");
+    assert_eq!(
+        kept,
+        Some(1),
+        "PRODUCT: bob still keeps {kept:?} generations of his key 120 s after alice, back and \
+         online with him, read his posts through the packages bound to her return, and carol, \
+         online, read him directly: alice's answers to his direct offers never settled what she \
+         owed him"
+    );
 
     // 6. A removal racing a return: carol is offline; alice leaves and joins again, and bob
     //    removes her at once. Removal wins wherever both are learnt.

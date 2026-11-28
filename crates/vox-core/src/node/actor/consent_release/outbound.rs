@@ -7,6 +7,7 @@ pub(super) enum Stage {
         queue: mpsc::OwnedPermit<PairwiseJob>,
         credit: PairwiseCredit,
         key_ref: Digest32,
+        revision: u64,
     },
     SealConsent {
         route: Offline,
@@ -15,7 +16,7 @@ pub(super) enum Stage {
     SealLog {
         route: Offline,
         keys: VecDeque<Skdm>,
-        history: bool,
+        /// The generation the package carries: its posted mark goes in the append's batch.
         generation: u64,
         posted_as: Digest32,
     },
@@ -39,13 +40,16 @@ impl Node {
         };
         match route {
             Route::Online { conn } => {
-                let Some(admitted) = self.reserve_key_deliveries(
-                    &room,
-                    continuation.target,
-                    &conn,
-                    std::slice::from_ref(skdm.as_ref()),
-                    false,
-                ) else {
+                let Some(admitted) = self
+                    .reserve_key_deliveries_waiting(
+                        &room,
+                        continuation.target,
+                        &conn,
+                        std::slice::from_ref(skdm.as_ref()),
+                        false,
+                    )
+                    .await
+                else {
                     return Err(Fault::DeliveryBusy);
                 };
                 let Some(PairwiseAdmission {
@@ -56,10 +60,16 @@ impl Node {
                 };
                 let key_ref = crate::governance::membership::skdm_ref(&skdm);
                 let id = (room, continuation.target, skdm.body.chain_id);
+                // The debt revision this key goes under: its answer settles nothing under another.
+                let revision = continuation
+                    .instance
+                    .lock()
+                    .await
+                    .history_revision(&continuation.target);
                 if let Some((frame, prekey)) = self
                     .deliveries
                     .get(&id)
-                    .filter(|delivery| delivery.key == key_ref)
+                    .filter(|delivery| delivery.key == key_ref && delivery.revision == revision)
                     .map(|delivery| (delivery.frame.clone(), delivery.prekey.clone()))
                 {
                     let opening = Some(crate::hash::sha256(&frame));
@@ -73,6 +83,7 @@ impl Node {
                             hello: false,
                             session: None,
                             history: false,
+                            revision,
                             epoch: continuation.attachment,
                         },
                         credit,
@@ -96,6 +107,7 @@ impl Node {
                     queue,
                     credit,
                     key_ref,
+                    revision,
                 });
                 Ok(self
                     .begin_pending_maintenance(
@@ -112,7 +124,21 @@ impl Node {
                     continuation.target,
                     crate::governance::membership::skdm_ref(&skdm),
                 );
-                if self.packages_posted.contains(&posted_as) {
+                // Posted once, durably: after a restart that came between a package and its
+                // grant, the posted mark in the member's row says so, and the grant is issued
+                // without another package.
+                let marked = {
+                    let channel = continuation.instance.lock().await;
+                    self.profile.as_ref().is_some_and(|profile| {
+                        channel.package_posted(
+                            profile.store(),
+                            &continuation.target,
+                            skdm.body.chain_id,
+                            &posted_as.2,
+                        )
+                    })
+                };
+                if marked || self.packages_posted.contains(&posted_as) {
                     continuation.stage = super::Stage::Offline {
                         route,
                         posted_as: posted_as.2,
@@ -209,6 +235,7 @@ impl Node {
                     queue,
                     credit,
                     key_ref,
+                    revision,
                 },
                 Saved::Packages(package_save::Saved::FramedOutbound {
                     frame,
@@ -255,6 +282,7 @@ impl Node {
                         key: key_ref,
                         reservation,
                         opening: frame.opening,
+                        revision,
                         prekey: prekey.clone(),
                     },
                 );
@@ -269,6 +297,7 @@ impl Node {
                         hello: false,
                         session: None,
                         history: false,
+                        revision,
                         epoch: continuation.attachment,
                     },
                     credit,
@@ -302,7 +331,6 @@ impl Node {
                 Stage::SealLog {
                     route,
                     keys,
-                    history,
                     generation,
                     posted_as,
                 },
@@ -321,8 +349,6 @@ impl Node {
                 continuation.stage = super::Stage::Packages {
                     route,
                     keys,
-                    history,
-                    generation,
                     posted_as,
                 };
                 continuation.prekey = reservation;
@@ -331,6 +357,7 @@ impl Node {
                     Work::Session(SessionWrite::Package {
                         package,
                         removal_generation,
+                        mark: Some((generation, posted_as)),
                     }),
                     maintenance_save::Continuation::Consent(continuation),
                     reply,

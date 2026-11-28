@@ -86,51 +86,48 @@ enum AuthoringCut {
 struct Rotation {
     origins: OriginKeyStore,
     newest_mint: u64,
-    owed: Vec<(Digest32, u64)>,
+    /// What the rotation owes ([`ChannelState::rotation_debt`]), and the key-debt ledger with
+    /// it applied, as the rotation's batch writes it.
+    debt: RotationDebt,
     history: Vec<u8>,
 }
 
-/// Serialize the immutable ledger with the ordered entitlement deltas, without cloning it.
-fn rotation_history_bytes(history: &BTreeMap<Digest32, u64>, owed: &[(Digest32, u64)]) -> Vec<u8> {
-    if owed.is_empty() {
-        return Vec::new();
+impl ChannelState {
+    /// A rotation from the ledgers given (this room's own, or a boundary's rewritten copies),
+    /// minting `minted`: its debt owes exactly that generation, and its commit mints it.
+    fn rotation(
+        &self,
+        store: &Store,
+        outstanding: &BTreeMap<Digest32, BTreeSet<u64>>,
+        entitled: &BTreeMap<Digest32, (u64, u64)>,
+        minted: u64,
+    ) -> Result<Rotation> {
+        let debt = self.rotation_debt(store, outstanding, entitled, &self.origins, minted)?;
+        Ok(Rotation {
+            origins: OriginKeyStore::from_state(&self.origins.to_state())?,
+            newest_mint: self.newest_mint_seq(),
+            history: debt.ledger_bytes(outstanding, &self.posted),
+            debt,
+        })
     }
-    let added = owed
-        .iter()
-        .filter(|(target, _)| !history.contains_key(target))
-        .count();
-    let mut encoder = Encoder::new();
-    encoder
-        .array(2)
-        .uint(DELIVERED_VERSION)
-        .array(history.len() + added);
-    let mut owed = owed.iter().peekable();
-    for (target, floor) in history {
-        while owed.peek().is_some_and(|(next, _)| next < target) {
-            if let Some((next, floor)) = owed.next() {
-                encoder.array(2).bytes(next).uint(*floor);
-            }
-        }
-        let floor = if owed.peek().is_some_and(|(next, _)| next == target) {
-            owed.next().map_or(*floor, |(_, next)| (*floor).min(*next))
-        } else {
-            *floor
-        };
-        encoder.array(2).bytes(target).uint(floor);
+
+    /// The generation an ordinary rotation mints: the one after the live one.
+    fn next_generation(&self) -> Result<u64> {
+        self.sender
+            .chain_id()
+            .checked_add(1)
+            .ok_or(Error::MalformedBundle("chain_id overflow"))
     }
-    for (target, floor) in owed {
-        encoder.array(2).bytes(target).uint(*floor);
-    }
-    encoder.finish()
 }
 
-fn install_rotation_history(history: &mut BTreeMap<Digest32, u64>, owed: Vec<(Digest32, u64)>) {
-    for (target, floor) in owed {
-        history
-            .entry(target)
-            .and_modify(|old| *old = (*old).min(floor))
-            .or_insert(floor);
-    }
+/// Install a committed rotation's debt into the room's ledger, saying who lost an evicted key.
+fn install_rotation_history(
+    room: &Digest32,
+    outstanding: &mut BTreeMap<Digest32, BTreeSet<u64>>,
+    debt: &RotationDebt,
+) {
+    let lost = debt.apply(outstanding);
+    debt.say_lost(room, &lost);
 }
 
 pub(crate) enum GovernanceWrite {
@@ -314,42 +311,19 @@ impl ChannelState {
             .entries
             .read(store, &self.sek, &self.channel_id)?
             .sparse_enabled();
+        // A message-bound rotation cannot wait: a reader opening a chain from its origin refuses
+        // a gap past `MAX_SKIP` iterations. A rotation due only to the time bound waits while
+        // the origin cap is full, whoever still needs the origin the mint would evict (condition
+        // 11); a mandatory or message-bound one evicts it, and says who loses it.
+        let message_due = self.sender.next_iteration().saturating_add(1)
+            >= crate::group::state::ROTATE_AFTER_MESSAGES;
         let rotation_due = force_rotation
-            || self.sender.should_rotate(rotation_now)
-            || self.sender.next_iteration().saturating_add(1)
-                >= crate::group::state::ROTATE_AFTER_MESSAGES;
+            || message_due
+            || (self.sender.should_rotate(rotation_now) && !self.origin_cap_holds());
         let rotation = if rotation_due {
-            (|| -> Result<Rotation> {
-                let readers = self.with_consent_facts(|facts| {
-                    self.entitled
-                        .keys()
-                        .filter(|target| facts.can_read(target, &me))
-                        .copied()
-                        .collect::<BTreeSet<_>>()
-                })?;
-                let retired = self.sender.chain_id();
-                let mut owed = Vec::new();
-                for (target, (from, _)) in &self.entitled {
-                    if *target == me || self.has_left(target) || !readers.contains(target) {
-                        continue;
-                    }
-                    let floor = match self.delivered.get(target) {
-                        None => *from,
-                        Some(delivered) if *delivered < retired => (*delivered + 1).max(*from),
-                        Some(_) => continue,
-                    };
-                    if floor <= retired {
-                        owed.push((*target, floor));
-                    }
-                }
-                Ok(Rotation {
-                    origins: OriginKeyStore::from_state(&self.origins.to_state())?,
-                    newest_mint: self.newest_mint_seq(),
-                    history: rotation_history_bytes(&self.history, &owed),
-                    owed,
-                })
-            })()
-            .ok()
+            self.next_generation()
+                .and_then(|minted| self.rotation(store, &self.outstanding, &self.entitled, minted))
+                .ok()
         } else {
             None
         };
@@ -691,7 +665,11 @@ impl ChannelState {
             if pending.rotation_committed {
                 if let Some(rotation) = pending.rotation {
                     self.origins = rotation.origins;
-                    install_rotation_history(&mut self.history, rotation.owed);
+                    install_rotation_history(
+                        &self.channel_id,
+                        &mut self.outstanding,
+                        &rotation.debt,
+                    );
                 }
             }
             if let Ok(Saved::Text(rendered)) = &result {
@@ -1462,7 +1440,14 @@ impl PendingText {
             return Ok(());
         };
         self.now_millis = self.rotation_now;
-        let next = self.sender.rotated(self.now_millis)?;
+        // The generation its debt owes, so what is minted and what is owed cannot differ.
+        let next = SenderChain::new(
+            &self.room,
+            self.epoch,
+            &signer.fingerprint(),
+            rotation.debt.minted,
+            self.now_millis,
+        )?;
         let mint = crate::node::consent_order::stamp_mint(store, signer, rotation.newest_mint)?;
         retain_generation(
             &mut rotation.origins,
@@ -1495,7 +1480,7 @@ impl PendingText {
                 ),
                 (
                     SEG_HISTORY,
-                    if rotation.owed.is_empty() {
+                    if rotation.debt.owed.is_empty() && rotation.debt.evicted.is_none() {
                         None
                     } else {
                         Some(seal_segment(

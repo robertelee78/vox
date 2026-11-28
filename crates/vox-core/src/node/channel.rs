@@ -244,11 +244,6 @@ const SEG_SERVICES: u64 = 5;
 /// generation's origin and reads it whole (ADR-006 §History, ADR-007 §Revocation).
 const SEG_ORIGINS: u64 = 6;
 
-/// The sender-key delivery ledger segment id within [`SegmentKind::KeyMaterial`]
-/// (M18.1): target → the highest generation this identity has delivered to it. What
-/// is *owed* is derived from this and the consent set, so it cannot go stale.
-const SEG_DELIVERED: u64 = 7;
-
 /// Persist the canonical signed empty public head before a new sparse room becomes visible.
 /// A joiner has no entry yet, but another member still needs an exact object to acknowledge
 /// before this node may leave the unsettled state and author its first entry.
@@ -340,10 +335,11 @@ fn is_step_body(room: &Digest32, body: &[u8]) -> bool {
     GroupMessage::from_wire(body)
         .is_ok_and(|message| message.header.channel_id == drive_channel(room))
 }
-/// The history ledger segment id within [`SegmentKind::KeyMaterial`] (V210-45):
-/// target → the oldest of this identity's generations it is still owed. Same encoding
-/// as [`SEG_DELIVERED`]. A row exists only while some of that history is undelivered;
-/// it is never the authority on what the target may read — `SEG_ENTITLED` is.
+/// The key-debt ledger segment id within [`SegmentKind::KeyMaterial`] (V210-45): target → the
+/// set of this identity's generations, the live one included, that the target has not
+/// acknowledged over a direct delivery ([`ChannelState::outstanding`]). Never the authority on
+/// what the target may read: `SEG_ENTITLED` and the consent facts are. Id 7, the former
+/// highest-delivered ledger, is neither read nor written any more.
 const SEG_HISTORY: u64 = 9;
 
 /// The entitlement segment id within [`SegmentKind::KeyMaterial`] (V210-45): target →
@@ -665,8 +661,14 @@ pub struct PreparedTrustMark {
 /// retention keeps it for that instead ([`ChannelState::unjoined_hold_secs`]).
 pub const UNJOINED_HOLD_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// At-rest version of the delivery-ledger segment.
-const DELIVERED_VERSION: u64 = 1;
+/// At-rest version of the key-debt ledger (`SEG_HISTORY`): explicit generation sets.
+const OUTSTANDING_VERSION: u64 = 2;
+/// The version before it, a floor per target: not proof of what was delivered, so a ledger in
+/// it is read as owing every retained generation each entitlement allows.
+const LEGACY_HISTORY_VERSION: u64 = 1;
+/// At most this many generations in one target's set: every retained origin, the live
+/// generation and the one a rotation is minting.
+const OUTSTANDING_ROW_MAX: usize = crate::group::history::MAX_RETAINED_ORIGINS + 2;
 /// Services encoding version.
 const SERVICES_VERSION: u64 = 2;
 /// The most services one channel may offer — a sanity bound on host config.
@@ -1198,6 +1200,10 @@ pub struct ChannelState {
     legacy_preparation: entry_store::Preparation,
     /// Current local trust used only to filter accepted-cache recovery reads.
     legacy_cache_trusted: Option<BTreeSet<Digest32>>,
+    /// The keyring as the last prune tick read it ([`Self::prepare_pending_key_prune`]): only
+    /// the named-limit line reads it, to say which trusted identity that has not joined loses an
+    /// origin a rotation evicts under its hold. No decision reads it.
+    keyring: Arc<BTreeSet<Digest32>>,
     trust_reconciled_generation: u64,
     trust_failed_generation: Option<u64>,
     /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
@@ -1229,14 +1235,28 @@ pub struct ChannelState {
     /// re-key the members who keep consent *at the new generation's origin* — which
     /// is what makes a rotation invisible to them (ADR-006 §History).
     origins: OriginKeyStore,
-    /// Target → the highest generation delivered to it (M18.1), persisted in
-    /// `SEG_DELIVERED`. Combined with the consent set this yields
-    /// [`ChannelState::owed_rekeys`]; it is never itself the authority on who may
-    /// read (the log is).
-    delivered: BTreeMap<Digest32, u64>,
-    /// Target → the oldest generation it is still owed (V210-45), persisted in
-    /// `SEG_HISTORY`. See [`ChannelState::owe_history`].
-    history: BTreeMap<Digest32, u64>,
+    /// Target → the generations of this identity's sender key, the live one included, that it
+    /// has not acknowledged over a direct delivery (V210-45), persisted in `SEG_HISTORY`. A
+    /// generation joins every entitled member's set when it is minted, leaves it only on that
+    /// member's authenticated answer that it holds it (or deleted it after reading), and its
+    /// origin is kept while a member that is not excluded still has it here. A package in the
+    /// log settles nothing. A target with no row owes the live generation only. Never the
+    /// authority on who may read: the consent facts and `entitled` are.
+    outstanding: BTreeMap<Digest32, BTreeSet<u64>>,
+    /// `(target, generation)` → the exact release a key package for it carried and the return
+    /// it was bound to ([`posted_release`]), for each outstanding generation a package was
+    /// posted for, kept in its row of `SEG_HISTORY` and written in the package's own append
+    /// batch: a package is posted once, a restart posts nothing again, and a generation leaving
+    /// the set takes its mark with it. It is also the evidence for the acknowledgement probe of
+    /// a member that came back (ruling-returner): only a marked release is offered to it
+    /// directly. Only an authenticated negative answer to that exact release clears it.
+    posted: Posted,
+    /// Target → the revision of its key debt, in memory: advanced whenever it is owed anew (a
+    /// refusal, a reset, a boundary), even when its set does not change. A direct delivery is
+    /// selected under a revision and its answer settles nothing under another
+    /// (`prepare_pending_consent_delivery`). No delivery in flight outlives the process, so
+    /// neither does this.
+    history_revision: BTreeMap<Digest32, u64>,
     /// Target → the earliest `(chain_id, iteration)` released to it (V210-45), persisted
     /// in `SEG_ENTITLED`. See [`ChannelState::entitled_from`].
     entitled: BTreeMap<Digest32, (u64, u64)>,
@@ -1557,43 +1577,278 @@ fn parse_marks(bytes: &[u8]) -> Result<BTreeMap<Digest32, TrustMark>> {
     Ok(out)
 }
 
-/// The delivery ledger segment: `[version, [[target, chain_id], …]]`, targets in
-/// canonical order.
-fn delivered_bytes(delivered: &BTreeMap<Digest32, u64>) -> Vec<u8> {
+/// `(target, generation)` → the [`posted_release`] of the key package posted for that
+/// outstanding generation ([`ChannelState::posted`]).
+pub(crate) type Posted = BTreeMap<(Digest32, u64), Digest32>;
+
+/// The key-debt ledger: per entitled member, the generations it has not acknowledged.
+pub(crate) type Outstanding = BTreeMap<Digest32, BTreeSet<u64>>;
+
+/// The return binding of a package for a member that never left.
+pub(crate) const NEVER_LEFT: Digest32 = [0; 32];
+
+/// A posted mark: the exact release a key package carried (`key`, its
+/// `governance::membership::skdm_ref`, which names room, epoch, author, generation and release
+/// iteration) and the return `back` it was bound to ([`NEVER_LEFT`] for a member that never
+/// left). A later return, or another release of the same generation, is another mark.
+pub(crate) fn posted_release(back: &Digest32, key: &Digest32) -> Digest32 {
+    let mut bound = Vec::with_capacity(96);
+    bound.extend_from_slice(b"vox key package posted, v1:");
+    bound.extend_from_slice(back);
+    bound.extend_from_slice(key);
+    sha256(&bound)
+}
+
+/// The key-debt ledger segment: `[2, [[target, [generation, …], [[generation, mark], …]],
+/// …]]`, targets and generations ascending; the third field, the posted marks of that row's
+/// generations ([`ChannelState::posted`], each a [`posted_release`]), is left out when the row
+/// has none. A mark of a generation not in its row is not written.
+fn outstanding_bytes(outstanding: &BTreeMap<Digest32, BTreeSet<u64>>, posted: &Posted) -> Vec<u8> {
     let mut e = Encoder::new();
-    e.array(2).uint(DELIVERED_VERSION).array(delivered.len());
-    for (target, chain_id) in delivered {
-        e.array(2).bytes(target).uint(*chain_id);
+    e.array(2)
+        .uint(OUTSTANDING_VERSION)
+        .array(outstanding.len());
+    for (target, generations) in outstanding {
+        let marks: Vec<_> = generations
+            .iter()
+            .filter_map(|g| posted.get(&(*target, *g)).map(|back| (*g, back)))
+            .collect();
+        e.array(if marks.is_empty() { 2 } else { 3 })
+            .bytes(target)
+            .array(generations.len());
+        for generation in generations {
+            e.uint(*generation);
+        }
+        if !marks.is_empty() {
+            e.array(marks.len());
+            for (generation, back) in marks {
+                e.array(2).uint(generation).bytes(back);
+            }
+        }
     }
     e.finish()
 }
 
-fn parse_delivered(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
+/// The stored key-debt ledger and its posted marks, or `None` for one in
+/// [`LEGACY_HISTORY_VERSION`], whose floors prove nothing and are not read. That one is decoded
+/// whole as main writes it (`[1, [[target, floor], …]]`), so a malformed row is refused, never
+/// taken as legacy. A row of the first version-2 shape (no marks) reads as nothing posted.
+fn parse_outstanding(bytes: &[u8]) -> Result<Option<(Outstanding, Posted)>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
-        return Err(Error::MalformedAtRest("delivery ledger arity"));
+        return Err(Error::MalformedAtRest("key debt ledger arity"));
     }
-    if d.uint()? != DELIVERED_VERSION {
-        return Err(Error::MalformedAtRest("delivery ledger version"));
+    match d.uint()? {
+        OUTSTANDING_VERSION => {}
+        LEGACY_HISTORY_VERSION => {
+            let n = d.array()?;
+            if n > AUTHORS_HARD_LIMIT {
+                return Err(Error::SizeLimitExceeded("key debt ledger rows"));
+            }
+            for _ in 0..n {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedAtRest("key debt ledger row arity"));
+                }
+                let _: Digest32 = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("key debt ledger target"))?;
+                d.uint()?;
+            }
+            d.finish()?;
+            return Ok(None);
+        }
+        _ => return Err(Error::MalformedAtRest("key debt ledger version")),
     }
     let n = d.array()?;
     // One row per author this identity could ever consent to.
     if n > AUTHORS_HARD_LIMIT {
-        return Err(Error::SizeLimitExceeded("delivery ledger rows"));
+        return Err(Error::SizeLimitExceeded("key debt ledger rows"));
     }
     let mut out = BTreeMap::new();
+    let mut posted = Posted::new();
     for _ in 0..n {
-        if d.array()? != 2 {
-            return Err(Error::MalformedAtRest("delivery ledger row arity"));
+        let arity = d.array()?;
+        if arity != 2 && arity != 3 {
+            return Err(Error::MalformedAtRest("key debt ledger row arity"));
         }
         let target: Digest32 = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedAtRest("delivery ledger target"))?;
-        out.insert(target, d.uint()?);
+            .map_err(|_| Error::MalformedAtRest("key debt ledger target"))?;
+        let count = d.array()?;
+        if count > OUTSTANDING_ROW_MAX {
+            return Err(Error::SizeLimitExceeded("key debt ledger generations"));
+        }
+        let mut generations = BTreeSet::new();
+        for _ in 0..count {
+            let generation = d.uint()?;
+            if generations.last().is_some_and(|last| *last >= generation) {
+                return Err(Error::MalformedAtRest("key debt ledger order"));
+            }
+            generations.insert(generation);
+        }
+        if out
+            .last_key_value()
+            .is_some_and(|(last, _)| *last >= target)
+        {
+            return Err(Error::MalformedAtRest("key debt ledger order"));
+        }
+        if arity == 3 {
+            let marks = d.array()?;
+            if marks == 0 || marks > count {
+                return Err(Error::MalformedAtRest("key debt ledger marks"));
+            }
+            let mut last = None;
+            for _ in 0..marks {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedAtRest("key debt ledger mark arity"));
+                }
+                let generation = d.uint()?;
+                let back: Digest32 = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("key debt ledger mark"))?;
+                if last.is_some_and(|last| last >= generation) || !generations.contains(&generation)
+                {
+                    return Err(Error::MalformedAtRest("key debt ledger mark order"));
+                }
+                last = Some(generation);
+                posted.insert((target, generation), back);
+            }
+        }
+        out.insert(target, generations);
     }
     d.finish()?;
-    Ok(out)
+    Ok(Some((out, posted)))
+}
+
+/// The generations a target entitled from generation `from` may be owed: every retained
+/// origin from `from` up to the live one, and the live one.
+fn entitled_generations(
+    origins: &OriginKeyStore,
+    room: &Digest32,
+    epoch: u64,
+    me: &Digest32,
+    live: u64,
+    from: u64,
+) -> BTreeSet<u64> {
+    let mut generations: BTreeSet<u64> = origins
+        .generations(room, epoch, me)
+        .into_iter()
+        .map(|(chain, _)| chain)
+        .filter(|chain| *chain >= from && *chain < live)
+        .collect();
+    if from <= live {
+        generations.insert(live);
+    }
+    generations
+}
+
+/// Which of an author's retired origins a release still needs ([`ChannelState::origins_needed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OriginsNeeded {
+    /// Every generation from this one on, for a trusted identity that has not joined.
+    pub(crate) from: Option<u64>,
+    /// Generations still in the set of a member that is not excluded.
+    pub(crate) pinned: BTreeSet<u64>,
+}
+
+impl OriginsNeeded {
+    /// Whether `generation`'s origin is still needed; the live one always is.
+    pub(crate) fn keeps(&self, generation: u64, live: u64) -> bool {
+        generation >= live
+            || self.from.is_some_and(|from| generation >= from)
+            || self.pinned.contains(&generation)
+    }
+}
+
+/// What one rotation owes ([`ChannelState::rotation_debt`]): generations added to members'
+/// sets, and the generation the mint evicts at the origin cap, which leaves every set.
+#[derive(Clone, Debug)]
+pub(crate) struct RotationDebt {
+    pub(crate) owed: Vec<(Digest32, BTreeSet<u64>)>,
+    pub(crate) evicted: Option<u64>,
+    /// Trusted identities that have not joined whose hold still kept `evicted`.
+    pub(crate) held: Vec<Digest32>,
+    /// The generation this debt owes as minted: the one its rotation mints.
+    pub(crate) minted: u64,
+    /// `test-knobs` mutant `rotation-readers` only: members the retiring generation leaves.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) dropped: Vec<(Digest32, u64)>,
+}
+
+impl RotationDebt {
+    /// Apply this debt to `ledger`; the members that lose the evicted generation.
+    pub(crate) fn apply(&self, ledger: &mut BTreeMap<Digest32, BTreeSet<u64>>) -> Vec<Digest32> {
+        for (target, add) in &self.owed {
+            ledger
+                .entry(*target)
+                .or_default()
+                .extend(add.iter().copied());
+        }
+        #[cfg(feature = "test-knobs")]
+        for (target, generation) in &self.dropped {
+            if let Some(generations) = ledger.get_mut(target) {
+                generations.remove(generation);
+            }
+        }
+        let mut lost = Vec::new();
+        if let Some(generation) = self.evicted {
+            for (target, generations) in ledger.iter_mut() {
+                if generations.remove(&generation) {
+                    lost.push(*target);
+                }
+            }
+        }
+        lost
+    }
+
+    /// `ledger` with this debt applied, as stored, with the posted marks of what stays in it.
+    pub(crate) fn ledger_bytes(
+        &self,
+        ledger: &BTreeMap<Digest32, BTreeSet<u64>>,
+        posted: &Posted,
+    ) -> Vec<u8> {
+        let mut ledger = ledger.clone();
+        self.apply(&mut ledger);
+        outstanding_bytes(&ledger, posted)
+    }
+
+    /// The named limit, said once a rotation that evicted a needed origin is installed: who can
+    /// no longer read what that generation sealed, a member whose set held it or a trusted
+    /// identity that has not joined whose hold still kept it.
+    pub(crate) fn say_lost(&self, room: &Digest32, lost: &[Digest32]) {
+        let Some(generation) = self.evicted else {
+            return;
+        };
+        let mut who: Vec<String> = lost
+            .iter()
+            .map(|member| crate::node::network::short_id(*member))
+            .collect();
+        who.extend(
+            self.held
+                .iter()
+                .filter(|identity| !lost.contains(identity))
+                .map(|identity| {
+                    format!(
+                        "{} (trusted, not joined yet)",
+                        crate::node::network::short_id(*identity)
+                    )
+                }),
+        );
+        if who.is_empty() {
+            return;
+        }
+        eprintln!(
+            "vox: room {}: this identity's oldest kept sender key, generation {generation}, was \
+             deleted at the {} kept keys a rotation may not exceed; never given it, {} cannot \
+             read what it sealed",
+            crate::node::network::short_id(*room),
+            crate::group::history::MAX_RETAINED_ORIGINS,
+            who.join(", ")
+        );
+    }
 }
 
 type Services = (BTreeMap<String, SocketAddr>, BTreeMap<String, ServiceKind>);
@@ -2166,6 +2421,7 @@ impl ChannelState {
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
+            keyring: Arc::default(),
             trust_reconciled_generation: 0,
             trust_failed_generation: None,
             key_packages: key_package_queue::Queue::new(1),
@@ -2177,16 +2433,17 @@ impl ChannelState {
             // to (M17.6).
             own_admission: Admission::Creator,
             origins,
-            delivered: BTreeMap::new(),
             node_retention: 0,
             node_step_retention: 0,
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
-            history: BTreeMap::new(),
+            outstanding: BTreeMap::new(),
+            posted: Posted::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             forward_migrated: true,
             deleted_receivers: pending_key_prune::DeletedReceivers::default(),
+            history_revision: BTreeMap::new(),
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
             board_kept: BoardKept::default(),
@@ -2654,21 +2911,6 @@ impl ChannelState {
             }
             None => OriginKeyStore::new(),
         };
-        let delivered =
-            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_DELIVERED)? {
-                Some(seg) => {
-                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_DELIVERED, &seg)?;
-                    parse_delivered(&bytes)?
-                }
-                None => BTreeMap::new(),
-            };
-        let history = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HISTORY)? {
-            Some(seg) => {
-                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_HISTORY, &seg)?;
-                parse_delivered(&bytes)?
-            }
-            None => BTreeMap::new(),
-        };
         let entitled =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ENTITLED)? {
                 Some(seg) => {
@@ -2677,6 +2919,40 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // The key debt (V210-45). A ledger in the floor format main wrote proves nothing about
+        // what was delivered, so it is read as owing every retained generation each entitlement
+        // allows; so is an entitled member with no row. Each is then taken again, directly, and
+        // its answer settles it. A generation whose origin is gone cannot be released by anyone
+        // and is not kept owed.
+        let (outstanding, posted) = {
+            let live = sender.chain_id();
+            let stored =
+                match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HISTORY)? {
+                    Some(seg) => {
+                        let bytes =
+                            open_segment(&sek, SegmentKind::KeyMaterial, SEG_HISTORY, &seg)?;
+                        parse_outstanding(&bytes)?
+                    }
+                    None => Some((BTreeMap::new(), Posted::new())),
+                };
+            let (stored, mut posted) = stored.unwrap_or_default();
+            let mut outstanding: BTreeMap<Digest32, BTreeSet<u64>> = stored
+                .into_iter()
+                .map(|(target, mut generations)| {
+                    generations.retain(|g| *g == live || origins.has(channel_id, epoch, *g));
+                    (target, generations)
+                })
+                .collect();
+            for (target, (from, _)) in &entitled {
+                if *target != me {
+                    outstanding.entry(*target).or_insert_with(|| {
+                        entitled_generations(&origins, channel_id, epoch, &me, live, *from)
+                    });
+                }
+            }
+            posted.retain(|(target, g), _| outstanding.get(target).is_some_and(|r| r.contains(g)));
+            (outstanding, posted)
+        };
         let trust_marks =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_TRUST_MARKS)? {
                 Some(seg) => {
@@ -2828,6 +3104,7 @@ impl ChannelState {
             entries,
             legacy_preparation,
             legacy_cache_trusted: None,
+            keyring: Arc::default(),
             trust_reconciled_generation: 0,
             trust_failed_generation: None,
             key_packages,
@@ -2837,16 +3114,17 @@ impl ChannelState {
             transient: BTreeSet::new(),
             own_admission,
             origins,
-            delivered,
             node_retention: 0,
             node_step_retention: 0,
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
-            history,
+            outstanding,
+            posted,
             entitled,
             trust_marks,
             forward_migrated,
             deleted_receivers,
+            history_revision: BTreeMap::new(),
             known_members,
             drive,
             board_kept,
@@ -3334,6 +3612,7 @@ impl ChannelState {
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
+            keyring: Arc::default(),
             trust_reconciled_generation: 0,
             trust_failed_generation: None,
             key_packages: key_package_queue::Queue::new(1),
@@ -3344,16 +3623,17 @@ impl ChannelState {
             // The join witness the responder signed (M17.6), written with the room above.
             own_admission,
             origins,
-            delivered: BTreeMap::new(),
             node_retention: 0,
             node_step_retention: 0,
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
-            history: BTreeMap::new(),
+            outstanding: BTreeMap::new(),
+            posted: Posted::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             forward_migrated: true,
             deleted_receivers: pending_key_prune::DeletedReceivers::default(),
+            history_revision: BTreeMap::new(),
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
             board_kept,
@@ -4276,25 +4556,26 @@ impl ChannelState {
             .len()
     }
 
-    /// The oldest generation of this identity's sender key that a release still owes
-    /// someone (V210-45): the generation a `trusted` identity's trust mark stands in, for
-    /// one this identity has not consented to yet — whether or not it has joined — the first
-    /// one for a trusted identity with no mark here (trusted before the room existed), and
-    /// every history floor still owed. `None`: nothing older than the live one is needed.
+    /// The generations of this identity's sender key whose origins a release still needs
+    /// (V210-45): every generation from the one a `trusted` identity's trust mark stands in,
+    /// for one this identity has not consented to yet — whether or not it has joined — or the
+    /// first one for a trusted identity with no mark here (trusted before the room existed);
+    /// and every generation still in the set of a member that is not excluded. The live origin
+    /// is the caller's to keep.
     ///
     /// **What is kept for someone who has not joined is kept for a while, not forever** (PRD-001
     /// R14, decider 2026-09-28): for the room's retention when it has one, otherwise
     /// [`UNJOINED_HOLD_SECS`]. A generation created before `now_ms` less that hold goes even
     /// though a trusted identity never came to collect it; one that joins later reads what is
-    /// still held. History floors owed to members who have joined are not bounded here: a member
-    /// that is entitled and offline keeps its floor until it takes its keys. A member that left
-    /// or was removed pins nothing (R6).
-    pub fn oldest_generation_needed(
+    /// still held. What members that have joined are owed is not bounded here: a member that is
+    /// entitled and offline keeps its generations until it acknowledges them. A member that
+    /// left or was removed pins nothing (R6).
+    pub(crate) fn origins_needed(
         &self,
         store: &Store,
         trusted: &BTreeSet<Digest32>,
         now: crate::time::Ms,
-    ) -> Result<Option<u64>> {
+    ) -> Result<OriginsNeeded> {
         let now_ms = now.get();
         let me = self.me();
         let unjoined = |id: &Digest32| *id != me && !self.entitled.contains_key(id);
@@ -4335,18 +4616,23 @@ impl ChannelState {
         let departed_pins = std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("departed-pins");
         #[cfg(not(feature = "test-knobs"))]
         let departed_pins = false;
-        let mut floor = waiting;
-        for (target, generation) in &self.history {
-            // Mutant `departed-pins`: a departed or removed member's floor pins origins too.
+        let mut pinned = BTreeSet::new();
+        for (target, generations) in &self.outstanding {
+            // Mutant `departed-pins`: a departed or removed member's set pins origins too.
             if departed_pins || !self.key_excluded(store, target)? {
-                floor = Some(floor.map_or(*generation, |held: u64| held.min(*generation)));
+                pinned.extend(generations.iter().copied());
             }
             #[cfg(feature = "test-knobs")]
             if departed_pins && self.key_excluded(store, target)? {
-                eprintln!("test-knobs: departed-pins mutant engaged: an excluded member pins generation {generation}");
+                if let Some(generation) = generations.first() {
+                    eprintln!("test-knobs: departed-pins mutant engaged: an excluded member pins generation {generation}");
+                }
             }
         }
-        Ok(floor)
+        Ok(OriginsNeeded {
+            from: waiting,
+            pinned,
+        })
     }
 
     /// How long a superseded generation is kept for a trusted identity that has not joined:
@@ -4471,19 +4757,7 @@ impl ChannelState {
         next: SenderChain,
         now_ms: u64,
     ) -> Result<u64> {
-        self.rotate_sender_to_checked(profile, next, now_ms, false)
-    }
-
-    /// The narrowing path may retain extra history while consent replay is pending;
-    /// it never authorizes a key release from that incomplete state.
-    fn rotate_sender_to_checked(
-        &mut self,
-        profile: &Profile,
-        next: SenderChain,
-        now_ms: u64,
-        narrowing: bool,
-    ) -> Result<u64> {
-        self.rotate_sender_with_presence(profile, next, now_ms, narrowing, false, false)
+        self.rotate_sender_with_presence(profile, next, now_ms, false, false)
     }
 
     fn rotate_sender_with_presence(
@@ -4491,7 +4765,6 @@ impl ChannelState {
         profile: &Profile,
         next: SenderChain,
         now_ms: u64,
-        narrowing: bool,
         settle_sparse: bool,
         recover_own: bool,
     ) -> Result<u64> {
@@ -4506,47 +4779,21 @@ impl ChannelState {
         }
         let chain_id = next.chain_id();
         let me = self.me();
-        let retired = self.sender.chain_id();
-        // **A generation retired before a reader took it is owed to that reader as history.**
-        // A member entitled to it that has not taken it — offline at the rotation, or refusing
-        // keys from an owner it does not trust yet (V210-118) — was owed it only as the live
-        // generation's re-key, which a rotation ends. Nothing owed it any more, so the next tick's
-        // prune (R14) deleted its origin before the member's refusal of the new key could owe it
-        // again, and the member never read what this identity wrote under it. Owed here, its
-        // history floor keeps it (`oldest_generation_needed`) until it is taken.
-        // Who may read this identity, from the room's facts in memory (FX-22); while they are
-        // refreshing and the lock narrows, every entitled member is kept.
-        let readers: Option<BTreeSet<Digest32>> = match self.with_consent_facts(|facts| {
-            self.entitled
-                .keys()
-                .filter(|t| facts.can_read(t, &me))
-                .copied()
-                .collect()
-        }) {
-            Ok(readers) => Some(readers),
-            Err(error) if narrowing && governance::refreshing(&error) => None,
-            Err(error) => return Err(error),
-        };
-        let mut owed = Vec::new();
-        for t in self.entitled.keys().copied() {
-            if t == me
-                || self.key_departed(&t)
-                || !readers.as_ref().is_none_or(|readers| readers.contains(&t))
-            {
-                continue;
-            }
-            let Some((from, _)) = self.entitled.get(&t) else {
-                continue;
-            };
-            let floor = match self.delivered.get(&t) {
-                None => *from,
-                Some(d) if *d < retired => (*d + 1).max(*from),
-                Some(_) => continue,
-            };
-            if floor <= retired {
-                owed.push((t, floor));
-            }
-        }
+        let debt = self.rotation_debt(
+            store,
+            &self.outstanding,
+            &self.entitled,
+            &self.origins,
+            chain_id,
+        )?;
+        let mut outstanding = self.outstanding.clone();
+        let lost = debt.apply(&mut outstanding);
+        let history_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &outstanding_bytes(&outstanding, &self.posted),
+        )?;
         // The mint's place in the consent order, persisted before the generation exists
         // (V210-45): a value is never handed out twice, so no later decision can tie it.
         let mint_seq = crate::node::consent_order::stamp_mint(
@@ -4598,7 +4845,11 @@ impl ChannelState {
                 profile,
                 &statement.to_wire(),
                 now_ms,
-                &[(SEG_SENDER, sender_seg), (SEG_ORIGINS, origins_seg)],
+                &[
+                    (SEG_SENDER, sender_seg),
+                    (SEG_ORIGINS, origins_seg),
+                    (SEG_HISTORY, history_seg),
+                ],
                 settle_sparse,
                 Some((next, origins)),
                 settle_sparse,
@@ -4619,6 +4870,12 @@ impl ChannelState {
                     SEG_ORIGINS,
                     &origins_seg,
                 )?;
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_HISTORY,
+                    &history_seg,
+                )?;
                 batch.commit()
             })();
             if let Err(e) = persisted {
@@ -4628,10 +4885,135 @@ impl ChannelState {
             }
             self.sender = next;
         }
-        for (target, floor) in owed {
-            self.owe_history(store, target, floor)?;
-        }
+        self.outstanding = outstanding;
+        debt.say_lost(&self.channel_id, &lost);
         Ok(chain_id)
+    }
+
+    /// **The rotation rule, for every rotation** (V210-45): `minted`, the generation this
+    /// rotation mints, joins the set of every member that holds a durable entitlement and is not
+    /// excluded, and the generation being retired stays in each set it is in until its member
+    /// acknowledges it. `minted` is the one the caller mints, not one above the live one: an
+    /// own-history recovery, a settlement or a catch-up jumps past generations its feed shows
+    /// were used. Whether a member's grant reads current at this moment does not decide its
+    /// debt: the author's own rotation Presence resets every grant until it is re-issued, and is
+    /// no withdrawal. What is released, and when, stays gated by a valid consent at that moment.
+    /// A member without an entitlement (one withdrawn, or never granted) is owed nothing: a row
+    /// it may still have is not extended. An entitled member with no row is read as owing what
+    /// its entitlement allows. At the origin cap the oldest origin is evicted by the mint, and
+    /// leaves every set with it (`evicted`).
+    pub(crate) fn rotation_debt(
+        &self,
+        store: &Store,
+        outstanding: &BTreeMap<Digest32, BTreeSet<u64>>,
+        entitled: &BTreeMap<Digest32, (u64, u64)>,
+        origins: &OriginKeyStore,
+        minted: u64,
+    ) -> Result<RotationDebt> {
+        #[cfg(feature = "test-knobs")]
+        let mut dropped = Vec::new();
+        let me = self.me();
+        let live = self.sender.chain_id();
+        if minted <= live {
+            return Err(Error::MalformedBundle(
+                "a rotation mints a later generation",
+            ));
+        }
+        let mut owed = Vec::new();
+        for (&target, (from, _)) in entitled {
+            if target == me || self.key_excluded(store, &target)? {
+                continue;
+            }
+            // `test-knobs` mutant `VOX_TEST_FWD_MUTANT=rotation-readers` puts back the grant
+            // filter of the old debt loop (cause 2): a member whose grant reads false at this
+            // moment, as every grant does between the author's own rotation Presence and its
+            // re-issue, is owed nothing by this rotation, and the retiring generation is owed
+            // to it no more.
+            #[cfg(feature = "test-knobs")]
+            if std::env::var("VOX_TEST_FWD_MUTANT").as_deref() == Ok("rotation-readers")
+                && self
+                    .with_consent_facts(|facts| facts.can_read(&target, &me))
+                    .is_ok_and(|reads| !reads)
+            {
+                if outstanding
+                    .get(&target)
+                    .is_some_and(|row| row.contains(&live))
+                {
+                    eprintln!(
+                        "test-knobs: rotation-readers mutant engaged: {} is owed nothing by \
+                         the rotation that retires generation {live}: its grant reads false",
+                        crate::node::network::short_id(target)
+                    );
+                }
+                dropped.push((target, live));
+                continue;
+            }
+            let mut add = if outstanding.contains_key(&target) {
+                BTreeSet::new()
+            } else {
+                entitled_generations(origins, &self.channel_id, self.epoch, &me, live, *from)
+            };
+            add.insert(minted);
+            owed.push((target, add));
+        }
+        let evicted = origins
+            .eviction_victim()
+            .filter(|(room, epoch, _)| *room == self.channel_id && *epoch == self.epoch)
+            .map(|(_, _, generation)| generation);
+        let held = evicted.map_or_else(Vec::new, |generation| {
+            self.unjoined_holding(origins, entitled, generation)
+        });
+        Ok(RotationDebt {
+            owed,
+            evicted,
+            held,
+            minted,
+            #[cfg(feature = "test-knobs")]
+            dropped,
+        })
+    }
+
+    /// The trusted identities that have not joined whose hold ([`Self::origins_needed`]) still
+    /// keeps `generation`, by the keyring the last prune tick read: who an eviction at the cap
+    /// leaves without what it would read on joining. Only the named-limit line reads this.
+    fn unjoined_holding(
+        &self,
+        origins: &OriginKeyStore,
+        entitled: &BTreeMap<Digest32, (u64, u64)>,
+        generation: u64,
+    ) -> Vec<Digest32> {
+        let me = self.me();
+        let cutoff = self
+            .now_hint
+            .saturating_sub(self.unjoined_hold_secs().saturating_mul(1_000));
+        let young = origins
+            .oldest_created_since(&self.channel_id, self.epoch, &me, cutoff)
+            .unwrap_or(u64::MAX);
+        if generation < young {
+            return Vec::new();
+        }
+        self.keyring
+            .iter()
+            .filter(|id| **id != me && !entitled.contains_key(*id))
+            .filter(|id| {
+                self.trust_marks
+                    .get(*id)
+                    .map_or(0, |(_, chain_id, _)| *chain_id)
+                    <= generation
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Whether a rotation due only to the time bound must wait (condition 11): this identity
+    /// holds as many origins here as it keeps, so the mint would evict one. Whoever still needs
+    /// it, a member's set or the hold for a trusted identity that has not joined, it waits for
+    /// the prune to free a place; message-bound and mandatory rotations evict and say who loses
+    /// it ([`RotationDebt::say_lost`]).
+    pub(crate) fn origin_cap_holds(&self) -> bool {
+        self.origins
+            .eviction_victim()
+            .is_some_and(|(room, epoch, _)| room == self.channel_id && epoch == self.epoch)
     }
 
     /// Mint an SKDM releasing this identity's **current** generation at its
@@ -4667,42 +5049,6 @@ impl ChannelState {
             let (iteration, key) = self.sender.current_position();
             self.sender.skdm_for(signer, iteration, key)
         }
-    }
-
-    /// Record that `target` refused generation `chain_id` of this identity's sender key, so it
-    /// is [`owed`](ChannelState::owed_rekeys) again. A later generation it did take stays recorded.
-    pub fn note_undelivered(
-        &mut self,
-        store: &Store,
-        target: Digest32,
-        chain_id: u64,
-    ) -> Result<()> {
-        // Only the generation that was refused: a later one that did land stays recorded.
-        if self.delivered.get(&target) != Some(&chain_id) {
-            return Ok(());
-        }
-        match chain_id.checked_sub(1) {
-            Some(before) => {
-                self.delivered.insert(target, before);
-            }
-            None => {
-                self.delivered.remove(&target);
-            }
-        }
-        self.persist_delivered(store)
-    }
-
-    /// Record that `target` has been delivered generation `chain_id` of this
-    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
-    pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
-        // **Generation 0 is recorded too** (V210-95). Defaulting a missing row to 0 and comparing
-        // made a taken generation-0 key look recorded already: it was held in memory and never
-        // written, so after a restart the member was owed the room's first key again.
-        if self.delivered.get(&target).is_some_and(|d| *d >= chain_id) {
-            return Ok(());
-        }
-        self.delivered.insert(target, chain_id);
-        self.persist_delivered(store)
     }
 
     /// Whether this identity has consented to `target` reading it here.
@@ -4906,10 +5252,7 @@ impl ChannelState {
         page.targets.retain(|target| {
             *target != me
                 && !self.key_departed(target)
-                && self
-                    .delivered
-                    .get(target)
-                    .is_none_or(|held| *held < current)
+                && self.owed_generations(target).contains(&current)
         });
         let mut error = None;
         page.targets
@@ -4926,8 +5269,11 @@ impl ChannelState {
         Ok(page)
     }
 
-    /// Check a single delivery target without collecting the room's consent page.
-    pub fn owed_rekey(&self, store: &Store, target: &Digest32) -> Result<bool> {
+    /// Whether `target` is still owed any generation of this identity's sender key it may be
+    /// given: the durable half of the shipped delivery status; the node adds work currently
+    /// admitted or in flight before reporting it. Durable consent, not a grant read at this
+    /// moment: the debt still stands while the author's own rotation waits for its re-grant.
+    pub(crate) fn key_delivery_pending(&self, store: &Store, target: &Digest32) -> Result<bool> {
         if self.poisoned.get() {
             return Err(self.save_failure());
         }
@@ -4937,22 +5283,11 @@ impl ChannelState {
         if self.is_member_removed(store, &self.me())? || self.is_member_removed(store, target)? {
             return Ok(false);
         }
-        Ok(self.has_consented(store, target)?
-            && self
-                .delivered
-                .get(target)
-                .is_none_or(|held| *held < self.sender.chain_id()))
+        Ok(self.has_consented(store, target)? && !self.owed_generations(target).is_empty())
     }
 
-    /// Whether `target` is still owed this identity's current generation or any entitled
-    /// historical generation. This is the durable half of the shipped delivery status; the node
-    /// adds work currently admitted or in flight before reporting it.
-    pub(crate) fn key_delivery_pending(&self, store: &Store, target: &Digest32) -> Result<bool> {
-        Ok(self.owed_rekey(store, target)? || self.owed_history_for(store, target)?.is_some())
-    }
-
-    /// Forget that `target` holds this identity's current sender key, so the next
-    /// re-key round delivers it again (ADR-004 O4).
+    /// Owe `target` this identity's current sender key again, so the next re-key round
+    /// delivers it (ADR-004 O4).
     ///
     /// For when the pairwise session a key was delivered over has been replaced by the
     /// one both ends keep: what was sealed under the dropped session cannot be opened.
@@ -4960,10 +5295,179 @@ impl ChannelState {
     /// # Errors
     /// If the ledger cannot be persisted.
     pub fn forget_delivery(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        if self.delivered.remove(target).is_some() {
-            self.persist_delivered(store)?;
+        self.owe_keys(store, *target, [self.sender.chain_id()], true)
+    }
+
+    /// `target`'s set as recorded: a target with no row owes the live generation only.
+    fn outstanding_of(&self, target: &Digest32) -> BTreeSet<u64> {
+        self.outstanding
+            .get(target)
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([self.sender.chain_id()]))
+    }
+
+    /// Whether `generation` can be owed to `target`: the live one, or a retained origin
+    /// inside its entitlement. Anything else nobody can release.
+    fn may_owe(&self, target: &Digest32, generation: u64) -> bool {
+        let live = self.sender.chain_id();
+        match self.entitled.get(target) {
+            Some((from, _)) => {
+                *from <= generation
+                    && (generation == live
+                        || (generation < live
+                            && self.origins.has(&self.channel_id, self.epoch, generation)))
+            }
+            None => generation == live,
         }
-        Ok(())
+    }
+
+    /// The generations `target` is owed and can be given, ascending.
+    pub(crate) fn owed_generations(&self, target: &Digest32) -> BTreeSet<u64> {
+        let mut owed = self.outstanding_of(target);
+        owed.retain(|generation| self.may_owe(target, *generation));
+        owed
+    }
+
+    /// The posted mark a key package for `target` carrying release `key` (its `skdm_ref`) has
+    /// now: bound to the return it is bound to now ([`Self::package_return`]).
+    pub(crate) fn package_binding(
+        &self,
+        store: &Store,
+        target: &Digest32,
+        key: &Digest32,
+    ) -> Result<Digest32> {
+        let back = self.package_return(store, target)?.unwrap_or(NEVER_LEFT);
+        Ok(posted_release(&back, key))
+    }
+
+    /// Whether a key package carrying exactly release `key` of `target`'s outstanding
+    /// `generation`, bound to `target`'s current return, is posted ([`Self::posted`]). A
+    /// binding that cannot be read now (a member that left, a return not yet held) is not.
+    pub(crate) fn package_posted(
+        &self,
+        store: &Store,
+        target: &Digest32,
+        generation: u64,
+        key: &Digest32,
+    ) -> bool {
+        self.outstanding_of(target).contains(&generation)
+            && self
+                .package_binding(store, target, key)
+                .is_ok_and(|mark| self.posted.get(&(*target, generation)) == Some(&mark))
+    }
+
+    /// The ledger as stored once a package for `target`'s `generation` with posted mark `mark`
+    /// is appended: written in that append's own batch. `None` when the generation is not owed.
+    pub(crate) fn package_mark(
+        &self,
+        target: Digest32,
+        generation: u64,
+        mark: Digest32,
+    ) -> Result<Option<SealedSegment>> {
+        if !self.outstanding_of(&target).contains(&generation) {
+            return Ok(None);
+        }
+        let mut posted = self.posted.clone();
+        posted.insert((target, generation), mark);
+        let mut outstanding = self.outstanding.clone();
+        outstanding
+            .entry(target)
+            .or_insert_with(|| self.outstanding_of(&target));
+        seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &outstanding_bytes(&outstanding, &posted),
+        )
+        .map(Some)
+    }
+
+    /// A package's append that carried [`Self::package_mark`] (or a consent's package append
+    /// that carried its mark) committed.
+    pub(crate) fn note_package_posted(
+        &mut self,
+        target: Digest32,
+        generation: u64,
+        mark: Digest32,
+    ) {
+        if self.outstanding_of(&target).contains(&generation) {
+            self.outstanding
+                .entry(target)
+                .or_insert_with(|| BTreeSet::from([generation]));
+            self.posted.insert((target, generation), mark);
+        }
+    }
+
+    /// `target` answered a direct offer of exactly release `key` of `generation` that it does
+    /// not hold, authenticated (ruling-returner, condition 5): the package posted for it may
+    /// not open, so its mark is cleared, in memory (the next package's append rewrites the
+    /// row), and one new package is posted. Nothing else changes: the debt stays. Whether a
+    /// mark of that exact release, bound to the current return, was cleared.
+    pub(crate) fn clear_package_posted(
+        &mut self,
+        store: &Store,
+        target: &Digest32,
+        generation: u64,
+        key: &Digest32,
+    ) -> bool {
+        if !self.package_posted(store, target, generation, key) {
+            return false;
+        }
+        self.posted.remove(&(*target, generation));
+        true
+    }
+
+    /// Whether each of `keys`, the releases `target` is owed now, was posted to it exactly in a
+    /// key package bound to its current return ([`Self::package_posted`]): the evidence the
+    /// acknowledgement probe of a member that came back needs before any of them goes to it
+    /// directly (ruling-returner, condition 2). None owed is no evidence.
+    pub(crate) fn releases_posted(&self, store: &Store, target: &Digest32, keys: &[Skdm]) -> bool {
+        !keys.is_empty()
+            && keys.iter().all(|key| {
+                self.package_posted(
+                    store,
+                    target,
+                    key.body.chain_id,
+                    &crate::governance::membership::skdm_ref(key),
+                )
+            })
+    }
+
+    /// Owe `target` `generations` (those it can be given). `renew`: the member is owed anew
+    /// (a refusal, a reset): no answer to a delivery selected before settles any of it.
+    /// **No debt without a durable entitlement** (V210-45): a target with none here, one never
+    /// granted or one withdrawn since, is owed nothing and gets no row, whatever its grant reads
+    /// at this moment, so nothing it refuses or resets can make it pin an origin. It is still
+    /// given the live generation while its consent is valid, as a member with no row is.
+    ///
+    /// # Errors
+    /// If the ledger cannot be persisted.
+    pub fn owe_keys(
+        &mut self,
+        store: &Store,
+        target: Digest32,
+        generations: impl IntoIterator<Item = u64>,
+        renew: bool,
+    ) -> Result<()> {
+        if renew {
+            self.renew_history_debt(target);
+        }
+        if !self.entitled.contains_key(&target) {
+            return Ok(());
+        }
+        let mut row = self.outstanding_of(&target);
+        let before = self.outstanding.get(&target).cloned();
+        row.extend(
+            generations
+                .into_iter()
+                .filter(|generation| self.may_owe(&target, *generation))
+                .collect::<Vec<_>>(),
+        );
+        if before.as_ref() == Some(&row) {
+            return Ok(());
+        }
+        self.outstanding.insert(target, row);
+        self.persist_outstanding(store)
     }
 
     /// This identity's retained generations here, `(chain_id, mint_seq)` ascending.
@@ -5344,34 +5848,30 @@ impl ChannelState {
         }
     }
 
-    /// Record that `target` is owed this identity's generations from `floor` up to the
-    /// current one **whole**, so the re-key round delivers them ([`Self::owed_history`],
-    /// [`Self::history_skdms`]) and retries them until they are taken (V210-45).
-    ///
-    /// Only ever lowers an existing row: owing more of what the target is entitled to is
-    /// harmless — a generation already held is ignored by [`Self::accept_skdm`] — and
-    /// owing less could strand it. What it is entitled to is the caller's
-    /// history floor, never this ledger.
-    ///
-    /// # Errors
-    /// If the ledger cannot be persisted.
-    pub fn owe_history(&mut self, store: &Store, target: Digest32, floor: u64) -> Result<()> {
-        if floor >= self.sender.chain_id() {
-            // Only the live generation: the ordinary re-key covers it.
-            return Ok(());
-        }
-        let entry = self.history.entry(target).or_insert(floor);
-        if *entry < floor {
-            return Ok(());
-        }
-        *entry = floor;
-        self.persist_history(store)
+    /// The revision of `target`'s key debt ([`Self::history_revision`]'s field): what a direct
+    /// delivery selected now carries to its answer.
+    #[must_use]
+    pub fn history_revision(&self, target: &Digest32) -> u64 {
+        self.history_revision.get(target).copied().unwrap_or(0)
     }
 
-    /// The oldest generation this one current consenter is still owed.
-    pub fn owed_history_for(&self, store: &Store, target: &Digest32) -> Result<Option<u64>> {
+    /// `target`'s key debt is owed anew (a refusal, a reset, a boundary): an answer to a
+    /// delivery selected before settles none of it.
+    pub fn renew_history_debt(&mut self, target: Digest32) {
+        let revision = self.history_revision.entry(target).or_insert(0);
+        *revision = revision.wrapping_add(1);
+    }
+
+    /// The generations this one current consenter is owed and may be given now, ascending;
+    /// `None` when there are none, or no key may go to it (removed, departed, no valid grant
+    /// at this moment: the author's own rotation Presence resets every grant until it is
+    /// re-issued, and the debt waits for that).
+    pub fn owed_keys_for(&self, store: &Store, target: &Digest32) -> Result<Option<BTreeSet<u64>>> {
         let me = self.me();
-        if self.is_member_removed(store, &me)? || self.is_member_removed(store, target)? {
+        if !self.settled
+            || self.is_member_removed(store, &me)?
+            || self.is_member_removed(store, target)?
+        {
             return Ok(None);
         }
         if *target == me
@@ -5380,29 +5880,32 @@ impl ChannelState {
         {
             return Ok(None);
         }
-        Ok(self.history.get(target).copied())
+        let owed = self.owed_generations(target);
+        Ok((!owed.is_empty()).then_some(owed))
     }
 
-    /// Inspect at most 64 history-ledger slots. An empty result with a next cursor
-    /// still has work; revoked and departed targets consume an inspected slot.
+    /// Inspect at most 64 ledger rows for targets owed a retired generation (one owed only the
+    /// live one is [`Self::owed_rekeys`]'s). An empty result with a next cursor still has
+    /// work; revoked and departed targets consume an inspected slot.
     pub fn owed_history_page(
         &self,
         store: &Store,
         after: Option<Digest32>,
-    ) -> Result<(BTreeMap<Digest32, u64>, Option<Digest32>)> {
+    ) -> Result<(Outstanding, Option<Digest32>)> {
         use std::ops::Bound::{Excluded, Unbounded};
         let me = self.me();
-        if self.is_member_removed(store, &me)? {
+        if !self.settled || self.is_member_removed(store, &me)? {
             return Ok((BTreeMap::new(), None));
         }
         let facts = self.consent_facts()?;
+        let live = self.sender.chain_id();
         let mut owed = BTreeMap::new();
         let mut slots = self
-            .history
+            .outstanding
             .range((after.map_or(Unbounded, Excluded), Unbounded));
         let mut next = None;
         for _ in 0..64 {
-            let Some((target, floor)) = slots.next() else {
+            let Some((target, _)) = slots.next() else {
                 return Ok((owed, None));
             };
             next = Some(*target);
@@ -5411,23 +5914,24 @@ impl ChannelState {
                 && facts.can_read(target, &me)
                 && !self.is_member_removed(store, target)?
             {
-                owed.insert(*target, *floor);
+                let generations = self.owed_generations(target);
+                if generations.iter().any(|generation| *generation < live) {
+                    owed.insert(*target, generations);
+                }
             }
         }
         Ok((owed, next))
     }
 
-    /// The SKDMs releasing this identity's retained generations from `floor` to the
-    /// current one, oldest first, each from where `target` is entitled
-    /// ([`Self::entitled_from`]): the generation its entitlement begins in from that
-    /// iteration, every later one at its origin, and none before it. A target with no
-    /// recorded entitlement gets none. A generation whose origin is no longer retained is
-    /// skipped: it cannot be released by anybody.
-    pub fn history_skdms(
+    /// The SKDMs releasing `generations` of this identity's sender key to `target`, oldest
+    /// first, each from where `target` is entitled ([`Self::entitled_from`]): the generation
+    /// its entitlement begins in from that iteration, every later retired one at its origin,
+    /// the live one as [`Self::rekey_skdm_for`] releases it, and none it may not be given.
+    pub fn owed_skdms(
         &self,
         profile: &Profile,
         target: &Digest32,
-        floor: u64,
+        generations: &BTreeSet<u64>,
     ) -> Result<Vec<Skdm>> {
         self.require_legacy_current(profile.store())?;
         self.require_forward_migrated()?;
@@ -5444,41 +5948,34 @@ impl ChannelState {
         if self.room_removal_rotation_needed(profile.store())? {
             return Err(Error::StreamRefused(KEYS_ROTATING));
         }
-        let Some((from_chain, from_iteration)) = self.entitled_from(target) else {
-            return Ok(Vec::new());
-        };
         let signer = profile.signer()?;
         let current = self.sender.chain_id();
         let mut out = Vec::new();
-        for chain_id in floor.max(from_chain)..=current {
-            if self.origins.has(&self.channel_id, self.epoch, chain_id) {
-                let iteration = if chain_id == from_chain {
-                    from_iteration
-                } else {
-                    0
-                };
-                out.push(self.origins.release_at(
-                    signer,
-                    &self.channel_id,
-                    self.epoch,
-                    chain_id,
-                    iteration,
-                )?);
+        for chain_id in generations {
+            if !self.may_owe(target, *chain_id) {
+                continue;
             }
+            if *chain_id == current {
+                out.push(self.rekey_skdm_for(profile, target)?);
+                continue;
+            }
+            let Some((from_chain, from_iteration)) = self.entitled_from(target) else {
+                continue;
+            };
+            let iteration = if *chain_id == from_chain {
+                from_iteration
+            } else {
+                0
+            };
+            out.push(self.origins.release_at(
+                signer,
+                &self.channel_id,
+                self.epoch,
+                *chain_id,
+                iteration,
+            )?);
         }
         Ok(out)
-    }
-
-    /// Record that every generation `target` was owed from its history floor has gone
-    /// out; a refusal of any of them owes it again ([`Self::owe_history`]).
-    ///
-    /// # Errors
-    /// If the ledger cannot be persisted.
-    pub fn note_history_delivered(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        if self.history.remove(target).is_some() {
-            self.persist_history(store)?;
-        }
-        Ok(())
     }
 
     /// Keep every fork proof the DAG holds in `SEG_FORKS`, if it holds more than are kept, or
@@ -5546,37 +6043,17 @@ impl ChannelState {
             .collect()
     }
 
-    fn persist_history(&mut self, store: &Store) -> Result<()> {
+    fn persist_outstanding(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_HISTORY,
-            &delivered_bytes(&self.history),
+            &outstanding_bytes(&self.outstanding, &self.posted),
         )?;
         if let Err(e) = store.put_segment(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_HISTORY,
-            &seg,
-        ) {
-            self.mark_poisoned();
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    fn persist_delivered(&mut self, store: &Store) -> Result<()> {
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_DELIVERED,
-            &delivered_bytes(&self.delivered),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_DELIVERED,
             &seg,
         ) {
             self.mark_poisoned();
@@ -6292,13 +6769,27 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Owe `target`, as history, every retired generation from the one its entitlement begins
-    /// in (V210-118). Nothing when it is entitled only to the live one, which the ordinary re-key
-    /// covers.
+    /// **The reset rule** (V210-118): `target` lost what it held (it refused for want of trust,
+    /// or offered a fresh reciprocal key), so it is owed anew every generation its entitlement
+    /// allows that is still retained, the live one included, even when its set does not change.
     pub fn owe_entitled_history(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        match self.entitled_from(target) {
-            Some((from, _)) => self.owe_history(store, *target, from),
-            None => Ok(()),
+        let generations = self.entitled_generations_of(target);
+        self.owe_keys(store, *target, generations, true)
+    }
+
+    /// What `target` may be owed from its entitlement on: every retained generation from it
+    /// and the live one; nothing without an entitlement recorded (no debt without one).
+    pub(crate) fn entitled_generations_of(&self, target: &Digest32) -> BTreeSet<u64> {
+        match self.entitled.get(target) {
+            Some((from, _)) => entitled_generations(
+                &self.origins,
+                &self.channel_id,
+                self.epoch,
+                &self.me(),
+                self.sender.chain_id(),
+                *from,
+            ),
+            None => BTreeSet::new(),
         }
     }
 
@@ -7305,6 +7796,12 @@ impl ChannelState {
             index.seal()?;
             batch.commit()
         })();
+    }
+
+    /// Whether [`Self::lock_now`] wiped this room instance's key: the instance was closed (left,
+    /// or dropped as the node locks), and nothing of it can be read or written any more.
+    pub(crate) fn key_wiped(&self) -> bool {
+        self.sek.is_locked()
     }
 
     /// App-lock this channel: wipe the SEK now. The state should be dropped

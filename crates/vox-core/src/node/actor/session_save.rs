@@ -1225,6 +1225,7 @@ impl Node {
                         SessionWrite::Package {
                             package,
                             removal_generation,
+                            mark: None,
                         },
                         continuation,
                         reply,

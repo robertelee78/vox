@@ -772,6 +772,7 @@ impl Node {
             }
             // The event that frees the room for a pass a person waits for (`vox trust add`).
             self.resume_parked_consents(room).await;
+            self.resume_parked_keys(room).await;
         }
     }
 

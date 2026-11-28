@@ -6,8 +6,10 @@ pub(crate) struct PendingConsent {
     append: PendingText,
     action: Action,
     entitled: BTreeMap<Digest32, (u64, u64)>,
-    history: BTreeMap<Digest32, u64>,
-    delivered: Option<BTreeMap<Digest32, u64>>,
+    /// The key-debt ledger this save writes (`ChannelState::outstanding`).
+    history: BTreeMap<Digest32, BTreeSet<u64>>,
+    /// The posted marks of that ledger (`ChannelState::posted`), written with it.
+    posted: crate::node::channel::Posted,
     rotation: Option<Rotation>,
     ledgers_committed: bool,
     origins_committed: Option<OriginKeyStore>,
@@ -40,6 +42,12 @@ struct Issuance {
     skdm: Box<Skdm>,
     entitled_from: (u64, u64),
     package: Option<crate::node::keypackage::KeyPackage>,
+    /// The posted mark of `package` ([`crate::node::channel::posted_release`]): written in the
+    /// package's own append batch when its generation is in the member's set; `None` once it
+    /// was not written.
+    mark: Option<Digest32>,
+    /// What the grant owes: every retained generation from the merged entitlement on.
+    owed: BTreeSet<u64>,
 }
 
 pub(crate) enum ConsentSaved {
@@ -52,14 +60,15 @@ pub(crate) enum ConsentSaved {
 pub(crate) struct CompletedConsent {
     append: CompletedText,
     entitled: Option<BTreeMap<Digest32, (u64, u64)>>,
-    history: Option<BTreeMap<Digest32, u64>>,
-    delivered: Option<BTreeMap<Digest32, u64>>,
+    history: Option<BTreeMap<Digest32, BTreeSet<u64>>>,
     origins: Option<OriginKeyStore>,
     /// A committed held-key deletion must be installed even when the later append failed.
     pub(crate) held: Option<(Digest32, Digest32)>,
     /// Actual committed heads, including a package committed before a failed consent.
     pub(crate) package_seq: Option<u64>,
     pub(crate) package: Option<crate::node::keypackage::KeyPackage>,
+    /// The posted mark `(member, generation, mark)` the committed package's append wrote.
+    posted_mark: Option<(Digest32, u64, Digest32)>,
     pub(crate) consent_seq: Option<u64>,
     package_unconfirmed: bool,
     pub(crate) result: Result<ConsentSaved>,
@@ -136,8 +145,7 @@ impl ChannelState {
             .checked_add(1)
             .ok_or(Error::MalformedBundle("sender chain_id overflow"))?;
         let mut entitled = self.entitled.clone();
-        let mut history = self.history.clone();
-        let mut delivered = self.delivered.clone();
+        let mut history = self.outstanding.clone();
         let targets: BTreeSet<_> = self
             .authors
             .keys()
@@ -183,8 +191,9 @@ impl ChannelState {
                         .get(&target)
                         .is_none_or(|(chain, _)| *chain <= cut.unwrap_or(0)));
             if needs_boundary {
+                // The boundary rewrites the set: a removed member is owed nothing, a readmitted
+                // or returned one only what its new entitlement allows (the rotation adds it).
                 history.remove(&target);
-                delivered.remove(&target);
                 if removed {
                     entitled.remove(&target);
                 } else {
@@ -206,39 +215,7 @@ impl ChannelState {
             }
         }
         drop(view);
-        let readers = self.with_consent_facts(|facts| {
-            entitled
-                .keys()
-                .filter(|target| facts.can_read(target, &me))
-                .copied()
-                .collect::<BTreeSet<_>>()
-        })?;
-        let retired = self.sender.chain_id();
-        let mut owed = Vec::new();
-        for (reader, (from, _)) in &entitled {
-            if *reader == me
-                || self.key_departed(reader)
-                || !readers.contains(reader)
-                || self.is_member_removed(store, reader)?
-            {
-                continue;
-            }
-            let floor = match delivered.get(reader) {
-                None => *from,
-                Some(delivered) if *delivered < retired => (*delivered + 1).max(*from),
-                Some(_) => continue,
-            };
-            if floor <= retired {
-                owed.push((*reader, floor));
-            }
-        }
-        let rotation = Rotation {
-            origins: OriginKeyStore::from_state(&self.origins.to_state())?,
-            newest_mint: self.newest_mint_seq(),
-            history: rotation_history_bytes(&history, &owed),
-            owed,
-        };
-        let delivered = Some(delivered);
+        let rotation = self.rotation(store, &history, &entitled, next_chain)?;
         let here = !self.said_left(&me);
         let mut append = self.prepare_pending_control(store, owner, now)?;
         append.removal_fence = Some(generation);
@@ -247,7 +224,7 @@ impl ChannelState {
             action: Action::RoomRotation { generation, here },
             entitled,
             history,
-            delivered,
+            posted: self.posted.clone(),
             rotation: Some(rotation),
             ledgers_committed: false,
             origins_committed: None,
@@ -273,9 +250,9 @@ impl ChannelState {
     ///    return is (R3): its return cut and one advance of the membership counter, so the
     ///    next rotation gives it a fresh chain and it reads from there on (accepted loss O2).
     /// 3. Every other entitled member that is neither removed nor departed keeps its
-    ///    entitlement and is owed again, from it, every retained generation (its origins are
-    ///    kept by its history row), and its delivery ledger row is dropped so the next re-key
-    ///    delivers it again under the new policy.
+    ///    entitlement and is owed again, from it, every retained generation and the live one
+    ///    (its origins are kept by its set), so the next re-key delivers them again under the
+    ///    new policy and each answer settles its own.
     pub(crate) fn prepare_forward_migration(
         &mut self,
         store: &Arc<Store>,
@@ -291,8 +268,7 @@ impl ChannelState {
         let live = self.sender.chain_id();
         let live_position = (live, self.sender.current_position().0);
         let mut entitled = self.entitled.clone();
-        let mut history = self.history.clone();
-        let mut delivered = self.delivered.clone();
+        let mut history = self.outstanding.clone();
         for (target, decision) in legacy_full {
             if *target == me
                 || !self
@@ -325,17 +301,16 @@ impl ChannelState {
                         *from = (*from).max(floor);
                     }
                     if let Some(row) = history.get_mut(target) {
-                        *row = (*row).max(floor.0);
-                        if *row >= live {
-                            history.remove(target);
-                        }
+                        row.retain(|generation| *generation >= floor.0);
                     }
                 }
                 None => {
                     if let Some(from) = entitled.get_mut(target) {
                         *from = live_position;
                     }
-                    history.remove(target);
+                    if let Some(row) = history.get_mut(target) {
+                        row.retain(|generation| *generation >= live);
+                    }
                 }
             }
         }
@@ -350,14 +325,15 @@ impl ChannelState {
             if target == me || self.key_excluded(store, &target)? || self.key_returned(&target) {
                 continue;
             }
-            let from = entitled[&target].0;
-            if from < live {
-                history
-                    .entry(target)
-                    .and_modify(|row| *row = (*row).min(from))
-                    .or_insert(from);
-            }
-            delivered.remove(&target);
+            let owed = entitled_generations(
+                &self.origins,
+                &self.channel_id,
+                self.epoch,
+                &me,
+                live,
+                entitled[&target].0,
+            );
+            history.entry(target).or_default().extend(owed);
         }
         let append = self.prepare_pending_control(store, owner, now)?;
         Ok(Some(PendingConsent {
@@ -365,7 +341,7 @@ impl ChannelState {
             action: Action::ForwardMigration { returns },
             entitled,
             history,
-            delivered: Some(delivered),
+            posted: self.posted.clone(),
             rotation: None,
             ledgers_committed: false,
             origins_committed: None,
@@ -422,13 +398,32 @@ impl ChannelState {
             ));
         }
         let entitled = self.entitled.clone();
-        let history = self.history.clone();
+        let history = self.outstanding.clone();
+        let from = self
+            .entitled
+            .get(&target)
+            .map_or(entitled_from, |old| (*old).min(entitled_from));
+        let owed = entitled_generations(
+            &self.origins,
+            &self.channel_id,
+            self.epoch,
+            &self.me(),
+            self.sender.chain_id(),
+            from.0,
+        );
         let mut append = self.prepare_pending_control(store, owner, now)?;
         append.removal_fence = Some(generation);
+        let mut mark = None;
         if package.is_some() {
-            if let Some(back) = self.package_return(store, &target)? {
+            let back = self.package_return(store, &target)?;
+            if let Some(back) = back {
                 append.require_ancestor(back);
             }
+            // A package is posted once (V210-45): its mark goes in its own append's batch.
+            mark = Some(crate::node::channel::posted_release(
+                &back.unwrap_or(crate::node::channel::NEVER_LEFT),
+                &crate::governance::membership::skdm_ref(&skdm),
+            ));
         }
         Ok(PendingConsent {
             append,
@@ -437,10 +432,12 @@ impl ChannelState {
                 skdm,
                 entitled_from,
                 package,
+                mark,
+                owed,
             }),
             entitled,
             history,
-            delivered: None,
+            posted: self.posted.clone(),
             rotation: None,
             ledgers_committed: false,
             origins_committed: None,
@@ -469,53 +466,20 @@ impl ChannelState {
             Err(error) if governance::refreshing(&error) => true,
             Err(error) => return Err(error),
         };
-        // Even an already committed revocation must replay its durable ledger cleanup.
+        // Even an already committed revocation must replay its durable ledger cleanup. The
+        // withdrawal is the target's boundary: its rotation owes the target nothing.
+        let mut entitled = self.entitled.clone();
+        let mut history = self.outstanding.clone();
+        entitled.remove(&target);
+        history.remove(&target);
         let rotation = if revoke {
             self.require_legacy_current(store)?;
-            let me = self.me();
-            let readers = match self.with_consent_facts(|facts| {
-                self.entitled
-                    .keys()
-                    .filter(|t| facts.can_read(t, &me))
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-            }) {
-                Ok(readers) => Some(readers),
-                Err(error) if governance::refreshing(&error) => None,
-                Err(error) => return Err(error),
-            };
-            let retired = self.sender.chain_id();
-            let mut owed = Vec::new();
-            for (reader, (from, _)) in &self.entitled {
-                if *reader == me
-                    || self.has_left(reader)
-                    || !readers
-                        .as_ref()
-                        .is_none_or(|readers| readers.contains(reader))
-                {
-                    continue;
-                }
-                let floor = match self.delivered.get(reader) {
-                    None => *from,
-                    Some(delivered) if *delivered < retired => (*delivered + 1).max(*from),
-                    Some(_) => continue,
-                };
-                if floor <= retired {
-                    owed.push((*reader, floor));
-                }
-            }
-            Some(Rotation {
-                origins: OriginKeyStore::from_state(&self.origins.to_state())?,
-                newest_mint: self.newest_mint_seq(),
-                history: rotation_history_bytes(&self.history, &owed),
-                owed,
-            })
+            Some(self.rotation(store, &history, &entitled, self.next_generation()?)?)
         } else {
             None
         };
         let entitled = self.entitled.clone();
-        let history = self.history.clone();
-        let delivered = Some(self.delivered.clone());
+        let history = self.outstanding.clone();
         let here = !self.said_left(&self.me());
         let append = if revoke {
             self.prepare_pending_control(store, owner, now)?
@@ -546,7 +510,7 @@ impl ChannelState {
             },
             entitled,
             history,
-            delivered,
+            posted: self.posted.clone(),
             rotation,
             ledgers_committed: false,
             origins_committed: None,
@@ -566,8 +530,8 @@ impl ChannelState {
             append,
             entitled,
             history,
-            delivered,
             origins,
+            posted_mark,
             result,
             ..
         } = completed;
@@ -583,14 +547,29 @@ impl ChannelState {
             if let Some(entitled) = entitled {
                 self.entitled = entitled;
             }
-            if let Some(history) = history {
-                self.history = history;
+            // A consent change that takes generations out of a member's set (a boundary, a
+            // withdrawal, the migration) owes it anew: no answer to a delivery selected before
+            // settles it. One that only adds (a grant) leaves answers in flight valid.
+            let renewed: Vec<Digest32> = history
+                .iter()
+                .flat_map(|history| {
+                    self.outstanding.iter().filter(|(target, old)| {
+                        history.get(*target).is_none_or(|new| !old.is_subset(new))
+                    })
+                })
+                .map(|(target, _)| *target)
+                .collect();
+            for target in renewed {
+                self.renew_history_debt(target);
             }
-            if let Some(delivered) = delivered {
-                self.delivered = delivered;
+            if let Some(history) = history {
+                self.outstanding = history;
             }
             if let Some(origins) = origins {
                 self.origins = origins;
+            }
+            if let Some((target, generation, mark)) = posted_mark {
+                self.note_package_posted(target, generation, mark);
             }
             if matches!(result, Ok(ConsentSaved::Migrated)) {
                 self.forward_migrated = true;
@@ -627,9 +606,13 @@ impl PendingConsent {
             })
             .map(ToString::to_string);
         let hash = self.append.committed.last().map(Entry::entry_hash);
-        let package = match self.action {
-            Action::Issue(issue) if self.package_seq.is_some() => issue.package,
-            _ => None,
+        let (package, posted_mark) = match self.action {
+            Action::Issue(issue) if self.package_seq.is_some() => {
+                let generation = issue.skdm.body.chain_id;
+                let mark = issue.mark.map(|mark| (issue.target, generation, mark));
+                (issue.package, mark)
+            }
+            _ => (None, None),
         };
         let append = CompletedText {
             pending: Some(self.append),
@@ -642,15 +625,11 @@ impl PendingConsent {
             append,
             entitled: self.ledgers_committed.then_some(self.entitled),
             history: self.ledgers_committed.then_some(self.history),
-            delivered: if self.ledgers_committed {
-                self.delivered
-            } else {
-                None
-            },
             origins: self.origins_committed,
             held: self.held_committed,
             package_seq: self.package_seq,
             package,
+            posted_mark,
             consent_seq: self.consent_seq,
             package_unconfirmed: self.package_attempted
                 && self.package_seq.is_none()
@@ -672,9 +651,67 @@ impl PendingConsent {
                     skdm,
                     entitled_from,
                     package,
+                    mark,
+                    owed,
                 } = issue;
+                let from = self
+                    .entitled
+                    .get(target)
+                    .map_or(*entitled_from, |old| (*old).min(*entitled_from));
+                self.entitled.insert(*target, from);
+                // The debt follows the merged floor, not the supplied one: a re-issued consent
+                // for an entitlement already held owes what that entitlement is owed (R5). It
+                // only adds: what the member has not acknowledged stays in its set.
+                let floor = from.0;
+                let history_owed = floor < self.append.sender.chain_id();
+                let row = self.history.entry(*target).or_default();
+                let before = row.len();
+                row.extend(
+                    owed.iter()
+                        .copied()
+                        .filter(|generation| *generation >= floor),
+                );
+                let changed = row.len() != before || before == 0;
                 if let Some(package) = package {
                     self.package_attempted = true;
+                    // **The package writes the grant's ledgers and its posted mark in its own
+                    // batch** (V210-45): it already hands the member the key, so the entitlement
+                    // and the debt it creates are true from here, and a restart before the grant
+                    // commits finds the mark, issues the grant and posts nothing again. A first
+                    // grant's row is created here, with its mark.
+                    let generation = skdm.body.chain_id;
+                    *mark = mark.filter(|_| {
+                        self.history
+                            .get(target)
+                            .is_some_and(|row| row.contains(&generation))
+                    });
+                    let mut posted = self.posted.clone();
+                    if let Some(mark) = *mark {
+                        posted.insert((*target, generation), mark);
+                    }
+                    let (entitled, history) = (&self.entitled, &self.history);
+                    let rows = self.append.sek.with(|sek| {
+                        Ok(vec![
+                            (
+                                SEG_ENTITLED,
+                                Some(seal_segment(
+                                    sek,
+                                    SegmentKind::KeyMaterial,
+                                    SEG_ENTITLED,
+                                    &positions_bytes(entitled),
+                                )?),
+                            ),
+                            (
+                                SEG_HISTORY,
+                                Some(seal_segment(
+                                    sek,
+                                    SegmentKind::KeyMaterial,
+                                    SEG_HISTORY,
+                                    &outstanding_bytes(history, &posted),
+                                )?),
+                            ),
+                        ])
+                    })?;
                     self.append.append(
                         store,
                         signer,
@@ -682,9 +719,11 @@ impl PendingConsent {
                         EntryKind::Content,
                         SignedEntryKind::KeyPackage,
                         None,
-                        &[],
+                        &rows,
                         None,
                     )?;
+                    self.posted = posted;
+                    self.ledgers_committed = true;
                     self.package_seq = Some(self.append.control_head(&signer.fingerprint()));
                     self.append.cleanup(store)?;
                 }
@@ -709,20 +748,7 @@ impl PendingConsent {
                     skdm,
                     HistoryMode::ForwardOnly,
                 )?;
-                let from = self
-                    .entitled
-                    .get(target)
-                    .map_or(*entitled_from, |old| (*old).min(*entitled_from));
-                self.entitled.insert(*target, from);
-                // The debt follows the merged floor, not the supplied one: a re-issued consent
-                // for an entitlement already held owes what that entitlement is owed (R5).
-                let floor = from.0;
-                let history_owed = floor < self.append.sender.chain_id();
-                let changed =
-                    history_owed && self.history.get(target).is_none_or(|old| *old > floor);
-                if changed {
-                    self.history.insert(*target, floor);
-                }
+                let changed = changed && !self.ledgers_committed;
                 let rows = self.append.sek.with(|sek| {
                     let mut rows = vec![(
                         SEG_ENTITLED,
@@ -740,7 +766,7 @@ impl PendingConsent {
                                 sek,
                                 SegmentKind::KeyMaterial,
                                 SEG_HISTORY,
-                                &delivered_bytes(&self.history),
+                                &outstanding_bytes(&self.history, &self.posted),
                             )?),
                         ));
                     }
@@ -794,22 +820,18 @@ impl PendingConsent {
                 } else {
                     None
                 };
+                // The withdrawal is the member's boundary: its entitlement and its set go, so
+                // it is owed nothing and pins nothing.
                 let mut entitled = self.entitled.clone();
                 let mut history = self.history.clone();
-                let mut delivered = self
-                    .delivered
-                    .clone()
-                    .ok_or(Error::MalformedAtRest("withdrawal delivered state missing"))?;
-                let changed = entitled.remove(&target).is_some()
-                    | history.remove(&target).is_some()
-                    | delivered.remove(&target).is_some();
+                let changed =
+                    entitled.remove(&target).is_some() | history.remove(&target).is_some();
                 if changed {
                     let mut batch = store.batch()?;
                     self.append.sek.with(|sek| {
                         for (slot, bytes) in [
                             (SEG_ENTITLED, positions_bytes(&entitled)),
-                            (SEG_HISTORY, delivered_bytes(&history)),
-                            (SEG_DELIVERED, delivered_bytes(&delivered)),
+                            (SEG_HISTORY, outstanding_bytes(&history, &self.posted)),
                         ] {
                             batch.put_segment(
                                 &self.append.room,
@@ -823,7 +845,6 @@ impl PendingConsent {
                     batch.commit()?;
                     self.entitled = entitled;
                     self.history = history;
-                    self.delivered = Some(delivered);
                     self.ledgers_committed = true;
                 }
                 Ok(ConsentSaved::Withdrawn(revocation))
@@ -835,10 +856,6 @@ impl PendingConsent {
                 Ok(ConsentSaved::RoomRotated)
             }
             Action::ForwardMigration { returns } => {
-                let delivered = self
-                    .delivered
-                    .as_ref()
-                    .ok_or(Error::MalformedAtRest("migration delivered state missing"))?;
                 let mut batch = store.batch()?;
                 self.append.sek.with(|sek| {
                     // Each return is reconciled before the ledgers are written, so its cut
@@ -854,8 +871,7 @@ impl PendingConsent {
                     }
                     for (slot, bytes) in [
                         (SEG_ENTITLED, positions_bytes(&self.entitled)),
-                        (SEG_HISTORY, delivered_bytes(&self.history)),
-                        (SEG_DELIVERED, delivered_bytes(delivered)),
+                        (SEG_HISTORY, outstanding_bytes(&self.history, &self.posted)),
                         (SEG_FORWARD_MIGRATED, forward_migrated_bytes()),
                     ] {
                         batch.put_segment(
@@ -885,7 +901,14 @@ impl PendingConsent {
             .rotation
             .take()
             .ok_or(Error::MalformedAtRest("withdrawal rotation missing"))?;
-        let next = self.append.sender.rotated(self.append.now_millis)?;
+        // The generation its debt owes, so what is minted and what is owed cannot differ.
+        let next = SenderChain::new(
+            &self.append.room,
+            self.append.epoch,
+            &signer.fingerprint(),
+            rotation.debt.minted,
+            self.append.now_millis,
+        )?;
         let mint = crate::node::consent_order::stamp_mint(store, signer, rotation.newest_mint)?;
         retain_generation(
             &mut rotation.origins,
@@ -896,12 +919,7 @@ impl PendingConsent {
             self.append.now_millis,
             mint,
         )?;
-        for (target, floor) in &rotation.owed {
-            self.history
-                .entry(*target)
-                .and_modify(|old| *old = (*old).min(*floor))
-                .or_insert(*floor);
-        }
+        let lost = rotation.debt.apply(&mut self.history);
         let rows = self.append.sek.with(|sek| {
             Ok([
                 (
@@ -928,7 +946,7 @@ impl PendingConsent {
                         sek,
                         SegmentKind::KeyMaterial,
                         SEG_HISTORY,
-                        &delivered_bytes(&self.history),
+                        &outstanding_bytes(&self.history, &self.posted),
                     )?),
                 ),
                 (
@@ -940,22 +958,6 @@ impl PendingConsent {
                                 SegmentKind::KeyMaterial,
                                 SEG_ENTITLED,
                                 &positions_bytes(&self.entitled),
-                            )
-                        })
-                        .transpose()?,
-                ),
-                (
-                    SEG_DELIVERED,
-                    checkpoint
-                        .map(|_| {
-                            let delivered = self.delivered.as_ref().ok_or(
-                                Error::MalformedAtRest("room rotation delivered state missing"),
-                            )?;
-                            seal_segment(
-                                sek,
-                                SegmentKind::KeyMaterial,
-                                SEG_DELIVERED,
-                                &delivered_bytes(delivered),
                             )
                         })
                         .transpose()?,
@@ -1022,6 +1024,7 @@ impl PendingConsent {
         self.append.sender = next;
         self.origins_committed = Some(rotation.origins);
         self.ledgers_committed = true;
+        rotation.debt.say_lost(&self.append.room, &lost);
         self.append.cleanup(store)
     }
 }

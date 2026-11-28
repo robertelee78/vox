@@ -27,8 +27,9 @@
 //! refused as behind its own history; bob's post written then, before her return, stays unread
 //! (coming back is a new key ceremony). W3: bob, who admitted her, is stopped before her recovery
 //! completes; alice, the holder, comes back and learns carol's admission notice through the board
-//! exchange with carol, serves the prefix, and carol posts. Mutant: `VOX_MUTANT_FWD=notice-not-offered`
-//! (carol never posts).
+//! exchange (she takes it from a board that holds it), serves the prefix, and carol posts. Mutant:
+//! `VOX_MUTANT_FWD=notice-not-exchanged`: admission notices are neither taken from nor offered to
+//! a board (carol never posts).
 
 #![cfg(unix)]
 

@@ -205,7 +205,7 @@ enum PreparedKind {
 struct RotationSaved {
     sender: SenderChain,
     origins: OriginKeyStore,
-    owed: Vec<(Digest32, u64)>,
+    debt: RotationDebt,
     settle: bool,
     recover: bool,
 }
@@ -574,38 +574,13 @@ impl ChannelState {
         self.ensure_local_append_available_mode(store, after_departure, recover)?;
         self.ensure_governance_append_eligible_by(store, &self.me(), settle, recover)?;
         let sparse = self.uses_sparse_history(store)?;
-        let rotation = if matches!(&mode, AppendMode::Rotate { .. }) {
-            let me = self.me();
-            let readers = self.with_consent_facts(|facts| {
-                self.entitled
-                    .keys()
-                    .filter(|target| facts.can_read(target, &me))
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-            })?;
-            let retired = self.sender.chain_id();
-            let mut owed = Vec::new();
-            for (target, (from, _)) in &self.entitled {
-                if *target == me || self.has_left(target) || !readers.contains(target) {
-                    continue;
-                }
-                let floor = match self.delivered.get(target) {
-                    None => *from,
-                    Some(delivered) if *delivered < retired => (*delivered + 1).max(*from),
-                    Some(_) => continue,
-                };
-                if floor <= retired {
-                    owed.push((*target, floor));
-                }
+        // The debt owes the generation this append mints: a recovery, settlement or catch-up
+        // jumps past every generation its feed shows was used, not just one past the live one.
+        let rotation = match &mode {
+            AppendMode::Rotate { next, .. } => {
+                Some(self.rotation(store, &self.outstanding, &self.entitled, *next)?)
             }
-            Some(Rotation {
-                origins: OriginKeyStore::from_state(&self.origins.to_state())?,
-                newest_mint: self.newest_mint_seq(),
-                history: rotation_history_bytes(&self.history, &owed),
-                owed,
-            })
-        } else {
-            None
+            AppendMode::Presence | AppendMode::Shares(_) => None,
         };
         let boundary = AppendBoundary {
             settle,
@@ -754,23 +729,22 @@ impl Prepared {
                 let result = (|| -> Result<bool> {
                     match &append.mode {
                         AppendMode::Rotate {
-                            next,
                             here,
                             settle,
                             recover,
                             ..
                         } => {
-                            let next = SenderChain::new(
-                                &append.pending.room,
-                                append.pending.epoch,
-                                &signer.fingerprint(),
-                                *next,
-                                append.pending.now_millis,
-                            )?;
                             let mut rotation = append
                                 .rotation
                                 .take()
                                 .ok_or(Error::Profile("recovery rotation state absent"))?;
+                            let next = SenderChain::new(
+                                &append.pending.room,
+                                append.pending.epoch,
+                                &signer.fingerprint(),
+                                rotation.debt.minted,
+                                append.pending.now_millis,
+                            )?;
                             let mint = crate::node::consent_order::stamp_mint(
                                 store,
                                 signer,
@@ -807,7 +781,9 @@ impl Prepared {
                                     ),
                                     (
                                         SEG_HISTORY,
-                                        if rotation.owed.is_empty() {
+                                        if rotation.debt.owed.is_empty()
+                                            && rotation.debt.evicted.is_none()
+                                        {
                                             None
                                         } else {
                                             Some(seal_segment(
@@ -855,7 +831,7 @@ impl Prepared {
                             rotation_saved = Some(RotationSaved {
                                 sender: next,
                                 origins: rotation.origins,
-                                owed: rotation.owed,
+                                debt: rotation.debt,
                                 settle: *settle,
                                 recover: *recover,
                             });
@@ -1026,7 +1002,11 @@ impl Completed {
                 if let Some(rotation) = rotation.filter(|_| owns) {
                     channel.sender = rotation.sender;
                     channel.origins = rotation.origins;
-                    install_rotation_history(&mut channel.history, rotation.owed);
+                    install_rotation_history(
+                        &channel.channel_id,
+                        &mut channel.outstanding,
+                        &rotation.debt,
+                    );
                     if rotation.settle {
                         channel.settled = true;
                     }

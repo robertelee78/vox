@@ -43,6 +43,33 @@ struct Owed {
 #[derive(Default)]
 pub(super) struct ParkedConsents(std::collections::BTreeMap<Digest32, Vec<Cursor>>);
 
+/// `VOX_TEST_HOLD_REGRANT_FILE=<path>` (proofs only): while the file names a member, no consent
+/// is issued to it, online or through the log, so two of this node's rotations can happen with
+/// no re-grant between them; `<path>.engaged` is written each time one is held.
+#[cfg(feature = "test-knobs")]
+fn regrant_held(target: &Digest32) -> bool {
+    let Some(path) = std::env::var_os("VOX_TEST_HOLD_REGRANT_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return false;
+    };
+    let held = std::fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some(crate::node::link::b32_encode(target).as_str());
+    if held {
+        let _ = std::fs::write(path.with_extension("engaged"), b"held consent");
+    }
+    held
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn regrant_held(_target: &Digest32) -> bool {
+    false
+}
+
 pub(super) struct Offline {
     attempt: u64,
     source_room: Digest32,
@@ -76,8 +103,6 @@ enum Stage {
     Packages {
         route: Offline,
         keys: VecDeque<Skdm>,
-        history: bool,
-        generation: u64,
         posted_as: Digest32,
     },
     Delivered(Offline),
@@ -146,13 +171,15 @@ impl Continuation {
 }
 
 impl Node {
+    /// `target` answered a direct delivery of `generation`, selected under debt `revision`, as
+    /// taken: save that exactly that generation left its set.
     pub(super) async fn begin_owned_pairwise_receipt(
         &mut self,
         room: Digest32,
         target: Digest32,
         generation: u64,
         removal_generation: u64,
-        whole_history: bool,
+        revision: u64,
     ) {
         if self.profile.is_none() {
             return;
@@ -177,8 +204,8 @@ impl Node {
             Work::Consent(consent_save::Work::Delivered {
                 target,
                 generation,
+                revision,
                 removal_generation: Some(removal_generation),
-                history: whole_history,
             }),
             maintenance_save::Continuation::Consent(continuation),
             None,
@@ -207,7 +234,7 @@ impl Node {
                     return;
                 };
                 match channel.owed_consents(profile.store(), &trusted) {
-                    Ok(owed) => owed.contains(&owner.peer),
+                    Ok(owed) => owed.contains(&owner.peer) && !regrant_held(&owner.peer),
                     Err(_) => continue,
                 }
             };
@@ -424,7 +451,10 @@ impl Node {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             owed.room = Some(room);
-            owed.targets = targets.into_iter().collect();
+            owed.targets = targets
+                .into_iter()
+                .filter(|target| !regrant_held(target))
+                .collect();
         }
     }
 
@@ -531,6 +561,9 @@ impl Node {
         lifetime: Option<Arc<Lifetime>>,
         cursor: Cursor,
     ) -> std::result::Result<bool, PrepareFailure> {
+        if regrant_held(&target) {
+            return Err(Fault::Unreachable.into());
+        }
         if !self.trust.is_trusted(&target) {
             return Err(Fault::NotTrusted.into());
         }
@@ -1197,8 +1230,6 @@ impl Node {
                 Stage::Packages {
                     route,
                     keys,
-                    history,
-                    generation,
                     posted_as,
                 },
                 Saved::Session(SessionSaved::Package { package, .. }),
@@ -1210,14 +1241,7 @@ impl Node {
                     stage: Stage::Delivered(route),
                     ..continuation
                 };
-                self.advance_owned_log_keys(room, next, keys, history, generation)
-                    .await;
-            }
-            (Stage::Delivered(_), Saved::Consent(consent_save::Effect::Delivered)) => {
-                self.settle_owned_key_receipt(room, &continuation).await;
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Done);
-                }
+                self.advance_owned_log_keys(room, next, keys).await;
             }
             (Stage::Acknowledged, Saved::Consent(consent_save::Effect::Delivered)) => {
                 self.settle_owned_key_receipt(room, &continuation).await;
@@ -1283,31 +1307,27 @@ impl Node {
             prekey: None,
             stage: Stage::Delivered(route),
         };
+        // **The log route settles nothing** (V210-45): a package only makes each owed key
+        // available to a member that is not reachable now. Every generation in its set stays
+        // there until its own authenticated answer to a direct delivery, the next time it is
+        // reachable.
         let selected = {
             let channel = continuation.instance.lock().await;
             self.profile
                 .as_ref()
                 .ok_or(Error::AtRestLocked)
-                .and_then(|profile| {
-                    let floor = channel.owed_history_for(profile.store(), &peer)?;
-                    let history = floor
-                        .map(|floor| channel.history_skdms(profile, &peer, floor))
-                        .transpose()?
-                        .filter(|keys| !keys.is_empty());
-                    let owed = channel.owed_rekey(profile.store(), &peer)?;
-                    let rekey = if history.is_none() && owed {
-                        Some(channel.rekey_skdm_for(profile, &peer)?)
-                    } else {
-                        None
-                    };
-                    Ok((history, rekey, channel.sender_generation()))
-                })
+                .and_then(
+                    |profile| match channel.owed_keys_for(profile.store(), &peer)? {
+                        Some(generations) => channel.owed_skdms(profile, &peer, &generations),
+                        None => Ok(Vec::new()),
+                    },
+                )
         };
-        let (history, rekey, generation) = match selected {
-            Ok(selected) => selected,
+        let keys: VecDeque<_> = match selected {
+            Ok(keys) => keys.into(),
             Err(error) if ChannelState::governance_refreshing(&error) => {
-                // The grant saved the history debt before invalidating its fold. Keep
-                // this exact offline delivery until that fold can select the owed keys.
+                // The grant saved the debt before invalidating its fold. Keep this exact
+                // offline delivery until that fold can select the owed keys.
                 let Stage::Delivered(route) = continuation.stage else {
                     return;
                 };
@@ -1329,24 +1349,21 @@ impl Node {
                 return;
             }
         };
-        let history_sent = history.is_some();
-        let keys: VecDeque<_> = match (history, rekey) {
-            (Some(keys), _) => keys.into(),
-            (None, Some(key)) => [key].into(),
-            _ => return,
-        };
+        if keys.is_empty() {
+            return;
+        }
         self.key_delivery_settling.insert((room, peer));
-        self.advance_owned_log_keys(room, continuation, keys, history_sent, generation)
-            .await;
+        self.advance_owned_log_keys(room, continuation, keys).await;
     }
 
+    /// Post each owed key as a package, once since this node unlocked: a fresh bundle is no
+    /// reason to post it again (the author cannot tell a member that opened it from one that
+    /// could not). Once none is left, the route is over; the debt is unchanged.
     async fn advance_owned_log_keys(
         &mut self,
         room: Digest32,
         mut continuation: Continuation,
         mut keys: VecDeque<Skdm>,
-        history: bool,
-        generation: u64,
     ) {
         while let Some(key) = keys.pop_front() {
             if !continuation.attached(self, &room) || !continuation.trusted(self) {
@@ -1357,7 +1374,19 @@ impl Node {
                 continuation.target,
                 crate::governance::membership::skdm_ref(&key),
             );
-            if self.packages_posted.contains(&posted_as) {
+            // Posted once, durably (the mark in the member's ledger row survives a restart).
+            let marked = {
+                let channel = continuation.instance.lock().await;
+                self.profile.as_ref().is_some_and(|profile| {
+                    channel.package_posted(
+                        profile.store(),
+                        &continuation.target,
+                        key.body.chain_id,
+                        &posted_as.2,
+                    )
+                })
+            };
+            if marked || self.packages_posted.contains(&posted_as) {
                 continue;
             }
             let Some(selected) = self
@@ -1373,8 +1402,7 @@ impl Node {
             continuation.stage = Stage::Outbound(outbound::Stage::SealLog {
                 route,
                 keys,
-                history,
-                generation,
+                generation: key.body.chain_id,
                 posted_as: posted_as.2,
             });
             self.begin_pending_maintenance(
@@ -1386,18 +1414,32 @@ impl Node {
             .await;
             return;
         }
-        self.begin_pending_maintenance(
-            room,
-            Work::Consent(consent_save::Work::Delivered {
-                target: continuation.target,
-                generation,
-                removal_generation: None,
-                history,
-            }),
-            maintenance_save::Continuation::Consent(continuation),
-            None,
-        )
-        .await;
+        self.settle_owned_log_route(room, &continuation).await;
+    }
+
+    /// The log route to `continuation.target` is over, every key it owes posted to its bundle:
+    /// no delivery to it is in flight any more unless a direct key is, whatever its durable debt
+    /// still owes.
+    async fn settle_owned_log_route(&mut self, room: Digest32, continuation: &Continuation) {
+        #[cfg(feature = "test-knobs")]
+        if let Some(profile) = self.profile.as_ref() {
+            let owed = continuation
+                .instance
+                .lock()
+                .await
+                .owed_keys_for(profile.store(), &continuation.target);
+            if let Ok(Some(owed)) = owed {
+                eprintln!(
+                    "test-knobs: every key owed to {} is in the log of room {}: generations {owed:?}",
+                    crate::node::link::b32_encode(&continuation.target),
+                    crate::node::network::short_id(room)
+                );
+            }
+        }
+        let pair = (room, continuation.target);
+        if !self.keys_in_flight.contains_key(&pair) && !self.history_in_flight.contains_key(&pair) {
+            self.key_delivery_settling.remove(&pair);
+        }
     }
 }
 
@@ -1419,11 +1461,8 @@ pub(super) fn retire_detached(
         }
         return;
     }
-    let final_delivery =
-        matches!(
-            &continuation.stage,
-            Stage::Delivered(_) | Stage::Acknowledged
-        ) && matches!(&result, Ok(Saved::Consent(consent_save::Effect::Delivered)));
+    let final_delivery = matches!(&continuation.stage, Stage::Acknowledged)
+        && matches!(&result, Ok(Saved::Consent(consent_save::Effect::Delivered)));
     let result = match result {
         Err(error) => Err(error),
         Ok(Saved::Consent(consent_save::Effect::Publication {
