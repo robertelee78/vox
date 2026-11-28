@@ -1286,6 +1286,7 @@ impl Node {
             let clock = Arc::clone(&self.clock);
             let ledger = Arc::clone(&self.bounded_sync.retirement_ledger);
             let news_record = Arc::clone(&record);
+            let wake_room = Arc::clone(&shared);
             self.history_frontier.admission_began(room);
             let task = tokio::spawn(async move {
                 let mut cell = task_cell.lock().await;
@@ -1376,29 +1377,61 @@ impl Node {
                     }
                 }
                 .await;
-                let failed = result.is_err();
-                match result {
+                // A failure is said in the daemon log and waits for what can end its cause
+                // (`runtime::failure_clears_by_itself`): a local release, or news. Its own
+                // cancellation (its fence retired) is not a failure.
+                let failure = match result {
                     // A finished flow ends here; one that failed is retired by the actor.
-                    Ok(()) => drop(cell.take()),
+                    Ok(()) => {
+                        drop(cell.take());
+                        None
+                    }
                     // Unless its own fence cancelled it, it keeps the root it held unsettled.
-                    Err(_error) => {
+                    Err(error) => {
+                        let mut root = None;
                         if let Some(flow) = cell.as_mut() {
                             if task_fence.is_retired() {
                                 flow.park();
                             } else {
                                 flow.fail();
+                                root = flow.failed_position();
                             }
                         }
+                        Some((error, root))
                     }
-                }
+                };
                 drop(cell);
-                if failed {
+                if let Some((error, root)) = failure {
                     // Its flow goes to retirement now (`start_admissions`); the room's
-                    // admission stays this task's until news that can change the outcome.
+                    // admission stays this task's until its cause can have ended.
                     frontier.wake();
-                    frontier
-                        .failed_admission_news(room, epoch, &news_record, &task_fence)
-                        .await;
+                    let clears =
+                        crate::node::history_stream::runtime::failure_clears_by_itself(&error);
+                    if !task_fence.is_retired() {
+                        frontier.failed_admission_said(room, root, &error, clears);
+                    }
+                    if clears {
+                        // The room's pending write or publication is held by another: its
+                        // release is the wake (registered under the room's lock, so none is
+                        // missed); then the room's next admission takes the root again.
+                        let wake = {
+                            let held = wake_room.lock().await;
+                            (held.post_pending()
+                                || held.history_publication_busy(&store).unwrap_or(true))
+                            .then(|| held.history_publication_wake())
+                        };
+                        if let Some(wake) = wake {
+                            tokio::select! {
+                                biased;
+                                () = task_fence.retired() => {}
+                                () = wake => {}
+                            }
+                        }
+                    } else {
+                        frontier
+                            .failed_admission_news(room, epoch, &news_record, &task_fence)
+                            .await;
+                    }
                 }
                 task_ended.store(true, Ordering::Release);
                 frontier.wake();

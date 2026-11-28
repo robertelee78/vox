@@ -66,9 +66,15 @@ pub(crate) struct CompletedReceived {
     /// one to (`observe_public`).
     announced: Option<(Digest32, u64)>,
     poisoned: bool,
+    /// A control's effect made its author's controls current here (`finish_history_effect`).
+    controls_ready: bool,
 }
 
 impl CompletedReceived {
+    /// Permission news is owed: the effect made its author's controls current.
+    pub(crate) fn controls_ready(&self) -> bool {
+        self.committed && self.controls_ready
+    }
     pub(crate) fn legacy_migration(&self) -> Option<crate::time::Ms> {
         (self.committed
             && matches!(
@@ -423,6 +429,7 @@ impl ChannelState {
             contiguous,
             announced,
             poisoned,
+            controls_ready: _,
         } = completed;
         let PendingReceived {
             room,
@@ -555,15 +562,18 @@ impl ChannelState {
 }
 
 impl PendingReceived {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn save(
         mut self,
         store: &Store,
         committed_ledger: &AtomicBool,
         received: &ReceivedFlow,
         refill: Option<&Entry>,
+        work: &mut crate::log::history::WorkBudget,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> CompletedReceived {
+        let mut controls_ready = false;
         let mut committed = false;
         let mut effect = None;
         let mut presence = None;
@@ -727,11 +737,13 @@ impl PendingReceived {
                 } else {
                     if publish_before_effect {
                         let mut index = self.index.write(&mut batch, sek, &self.room)?;
-                        let catalog = index.finish_history_effect(
+                        let (catalog, ready) = index.finish_history_effect(
                             entry,
                             &FinishedHistoryEffect { hash },
                             self.me,
+                            work,
                         )?;
+                        controls_ready = ready;
                         index.seal()?;
                         if catalog {
                             batch.ruled();
@@ -762,6 +774,7 @@ impl PendingReceived {
                             log,
                             entry,
                             self.late,
+                            None,
                         )?;
                         consent = accepted.current_advanced;
                         governance_changed = accepted.work_changed;
@@ -848,11 +861,13 @@ impl PendingReceived {
                 if admitted {
                     if !is_refill && (kind == SignedEntryKind::Content || !publish_before_effect) {
                         let mut index = self.index.write(&mut batch, sek, &self.room)?;
-                        let catalog = index.finish_history_effect(
+                        let (catalog, ready) = index.finish_history_effect(
                             entry,
                             &FinishedHistoryEffect { hash },
                             self.me,
+                            work,
                         )?;
+                        controls_ready = ready;
                         index.seal()?;
                         if catalog {
                             batch.ruled();
@@ -962,6 +977,7 @@ impl PendingReceived {
             contiguous,
             announced,
             poisoned,
+            controls_ready,
         }
     }
 }

@@ -12,6 +12,8 @@
 //! to ask; a holder's answer corrects it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::error::{Error, Result};
@@ -367,8 +369,6 @@ struct Peer {
     fork_asks: BTreeMap<Digest32, u8>,
 }
 
-/// A room's record generation made durable, and the flush that made it so.
-type DurableFlush = (u64, Arc<tokio::sync::OnceCell<()>>);
 /// Runs kept, and runs inside a span.
 type RunSplit = (Vec<(u64, u64)>, Vec<(u64, u64)>);
 
@@ -386,9 +386,6 @@ pub(crate) struct Holdings {
     peers: StdMutex<HashMap<(Digest32, Digest32, u64), Peer>>,
     /// Per (room, peer): the room generation whose holdings this node last told that peer.
     told: StdMutex<HashMap<(Digest32, Digest32), u64>>,
-    /// Per room: the record generation whose received entries the last flush made durable, and
-    /// that flush, run once by whichever connection's tell needs it first.
-    durable: StdMutex<HashMap<Digest32, DurableFlush>>,
 }
 
 impl Holdings {
@@ -879,37 +876,23 @@ impl Holdings {
             .collect()
     }
 
-    /// The room's received entries are durable through the record of `generation`: one flush
-    /// per publication of the record, whichever connection's tell needs it first; the others
-    /// share it (a later one covers an earlier record too).
-    async fn durable(&self, room: Digest32, generation: u64, store: &Arc<Store>) -> Result<()> {
-        let flush = {
-            let mut durable = lock(&self.durable);
-            let at = durable
-                .entry(room)
-                .or_insert_with(|| (generation, Arc::default()));
-            if at.0 < generation {
-                *at = (generation, Arc::default());
+    /// The room's received entries are durable before a changed Holding is told: every receive
+    /// debt of the room, each flow's own included (a source whose effect is still owed, a body
+    /// refilled before its effect: `Store::received_debts_for_room`), is enumerated afresh each
+    /// time (under the store writer, so a commit and its debt registration have finished) and
+    /// flushed. A debt a durable commit already covers begins no transaction
+    /// (`Store::flush_received_through`): nothing owed, no flush.
+    async fn durable(&self, room: Digest32, store: &Arc<Store>) -> Result<()> {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || {
+            store.finish_received_replacement()?;
+            for debt in store.received_debts_for_room(room) {
+                store.flush_received_through(debt)?;
             }
-            Arc::clone(&at.1)
-        };
-        flush
-            .get_or_try_init(|| {
-                let store = Arc::clone(store);
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        store.finish_received_replacement()?;
-                        for debt in store.received_semantic_debts_for_room(room).0 {
-                            store.flush_received_through(debt)?;
-                        }
-                        Ok::<(), Error>(())
-                    })
-                    .await
-                    .map_err(|_| Error::Unreachable("history flush worker stopped"))?
-                }
-            })
-            .await
-            .map(drop)
+            Ok::<(), Error>(())
+        })
+        .await
+        .map_err(|_| Error::Unreachable("history flush worker stopped"))?
     }
 
     /// The room generations told since the actor last took them: each is credited to its port.
@@ -967,6 +950,87 @@ pub(crate) struct Ready {
     /// refill, which checks this debt again in its own transaction.
     pub(crate) key_body: Option<super::KeyBodyNeed>,
     charge: Arc<Charge>,
+    /// What its last admission operation checked before it stopped (JoinDesign S1), kept with
+    /// it across a wait under its own charge: the copies of this entry share it, and the one
+    /// that resumes takes it.
+    checked: Option<Arc<StdMutex<Option<KeptChecked>>>>,
+}
+
+/// What admission checked of one root, kept with it while it waits in the frontier, under its
+/// exact size taken out of its admission's headroom ([`CheckedRoom::keep`]); the charge goes
+/// back when it is dropped, or into the next admission's headroom that takes the root
+/// ([`CheckedRoom::restore`]).
+pub(super) struct KeptChecked {
+    checked: Option<Box<super::admission::Checked>>,
+    _charge: Charge,
+}
+
+/// An admission's headroom for what its entries' operations check (JoinDesign S1): one charge
+/// to the room's assembly, taken before its root leaves the ready set
+/// ([`Frontier::reserve_checked_or_wake`], `admission::Checked::headroom`), held while the
+/// admission runs, and the one debit every state it keeps lives under. A state the root waits
+/// with in the frontier takes its exact size out of it ([`Self::keep`]) and brings it back
+/// when the root is taken again ([`Self::restore`]).
+pub(super) struct CheckedRoom(Charge);
+
+impl CheckedRoom {
+    /// What it holds.
+    pub(super) fn bytes(&self) -> usize {
+        self.0.bytes
+    }
+
+    /// `other`'s bytes held as this room's.
+    pub(super) fn join(&mut self, other: CheckedRoom) {
+        self.0.join(other.0);
+    }
+
+    /// `checked` as kept with its root in the frontier, under its exact size taken out of this
+    /// room; none when the room does not hold that much.
+    pub(super) fn keep(&mut self, checked: Box<super::admission::Checked>) -> Option<KeptChecked> {
+        let bytes = checked.bytes();
+        (bytes <= self.0.bytes).then(|| KeptChecked {
+            checked: Some(checked),
+            _charge: self.0.split(bytes),
+        })
+    }
+
+    /// What a root kept, its charge back in this room; beyond `most`, what the room then holds
+    /// goes back to the assembly (never less than the state itself). `most` is the base only at
+    /// a new root, when no other state lives under the room; a declined wait passes no limit.
+    pub(super) fn restore(
+        &mut self,
+        kept: KeptChecked,
+        most: usize,
+    ) -> Option<Box<super::admission::Checked>> {
+        let KeptChecked {
+            checked,
+            _charge: charge,
+        } = kept;
+        self.0.join(charge);
+        self.trim(most.max(checked.as_ref().map_or(0, |checked| checked.bytes())));
+        checked
+    }
+
+    /// What it holds beyond `most` goes back to the assembly.
+    pub(super) fn trim(&mut self, most: usize) {
+        let over = self.0.bytes.saturating_sub(most);
+        drop(self.0.split(over));
+    }
+}
+
+/// The next release of a charge to the node's assembly ([`Frontier::reserve_checked_or_wake`]).
+pub(super) type AssemblyWake = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
+impl Ready {
+    /// Keeps what admission checked with this entry, with its charge.
+    pub(super) fn keep_checked(&mut self, kept: KeptChecked) {
+        self.checked = Some(Arc::new(StdMutex::new(Some(kept))));
+    }
+
+    /// What admission checked with this entry, taken by the one admission that resumes it.
+    pub(super) fn take_checked(&self) -> Option<KeptChecked> {
+        self.checked.as_ref().and_then(|kept| lock(kept).take())
+    }
 }
 
 /// A sealed key package.
@@ -1213,6 +1277,17 @@ struct FrontierInner {
     /// set until the hold file is gone ([`held_consent`]).
     #[cfg(feature = "test-knobs")]
     held_consents: Vec<(Digest32, Ready)>,
+    /// Per (room, author, seq) of an entry waiting at a position: the other authors' controls
+    /// (author, position) its stop found it lacks too (`settled`). When its wait ends, it waits
+    /// for the next of them still held here unadmitted instead of running again
+    /// ([`FrontierInner::release`]): one stop per entry, not one per author.
+    rest: HashMap<(Digest32, Digest32, u64), Vec<(Digest32, u64)>>,
+    /// Per (room, root) of a failed admission: the cause it was last said with in the daemon log
+    /// (`Frontier::failed_admission_said`). A root's is kept only while that entry is ready, in
+    /// admission or waiting here, and dropped when it leaves (`refresh`): each retained entry
+    /// and cause is said once, and this is no larger than what is retained. A failure with no
+    /// root keeps one per room.
+    said: HashMap<(Digest32, Option<(Digest32, u64)>), String>,
 }
 
 impl FrontierInner {
@@ -1400,6 +1475,9 @@ impl FrontierInner {
             }
         }
         self.views.remove(&room);
+        if !admitting && !waiting {
+            self.said.remove(&(room, Some((author, seq))));
+        }
         !admitting && !waiting && self.unblock(room, author, seq)
     }
 
@@ -1423,6 +1501,7 @@ impl FrontierInner {
         self.queue(room, item);
         self.refresh(room, author, seq);
         self.quiet.remove(&room);
+        self.rest.remove(&(room, author, seq));
     }
 
     /// An entry goes into the room's ready set in its class, classified here, at handover:
@@ -1502,6 +1581,28 @@ impl FrontierInner {
         }
     }
 
+    /// M13 (`VOX_MUTANT_NEED_SETTLES_EVERY_ROOT`, test-knobs only): when a root of the room's
+    /// admission starts to wait (`Frontier::settled` for a need, `Frontier::wait_at_held` at a
+    /// held control's position), every entry of the room's ready set, every author's, waits on
+    /// that same wait: one author's wait holds the others' posts.
+    #[cfg(feature = "test-knobs")]
+    fn mutant_settles_every_root(&mut self, room: Digest32, wait: Wait) {
+        if !mutant("VOX_MUTANT_NEED_SETTLES_EVERY_ROOT") {
+            return;
+        }
+        for item in self.ready.remove(&room).unwrap_or_default().into_items() {
+            let (author, seq) = (item.entry.skeleton.author_id, item.entry.skeleton.seq);
+            let peer = self.admitting.remove(&(room, author, seq));
+            self.waits_for.insert((room, author, seq), wait);
+            let kept = peer.map(|peer| (peer, item));
+            self.waiting
+                .entry((room, wait))
+                .or_default()
+                .push(((author, seq), kept));
+            self.refresh(room, author, seq);
+        }
+    }
+
     /// The entries waiting for `wait` stop waiting: the kept ones go to the ready set (where
     /// `queue` checks them again); the others are owed again. Returns how many went to the
     /// ready set. A position no waiter waits for any more keeps no priority from them. A held
@@ -1523,10 +1624,15 @@ impl FrontierInner {
                 self.waits_for.remove(&(room, author, seq));
                 match kept {
                     Some((peer, ready)) => {
+                        if let Some((a, s)) = self.next_rest(room, (author, seq), wait) {
+                            self.wait(room, (author, seq), Wait::At(a, s), Some((peer, ready)));
+                            continue;
+                        }
                         self.make_ready(room, peer, ready);
                         released += 1;
                     }
                     None => {
+                        self.rest.remove(&(room, author, seq));
                         if self.refresh(room, author, seq) {
                             ended.push(Wait::At(author, seq));
                         }
@@ -1535,6 +1641,34 @@ impl FrontierInner {
             }
         }
         released
+    }
+
+    /// The next control entry `(author, seq)` noted it lacks (`rest`) that is still held here
+    /// unadmitted, other than the one whose wait just ended: an authenticated positional fact
+    /// whose publication releases its waiters (`Frontier::published`). One not held (admitted
+    /// meanwhile, or never handed) is passed over: the entry runs again and its walk decides.
+    fn next_rest(
+        &mut self,
+        room: Digest32,
+        (author, seq): (Digest32, u64),
+        ended: Wait,
+    ) -> Option<(Digest32, u64)> {
+        let list = self.rest.get_mut(&(room, author, seq))?;
+        while let Some((a, s)) = list.pop() {
+            if Wait::At(a, s) != ended
+                && self
+                    .controls
+                    .get(&(room, a))
+                    .is_some_and(|held| held.contains(s))
+            {
+                if list.is_empty() {
+                    self.rest.remove(&(room, author, seq));
+                }
+                return Some((a, s));
+            }
+        }
+        self.rest.remove(&(room, author, seq));
+        None
     }
 }
 
@@ -1971,6 +2105,48 @@ impl Frontier {
         lock(&self.inner).quiet.insert(room);
     }
 
+    /// Say in the daemon log, once per entry and cause, why a room's admission failed and what
+    /// it waits for before it tries again (`clears`: a local release, otherwise news).
+    pub(crate) fn failed_admission_said(
+        &self,
+        room: Digest32,
+        root: Option<(Digest32, u64)>,
+        error: &crate::error::Error,
+        clears: bool,
+    ) {
+        let cause = error.to_string();
+        {
+            let mut inner = lock(&self.inner);
+            if inner.said.get(&(room, root)) == Some(&cause) {
+                return;
+            }
+            let retained = root.is_none_or(|(author, seq)| {
+                let key = (room, author, seq);
+                inner.admitting.contains_key(&key) || inner.waits_for.contains_key(&key)
+            });
+            if retained {
+                inner.said.insert((room, root), cause.clone());
+            }
+        }
+        let what = match root {
+            Some((author, seq)) => format!(
+                "entry {seq} of {} is not admitted yet",
+                crate::node::network::short_id(author)
+            ),
+            None => "admission stopped".to_owned(),
+        };
+        let waits = if clears {
+            "it waits for the room's write to be released and is tried again"
+        } else {
+            "it waits for a change that can admit it (a new entry, key, trust, governance or room change)"
+        };
+        eprintln!(
+            "vox: room {}: {what}: {}; {waits}",
+            crate::node::network::short_id(room),
+            cause
+        );
+    }
+
     /// The one recovery edge of a failed room admission (design simple-sync §3): what can
     /// change its outcome since it began, and nothing else. Returns at the first of:
     /// - its fence retired: its room or the node retired or replaced it (leave, close,
@@ -2030,6 +2206,43 @@ impl Frontier {
             .is_some_and(|ready| !ready.is_empty())
     }
 
+    /// `bytes` of `connection`'s assembly as an admission's headroom ([`CheckedRoom`]), taken
+    /// before its root leaves the ready set (C5, [`Assembly`]): short of room, what no admission
+    /// holds gives way first ([`Self::shed`], every room); none when even then the node's count
+    /// has no room.
+    fn reserve_checked(
+        &self,
+        connection: (Digest32, Digest32),
+        bytes: usize,
+    ) -> Option<CheckedRoom> {
+        self.assembly
+            .charge(connection, bytes)
+            .or_else(|| {
+                self.shed(None)
+                    .then(|| self.assembly.charge(connection, bytes))
+                    .flatten()
+            })
+            .map(CheckedRoom)
+    }
+
+    /// [`Self::reserve_checked`], or, while the node's count has no room even then, the wake
+    /// of its next release: what is left counted is held by running admissions (each within
+    /// its own headroom, which it never waits to grow) and the answers being checked, which
+    /// give it back by themselves (C5). The wake is taken before the room is looked for, so no
+    /// release between the two is missed.
+    pub(super) fn reserve_checked_or_wake(
+        &self,
+        connection: (Digest32, Digest32),
+        bytes: usize,
+    ) -> std::result::Result<CheckedRoom, AssemblyWake> {
+        let mut released = self.assembly.released.subscribe();
+        self.reserve_checked(connection, bytes).ok_or_else(|| {
+            Box::pin(async move {
+                let _ = released.changed().await;
+            }) as AssemblyWake
+        })
+    }
+
     /// The room's admission takes ONE entry: urgent and ordinary alternating, each in its
     /// rotation over authors ([`ReadySet`]).
     pub(crate) fn take(&self, room: Digest32) -> Option<Ready> {
@@ -2068,6 +2281,7 @@ impl Frontier {
     /// fetches that position if no connection holds it), otherwise for the need itself. A
     /// control owed again (no need) leaves the frontier: what waits for its position is
     /// released and checked again.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn settled(
         &self,
         room: Digest32,
@@ -2076,6 +2290,7 @@ impl Frontier {
         need: Option<(Need, Option<Arc<SignedHead>>)>,
         kept: Option<(Digest32, Ready)>,
         at: Option<(Digest32, u64)>,
+        also: Vec<(Digest32, u64)>,
     ) {
         let mut inner = lock(&self.inner);
         inner.admitting.remove(&(room, author, seq));
@@ -2086,24 +2301,15 @@ impl Frontier {
             // (`Ready::charge`), so the wait's end admits it without a second fetch; when
             // assembly is short of room it gives way and only its place is kept
             // ([`Frontier::shed`]).
+            // With the other controls it lacks (`also`), it waits for each in turn.
+            if kept.is_some() && !also.is_empty() {
+                inner.rest.insert((room, author, seq), also);
+            }
             inner.wait(room, (author, seq), wait, kept);
             // M13 (`VOX_MUTANT_NEED_SETTLES_EVERY_ROOT`): every entry of the room's ready set,
             // every author's, waits on this one need too.
             #[cfg(feature = "test-knobs")]
-            if mutant("VOX_MUTANT_NEED_SETTLES_EVERY_ROOT") {
-                for item in inner.ready.remove(&room).unwrap_or_default().into_items() {
-                    let (author, seq) = (item.entry.skeleton.author_id, item.entry.skeleton.seq);
-                    let peer = inner.admitting.remove(&(room, author, seq));
-                    inner.waits_for.insert((room, author, seq), wait);
-                    let kept = peer.map(|peer| (peer, item));
-                    inner
-                        .waiting
-                        .entry((room, wait))
-                        .or_default()
-                        .push(((author, seq), kept));
-                    inner.refresh(room, author, seq);
-                }
-            }
+            inner.mutant_settles_every_root(room, wait);
         }
         let released = if inner.refresh(room, author, seq) {
             inner.release(room, Wait::At(author, seq))
@@ -2115,6 +2321,50 @@ impl Frontier {
             self.handed.notify_one();
         }
         self.change();
+    }
+
+    /// Root `(author, seq)` of a room's admission waits for position `(a, s)` if that position
+    /// is a control handed here and not admitted yet (`controls`), with its kept copy and the
+    /// other controls it lacks (`also`, taken only when it waits). Decided and registered in one
+    /// frontier lock hold, so that position's publication (`published`, which unblocks it in the
+    /// same lock) either came before and the root does not wait, or comes after and releases
+    /// it. Returns whether it waits.
+    pub(crate) fn wait_at_held(
+        &self,
+        room: Digest32,
+        (author, seq): (Digest32, u64),
+        (a, s): (Digest32, u64),
+        kept: (Digest32, Ready),
+        also: &mut Vec<(Digest32, u64)>,
+    ) -> bool {
+        let mut inner = lock(&self.inner);
+        if !inner
+            .controls
+            .get(&(room, a))
+            .is_some_and(|held| held.contains(s))
+        {
+            return false;
+        }
+        inner.admitting.remove(&(room, author, seq));
+        if !also.is_empty() {
+            inner.rest.insert((room, author, seq), std::mem::take(also));
+        }
+        inner.wait(room, (author, seq), Wait::At(a, s), Some(kept));
+        // M13: the second place a root waits (at a held control's position) settles every
+        // entry of the room's ready set on that wait too, as `settled` does.
+        #[cfg(feature = "test-knobs")]
+        inner.mutant_settles_every_root(room, Wait::At(a, s));
+        let released = if inner.refresh(room, author, seq) {
+            inner.release(room, Wait::At(author, seq))
+        } else {
+            0
+        };
+        drop(inner);
+        if released > 0 {
+            self.handed.notify_one();
+        }
+        self.change();
+        true
     }
 
     /// Position `(author, seq)` was admitted: it is settled, the connection that handed it over
@@ -3014,13 +3264,9 @@ async fn tell(c: &Connection) -> Result<()> {
                 },
             );
             if !news.is_empty() {
-                // What is told must be durable: received entries reach the disk first, once
-                // per publication of the record for every connection of the room.
-                if let Err(error) = c
-                    .holdings
-                    .durable(c.room, snapshot.generation(), &c.store)
-                    .await
-                {
+                // What is told must be durable: received entries reach the disk first, the
+                // room's debts enumerated afresh for this Holding.
+                if let Err(error) = c.holdings.durable(c.room, &c.store).await {
                     c.refused(error, before)?;
                     continue;
                 }
@@ -4629,6 +4875,7 @@ async fn exchange<'a>(
                 entry: Arc::new(entry),
                 key_body,
                 charge: Arc::clone(&shared),
+                checked: None,
             })
             .collect();
         c.frontier.hand(room, peer, ready)
@@ -4647,7 +4894,11 @@ async fn exchange<'a>(
     // again from the record as it is now, when what was asked is met or under way elsewhere:
     // the record of the author moved meanwhile (another connection's refill of the same package
     // committed, an admission of the same positions; the record read again above when it still
-    // owed what the store no longer does), or the asked body is `owned` by another admission.
+    // owed what the store no longer does), or the asked body is `owned` by another admission,
+    // or the coverage need asked for is `met` by what the store already held (`covered`): the
+    // record stops reading an author's coverage once it has admitted positions
+    // (`held_history`), so a need registered after the answer that met it is planned once
+    // more; `Frontier::covered` above met it, and no plan asks it again.
     let gave = resume
         || !handing.is_empty()
         || checked.brought
@@ -4668,9 +4919,10 @@ async fn exchange<'a>(
         }
     };
     drop(now);
+    let met = matches!(ask.need, Some(Need::Controls { hi, .. }) if hi <= covered);
     let refused = matches!(status, Status::Busy | Status::Cancelled)
         || (stopped_early && !resume)
-        || (!gave && stood && !owned);
+        || (!gave && stood && !owned && !met);
     // Parked on (`Connection::refused`), with all the same answer proved kept above. A partial
     // body goes with the park, as every live request of a parked connection does.
     if refused {

@@ -62,8 +62,17 @@ pub(crate) struct ValidatedSparseEntry {
     included: IncludedHeader,
     pre_context: ControlContext,
     payload_state: SparsePayloadState,
+    /// The entry hash and the fingerprint of the key its governance body's signature was
+    /// verified under at typing (JoinDesign S4).
+    signed_under: Option<(Digest32, Digest32)>,
 }
 impl ValidatedSparseEntry {
+    /// The entry hash and key fingerprint its governance body's signature was verified under
+    /// (`TypedSparseBody::verify`): the source transaction verifies it again only under
+    /// another key or for another entry (`governance::accepted_into`, JoinDesign S4).
+    pub(crate) fn signed_under(&self) -> Option<(Digest32, Digest32)> {
+        self.signed_under
+    }
     pub(crate) fn included(&self) -> &IncludedHeader {
         &self.included
     }
@@ -286,6 +295,8 @@ impl SparseParent {
 pub(crate) struct TypedSparseBody {
     hash: Digest32,
     state: SparsePayloadState,
+    /// The fingerprint of the key its governance body's signature was verified under.
+    signed_under: Option<Digest32>,
 }
 
 /// Holding an addressed ciphertext is not applying its key. Key installation and private
@@ -340,6 +351,16 @@ pub(crate) struct SparseValidation {
     coordinate: usize,
     finished: bool,
     payload_state: SparsePayloadState,
+    /// Within one operation (`end_operation` ends it, JoinDesign S2): the entry's own context
+    /// as loaded and checked against its signed hash, whether its head was found committed
+    /// (a committed head stays committed), and whether every parent's whole context was
+    /// checked in this operation (`parents_checked`).
+    held: Option<std::sync::Arc<ControlContext>>,
+    head_committed: bool,
+    parents_checked: bool,
+    /// Its typed body's entry hash and the key fingerprint its governance signature was
+    /// verified under (`TypedSparseBody::verify`); none after a restore from a checkpoint.
+    signed_under: Option<(Digest32, Digest32)>,
     /// Rule F3: coordinates naming a proved splitter at or after its boundary that are not this
     /// node's accepted control (`underclaim` false), and parents' coordinates of it the signed
     /// context does not dominate (`underclaim` true), one of each per author. Kept unresolved
@@ -353,6 +374,23 @@ pub(crate) struct SparseValidation {
 struct Deferred {
     reference: EntryReference,
     underclaim: bool,
+}
+
+/// The most parent references one entry has (its own predecessor and its `seen`), each a
+/// receipt a validation holds (`SparseValidation::new`).
+pub(crate) const MAX_PARENTS: usize = 17;
+
+/// The most deferrals one whole validation can hold, across all its operations. `defer` keeps
+/// one per (author, underclaim), and every deferred author is a proved splitter
+/// (`Splits::reaching`): a `ForkBoundary` is recorded only from a fork proof verified under the
+/// author's key in the room's authors map (`note_fork_in`'s callers), which never shrinks and
+/// holds at most [`AUTHORS_HARD_LIMIT`](crate::node::channel::AUTHORS_HARD_LIMIT) authors.
+const MAX_DEFERRALS: usize = 2 * crate::node::channel::AUTHORS_HARD_LIMIT;
+
+/// The most bytes one whole validation's deferrals can take: [`MAX_DEFERRALS`], in a vector
+/// that grows by doubling from four, so to the next power of two at most.
+pub(crate) fn deferred_bytes_max() -> usize {
+    MAX_DEFERRALS.next_power_of_two().max(4) * std::mem::size_of::<Deferred>()
 }
 
 impl TypedSparseBody {
@@ -390,7 +428,11 @@ impl TypedSparseBody {
                 ContextUpdate | Termination => SparsePayloadState::Held,
                 _ => return Ok(PayloadValidation::BodyRequired),
             };
-            return Ok(PayloadValidation::Complete(Self { hash, state }));
+            return Ok(PayloadValidation::Complete(Self {
+                hash,
+                state,
+                signed_under: None,
+            }));
         };
         if payload.len() as u64 != entry.skeleton.payload_len
             || sha256(payload) != entry.skeleton.payload_hash
@@ -399,6 +441,7 @@ impl TypedSparseBody {
                 "typed payload differs from signed commitment",
             ));
         }
+        let mut signed_under = None;
         match v2.kind {
             Governance | StepPolicy => {
                 if !budget.take_signature() {
@@ -406,6 +449,7 @@ impl TypedSparseBody {
                 }
                 let body = GovEntry::body_bound_to(entry)?;
                 body.verify(key)?;
+                signed_under = Some(key.fingerprint());
             }
             Content => {
                 use crate::cbor::Decoder;
@@ -483,11 +527,33 @@ impl TypedSparseBody {
         Ok(PayloadValidation::Complete(Self {
             hash,
             state: SparsePayloadState::Held,
+            signed_under,
         }))
     }
 }
 
 impl SparseValidation {
+    /// The parents this validation checks (read-only: the walk before a wait names what they
+    /// lack, `history_stream::admission::prerequisites`).
+    pub(crate) fn parents(&self) -> &[Option<SparseParent>] {
+        &self.parents
+    }
+    /// Every parent's whole context was checked in this operation (`SparseParent::
+    /// check_published`, by the start that made these parents): not checked again here.
+    pub(crate) fn parents_checked(&mut self) {
+        self.parents_checked = true;
+    }
+    /// This operation ends: what it held or found is not carried into the next.
+    pub(crate) fn end_operation(&mut self) {
+        self.held = None;
+        self.head_committed = false;
+        self.parents_checked = false;
+    }
+    /// The heap its F3 deferrals take ([`Self::deferred`] is kept across operations): their
+    /// allocated capacity, which a retained continuation is charged for.
+    pub(crate) fn deferred_bytes(&self) -> usize {
+        self.deferred.capacity() * std::mem::size_of::<Deferred>()
+    }
     pub(crate) fn checkpoint_target(&self) -> (Digest32, TreeBinding, u64, u64) {
         let seq = self.included.header().entry().skeleton.seq;
         (self.included.head_id(), self.included.binding(), seq, seq)
@@ -548,7 +614,7 @@ impl SparseValidation {
         }
         let included = IncludedHeader::from_authenticated_receipt(d.bytes()?)?;
         let count = d.array()?;
-        if count > 17 {
+        if count > MAX_PARENTS {
             return Err(Error::MalformedAtRest("sparse checkpoint parent count"));
         }
         let mut parents = Vec::with_capacity(count);
@@ -633,6 +699,7 @@ impl SparseValidation {
         let body = TypedSparseBody {
             hash: header.entry_hash(),
             state,
+            signed_under: None,
         };
         let mut cursor = Self::new(included, body, parents)?;
         cursor.parent = parent;
@@ -657,7 +724,7 @@ impl SparseValidation {
         let seen = checked_seen(v2);
         if body.hash != entry.entry_hash()
             || parents.len() != own + seen.len()
-            || parents.len() > 17
+            || parents.len() > MAX_PARENTS
         {
             return Err(Error::MalformedBundle(
                 "sparse entry body or parent count differs",
@@ -701,6 +768,10 @@ impl SparseValidation {
             finished: false,
             payload_state: body.state,
             deferred: Vec::new(),
+            signed_under: body.signed_under.map(|key| (body.hash, key)),
+            held: None,
+            head_committed: false,
+            parents_checked: false,
         })
     }
 
@@ -727,9 +798,16 @@ impl SparseValidation {
             .v2
             .as_ref()
             .ok_or(Error::MalformedBundle("sparse v2 binding"))?;
-        let Some(pre) = input.history_context(&v2.pre_context)? else {
-            return Ok(SparseValidationStep::MissingContext(v2.pre_context));
+        let pre = match &self.held {
+            Some(pre) => std::sync::Arc::clone(pre),
+            None => {
+                let Some(pre) = input.history_context(&v2.pre_context)? else {
+                    return Ok(SparseValidationStep::MissingContext(v2.pre_context));
+                };
+                std::sync::Arc::new(pre)
+            }
         };
+        budget.refund_context_load(pre.coordinates.len());
         if pre.room != self.included.binding().room
             || pre.scope != self.included.binding().scope
             || pre.hash() != v2.pre_context
@@ -745,11 +823,15 @@ impl SparseValidation {
                 "sparse checkpoint coordinate exceeds context",
             ));
         }
-        if !input.history_head_committed(&self.included.head_id(), self.included.binding())? {
+        if !self.head_committed
+            && !input.history_head_committed(&self.included.head_id(), self.included.binding())?
+        {
             return Err(Error::MalformedBundle(
                 "sparse head has no accepted consistency",
             ));
         }
+        self.head_committed = true;
+        self.held = Some(std::sync::Arc::clone(&pre));
         if self.parent < self.parents.len() {
             let Some(parent) = &self.parents[self.parent] else {
                 // A waived reference adds nothing: no frontier of it is followed.
@@ -789,12 +871,17 @@ impl SparseValidation {
                 return Ok(SparseValidationStep::Yielded);
             }
             // The same whole-context check admission made before preflight (`check_published`),
-            // again here, where the parent's context is consumed for authority.
-            parent.check_published(input)?;
+            // again here, where the parent's context is consumed for authority, unless the start
+            // of this same operation made it (`parents_checked`): a pure check of immutable
+            // signed and content-addressed facts.
+            if !self.parents_checked {
+                parent.check_published(input)?;
+            }
             let hash = parent.prefix().frontier;
             let Some(frontier) = input.history_context(&hash)? else {
                 return Ok(SparseValidationStep::MissingContext(hash));
             };
+            budget.refund_context_load(frontier.coordinates.len());
             if self.parent_coordinate > frontier.coordinates.len() {
                 return Err(Error::MalformedAtRest(
                     "sparse checkpoint coordinate exceeds parent",
@@ -808,7 +895,7 @@ impl SparseValidation {
             if self.parent == 0
                 && entry.skeleton.seq > 1
                 && v2.kind == SignedEntryKind::Content
-                && pre != frontier
+                && *pre != frontier
             {
                 return Err(Error::MalformedBundle(
                     "content changes control context without a control",
@@ -857,18 +944,33 @@ impl SparseValidation {
                 // A higher coordinate is not by itself a continuity proof. Both endpoints
                 // must belong to this node's consistency-accepted author commitment. This
                 // also rejects a malformed context hidden in an omitted content leaf.
-                if !budget.take_control_lookup() {
-                    return Ok(SparseValidationStep::Yielded);
-                }
-                match validate_control_coordinate(input, &pre, earlier)? {
-                    Some(
-                        SparseValidationStep::Mismatch(reference)
-                        | SparseValidationStep::MissingControl(reference),
-                    ) if splits.reaching(&reference.author, reference.seq).is_some() => {
-                        defer(&mut self.deferred, &reference, false);
+                // Each such fact is checked once: the same coordinate as the entry's own is
+                // checked by the identical call in the context phase below, and a published
+                // parent's frontier (`check_published`: its own pre-context, joined with
+                // itself for a control) was checked by that parent's own admission here; the
+                // later endpoint's source prefix covers the lower one's. A coordinate naming a
+                // proved splitter (rule F3) is checked here whatever its parent, for its
+                // deferral.
+                let same = pre
+                    .coordinates
+                    .binary_search_by_key(&earlier.author, |coordinate| coordinate.author)
+                    .is_ok_and(|at| pre.coordinates[at].seq == earlier.seq);
+                if !(same || matches!(parent, SparseParent::Published { .. }))
+                    || splits.reaching(&earlier.author, earlier.seq).is_some()
+                {
+                    if !budget.take_control_lookup() {
+                        return Ok(SparseValidationStep::Yielded);
                     }
-                    Some(pending) => return Ok(pending),
-                    None => {}
+                    match validate_control_coordinate(input, &pre, earlier)? {
+                        Some(
+                            SparseValidationStep::Mismatch(reference)
+                            | SparseValidationStep::MissingControl(reference),
+                        ) if splits.reaching(&reference.author, reference.seq).is_some() => {
+                            defer(&mut self.deferred, &reference, false);
+                        }
+                        Some(pending) => return Ok(pending),
+                        None => {}
+                    }
                 }
                 self.parent_coordinate += 1;
             }
@@ -928,10 +1030,12 @@ impl SparseValidation {
             return Ok(SparseValidationStep::Unmatched(reference.clone()));
         }
         self.finished = true;
+        self.held = None;
         Ok(SparseValidationStep::Complete(ValidatedSparseEntry {
             included: self.included.clone(),
-            pre_context: pre,
+            pre_context: std::sync::Arc::unwrap_or_clone(pre),
             payload_state: self.payload_state,
+            signed_under: self.signed_under,
         }))
     }
 }
@@ -946,6 +1050,10 @@ fn defer(deferred: &mut Vec<Deferred>, reference: &EntryReference, underclaim: b
             reference: reference.clone(),
             underclaim,
         });
+        debug_assert!(
+            deferred.len() <= MAX_DEFERRALS,
+            "deferrals past MAX_DEFERRALS"
+        );
     }
 }
 

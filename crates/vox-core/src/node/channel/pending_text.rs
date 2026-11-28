@@ -1275,6 +1275,7 @@ impl PendingText {
                 id,
                 &entry,
                 late,
+                None,
             )?;
             if accepted.work_changed {
                 if let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) {

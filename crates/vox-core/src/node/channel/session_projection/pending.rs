@@ -10,6 +10,10 @@ use crate::node::store::Store;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// What [`ChannelState::governance_public`] reads: readiness, display revision and expiry, and
+/// the semantic facts' readiness, build basis and admin clock.
+pub(crate) type GovernancePublic = (bool, u64, u64, (bool, Option<(u64, u64)>, Option<u64>));
+
 #[derive(Clone, Copy)]
 pub(crate) enum ProjectionWork {
     Governance,
@@ -279,6 +283,22 @@ impl ChannelState {
         self.install_projection_result(store, completed).map(|_| ())
     }
 
+    /// The room's governance as readers and serving take it: readiness, the display's revision
+    /// and expiry, and the installed semantic facts. Read around an owned operation's install
+    /// (`Source::write_owned_reserved`): an installation that changed it changed public state,
+    /// which is published even when the operation committed nothing.
+    pub(crate) fn governance_public(&self) -> GovernancePublic {
+        (
+            self.governance_ready,
+            self.governance_display.revision,
+            self.governance_display.valid_until,
+            self.governance_semantic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .installed(),
+        )
+    }
+
     /// The shared log/cache allocator's high-water mark after a governance turn that may have
     /// taken arrivals from it (MP-11): never lowered, so no id is used twice.
     pub(in crate::node::channel) fn install_next_log(&mut self, next_log_id: u64) {
@@ -327,6 +347,7 @@ impl PendingProjection {
                         &self.me,
                         self.now,
                         &mut self.next_log_id,
+                        governance::FOLD_BUDGET,
                     )?;
                     retracted = progress.retracted;
                     let mut ready = progress.ready;

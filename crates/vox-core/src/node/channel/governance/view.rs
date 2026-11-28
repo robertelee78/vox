@@ -344,6 +344,12 @@ impl SemanticState {
             .map(|_| std::sync::Arc::clone(&self.facts.consent))
     }
 
+    /// What an installation changes of these facts as readers take them: readiness, the basis
+    /// the installed facts were built from, and the admin clock ([`Self::install`]).
+    pub(in crate::node::channel) fn installed(&self) -> (bool, Option<(u64, u64)>, Option<u64>) {
+        (self.ready, self.source, self.facts.admin_clock)
+    }
+
     pub(in crate::node::channel) fn take_work(&mut self) -> SemanticWork {
         SemanticWork {
             serial: self.serial,

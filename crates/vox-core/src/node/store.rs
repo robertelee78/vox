@@ -712,6 +712,8 @@ pub struct Store {
     /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
     writer: Mutex<Epochs>,
+    /// `Epochs::next_transaction` as of the last commit, readable without the writer.
+    committed_transaction: AtomicU64,
     /// One agreement settlement may wait for this store's physical writer at a time.
     agreement_settlement: Arc<tokio::sync::Semaphore>,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
@@ -841,6 +843,7 @@ impl Store {
             )?,
             opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
+            committed_transaction: AtomicU64::new(0),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
             give_back: Arc::default(),
@@ -873,6 +876,7 @@ impl Store {
             )?,
             opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
+            committed_transaction: AtomicU64::new(0),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
             give_back: Arc::default(),
@@ -1630,6 +1634,7 @@ impl Store {
             received_authors: BTreeSet::new(),
             small_schema_checked: false,
             history_touched: BTreeMap::new(),
+            segments_written: 0,
             epochs,
         })
     }
@@ -1656,6 +1661,7 @@ impl Store {
             received_authors: BTreeSet::new(),
             small_schema_checked: false,
             history_touched: BTreeMap::new(),
+            segments_written: 0,
             epochs,
         })
     }
@@ -1720,6 +1726,12 @@ impl Store {
         Arc::clone(&self.agreement_settlement)
     }
 
+    /// The identity of the last committed transaction: it moves with every commit, so an
+    /// operation that read it before and after knows whether anything committed meanwhile.
+    pub(crate) fn transaction_identity(&self) -> u64 {
+        self.committed_transaction.load(Ordering::Acquire)
+    }
+
     pub(crate) fn received_semantic_debts_for_room(
         &self,
         room: Digest32,
@@ -1731,6 +1743,25 @@ impl Store {
             .flat_map(|(_, debts)| debts.iter().cloned())
             .collect();
         (debts, epochs.replacement)
+    }
+
+    /// Every receive owner's debt in one room: each flow's latest received transaction not yet
+    /// durable, with or without an author an effect associated with it (a source whose effect
+    /// is still owed, a body refilled before its effect). An author debt is never outside it:
+    /// it is registered in the same commit that sets its flow's debt to that transaction, a
+    /// flow's debt only grows, and both leave together once durable
+    /// ([`Self::settle_durable_through`]).
+    pub(crate) fn received_debts_for_room(&self, room: Digest32) -> Vec<ReceivedDebt> {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        epochs
+            .pending
+            .iter()
+            .filter(|pending| pending.owner.room == room)
+            .map(|pending| ReceivedDebt {
+                owner: Arc::clone(&pending.owner),
+                through: pending.through,
+            })
+            .collect()
     }
 
     /// Capture without attempting fallible replacement completion. The returned watch is
@@ -2426,6 +2457,8 @@ pub struct Batch<'a> {
     received_authors: BTreeSet<Digest32>,
     /// What this batch changed of each room's history, installed in the store at commit.
     history_touched: BTreeMap<Digest32, HistoryTouched>,
+    /// How many segment puts and deletes this batch queued (`Batch::segments_written`).
+    segments_written: u64,
     small_schema_checked: bool,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
@@ -2709,6 +2742,7 @@ impl Batch<'_> {
             .map_err(storage("open segments"))?
             .remove(key)
             .map_err(storage("delete old segment"))?;
+        self.segments_written += 1;
         Ok(())
     }
 
@@ -2730,7 +2764,14 @@ impl Batch<'_> {
                 .map_err(storage("delete segment"))?
                 .is_some();
         }
+        self.segments_written += 1;
         Ok(existed)
+    }
+
+    /// How many segment puts and deletes this batch has queued: a caller that wrote only
+    /// segments can tell a write that changed nothing (`HistoryAdmission`, JoinDesign S2).
+    pub(crate) fn segments_written(&self) -> u64 {
+        self.segments_written
     }
 
     /// Queue a public metadata write (see [`Store::put_meta`]).
@@ -2762,6 +2803,7 @@ impl Batch<'_> {
             received_authors,
             history_touched,
             small_schema_checked: _,
+            segments_written: _,
             mut epochs,
         } = self;
         let class = if !received_authors.is_empty() && matches!(class, Class::Derived) {
@@ -2794,6 +2836,9 @@ impl Batch<'_> {
             }
         }
         epochs.next_transaction = transaction;
+        store
+            .committed_transaction
+            .store(transaction, Ordering::Release);
         if flushed {
             Store::settle_durable_through(&mut epochs, transaction);
         } else if matches!(class, Class::Received) {

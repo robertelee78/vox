@@ -1669,6 +1669,8 @@ pub(crate) struct Write<'a, 's> {
     channel: &'a Digest32,
     directory: Directory,
     destination: Option<u64>,
+    /// The directory as it was opened, to tell a write that changed nothing (`unchanged`).
+    opened: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl EntryIndex {
@@ -1678,11 +1680,11 @@ impl EntryIndex {
         sek: &'a Sek,
         channel: &'a Digest32,
     ) -> Result<Write<'a, 's>> {
-        let mut directory =
-            match Source::Batch(batch).open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)? {
-                Some(bytes) => Directory::parse(&bytes)?,
-                None => Directory::default(),
-            };
+        let opened = Source::Batch(batch).open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?;
+        let mut directory = match &opened {
+            Some(bytes) => Directory::parse(bytes)?,
+            None => Directory::default(),
+        };
         directory.ensure_instance()?;
         directory.provisional_attached = directory
             .legacy_provisional
@@ -1695,6 +1697,7 @@ impl EntryIndex {
             channel,
             directory,
             destination: None,
+            opened,
         })
     }
     pub(crate) fn commit_generation(&self) -> u64 {
@@ -2064,6 +2067,23 @@ impl<'s> Write<'_, 's> {
         let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, DIRECTORY, &bytes)?;
         self.batch
             .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)
+    }
+
+    /// How many segments this write's batch has queued so far: the mark `unchanged` compares.
+    pub(crate) fn segments_written(&self) -> u64 {
+        self.batch.segments_written()
+    }
+
+    /// Whether this write changed nothing: its directory is still the one it opened and its
+    /// batch queued no segment since `segments` (`Batch::segments_written`), so sealing and
+    /// committing it would only move the revision and empty every reader's cache
+    /// (JoinDesign S2).
+    pub(crate) fn unchanged(&self, segments: u64) -> bool {
+        self.batch.segments_written() == segments
+            && self
+                .opened
+                .as_ref()
+                .is_some_and(|opened| **opened == *self.directory.bytes())
     }
 }
 

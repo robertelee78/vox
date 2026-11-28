@@ -17,9 +17,9 @@ pub(in crate::node::channel) use view::{
 #[cfg(feature = "test-knobs")]
 pub(crate) use sparse::seen_hint_mutant;
 pub(crate) use sparse::{
-    checked_seen, sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparseParent,
-    SparsePayloadState, SparseValidation, SparseValidationStep, TypedSparseBody,
-    ValidatedSparseEntry, VerifiedParentPrefix,
+    checked_seen, deferred_bytes_max, sparse_control_evaluation, ControlEvaluation,
+    PayloadValidation, SparseParent, SparsePayloadState, SparseValidation, SparseValidationStep,
+    TypedSparseBody, ValidatedSparseEntry, VerifiedParentPrefix, MAX_PARENTS,
 };
 
 use super::entry_store::EntryIndex;
@@ -685,6 +685,7 @@ pub(super) struct Acceptance {
     pub(super) current_advanced: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe(
     writer: &mut facts::Write<'_, '_>,
     log: u64,
@@ -693,6 +694,7 @@ fn observe(
     entry: &crate::log::entry::Entry,
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
+    signed_under: Option<(Digest32, Digest32)>,
 ) -> Result<Acceptance> {
     use crate::governance::entry::GovEntry;
     let hash = entry.entry_hash();
@@ -756,7 +758,11 @@ fn observe(
     };
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
-    if let Err(error) = body.verify(key) {
+    // The same signature over the same entry under the author's same current key was verified
+    // when the entry was typed in this admission (`signed_under`, JoinDesign S4): equal bytes
+    // under an equal key verify equally. Under any other key it is verified here as always.
+    let verified = signed_under == Some((hash, key.fingerprint()));
+    if let Err(error) = if verified { Ok(()) } else { body.verify(key) } {
         return if entry.skeleton.v2.is_some() && !member_fact {
             Err(error)
         } else {
@@ -861,7 +867,7 @@ fn advance_source(
         if published {
             let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
             let late = input.child_after(&hash, None)?.is_some();
-            let accepted = observe(&mut writer, id, clock, late, &entry, authors, root)?;
+            let accepted = observe(&mut writer, id, clock, late, &entry, authors, root, None)?;
             if accepted.work_changed && grants_this_reader(&entry, me) {
                 backfill.insert(entry.skeleton.author_id);
             }
@@ -970,6 +976,7 @@ pub(super) fn accepted_into(
     log: u64,
     entry: &crate::log::entry::Entry,
     late: bool,
+    signed_under: Option<(Digest32, Digest32)>,
 ) -> Result<Acceptance> {
     let (clock, sparse) = {
         let input = entries.in_batch(batch, sek, room)?;
@@ -981,7 +988,16 @@ pub(super) fn accepted_into(
     };
     let mut writer = facts::Write::open(batch, sek, room)?;
     writer.set_control_only(sparse);
-    let accepted = observe(&mut writer, log, clock, late, entry, authors, root)?;
+    let accepted = observe(
+        &mut writer,
+        log,
+        clock,
+        late,
+        entry,
+        authors,
+        root,
+        signed_under,
+    )?;
     writer.live_receipt(log)?;
     let backfill = accepted.work_changed && grants_this_reader(entry, me);
     writer.seal()?;
@@ -1026,7 +1042,9 @@ fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Res
 /// rather than draining all newly received rows while starving older obligations.
 /// No future complete-page vector or borrowed snapshot survives this function.
 /// `next_log` is the room's shared log/cache allocator: a row that comes back takes its new
-/// arrival from it (MP-11), and the caller installs what it advanced to.
+/// arrival from it (MP-11), and the caller installs what it advanced to. `allowance` bounds the
+/// turn's order/evaluation phase steps in wall time (`FOLD_BUDGET` for a maintenance turn); at
+/// least one step runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn advance(
     store: &Store,
@@ -1038,6 +1056,7 @@ pub(super) fn advance(
     me: &Digest32,
     now: u64,
     next_log: &mut u64,
+    allowance: std::time::Duration,
 ) -> Result<Progress> {
     let current = progress(store, sek, room, now)?;
     if current.ready && !current.pending {
@@ -1079,7 +1098,7 @@ pub(super) fn advance(
                     fold_ready = true;
                     break;
                 }
-                if started.elapsed() >= FOLD_BUDGET {
+                if started.elapsed() >= allowance {
                     break;
                 }
             }
@@ -1092,7 +1111,7 @@ pub(super) fn advance(
             let mut decided = Vec::new();
             if fold_ready {
                 for _ in 0..FOLD_STEPS {
-                    if started.elapsed() >= FOLD_BUDGET || !writer.causal_settled()? {
+                    if started.elapsed() >= allowance || !writer.causal_settled()? {
                         break;
                     }
                     let replayed = writer.eligibility_replay_step(&input)?;
@@ -1139,7 +1158,7 @@ pub(super) fn advance(
 
 /// At most this many order/evaluation phase steps, and at most this long, per governance turn.
 const FOLD_STEPS: usize = 256;
-const FOLD_BUDGET: std::time::Duration = std::time::Duration::from_millis(40);
+pub(super) const FOLD_BUDGET: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// `VOX_TEST_FOLD_HOLD_FILE`: while the named file exists, no room's governance fold advances.
 /// Read only by a `test-knobs` build; a release `vox` holds nothing (#300).
